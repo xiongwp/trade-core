@@ -28,10 +28,27 @@
           font-variant-numeric: tabular-nums; }
   #last.up { color: var(--up); } #last.down { color: var(--down); }
   #meta { color: var(--dim); font-size: 12px; }
-  #wrap { padding: 10px 14px; }
-  canvas { width: 100%; height: calc(100vh - 110px); display: block;
+  #wrap { padding: 10px 14px; display: flex; gap: 10px; }
+  canvas { flex: 1; min-width: 0; height: calc(100vh - 110px); display: block;
            background: var(--panel); border: 1px solid var(--border);
            border-radius: 8px; }
+  #depth { width: 210px; flex: none; background: var(--panel);
+           border: 1px solid var(--border); border-radius: 8px;
+           padding: 10px; font-variant-numeric: tabular-nums; font-size: 12px; }
+  #depth h2 { font-size: 12px; color: var(--dim); font-weight: 600;
+              margin-bottom: 6px; }
+  .row { position: relative; display: flex; justify-content: space-between;
+         padding: 2px 4px; border-radius: 4px; overflow: hidden; }
+  .row .bar { position: absolute; top: 0; right: 0; bottom: 0; opacity: .18; }
+  .row.ask .bar { background: var(--down); }
+  .row.bid .bar { background: var(--up); }
+  .row.ask .px { color: var(--down); } .row.bid .px { color: var(--up); }
+  .row span { position: relative; }
+  #spread { text-align: center; color: var(--dim); padding: 5px 0;
+            border-top: 1px dashed var(--border); border-bottom: 1px dashed var(--border);
+            margin: 4px 0; }
+  #conn { font-size: 11px; color: var(--dim); }
+  #conn.ws { color: var(--up); }
 </style>
 </head>
 <body>
@@ -41,13 +58,22 @@
   <div class="iv" id="iv"></div>
   <span id="last">–</span>
   <span id="meta"></span>
+  <span id="conn">连接中…</span>
 </header>
-<div id="wrap"><canvas id="cv"></canvas></div>
+<div id="wrap">
+  <canvas id="cv"></canvas>
+  <div id="depth">
+    <h2>盘口（卖５档 / 买５档）</h2>
+    <div id="asks"></div>
+    <div id="spread">–</div>
+    <div id="bids"></div>
+  </div>
+</div>
 <script>
 "use strict";
 const INTERVALS = [["1s","1秒"],["1m","1分"],["3m","3分"],["5m","5分"],["10m","10分"],
                    ["15m","15分"],["30m","30分"],["1d","日"],["1w","周"],["1mo","月"]];
-let interval = "1s", symbol = null, candles = [], prevClose = null;
+let interval = "1s", symbol = null, candles = [], depth = null, prevClose = null;
 
 const ivBox = document.getElementById("iv");
 for (const [key, label] of INTERVALS) {
@@ -56,11 +82,51 @@ for (const [key, label] of INTERVALS) {
   if (key === interval) b.classList.add("on");
   b.onclick = () => { interval = key;
     ivBox.querySelectorAll("button").forEach(x => x.classList.toggle("on", x.dataset.k === key));
-    refresh(); };
+    resubscribe(); refresh(); };
   ivBox.appendChild(b);
 }
 const symSel = document.getElementById("sym");
-symSel.onchange = () => { symbol = symSel.value; refresh(); };
+symSel.onchange = () => { symbol = symSel.value; resubscribe(); refresh(); };
+
+// --- live updates: WebSocket push, polling as fallback ---------------------
+let ws = null, wsAlive = false;
+const connEl = document.getElementById("conn");
+function resubscribe() {
+  if (ws) { try { ws.close(); } catch (e) {} ws = null; wsAlive = false; }
+  if (symbol == null) return;
+  try {
+    ws = new WebSocket(`ws://${location.host}/ws?symbol=${symbol}&interval=${interval}`);
+    ws.onmessage = ev => {
+      wsAlive = true;
+      connEl.textContent = "WebSocket 推送"; connEl.className = "ws";
+      const m = JSON.parse(ev.data);
+      candles = m.candles; depth = m.depth;
+      draw(); drawDepth();
+    };
+    ws.onclose = ws.onerror = () => {
+      wsAlive = false;
+      connEl.textContent = "轮询模式"; connEl.className = "";
+    };
+  } catch (e) { wsAlive = false; }
+}
+
+function drawDepth() {
+  if (!depth) return;
+  const mk = (rows, cls, reverse) => {
+    const maxQ = Math.max(1, ...rows.map(r => r[1]));
+    const list = reverse ? [...rows].reverse() : rows;
+    return list.map(([p, q]) =>
+      `<div class="row ${cls}"><div class="bar" style="width:${(q / maxQ * 100).toFixed(1)}%"></div>` +
+      `<span class="px">${p}</span><span>${q}</span></div>`).join("");
+  };
+  // Asks shown high→low so best ask sits just above the spread.
+  document.getElementById("asks").innerHTML = mk(depth.asks, "ask", true);
+  document.getElementById("bids").innerHTML = mk(depth.bids, "bid", false);
+  const spread = document.getElementById("spread");
+  if (depth.asks.length && depth.bids.length)
+    spread.textContent = `价差 ${depth.asks[0][0] - depth.bids[0][0]}`;
+  else spread.textContent = "–";
+}
 
 async function loadSymbols() {
   try {
@@ -69,16 +135,21 @@ async function loadSymbols() {
     const cur = symbol;
     symSel.innerHTML = syms.map(s => `<option value="${s}">品种 ${s}</option>`).join("");
     if (cur && syms.includes(+cur)) symSel.value = cur;
+    const had = symbol != null;
     symbol = symSel.value;
+    if (!had) resubscribe(); // first symbol discovered: open the WS
   } catch (e) {}
 }
 
 async function refresh() {
   if (symbol == null) { await loadSymbols(); if (symbol == null) return; }
+  if (wsAlive) return; // WS is pushing; polling not needed
   try {
     const r = await fetch(`/api/candles?symbol=${symbol}&interval=${interval}&limit=120`);
     candles = await r.json();
-    draw();
+    const d = await fetch(`/api/depth?symbol=${symbol}`);
+    depth = await d.json();
+    draw(); drawDepth();
   } catch (e) {}
 }
 

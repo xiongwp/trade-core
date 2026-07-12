@@ -54,6 +54,10 @@ const RT_CANCELLED: u8 = 6;
 const RT_REJECTED: u8 = 7;
 const RT_MODIFIED: u8 = 8;
 const RT_NOTFOUND: u8 = 9;
+/// One depth ladder level (market-data): aux = level index, price/qty set.
+pub const RT_DEPTH_LEVEL: u8 = 10;
+/// Depth snapshot terminator: aux = bid_levels | ask_levels << 8.
+pub const RT_DEPTH_END: u8 = 11;
 
 /// A borrowed view over one wire frame. Reads fields in place; copies nothing.
 #[derive(Clone, Copy)]
@@ -297,6 +301,24 @@ pub fn encode_report(r: &ExecReport, out: &mut [u8; REPORT_LEN]) {
         ExecReport::NotFound { instrument, order_id } => {
             put(RT_NOTFOUND, instrument, order_id, 0, 0, 0, 0)
         }
+        ExecReport::DepthLevel { instrument, side, level, price, qty } => put(
+            RT_DEPTH_LEVEL,
+            instrument,
+            OrderId(0),
+            level as u64,
+            price,
+            qty,
+            match side { Side::Buy => 0, Side::Sell => 1 },
+        ),
+        ExecReport::DepthEnd { instrument, bid_levels, ask_levels } => put(
+            RT_DEPTH_END,
+            instrument,
+            OrderId(0),
+            bid_levels as u64 | (ask_levels as u64) << 8,
+            0,
+            0,
+            0,
+        ),
     }
 }
 

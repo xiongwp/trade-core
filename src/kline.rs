@@ -176,6 +176,95 @@ impl KlineAggregator {
         v.sort();
         v
     }
+
+    /// Persist all candle history **atomically** (temp file + rename), with an
+    /// FNV checksum so a torn write is detected rather than loaded.
+    pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut buf: Vec<u8> = Vec::with_capacity(1 << 16);
+        buf.extend_from_slice(b"TCK1");
+        buf.extend_from_slice(&(self.cap as u64).to_le_bytes());
+        buf.extend_from_slice(&(self.series.len() as u32).to_le_bytes());
+        let mut instruments: Vec<_> = self.series.keys().copied().collect();
+        instruments.sort();
+        for inst in instruments {
+            let series = &self.series[&inst];
+            buf.extend_from_slice(&inst.0.to_le_bytes());
+            for dq in series {
+                buf.extend_from_slice(&(dq.len() as u32).to_le_bytes());
+                for c in dq {
+                    for v in [c.start, c.open, c.high, c.low, c.close, c.volume, c.trades as u64] {
+                        buf.extend_from_slice(&v.to_le_bytes());
+                    }
+                }
+            }
+        }
+        let h = crate::journal::fnv1a(&buf);
+        buf.extend_from_slice(&h.to_le_bytes());
+
+        let tmp = path.with_extension("tmp");
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&buf)?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, path)
+    }
+
+    /// Load history saved by [`save`](Self::save). Corrupt/missing = `Err`.
+    pub fn load(path: &std::path::Path) -> std::io::Result<Self> {
+        let buf = std::fs::read(path)?;
+        let bad = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, m.to_string());
+        if buf.len() < 24 || &buf[0..4] != b"TCK1" {
+            return Err(bad("bad magic"));
+        }
+        let body = buf.len() - 8;
+        let stored = u64::from_le_bytes(buf[body..].try_into().unwrap());
+        if crate::journal::fnv1a(&buf[..body]) != stored {
+            return Err(bad("checksum mismatch"));
+        }
+        let cap = u64::from_le_bytes(buf[4..12].try_into().unwrap()) as usize;
+        let n_inst = u32::from_le_bytes(buf[12..16].try_into().unwrap()) as usize;
+        let mut agg = KlineAggregator::new(cap);
+        let mut pos = 16;
+        let take = |pos: &mut usize, n: usize| -> std::io::Result<()> {
+            if *pos + n > body {
+                return Err(bad("truncated"));
+            }
+            Ok(())
+        };
+        for _ in 0..n_inst {
+            take(&mut pos, 4)?;
+            let inst = InstrumentId(u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()));
+            pos += 4;
+            let mut series = Vec::with_capacity(INTERVALS.len());
+            for _ in 0..INTERVALS.len() {
+                take(&mut pos, 4)?;
+                let n = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+                pos += 4;
+                take(&mut pos, n * 56)?;
+                let mut dq = VecDeque::with_capacity(n);
+                for _ in 0..n {
+                    let u = |k: usize| {
+                        u64::from_le_bytes(buf[pos + k * 8..pos + k * 8 + 8].try_into().unwrap())
+                    };
+                    dq.push_back(Candle {
+                        start: u(0),
+                        open: u(1),
+                        high: u(2),
+                        low: u(3),
+                        close: u(4),
+                        volume: u(5),
+                        trades: u(6) as u32,
+                    });
+                    pos += 56;
+                }
+                series.push(dq);
+            }
+            agg.series.insert(inst, series);
+        }
+        Ok(agg)
+    }
 }
 
 #[cfg(test)]
@@ -239,6 +328,36 @@ mod tests {
         assert_eq!(d.len(), 1);
         assert_eq!(d[0].volume, 11);
         assert_eq!(d[0].trades, 4);
+    }
+
+    #[test]
+    fn save_load_round_trips_and_rejects_corruption() {
+        let dir = std::env::temp_dir().join(format!("tc-kline-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("k.bin");
+
+        let mut agg = KlineAggregator::new(50);
+        for i in 0..500u64 {
+            agg.on_trade(InstrumentId(1 + (i % 3) as u32), 1_700_000_000 + i, 990 + i % 20, 1 + i % 9);
+        }
+        agg.save(&path).unwrap();
+        let loaded = KlineAggregator::load(&path).unwrap();
+        assert_eq!(loaded.instruments(), agg.instruments());
+        for sym in agg.instruments() {
+            for (name, _) in INTERVALS {
+                assert_eq!(
+                    loaded.candles(sym, name, 100),
+                    agg.candles(sym, name, 100),
+                    "series {sym} {name} must round-trip"
+                );
+            }
+        }
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[40] ^= 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(KlineAggregator::load(&path).is_err(), "corruption must be detected");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

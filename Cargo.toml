@@ -13,6 +13,20 @@ categories = ["finance", "data-structures"]
 name = "trade_core"
 path = "src/lib.rs"
 
+# The three deployed services: order (flow generator / order-system stand-in),
+# trade-core (the matching node), market-data (K-lines + depth + chart UI).
+[[bin]]
+name = "trade-core"
+path = "src/bin/exchange_server.rs"
+
+[[bin]]
+name = "order"
+path = "src/bin/sim_trader.rs"
+
+[[bin]]
+name = "market-data"
+path = "src/bin/market_data.rs"
+
 [[example]]
 name = "demo"
 path = "examples/demo.rs"

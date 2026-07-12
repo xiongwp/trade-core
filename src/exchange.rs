@@ -110,6 +110,11 @@ pub enum ExecReport {
     Rejected { instrument: InstrumentId, order_id: OrderId, reason: &'static str },
     Modified { instrument: InstrumentId, order_id: OrderId, remaining: Qty },
     NotFound { instrument: InstrumentId, order_id: OrderId },
+    /// One level of a depth-of-market snapshot (market-data feed). `level` is
+    /// 0 = best. A snapshot is a run of `DepthLevel`s closed by `DepthEnd`.
+    DepthLevel { instrument: InstrumentId, side: Side, level: u8, price: Price, qty: Qty },
+    /// Terminates a depth snapshot; carries how many levels each side sent.
+    DepthEnd { instrument: InstrumentId, bid_levels: u8, ask_levels: u8 },
 }
 
 /// A function that produces a fresh matching strategy for each new instrument.
@@ -392,6 +397,7 @@ fn build_inner(
             parked: parked.clone(),
             default_pool: (config.pool_orders_per_book, config.prefault),
             pin_core: config.pin_cpus.then_some(shard_id),
+            last_depth: Instant::now(),
         };
         threads.push(
             thread::Builder::new()
@@ -688,7 +694,12 @@ struct Shard {
     parked: Arc<AtomicUsize>,
     default_pool: (usize, bool),
     pin_core: Option<usize>,
+    last_depth: Instant,
 }
+
+/// Depth-of-market publish cadence and ladder size.
+const DEPTH_EVERY: Duration = Duration::from_millis(200);
+const DEPTH_LEVELS: usize = 5;
 
 impl Shard {
     fn run(&mut self) {
@@ -734,7 +745,10 @@ impl Shard {
                 }
             }
 
-            if !worked {
+            if worked {
+                // Under sustained load, still publish depth on cadence.
+                self.maybe_publish_depth();
+            } else {
                 if !self.running.load(Ordering::Acquire)
                     && self.high_rx.is_empty()
                     && self.normal_rx.is_empty()
@@ -748,6 +762,7 @@ impl Shard {
                 if self.snapshot_due() {
                     self.take_snapshot();
                 }
+                self.maybe_publish_depth();
                 thread::yield_now();
             }
         }
@@ -762,6 +777,64 @@ impl Shard {
         }
         if is_parked {
             self.parked.fetch_sub(1, Ordering::Release);
+        }
+    }
+
+    /// Publish a top-N depth snapshot per instrument onto the result stream
+    /// (mirrored to market-data subscribers by the gateway), on a cadence.
+    fn maybe_publish_depth(&mut self) {
+        if self.last_depth.elapsed() < DEPTH_EVERY {
+            return;
+        }
+        self.last_depth = Instant::now();
+        // Collect first (immutable borrow), then emit.
+        let mut out: Vec<ExecReport> = Vec::new();
+        for (&instrument, engine) in self.processor.engines.iter() {
+            let book = engine.book();
+            if book.is_empty() {
+                continue;
+            }
+            let bids = book.top_levels(Side::Buy, DEPTH_LEVELS);
+            let asks = book.top_levels(Side::Sell, DEPTH_LEVELS);
+            for (i, &(price, qty)) in bids.iter().enumerate() {
+                out.push(ExecReport::DepthLevel {
+                    instrument,
+                    side: Side::Buy,
+                    level: i as u8,
+                    price,
+                    qty,
+                });
+            }
+            for (i, &(price, qty)) in asks.iter().enumerate() {
+                out.push(ExecReport::DepthLevel {
+                    instrument,
+                    side: Side::Sell,
+                    level: i as u8,
+                    price,
+                    qty,
+                });
+            }
+            out.push(ExecReport::DepthEnd {
+                instrument,
+                bid_levels: bids.len() as u8,
+                ask_levels: asks.len() as u8,
+            });
+        }
+        for r in out {
+            self.emit_report(r);
+        }
+    }
+
+    fn emit_report(&self, report: ExecReport) {
+        let mut pending = report;
+        loop {
+            match self.result_tx.push(pending) {
+                Ok(()) => return,
+                Err(returned) => {
+                    pending = returned;
+                    thread::yield_now();
+                }
+            }
         }
     }
 
