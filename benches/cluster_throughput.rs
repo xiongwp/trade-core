@@ -37,6 +37,7 @@ fn generate(node: u64, n: u64) -> Vec<Command> {
             out.push(Command::Cancel {
                 instrument: trade_core::InstrumentId(0),
                 order_id: OrderId(base + rng.range(1, i - 1)),
+                cmd_id: base + i,
             });
         } else {
             let side = if rng.next() & 1 == 0 { Side::Buy } else { Side::Sell };

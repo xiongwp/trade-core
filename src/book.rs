@@ -674,7 +674,13 @@ impl OrderBook {
         if new_remaining > o.remaining {
             return false;
         }
+        let delta = o.remaining - new_remaining;
+        let (side, price) = (o.side, o.price);
         o.remaining = new_remaining;
+        // Keep the level aggregate truthful (depth/FOK read lv.qty, not orders).
+        if let Some(lv) = self.side_mut(side).get_mut(price) {
+            lv.qty -= delta;
+        }
         true
     }
 
@@ -683,6 +689,13 @@ impl OrderBook {
     pub fn cancel(&mut self, id: OrderId) -> Option<Order> {
         let loc = self.locate.remove(&id)?;
         let order = *self.pool.get(loc.slot);
+        // Keep the level aggregates truthful at cancel time: the tombstone
+        // contributes nothing from this instant, even though its deque entry
+        // is reclaimed lazily (reclaim paths do NOT re-subtract).
+        if let Some(lv) = self.side_mut(order.side).get_mut(order.price) {
+            lv.qty -= order.remaining;
+            lv.live -= 1;
+        }
         // **Tombstone, O(1).** Scanning a deep level for the entry's position
         // is O(level) — the 20M-order stress test showed cancels grinding on
         // million-order levels. Instead the order is marked dead in place

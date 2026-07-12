@@ -62,7 +62,7 @@ fn main() {
         let sym = InstrumentId(1 + (rng.next() % 4) as u32);
         if i > 1000 && rng.next() % 7 == 0 {
             // Cancel an earlier order (may be already gone -> NotFound, fine).
-            wire::encode_cancel(sym, OrderId(rng.range(1, i - 1)), &mut frame);
+            wire::encode_cancel(sym, OrderId(rng.range(1, i - 1)), i, &mut frame);
         } else {
             let side = if rng.next() & 1 == 0 { Side::Buy } else { Side::Sell };
             let order = Order::limit(OrderId(i), side, rng.range(990, 1010), rng.range(1, 50))

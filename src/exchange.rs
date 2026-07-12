@@ -50,17 +50,23 @@ use crate::wire;
 pub enum Command {
     /// Submit a new order (low-priority queue).
     New(Order),
-    /// Cancel a resting order (high-priority queue).
+    /// Cancel a resting order (high-priority queue). `cmd_id` is the
+    /// order-system-assigned **unique increasing command id** (Leaf-style, the
+    /// same series as new-order ids): cancels and modifies are first-class
+    /// sequenced commands, so a crash replay reproduces them exactly and
+    /// re-sent commands are attributable end-to-end.
     Cancel {
         instrument: InstrumentId,
         order_id: OrderId,
+        cmd_id: u64,
     },
-    /// Amend a resting order (high-priority queue).
+    /// Amend a resting order (high-priority queue); `cmd_id` as on `Cancel`.
     Modify {
         instrument: InstrumentId,
         order_id: OrderId,
         new_price: Price,
         new_qty: Qty,
+        cmd_id: u64,
     },
     /// Forced liquidation (high-priority queue): cancel every resting order of
     /// `user` on `instrument`, then, if `close_qty > 0`, submit a protected
@@ -224,8 +230,8 @@ impl OrderGateway {
     }
 
     /// Convenience: cancel a resting order.
-    pub fn cancel(&self, instrument: InstrumentId, order_id: OrderId) -> Result<(), Command> {
-        self.submit(Command::Cancel { instrument, order_id })
+    pub fn cancel(&self, instrument: InstrumentId, order_id: OrderId, cmd_id: u64) -> Result<(), Command> {
+        self.submit(Command::Cancel { instrument, order_id, cmd_id })
     }
 
     /// Convenience: amend a resting order.
@@ -235,8 +241,9 @@ impl OrderGateway {
         order_id: OrderId,
         new_price: Price,
         new_qty: Qty,
+        cmd_id: u64,
     ) -> Result<(), Command> {
-        self.submit(Command::Modify { instrument, order_id, new_price, new_qty })
+        self.submit(Command::Modify { instrument, order_id, new_price, new_qty, cmd_id })
     }
 
     /// Convenience: force-close a user on an instrument.
@@ -370,8 +377,11 @@ fn build_inner(
             std::fs::create_dir_all(dir).expect("create journal dir");
             let jpath = dir.join(format!("journal-shard-{shard_id}.bin"));
             let spath = dir.join(format!("snapshot-shard-{shard_id}.bin"));
-            recover_into(&mut processor, &spath, &jpath).expect("recover shard state");
-            let w = JournalWriter::open(&jpath, config.journal_flush).expect("open journal");
+            let (_, last_seq) =
+                recover_stats(&mut processor, &spath, &jpath).expect("recover shard state");
+            let mut w = JournalWriter::open(&jpath, config.journal_flush).expect("open journal");
+            // The journal seq IS the total order: continue it, never restart it.
+            w.resume_from(last_seq);
             if let Ok(fh) = w.file_handle() {
                 journal::spawn_fsyncer(fh, config.journal_fsync, running.clone());
             }
@@ -538,14 +548,14 @@ impl Processor {
     pub fn process(&mut self, cmd: Command, emit: &mut dyn FnMut(ExecReport)) {
         match cmd {
             Command::New(order) => self.process_new(order, emit),
-            Command::Cancel { instrument, order_id } => {
+            Command::Cancel { instrument, order_id, .. } => {
                 if self.engine_for(instrument).cancel(order_id) {
                     emit(ExecReport::Cancelled { instrument, order_id });
                 } else {
                     emit(ExecReport::NotFound { instrument, order_id });
                 }
             }
-            Command::Modify { instrument, order_id, new_price, new_qty } => {
+            Command::Modify { instrument, order_id, new_price, new_qty, .. } => {
                 match self.engine_for(instrument).modify(order_id, new_price, new_qty) {
                     ModifyOutcome::NotFound => {
                         emit(ExecReport::NotFound { instrument, order_id })
@@ -963,6 +973,17 @@ pub fn recover_into(
     snapshot_path: &Path,
     journal_path: &Path,
 ) -> std::io::Result<u64> {
+    Ok(recover_stats(processor, snapshot_path, journal_path)?.0)
+}
+
+/// Like [`recover_into`], additionally returning the **highest journal seq
+/// observed** (snapshot's or any record's) — the writer must resume from it so
+/// the total order stays strictly increasing across restarts.
+pub fn recover_stats(
+    processor: &mut Processor,
+    snapshot_path: &Path,
+    journal_path: &Path,
+) -> std::io::Result<(u64, u64)> {
     let mut skip_seq = 0;
     if snapshot_path.exists() {
         let snap = snapshot::load(snapshot_path)?;
@@ -970,8 +991,10 @@ pub fn recover_into(
         skip_seq = snap.journal_seq;
     }
     let mut applied = 0u64;
+    let mut last_seq = skip_seq;
     if journal_path.exists() {
         for record in JournalReader::open(journal_path)? {
+            last_seq = last_seq.max(record.seq);
             if record.seq <= skip_seq {
                 continue; // already covered by the snapshot
             }
@@ -985,7 +1008,7 @@ pub fn recover_into(
             }
         }
     }
-    Ok(applied)
+    Ok((applied, last_seq))
 }
 
 /// FNV-1a fingerprint of a report stream (order-sensitive). Two runs with equal

@@ -99,6 +99,16 @@ impl JournalWriter {
         self.seq
     }
 
+    /// Resume the sequence counter after recovery. The journal seq is **the**
+    /// total order that determines replay results, so across restarts it must
+    /// stay strictly increasing: a writer restarting at 0 would append records
+    /// whose seqs duplicate earlier ones, corrupting the
+    /// `seq <= snapshot.journal_seq` skip filter on the next recovery.
+    pub fn resume_from(&mut self, seq: u64) {
+        debug_assert!(self.seq == 0, "resume_from is for freshly opened writers");
+        self.seq = self.seq.max(seq);
+    }
+
     /// Truncate the journal file to zero length. Call **only after** a snapshot
     /// covering every record has been durably written; the sequence counter
     /// keeps counting from where it was, so recovery's `seq > snapshot_seq`

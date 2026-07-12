@@ -47,10 +47,20 @@ fn random_flow(n: u64) -> Vec<trade_core::Command> {
     let mut out = Vec::new();
     for i in 1..=n {
         let r = next();
-        if r % 5 == 0 && i > 10 {
+        if r % 7 == 0 && i > 10 {
+            // Modifies are sequenced commands too: same replay guarantees.
+            out.push(trade_core::Command::Modify {
+                instrument: InstrumentId(0),
+                order_id: OrderId(1 + r % (i - 1)),
+                new_price: 990 + r % 21,
+                new_qty: 1 + r % 30,
+                cmd_id: i,
+            });
+        } else if r % 5 == 0 && i > 10 {
             out.push(trade_core::Command::Cancel {
                 instrument: InstrumentId(0),
                 order_id: OrderId(1 + r % (i - 1)),
+                cmd_id: i,
             });
         } else {
             let side = if r & 1 == 0 { Side::Buy } else { Side::Sell };
@@ -151,6 +161,60 @@ fn replay_until_timestamp_stops_early() {
     assert_eq!(partial.commands, 100, "time-bounded replay must stop at the cut");
     let engine = partial.processor.engine(InstrumentId(0)).unwrap();
     assert_eq!(engine.book().len(), 100, "state = exactly the first batch");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The total-order property, stated as the canonical example: New(1) →
+/// Modify(1) → Cancel(1) must replay in exactly journal-seq order, leaving no
+/// order — even though Cancel/Modify travelled the high-priority queue and New
+/// the normal queue. One journal, one seq series, queue routing invisible.
+#[test]
+fn new_modify_cancel_share_one_total_order() {
+    let dir = temp_dir("total-order");
+    let cfg = ExchangeConfig {
+        shards: 1,
+        journal_dir: Some(dir.clone()),
+        journal_flush: Duration::from_millis(5),
+        ..ExchangeConfig::default()
+    };
+    let (gw, sink, handle) = build(cfg);
+
+    // Force the exact interleaving by draining between commands so each is
+    // processed (and journaled) before the next is enqueued.
+    gw.new_order(Order::limit(OrderId(1), Side::Buy, 100, 10)).unwrap();
+    let _ = drain_all(&sink);
+    gw.modify(InstrumentId(0), OrderId(1), 101, 10, 2).unwrap();
+    let _ = drain_all(&sink);
+    gw.cancel(InstrumentId(0), OrderId(1), 3).unwrap();
+    let _ = drain_all(&sink);
+    handle.shutdown();
+
+    // The journal holds the three commands with strictly increasing seqs, in
+    // execution order — Cancel did NOT get its own file or seq series.
+    let jpath = dir.join("journal-shard-0.bin");
+    let records: Vec<_> =
+        trade_core::journal::JournalReader::open(&jpath).unwrap().collect();
+    assert_eq!(records.len(), 3);
+    assert!(
+        records.windows(2).all(|w| w[1].seq == w[0].seq + 1),
+        "one contiguous seq series"
+    );
+
+    // Replaying 1 → 2 → 3 ends with no order on the book.
+    let summary = replay_journal(&jpath, || Box::new(PriceTimePriority), None, None).unwrap();
+    assert_eq!(summary.commands, 3);
+    let engine = summary.processor.engine(InstrumentId(0)).unwrap();
+    assert!(engine.book().is_empty(), "New→Modify→Cancel must leave nothing");
+
+    // Restart continuity: a writer reopened over this journal must CONTINUE
+    // the seq series (a restart-at-zero would corrupt the total order).
+    let mut w =
+        trade_core::journal::JournalWriter::open(&jpath, Duration::from_millis(5)).unwrap();
+    w.resume_from(records.last().unwrap().seq);
+    let frame = [1u8; trade_core::wire::MSG_LEN];
+    let next = w.append(0, &frame).unwrap();
+    assert_eq!(next, 4, "seq must continue the total order across restarts");
 
     std::fs::remove_dir_all(&dir).ok();
 }

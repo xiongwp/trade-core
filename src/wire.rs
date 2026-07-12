@@ -24,9 +24,14 @@
 //! | 3   | 1    | time-in-force (0=GTC, 1=IOC, 2=FOK)                      |
 //! | 4   | 4    | instrument id (u32)                                      |
 //! | 8   | 8    | order id (u64) — close-order id for ForceClose           |
-//! | 16  | 8    | price (u64) — new price for Modify                       |
+//! | 16  | 8    | price (u64) — new price for Modify; **cmd_id for Cancel** |
 //! | 24  | 8    | quantity (u64) — new qty for Modify, close qty for FC    |
-//! | 32  | 8    | user id (u64)                                            |
+//! | 32  | 8    | user id (u64) — **cmd_id for Modify**                    |
+//!
+//! Every command carries a unique increasing id: New = order id; Cancel/Modify
+//! = `cmd_id` from the same Leaf-style series. Combined with the journal seq
+//! this makes cancels and modifies first-class sequenced commands — crash
+//! replay reproduces the full command stream, not just the new orders.
 
 use crate::exchange::{Command, ExecReport};
 use crate::order::Order;
@@ -146,12 +151,14 @@ impl<'a> WireView<'a> {
             MT_CANCEL => Some(Command::Cancel {
                 instrument: self.instrument(),
                 order_id: self.order_id(),
+                cmd_id: self.price(), // rides in the price slot
             }),
             MT_MODIFY => Some(Command::Modify {
                 instrument: self.instrument(),
                 order_id: self.order_id(),
                 new_price: self.price(),
                 new_qty: self.qty(),
+                cmd_id: self.user(), // rides in the user slot
             }),
             MT_FORCE_CLOSE => Some(Command::ForceClose {
                 instrument: self.instrument(),
@@ -189,12 +196,14 @@ pub fn encode_new(order: &Order, out: &mut [u8; MSG_LEN]) {
     out[32..40].copy_from_slice(&order.user.to_le_bytes());
 }
 
-/// Encode a `Cancel` frame.
-pub fn encode_cancel(instrument: InstrumentId, order_id: OrderId, out: &mut [u8; MSG_LEN]) {
+/// Encode a `Cancel` frame. `cmd_id` (unique, increasing — same id series as
+/// new orders) rides in the otherwise-unused price slot.
+pub fn encode_cancel(instrument: InstrumentId, order_id: OrderId, cmd_id: u64, out: &mut [u8; MSG_LEN]) {
     out.fill(0);
     out[0] = MT_CANCEL;
     out[4..8].copy_from_slice(&instrument.0.to_le_bytes());
     out[8..16].copy_from_slice(&order_id.0.to_le_bytes());
+    out[16..24].copy_from_slice(&cmd_id.to_le_bytes());
 }
 
 /// Encode a `Modify` frame.
@@ -203,6 +212,7 @@ pub fn encode_modify(
     order_id: OrderId,
     new_price: Price,
     new_qty: Qty,
+    cmd_id: u64,
     out: &mut [u8; MSG_LEN],
 ) {
     out.fill(0);
@@ -211,6 +221,7 @@ pub fn encode_modify(
     out[8..16].copy_from_slice(&order_id.0.to_le_bytes());
     out[16..24].copy_from_slice(&new_price.to_le_bytes());
     out[24..32].copy_from_slice(&new_qty.to_le_bytes());
+    out[32..40].copy_from_slice(&cmd_id.to_le_bytes());
 }
 
 /// Encode a `ForceClose` frame: cancel all of `user`'s resting orders on
@@ -241,9 +252,11 @@ pub fn encode_force_close(
 pub fn encode_command(cmd: &Command, out: &mut [u8; MSG_LEN]) {
     match cmd {
         Command::New(order) => encode_new(order, out),
-        Command::Cancel { instrument, order_id } => encode_cancel(*instrument, *order_id, out),
-        Command::Modify { instrument, order_id, new_price, new_qty } => {
-            encode_modify(*instrument, *order_id, *new_price, *new_qty, out)
+        Command::Cancel { instrument, order_id, cmd_id } => {
+            encode_cancel(*instrument, *order_id, *cmd_id, out)
+        }
+        Command::Modify { instrument, order_id, new_price, new_qty, cmd_id } => {
+            encode_modify(*instrument, *order_id, *new_price, *new_qty, *cmd_id, out)
         }
         Command::ForceClose { instrument, user, close_order_id, close_side, close_qty } => {
             encode_force_close(*instrument, *user, *close_order_id, *close_side, *close_qty, out)
@@ -430,16 +443,16 @@ mod tests {
     #[test]
     fn cancel_modify_force_close_round_trip() {
         let mut frame = [0u8; MSG_LEN];
-        encode_cancel(InstrumentId(3), OrderId(9), &mut frame);
+        encode_cancel(InstrumentId(3), OrderId(9), 77, &mut frame);
         assert!(matches!(
             WireView::parse(&frame).unwrap().to_command().unwrap(),
-            Command::Cancel { instrument: InstrumentId(3), order_id: OrderId(9) }
+            Command::Cancel { instrument: InstrumentId(3), order_id: OrderId(9), cmd_id: 77 }
         ));
 
-        encode_modify(InstrumentId(1), OrderId(5), 500, 12, &mut frame);
+        encode_modify(InstrumentId(1), OrderId(5), 500, 12, 78, &mut frame);
         assert!(matches!(
             WireView::parse(&frame).unwrap().to_command().unwrap(),
-            Command::Modify { order_id: OrderId(5), new_price: 500, new_qty: 12, .. }
+            Command::Modify { order_id: OrderId(5), new_price: 500, new_qty: 12, cmd_id: 78, .. }
         ));
 
         encode_force_close(InstrumentId(4), 777, OrderId(88), Side::Sell, 250, &mut frame);

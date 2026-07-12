@@ -204,3 +204,30 @@ fn strategies_agree_when_clearing_whole_level() {
         assert!(e.book().is_empty());
     }
 }
+
+/// Regression: cancel and in-place reduce must keep the level's aggregate
+/// quantity truthful — depth, top-of-book and FOK all read the aggregate, so
+/// a stale counter means phantom liquidity (FOK accepting unfillable orders).
+#[test]
+fn aggregates_stay_truthful_after_cancel_and_reduce() {
+    let mut e = MatchingEngine::with_strategy(PriceTimePriority);
+    e.submit(Order::limit(OrderId(1), Side::Sell, 100, 10));
+    e.submit(Order::limit(OrderId(2), Side::Sell, 100, 7));
+    assert_eq!(e.book().depth(Side::Sell), vec![(100, 17, 2)]);
+
+    // Cancel #1 (tombstoned lazily): depth must drop immediately.
+    assert!(e.cancel(OrderId(1)));
+    assert_eq!(e.book().depth(Side::Sell), vec![(100, 7, 1)]);
+    assert_eq!(e.book().top_levels(Side::Sell, 5), vec![(100, 7)]);
+
+    // Reduce #2 from 7 -> 3 in place: aggregate follows.
+    e.modify(OrderId(2), 100, 3);
+    assert_eq!(e.book().depth(Side::Sell), vec![(100, 3, 1)]);
+
+    // FOK reads the aggregate: 5 lots must be rejected, 3 must fill fully.
+    let r = e.submit(Order::limit(OrderId(3), Side::Buy, 100, 5).with_tif(TimeInForce::Fok));
+    assert_eq!(r.status, OrderStatus::Rejected, "phantom liquidity must not fool FOK");
+    let r = e.submit(Order::limit(OrderId(4), Side::Buy, 100, 3).with_tif(TimeInForce::Fok));
+    assert_eq!(r.status, OrderStatus::Filled);
+    assert!(e.book().is_empty());
+}

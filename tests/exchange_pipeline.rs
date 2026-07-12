@@ -98,7 +98,7 @@ fn cancel_takes_priority_over_queued_new_orders() {
     for i in 0..500u64 {
         gw.new_order(Order::limit(OrderId(1000 + i), Side::Buy, 100, 1)).unwrap();
     }
-    gw.cancel(sym, OrderId(1)).unwrap();
+    gw.cancel(sym, OrderId(1), 2000).unwrap();
 
     // Resume: the shard drains HIGH first, so the maker is cancelled before any
     // queued buy runs -> the whole wall of buys finds an empty book.
@@ -139,7 +139,7 @@ fn modify_reduce_keeps_priority_and_reports_modified() {
     gw.new_order(Order::limit(OrderId(1), Side::Sell, 100, 10)).unwrap();
     let _ = collect(&sink, 2);
     // Reduce 10 -> 4 at same price: keeps priority, reports Modified.
-    gw.modify(sym, OrderId(1), 100, 4).unwrap();
+    gw.modify(sym, OrderId(1), 100, 4, 2001).unwrap();
 
     let reports = collect(&sink, 1);
     handle.shutdown();

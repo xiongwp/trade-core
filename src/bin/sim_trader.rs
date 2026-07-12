@@ -109,7 +109,8 @@ fn main() {
 
         // Occasionally cancel something old to keep the books tidy.
         if rng.next() % 16 == 0 {
-            wire::encode_cancel(sym, OrderId(id - rng.range(1, 200).min(id - 1)), &mut frame);
+            id += 1;
+            wire::encode_cancel(sym, OrderId(id - rng.range(2, 200).min(id - 1)), id, &mut frame);
             let _ = sock.write_all(&frame);
         }
     }
