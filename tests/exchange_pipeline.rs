@@ -43,7 +43,8 @@ fn matches_across_multiple_assets_independently() {
     gw.new_order(Order::limit(OrderId(3), Side::Buy, 100, 10).on(aapl)).unwrap();
     gw.new_order(Order::limit(OrderId(4), Side::Buy, 5000, 3).on(btc)).unwrap();
 
-    let reports = collect(&sink, 8); // 4 Accepted + 2 Trade + 2 Filled at least
+    // Full lifecycle = 10 reports: 4 Accepted + 2 Resting + 2 Trade + 2 Filled.
+    let reports = collect(&sink, 10);
     handle.shutdown();
 
     // A trade printed on each instrument, isolated from the other.

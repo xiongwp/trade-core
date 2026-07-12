@@ -49,8 +49,11 @@ fn main() {
     println!("[load] phase 1: generating {total} orders into 10 DBs x 100 tables…");
     let t0 = Instant::now();
     let slots = (DB_COUNT * TABLES_PER_DB) as usize;
-    let mut tables: Vec<Vec<[u8; MSG_LEN]>> =
-        (0..slots).map(|_| Vec::with_capacity(total as usize / slots + 64)).collect();
+    // Tables hold row COUNTS (the sharded-storage demo); frames stream in
+    // SUBMISSION order — ids are allocated at send time, so each shard sees a
+    // monotonic id stream (the dedup contract).
+    let mut tables: Vec<u64> = vec![0; slots];
+    let mut flat: Vec<[u8; MSG_LEN]> = Vec::with_capacity(total as usize);
 
     let mut rng = Rng(0xE2E_2024);
     let mut frame = [0u8; MSG_LEN];
@@ -70,18 +73,13 @@ fn main() {
                 .by(user);
             wire::encode_new(&order, &mut frame);
         }
-        tables[slot].push(frame);
+        tables[slot] += 1;
+        flat.push(frame);
     }
     let per_db: Vec<u64> = (0..DB_COUNT as usize)
-        .map(|db| {
-            (0..TABLES_PER_DB as usize)
-                .map(|t| tables[db * TABLES_PER_DB as usize + t].len() as u64)
-                .sum()
-        })
+        .map(|db| (0..TABLES_PER_DB as usize).map(|t| tables[db * TABLES_PER_DB as usize + t]).sum())
         .collect();
-    let (tmin, tmax) = tables.iter().fold((u64::MAX, 0u64), |(lo, hi), t| {
-        (lo.min(t.len() as u64), hi.max(t.len() as u64))
-    });
+    let (tmin, tmax) = tables.iter().fold((u64::MAX, 0u64), |(lo, hi), &t| (lo.min(t), hi.max(t)));
     println!(
         "[load] generated in {:.1?}; per-DB rows: {:?}",
         t0.elapsed(),
@@ -135,21 +133,16 @@ fn main() {
         }
     });
 
-    // Stream table by table, round-robin across DBs so users interleave, in
-    // 4096-frame (160 KiB) batches.
+    // Stream in submission (id) order, in 4096-frame (160 KiB) batches.
     let t1 = Instant::now();
     let mut batch: Vec<u8> = Vec::with_capacity(MSG_LEN * 4096);
     let mut sent = 0u64;
-    for table_idx in 0..TABLES_PER_DB as usize {
-        for db in 0..DB_COUNT as usize {
-            for f in &tables[db * TABLES_PER_DB as usize + table_idx] {
-                batch.extend_from_slice(f);
-                if batch.len() >= MSG_LEN * 4096 {
-                    sock.write_all(&batch).expect("stream orders");
-                    sent += (batch.len() / MSG_LEN) as u64;
-                    batch.clear();
-                }
-            }
+    for f in &flat {
+        batch.extend_from_slice(f);
+        if batch.len() >= MSG_LEN * 4096 {
+            sock.write_all(&batch).expect("stream orders");
+            sent += (batch.len() / MSG_LEN) as u64;
+            batch.clear();
         }
     }
     if !batch.is_empty() {

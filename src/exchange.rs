@@ -519,7 +519,12 @@ pub struct Processor {
     /// 0-ids bypass (legacy/tests). Persisted in snapshots (exactly-once
     /// across crash + order-system re-send).
     dedup: bool,
-    max_cmd_id: u64,
+    /// Dual dedup cursors — one per intake queue. The high-priority queue
+    /// legitimately reorders admin commands ahead of News, so a single cursor
+    /// would be poisoned by a jumping cancel and dup-reject every later New.
+    /// Each queue is FIFO, so per-stream monotonic ids hold.
+    max_new_id: u64,
+    max_admin_id: u64,
     fees: crate::fees::FeeSchedule,
     /// Halted instruments (circuit breaker); command-driven, snapshot-persisted.
     halted: std::collections::HashSet<InstrumentId>,
@@ -542,7 +547,8 @@ impl Processor {
             stp: SelfTradePolicy::Allow,
             limits: None,
             dedup: false,
-            max_cmd_id: 0,
+            max_new_id: 0,
+            max_admin_id: 0,
             fees: crate::fees::FeeSchedule::default(),
             halted: std::collections::HashSet::new(),
             suspended: std::collections::HashSet::new(),
@@ -624,7 +630,8 @@ impl Processor {
 
     /// Restore engines from a snapshot. Only valid on a fresh processor.
     pub fn restore_state(&mut self, snap: &Snapshot) {
-        self.max_cmd_id = self.max_cmd_id.max(snap.max_cmd_id);
+        self.max_new_id = self.max_new_id.max(snap.max_cmd_id);
+        self.max_admin_id = self.max_admin_id.max(snap.max_admin_id);
         self.halted.extend(snap.halted.iter().map(|&i| InstrumentId(i)));
         self.suspended.extend(snap.suspended.iter().copied());
         for &(u, i, q) in &snap.positions {
@@ -668,22 +675,24 @@ impl Processor {
         // twice. Deterministic under replay: duplicates are journaled too, and
         // the same gate skips them again.
         if self.dedup {
-            let (id, inst) = match &cmd {
-                Command::New(o) => (o.id.0, o.instrument),
-                Command::Cancel { cmd_id, instrument, .. } => (*cmd_id, *instrument),
-                Command::Modify { cmd_id, instrument, .. } => (*cmd_id, *instrument),
+            // (id, instrument, is_admin_stream)
+            let (id, inst, admin) = match &cmd {
+                Command::New(o) => (o.id.0, o.instrument, false),
+                Command::Cancel { cmd_id, instrument, .. } => (*cmd_id, *instrument, true),
+                Command::Modify { cmd_id, instrument, .. } => (*cmd_id, *instrument, true),
                 Command::ForceClose { close_order_id, instrument, .. } => {
-                    (close_order_id.0, *instrument)
+                    (close_order_id.0, *instrument, true)
                 }
-                Command::Halt { cmd_id, instrument } => (*cmd_id, *instrument),
-                Command::Resume { cmd_id, instrument } => (*cmd_id, *instrument),
-                Command::HaltUser { cmd_id, instrument, .. } => (*cmd_id, *instrument),
-                Command::ResumeUser { cmd_id, instrument, .. } => (*cmd_id, *instrument),
+                Command::Halt { cmd_id, instrument } => (*cmd_id, *instrument, true),
+                Command::Resume { cmd_id, instrument } => (*cmd_id, *instrument, true),
+                Command::HaltUser { cmd_id, instrument, .. } => (*cmd_id, *instrument, true),
+                Command::ResumeUser { cmd_id, instrument, .. } => (*cmd_id, *instrument, true),
                 // Batches are gated per inner command (recursive process call).
-                Command::Batch(_) => (0, InstrumentId(0)),
+                Command::Batch(_) => (0, InstrumentId(0), false),
             };
             if id != 0 {
-                if id <= self.max_cmd_id {
+                let cursor = if admin { &mut self.max_admin_id } else { &mut self.max_new_id };
+                if id <= *cursor {
                     emit(ExecReport::Rejected {
                         instrument: inst,
                         order_id: OrderId(id),
@@ -691,7 +700,7 @@ impl Processor {
                     });
                     return;
                 }
-                self.max_cmd_id = id;
+                *cursor = id;
             }
         }
         match cmd {
@@ -1090,7 +1099,8 @@ impl Shard {
         if snapshot::write(
             path,
             j.seq(),
-            self.processor.max_cmd_id,
+            self.processor.max_new_id,
+            self.processor.max_admin_id,
             &halted,
             &suspended,
             &positions,

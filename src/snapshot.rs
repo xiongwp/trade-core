@@ -101,8 +101,9 @@ pub struct EngineState {
 pub struct Snapshot {
     /// Journal sequence at capture time; replay records with seq > this.
     pub journal_seq: u64,
-    /// Idempotency high-water mark: highest command id seen (dedup cursor).
+    /// Idempotency high-water marks (dual dedup cursors: New / admin streams).
     pub max_cmd_id: u64,
+    pub max_admin_id: u64,
     /// Halted instruments (circuit breaker state must survive snapshots).
     pub halted: Vec<u32>,
     /// Suspended users.
@@ -117,6 +118,7 @@ pub fn write(
     path: &Path,
     journal_seq: u64,
     max_cmd_id: u64,
+    max_admin_id: u64,
     halted: &[u32],
     suspended: &[u64],
     positions: &[(u64, u32, i64)],
@@ -127,6 +129,7 @@ pub fn write(
     buf.extend_from_slice(&VERSION.to_le_bytes());
     buf.extend_from_slice(&journal_seq.to_le_bytes());
     buf.extend_from_slice(&max_cmd_id.to_le_bytes());
+    buf.extend_from_slice(&max_admin_id.to_le_bytes());
     buf.extend_from_slice(&(halted.len() as u32).to_le_bytes());
     for h in halted {
         buf.extend_from_slice(&h.to_le_bytes());
@@ -185,7 +188,8 @@ pub fn load(path: &Path) -> io::Result<Snapshot> {
     }
     let journal_seq = u64::from_le_bytes(buf[8..16].try_into().unwrap());
     let max_cmd_id = u64::from_le_bytes(buf[16..24].try_into().unwrap());
-    let mut pos = 24;
+    let max_admin_id = u64::from_le_bytes(buf[24..32].try_into().unwrap());
+    let mut pos = 32;
     let n_halt = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
     pos += 4;
     let mut halted = Vec::with_capacity(n_halt);
@@ -234,7 +238,7 @@ pub fn load(path: &Path) -> io::Result<Snapshot> {
         }
         engines.push(EngineState { instrument, engine_seq, orders });
     }
-    Ok(Snapshot { journal_seq, max_cmd_id, halted, suspended, positions, engines })
+    Ok(Snapshot { journal_seq, max_cmd_id, max_admin_id, halted, suspended, positions, engines })
 }
 
 #[cfg(test)]
@@ -255,11 +259,12 @@ mod tests {
                 Order::limit(OrderId(2), Side::Sell, 101, 3).on(InstrumentId(7)).by(22),
             ],
         }];
-        write(&path, 1000, 555, &[7], &[42], &[(9, 7, -3)], &engines).unwrap();
+        write(&path, 1000, 555, 556, &[7], &[42], &[(9, 7, -3)], &engines).unwrap();
 
         let snap = load(&path).unwrap();
         assert_eq!(snap.journal_seq, 1000);
         assert_eq!(snap.max_cmd_id, 555);
+        assert_eq!(snap.max_admin_id, 556);
         assert_eq!(snap.halted, vec![7]);
         assert_eq!(snap.suspended, vec![42]);
         assert_eq!(snap.positions, vec![(9, 7, -3)]);

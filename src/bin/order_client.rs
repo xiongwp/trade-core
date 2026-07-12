@@ -39,7 +39,7 @@ fn main() {
     send(&frame, &mut sock);
     wire::encode_new(&Order::limit(OrderId(2), Side::Sell, 100, 5).on(aapl), &mut frame);
     send(&frame, &mut sock);
-    wire::encode_cancel(aapl, OrderId(1), 9001, &mut frame); // cancel the first ask (cmd_id 9001)
+    wire::encode_cancel(aapl, OrderId(1), 4, &mut frame); // cancel (admin cmd_id 4)
     send(&frame, &mut sock);
     wire::encode_new(&Order::limit(OrderId(3), Side::Buy, 100, 5).on(aapl), &mut frame);
     send(&frame, &mut sock); // should trade against #2, not the cancelled #1
@@ -48,7 +48,7 @@ fn main() {
     // (The demo server's price guard references 1000, so stay in-band.)
     wire::encode_new(&Order::limit(OrderId(10), Side::Buy, 1000, 2).on(btc), &mut frame);
     send(&frame, &mut sock);
-    wire::encode_modify(btc, OrderId(10), 1001, 2, 9002, &mut frame); // raise price (cmd_id 9002)
+    wire::encode_modify(btc, OrderId(10), 1001, 2, 14, &mut frame); // raise price (admin cmd_id 14)
     send(&frame, &mut sock);
     wire::encode_new(&Order::limit(OrderId(11), Side::Sell, 1000, 2).on(btc), &mut frame);
     send(&frame, &mut sock);

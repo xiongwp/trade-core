@@ -248,7 +248,7 @@ fn duplicate_commands_are_rejected_and_cursor_persists() {
     // still rejects old ids.
     let dir = temp_dir("dedup");
     let path = dir.join("s.bin");
-    trade_core::snapshot::write(&path, 0, 6, &[], &[], &[], &p.export_state()).unwrap();
+    trade_core::snapshot::write(&path, 0, 6, 6, &[], &[], &[], &p.export_state()).unwrap();
     let snap = trade_core::snapshot::load(&path).unwrap();
     let mut p2 = Processor::new(|| Box::new(PriceTimePriority), None).with_dedup(true);
     p2.restore_state(&snap);
