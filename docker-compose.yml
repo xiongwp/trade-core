@@ -1,46 +1,46 @@
-# One-click deployment of the separated services:
+# One-click deployment of the three separately deployed services:
 #
-#   matching     — the matching-engine node (orders :9001, market-data :9101)
-#   market-data  — K-line aggregation + chart UI      http://localhost:8080
-#   sim-trader   — a stand-in order system generating live flow
+#   trade-core   — the matching node (orders :9001, market-data fanout :9101)
+#   market-data  — K-lines + depth ladder + chart UI/WS    http://localhost:8080
+#   order        — the order system (demo flow generator; swap in your real
+#                  order system — it speaks the same 40-byte TCP protocol)
 #
 #   docker compose up --build
-#   open http://localhost:8080        # candlestick chart (1s…1mo intervals)
-#
-# In production, replace sim-trader with your real order system (it speaks the
-# same 40-byte TCP protocol) and scale matching nodes horizontally — one
-# instrument set per node, routed by cluster::ClusterMap.
+#   open http://localhost:8080     # candlesticks + depth, WebSocket push
 
 services:
-  matching:
+  trade-core:
     build: .
     image: trade-core-node
     ports:
-      - "9001:9001"   # order system connection
+      - "9001:9001"   # order-system connection
       - "9101:9101"   # market-data fanout
     environment:
       SHARDS: "4"
       POOL_MB: "1024"       # raise to 3072 in prod
       BAND_BPS: "1000"      # anti-spike band ±10%
     volumes:
-      - matching-journal:/data/journal
+      - trade-core-journal:/data/journal
     restart: unless-stopped
 
   market-data:
     image: trade-core-node
     depends_on:
-      - matching
-    command: ["exec market_data matching:9101 0.0.0.0:8080"]
+      - trade-core
+    command: ["exec market-data trade-core:9101 0.0.0.0:8080 /data/md"]
     ports:
-      - "8080:8080"   # chart UI + JSON API
+      - "8080:8080"   # chart UI + JSON API + WebSocket
+    volumes:
+      - market-data-history:/data/md
     restart: unless-stopped
 
-  sim-trader:
+  order:
     image: trade-core-node
     depends_on:
-      - matching
-    command: ["exec sim_trader matching:9001 300"]
+      - trade-core
+    command: ["exec order trade-core:9001 300"]
     restart: unless-stopped
 
 volumes:
-  matching-journal:
+  trade-core-journal:
+  market-data-history:

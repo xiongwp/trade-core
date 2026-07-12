@@ -417,10 +417,12 @@ fn main() {
     });
     let agg = persist
         .as_ref()
-        .and_then(|p| {
-            KlineAggregator::load(p)
-                .inspect(|_| eprintln!("[md] loaded candle history from {}", p.display()))
-                .ok()
+        .and_then(|p| match KlineAggregator::load(p) {
+            Ok(a) => {
+                eprintln!("[md] loaded candle history from {}", p.display());
+                Some(a)
+            }
+            Err(_) => None,
         })
         .unwrap_or_else(|| KlineAggregator::new(2000));
 

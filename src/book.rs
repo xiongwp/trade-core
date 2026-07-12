@@ -13,7 +13,7 @@
 //! * a hard, up-front memory budget: e.g. a 3 GiB pool ≈ 50 million resting
 //!   orders, reserved once at startup (see [`OrderPool::with_capacity`]).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use crate::order::Order;
 use crate::strategy::RestingOrder;
@@ -86,17 +86,31 @@ impl OrderPool {
     }
 }
 
-/// Where a resting order lives: which side, which price level, which slot.
+/// Where a resting order lives: its slot in the pool (side/price live on the
+/// order itself; cancels are O(1) tombstones and never walk a level).
 #[derive(Clone, Copy, Debug)]
 struct Loc {
-    side: Side,
-    price: Price,
     slot: u32,
 }
 
 // ---------------------------------------------------------------------------
 // Price-level index: dense direct-index window + hierarchical bitmap
 // ---------------------------------------------------------------------------
+
+/// One price level: time-ordered order slots plus **incrementally maintained
+/// aggregates**. Summing a level by iterating it is O(orders) — with
+/// million-order levels (seen in the 20M stress test) that made the 200 ms
+/// depth publish itself quadratic. `qty`/`live` are updated O(1) on insert,
+/// fill and cancel, so depth/FOK queries are O(levels), never O(orders).
+#[derive(Clone, Debug, Default)]
+struct Level {
+    /// Pool slots in time priority (may contain tombstones awaiting reclaim).
+    orders: VecDeque<u32>,
+    /// Total live remaining quantity at this level.
+    qty: Qty,
+    /// Count of live (non-tombstoned) orders.
+    live: u32,
+}
 
 /// Ticks covered by the dense window (first insert centres it). Kept small on
 /// purpose: the price guard confines active prices to a band, and a compact
@@ -122,7 +136,7 @@ struct LevelIndex {
     /// Window start price; `Price::MAX` until the first insert centres it.
     base: Price,
     /// Dense per-tick levels; `levels[price - base]` — allocated lazily.
-    levels: Vec<Vec<u32>>,
+    levels: Vec<Level>,
     /// Occupancy bitmap: bit i set <=> levels[i] non-empty.
     l0: [u64; W_WORDS],
     /// Summary bitmap: bit w set <=> l0[w] != 0.
@@ -130,7 +144,7 @@ struct LevelIndex {
     /// Occupied levels inside the window.
     in_window: usize,
     /// Out-of-window levels (rare; unbounded prices stay correct).
-    overflow: BTreeMap<Price, Vec<u32>>,
+    overflow: BTreeMap<Price, Level>,
 }
 
 impl Default for LevelIndex {
@@ -173,32 +187,41 @@ impl LevelIndex {
         }
     }
 
-    /// Append `slot` to the level at `price` (creating the level if needed).
-    fn push(&mut self, price: Price, slot: u32) {
+    /// Append `slot` (a live order of `remaining` lots) to the level at
+    /// `price`, creating the level if needed and updating its aggregates.
+    fn push(&mut self, price: Price, slot: u32, remaining: Qty) {
         if self.base == Price::MAX {
             // Centre the window on the first price seen.
             self.base = price.saturating_sub((WINDOW / 2) as u64);
-            self.levels.resize(WINDOW, Vec::new());
+            self.levels.resize(WINDOW, Level::default());
         }
         match self.idx(price) {
             Some(i) => {
-                if self.levels[i].is_empty() {
+                if self.levels[i].orders.is_empty() {
                     self.set_bit(i);
                     self.in_window += 1;
                 }
-                self.levels[i].push(slot);
+                let lv = &mut self.levels[i];
+                lv.orders.push_back(slot);
+                lv.qty += remaining;
+                lv.live += 1;
             }
-            None => self.overflow.entry(price).or_default().push(slot),
+            None => {
+                let lv = self.overflow.entry(price).or_default();
+                lv.orders.push_back(slot);
+                lv.qty += remaining;
+                lv.live += 1;
+            }
         }
     }
 
     /// The (non-empty) level at `price`.
     #[inline]
-    fn get(&self, price: Price) -> Option<&Vec<u32>> {
+    fn get(&self, price: Price) -> Option<&Level> {
         match self.idx(price) {
             Some(i) => {
                 let lv = self.levels.get(i)?;
-                (!lv.is_empty()).then_some(lv)
+                (!lv.orders.is_empty()).then_some(lv)
             }
             None => self.overflow.get(&price),
         }
@@ -206,11 +229,11 @@ impl LevelIndex {
 
     /// Mutable access; pair with [`Self::sweep`] after possibly emptying it.
     #[inline]
-    fn get_mut(&mut self, price: Price) -> Option<&mut Vec<u32>> {
+    fn get_mut(&mut self, price: Price) -> Option<&mut Level> {
         match self.idx(price) {
             Some(i) => {
                 let lv = self.levels.get_mut(i)?;
-                (!lv.is_empty()).then_some(lv)
+                (!lv.orders.is_empty()).then_some(lv)
             }
             None => self.overflow.get_mut(&price),
         }
@@ -220,13 +243,13 @@ impl LevelIndex {
     fn sweep(&mut self, price: Price) {
         match self.idx(price) {
             Some(i) => {
-                if self.levels.get(i).is_some_and(|lv| lv.is_empty()) && self.bit(i) {
+                if self.levels.get(i).is_some_and(|lv| lv.orders.is_empty()) && self.bit(i) {
                     self.clear_bit(i);
                     self.in_window -= 1;
                 }
             }
             None => {
-                if self.overflow.get(&price).is_some_and(|lv| lv.is_empty()) {
+                if self.overflow.get(&price).is_some_and(|lv| lv.orders.is_empty()) {
                     self.overflow.remove(&price);
                 }
             }
@@ -281,7 +304,7 @@ impl LevelIndex {
     }
 
     /// Visit occupied levels in ascending price order until `f` returns false.
-    fn walk_asc(&self, mut f: impl FnMut(Price, &Vec<u32>) -> bool) {
+    fn walk_asc(&self, mut f: impl FnMut(Price, &Level) -> bool) {
         for (px, lv) in self.overflow.range(..self.base) {
             if !f(*px, lv) {
                 return;
@@ -307,7 +330,7 @@ impl LevelIndex {
     }
 
     /// Visit occupied levels in descending price order until `f` returns false.
-    fn walk_desc(&self, mut f: impl FnMut(Price, &Vec<u32>) -> bool) {
+    fn walk_desc(&self, mut f: impl FnMut(Price, &Level) -> bool) {
         if self.base != Price::MAX {
             for (px, lv) in self.overflow.range(self.base + WINDOW as u64..).rev() {
                 if !f(*px, lv) {
@@ -438,50 +461,103 @@ impl OrderBook {
         self.locate.len()
     }
 
-    /// A time-ordered, read-only view of the orders resting at `(side, price)`,
-    /// for handing to a matching strategy.
+    /// A time-ordered, read-only view of the live orders resting at
+    /// `(side, price)` (tombstones skipped; no cleanup).
     pub fn level_view(&self, side: Side, price: Price) -> Vec<RestingOrder> {
         let mut out = Vec::new();
-        self.level_view_into(side, price, &mut out);
+        if let Some(lv) = self.side(side).get(price) {
+            for &i in &lv.orders {
+                let o = self.pool.get(i);
+                if o.remaining > 0 {
+                    out.push(RestingOrder {
+                        id: o.id,
+                        remaining: o.remaining,
+                        timestamp: o.timestamp,
+                        user: o.user,
+                    });
+                }
+            }
+        }
         out
     }
 
-    /// Allocation-free variant of [`level_view`](Self::level_view): clears and
-    /// refills `out` (the matching engine reuses one buffer across all crosses).
-    pub fn level_view_into(&self, side: Side, price: Price, out: &mut Vec<RestingOrder>) {
+    /// Allocation-free level view for the matching engine: clears and refills
+    /// `out`, **reclaiming tombstoned entries at the level front** (cancelled
+    /// orders are marked dead in O(1) and physically removed here, amortised
+    /// into matching).
+    pub fn level_view_into(&mut self, side: Side, price: Price, out: &mut Vec<RestingOrder>) {
+        self.level_view_capped(side, price, Qty::MAX, out);
+    }
+
+    /// Like [`level_view_into`](Self::level_view_into) but stops once the
+    /// copied orders' cumulative remaining reaches `cap_qty`.
+    ///
+    /// FIFO allocation only ever touches the *front* of a level, so copying a
+    /// 40k-order level to fill a 10-lot aggressor is pure waste — the 20M-order
+    /// stress test exposed exactly that as quadratic behaviour. Strategies that
+    /// declare they don't need the full level get this capped view.
+    pub fn level_view_capped(
+        &mut self,
+        side: Side,
+        price: Price,
+        cap_qty: Qty,
+        out: &mut Vec<RestingOrder>,
+    ) {
         out.clear();
-        if let Some(idxs) = self.side(side).get(price) {
-            out.extend(idxs.iter().map(|&i| {
-                let o = self.pool.get(i);
-                RestingOrder {
+        let pool = &mut self.pool;
+        let index = match side {
+            Side::Buy => &mut self.bids,
+            Side::Sell => &mut self.asks,
+        };
+        if let Some(lv) = index.get_mut(price) {
+            // Reclaim tombstones at the front (cancelled orders, O(1) each).
+            while let Some(&front) = lv.orders.front() {
+                if pool.get(front).remaining == 0 {
+                    lv.orders.pop_front();
+                    pool.release(front);
+                } else {
+                    break;
+                }
+            }
+            let mut covered: Qty = 0;
+            for &i in lv.orders.iter() {
+                let o = pool.get(i);
+                if o.remaining == 0 {
+                    continue; // mid-level tombstone; reclaimed when it reaches the front
+                }
+                out.push(RestingOrder {
                     id: o.id,
                     remaining: o.remaining,
                     timestamp: o.timestamp,
                     user: o.user,
+                });
+                covered = covered.saturating_add(o.remaining);
+                if covered >= cap_qty {
+                    break;
                 }
-            }));
+            }
         }
+        index.sweep(price);
     }
 
     /// Total resting quantity reachable by an aggressor with limit `limit`
     /// (pass `Price::MAX`/`MIN` for market orders).
     pub fn crossable_qty(&self, aggressor: Side, limit: Price) -> Qty {
         let levels = self.side(aggressor.opposite());
-        let pool = &self.pool;
         let mut sum: Qty = 0;
         match aggressor {
-            Side::Buy => levels.walk_asc(|px, idxs| {
+            Side::Buy => levels.walk_asc(|px, lv| {
                 if px > limit {
                     return false;
                 }
-                sum += idxs.iter().map(|&i| pool.get(i).remaining).sum::<Qty>();
+                sum += lv.qty;
                 true
             }),
-            Side::Sell => levels.walk_desc(|px, idxs| {
+            Side::Sell => levels.walk_desc(|px, lv| {
                 if px < limit {
                     return false;
                 }
-                sum += idxs.iter().map(|&i| pool.get(i).remaining).sum::<Qty>();
+                sum += lv.qty;
                 true
             }),
         }
@@ -497,8 +573,8 @@ impl OrderBook {
         );
         let (id, side, price, user) = (order.id, order.side, order.price, order.user);
         let slot = self.pool.alloc(order);
-        self.locate.insert(id, Loc { side, price, slot });
-        self.side_mut(side).push(price, slot);
+        self.locate.insert(id, Loc { slot });
+        self.side_mut(side).push(price, slot, order.remaining);
         Self::count_user(&mut self.user_counts, user, 1);
     }
 
@@ -514,24 +590,66 @@ impl OrderBook {
             Side::Sell => &mut self.asks,
         };
 
-        if let Some(idxs) = index.get_mut(price) {
-            idxs.retain(|&i| {
-                let o = pool.get_mut(i);
-                // Fills per level are few (often 1-2): a linear scan beats
-                // building a HashMap — and allocates nothing.
-                if let Some(&(_, q)) = fills.iter().find(|(id, _)| *id == o.id) {
-                    debug_assert!(q <= o.remaining, "over-fill of {}", o.id);
-                    o.remaining -= q;
+        if let Some(lv) = index.get_mut(price) {
+            let Level { orders, qty, live } = lv;
+            // Fast path: FIFO fills consume the level's *front prefix*, so
+            // apply them with O(1) pop_front instead of an O(level) retain —
+            // vital when a hot level holds tens of thousands of orders.
+            let mut applied = 0;
+            for &(id, q) in fills {
+                // Discard tombstoned fronts (cancelled, awaiting reclaim).
+                while let Some(&front) = orders.front() {
+                    if pool.get(front).remaining == 0 {
+                        orders.pop_front();
+                        pool.release(front);
+                    } else {
+                        break;
+                    }
                 }
+                let Some(&front) = orders.front() else { break };
+                let o = pool.get_mut(front);
+                if o.id != id {
+                    break; // not a prefix fill (pro-rata / size-priority)
+                }
+                debug_assert!(q <= o.remaining, "over-fill of {}", o.id);
+                o.remaining -= q;
+                *qty -= q;
+                applied += 1;
                 if o.remaining == 0 {
                     locate.remove(&o.id);
                     Self::count_user(user_counts, o.user, -1);
-                    pool.release(i);
-                    false
+                    *live -= 1;
+                    pool.release(front);
+                    orders.pop_front();
                 } else {
-                    true
+                    break; // partially-filled front stays; prefix ends here
                 }
-            });
+            }
+            // General path for whatever the prefix pass didn't cover.
+            if applied < fills.len() {
+                let rest = &fills[applied..];
+                orders.retain(|&i| {
+                    let o = pool.get_mut(i);
+                    // Fills per level are few here: linear scan, no allocation.
+                    if let Some(&(_, q)) = rest.iter().find(|(id, _)| *id == o.id) {
+                        debug_assert!(q <= o.remaining, "over-fill of {}", o.id);
+                        o.remaining -= q;
+                        *qty -= q;
+                    }
+                    if o.remaining == 0 {
+                        // A fill-kill still holds its locate entry; a tombstone
+                        // (cancelled earlier) does not — don't double-count.
+                        if locate.remove(&o.id).is_some() {
+                            Self::count_user(user_counts, o.user, -1);
+                            *live -= 1;
+                        }
+                        pool.release(i);
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
         }
         index.sweep(price);
     }
@@ -565,14 +683,12 @@ impl OrderBook {
     pub fn cancel(&mut self, id: OrderId) -> Option<Order> {
         let loc = self.locate.remove(&id)?;
         let order = *self.pool.get(loc.slot);
-        let index = self.side_mut(loc.side);
-        if let Some(idxs) = index.get_mut(loc.price) {
-            if let Some(pos) = idxs.iter().position(|&i| i == loc.slot) {
-                idxs.remove(pos);
-            }
-        }
-        index.sweep(loc.price);
-        self.pool.release(loc.slot);
+        // **Tombstone, O(1).** Scanning a deep level for the entry's position
+        // is O(level) — the 20M-order stress test showed cancels grinding on
+        // million-order levels. Instead the order is marked dead in place
+        // (remaining = 0); the matching path discards tombstones lazily as it
+        // walks level fronts, releasing the slots then.
+        self.pool.get_mut(loc.slot).remaining = 0;
         Self::count_user(&mut self.user_counts, order.user, -1);
         Some(order)
     }
@@ -590,10 +706,11 @@ impl OrderBook {
     /// The top `n` levels of `side` as `(price, total_qty)`, best price first —
     /// the depth-of-market feed for market data.
     pub fn top_levels(&self, side: Side, n: usize) -> Vec<(Price, Qty)> {
-        let pool = &self.pool;
         let mut rows = Vec::with_capacity(n);
-        let mut push = |px: Price, idxs: &Vec<u32>| {
-            rows.push((px, idxs.iter().map(|&i| pool.get(i).remaining).sum::<Qty>()));
+        let mut push = |px: Price, lv: &Level| {
+            if lv.qty > 0 {
+                rows.push((px, lv.qty)); // skip all-tombstone levels
+            }
             rows.len() < n
         };
         match side {
@@ -606,14 +723,11 @@ impl OrderBook {
     /// A snapshot of the book as `(price, total_qty, order_count)` rows, best
     /// price first, for display and diagnostics.
     pub fn depth(&self, side: Side) -> Vec<(Price, Qty, usize)> {
-        let pool = &self.pool;
         let mut rows = Vec::new();
-        let mut push = |px: Price, idxs: &Vec<u32>| {
-            rows.push((
-                px,
-                idxs.iter().map(|&i| pool.get(i).remaining).sum::<Qty>(),
-                idxs.len(),
-            ));
+        let mut push = |px: Price, lv: &Level| {
+            if lv.qty > 0 {
+                rows.push((px, lv.qty, lv.live as usize)); // tombstones excluded
+            }
             true
         };
         match side {

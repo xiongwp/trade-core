@@ -17,6 +17,11 @@ impl MatchingStrategy for PriceTimePriority {
         "price-time"
     }
 
+    /// FIFO only consumes the front of a level: a capped view suffices.
+    fn full_level_required(&self) -> bool {
+        false
+    }
+
     fn allocate_into(&self, resting: &[RestingOrder], incoming: Qty, out: &mut Vec<Allocation>) {
         let mut remaining = incoming;
         for r in resting {

@@ -78,6 +78,16 @@ pub trait MatchingStrategy: Send + Sync {
         out
     }
 
+    /// Whether the strategy needs to see the *entire* price level to allocate.
+    /// Pro-rata and size-priority do (they weigh every resting order); FIFO
+    /// does not — it only ever consumes the front, so the engine hands it a
+    /// view capped at the aggressor's quantity. On deep levels (tens of
+    /// thousands of orders) this is the difference between O(fill) and
+    /// O(level) per cross.
+    fn full_level_required(&self) -> bool {
+        true
+    }
+
     /// Verify the allocation contract for a given input/output. Returns `Err`
     /// with a description on the first violation.
     fn validate(

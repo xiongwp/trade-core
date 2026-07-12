@@ -8,13 +8,14 @@ COPY assets ./assets
 COPY benches ./benches
 COPY examples ./examples
 RUN cargo build --release \
-    --bin exchange_server --bin order_client --bin market_data --bin sim_trader
+    --bin trade-core --bin order --bin market-data --bin order_client --bin order_load
 
 FROM debian:stable-slim
-COPY --from=build /src/target/release/exchange_server /usr/local/bin/exchange_server
+COPY --from=build /src/target/release/trade-core /usr/local/bin/trade-core
+COPY --from=build /src/target/release/order /usr/local/bin/order
+COPY --from=build /src/target/release/market-data /usr/local/bin/market-data
 COPY --from=build /src/target/release/order_client /usr/local/bin/order_client
-COPY --from=build /src/target/release/market_data /usr/local/bin/market_data
-COPY --from=build /src/target/release/sim_trader /usr/local/bin/sim_trader
+COPY --from=build /src/target/release/order_load /usr/local/bin/order_load
 
 # Journal + snapshots live here; mount a volume to survive container restarts
 # (the server recovers state from snapshot + journal on startup).
@@ -30,7 +31,7 @@ ENV ADDR=0.0.0.0:9001 \
     BAND_BPS=1000 \
     MD_ADDR=0.0.0.0:9101
 
-# Default runs the matching node; compose overrides `command` per service to
-# run market_data / sim_trader / order_client from the same image.
+# Default runs the matching node (trade-core); compose overrides `command`
+# per service to run market-data / order from the same image.
 ENTRYPOINT ["/bin/sh", "-c"]
-CMD ["exec exchange_server \"$ADDR\" \"$SHARDS\" \"$STRATEGY\" \"$JOURNAL_DIR\" \"$POOL_MB\" \"$BAND_BPS\" \"$MD_ADDR\""]
+CMD ["exec trade-core \"$ADDR\" \"$SHARDS\" \"$STRATEGY\" \"$JOURNAL_DIR\" \"$POOL_MB\" \"$BAND_BPS\" \"$MD_ADDR\""]

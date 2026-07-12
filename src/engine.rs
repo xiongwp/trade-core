@@ -237,7 +237,14 @@ impl MatchingEngine {
                 }
             }
 
-            self.book.level_view_into(maker_side, px, &mut self.view_buf);
+            // FIFO-style strategies only consume the level's front: cap the
+            // view at the aggressor's quantity so deep levels stay O(fill).
+            if self.strategy.full_level_required() {
+                self.book.level_view_into(maker_side, px, &mut self.view_buf);
+            } else {
+                self.book
+                    .level_view_capped(maker_side, px, order.remaining, &mut self.view_buf);
+            }
 
             // Self-trade prevention: does this level hold the taker's own order?
             if self.stp != SelfTradePolicy::Allow && order.user != 0 {
@@ -264,6 +271,13 @@ impl MatchingEngine {
                         }
                     }
                 }
+            }
+
+            // The level may have held only tombstones (cancelled orders): the
+            // view reclaimed them and swept the level away. Re-read the best
+            // price — progress is guaranteed because the level's bit is gone.
+            if self.view_buf.is_empty() {
+                continue;
             }
 
             self.alloc_buf.clear();
