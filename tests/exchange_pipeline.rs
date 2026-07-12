@@ -6,11 +6,16 @@ use trade_core::prelude::*;
 use trade_core::InstrumentId;
 
 /// Collect reports until `want` of them arrive or a timeout elapses.
+/// Periodic depth-of-market frames are ignored (they interleave on a timer).
 fn collect(sink: &trade_core::ResultSink, want: usize) -> Vec<ExecReport> {
     let mut got = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(5);
     while got.len() < want && Instant::now() < deadline {
-        let n = sink.poll(|r| got.push(r));
+        let n = sink.poll(|r| {
+            if !matches!(r, ExecReport::DepthLevel { .. } | ExecReport::DepthEnd { .. }) {
+                got.push(r);
+            }
+        });
         if n == 0 {
             std::thread::yield_now();
         }

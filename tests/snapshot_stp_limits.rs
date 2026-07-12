@@ -20,7 +20,7 @@ fn drain_all(sink: &trade_core::ResultSink) -> Vec<ExecReport> {
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut idle = 0;
     while Instant::now() < deadline && idle < 2000 {
-        if sink.poll(|r| reports.push(r)) == 0 {
+        if sink.poll(|r| if !matches!(r, ExecReport::DepthLevel { .. } | ExecReport::DepthEnd { .. }) { reports.push(r) }) == 0 {
             idle += 1;
             std::thread::yield_now();
         } else {

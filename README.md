@@ -9,7 +9,8 @@ pipeline (intake queue → match → report queue → drained):**
 
 | Configuration | Aggregate throughput |
 |---|---|
-| 6 nodes, journal ON (1 s flush/fsync) | **5.7 – 6.3 M orders/s** ✓ |
+| **20M-order E2E stress** (3 services, TCP, journal+chart live) | **9.16 M orders/s** ✓ |
+| 6 nodes, journal ON (1 s flush/fsync) | 5.7 – 6.3 M orders/s ✓ |
 | 5 nodes, journal off | **6.3 – 6.6 M orders/s** |
 | 1 node | 1.87 M orders/s |
 
@@ -53,8 +54,9 @@ scheduler noise — Linux with isolated, pinned cores trims them.)
 | Snapshots + journal truncation | atomic per-shard snapshots; recovery = snapshot + journal tail, O(commands since last snapshot); `build()` auto-recovers on restart | `snapshot_plus_journal_tail_equals_continuous_state`, restart test |
 | Self-trade prevention (STP) | `SelfTradePolicy`: CancelTaker / CancelMaker / CancelBoth, enforced inside the crossing loop | STP taker & maker tests |
 | Static pre-trade limits | `RiskLimits`: max qty, max notional, max open orders per user (O(1) via book counters) | `risk_limits_reject_oversize_and_order_count` |
-| Docker one-click deploy | multi-stage `Dockerfile` + `docker-compose.yml`: **separately deployed** matching / market-data / order-flow services, persistent journal volumes | full stack `compose up` verified, chart served from containers |
-| Market data & chart frontend | trade fanout port on the gateway → `market_data` service aggregates **K-lines at 1s/1m/3m/5m/10m/15m/30m/1d/1w/1mo** (Monday weeks, calendar months) → canvas candlestick UI + JSON API | [kline.rs](src/kline.rs) bucket/OHLCV tests; live chart verified in browser |
+| Docker one-click deploy | multi-stage `Dockerfile` + `docker-compose.yml`: the three services **order / trade-core / market-data**, persistent journal volumes | full stack `compose up` verified, chart served from containers |
+| Market data & chart frontend | fanout port → `market-data` service: **K-lines (1s…1mo)** + **depth ladder (top-5 bid/ask)** + canvas UI, **WebSocket push** (poll fallback), **candle history persisted** (atomic 10 s snapshots, loaded on restart) | kline tests incl. persistence; chart+depth+WS verified live in browser |
+| O(1) under stress | 20M-order test exposed three O(level) hot spots — full-level view copies, O(level) cancels, O(level) depth sums — fixed via capped FIFO views, **tombstone cancels**, and per-level aggregate counters | E2E: 20M orders in 2.18 s (9.16M/s) with chart live |
 | Order system sharded 10 DB × 100 tables by user id | `sharding::route(user_id)` (splitmix64 → 1000 slots); DDL name enumeration | uniformity test (<5% skew) |
 | TCP long-connection intake | binary 40-byte frames, parse-in-place over a reusable buffer; reports streamed back async | [tcp_roundtrip.rs](tests/tcp_roundtrip.rs) |
 

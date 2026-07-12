@@ -125,6 +125,9 @@ fn main() {
                         buf.copy_within(off..filled, 0);
                         filled -= off;
                     }
+                    if term / 1_000_000 != t_term.load(Ordering::Relaxed) / 1_000_000 {
+                        eprintln!("[load] progress: {term} terminals, {trd} trades");
+                    }
                     t_term.store(term, Ordering::Release);
                     t_trade.store(trd, Ordering::Release);
                 }
@@ -165,13 +168,13 @@ fn main() {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     let e2e = t1.elapsed();
-    drop(sock);
-    let _ = reader.join();
-
     println!(
         "[load] END-TO-END: {total} orders in {e2e:.2?} -> {:.0} orders/s \
          ({} trades printed)",
         total as f64 / e2e.as_secs_f64(),
         trades.load(Ordering::Acquire)
     );
+    // Unblock the reader (it shares the socket) and exit.
+    let _ = sock.shutdown(std::net::Shutdown::Both);
+    let _ = reader.join();
 }
