@@ -78,6 +78,22 @@ pub enum Command {
         close_side: Side,
         close_qty: Qty,
     },
+    /// Admin: halt trading on an instrument (circuit breaker / 停牌). New
+    /// orders are rejected while halted; cancels/modifies still work. Journaled
+    /// like every command, so replay reproduces halt windows exactly — price
+    /// triggers live in the (external) risk monitor, which SENDS this command.
+    Halt { instrument: InstrumentId, cmd_id: u64 },
+    /// Admin: resume trading on a halted instrument.
+    Resume { instrument: InstrumentId, cmd_id: u64 },
+    /// Admin: suspend a **user** (all their new orders rejected; cancels still
+    /// work). exchange-core's user-suspend, command-driven and journaled.
+    HaltUser { instrument: InstrumentId, user: u64, cmd_id: u64 },
+    /// Admin: lift a user suspension.
+    ResumeUser { instrument: InstrumentId, user: u64, cmd_id: u64 },
+    /// A group of commands applied **atomically** (no other command from any
+    /// queue interleaves): all must target this shard's instruments. Each inner
+    /// command is journaled/replicated individually, preserving the total order.
+    Batch(Vec<Command>),
 }
 
 impl Command {
@@ -88,6 +104,11 @@ impl Command {
             Command::Cancel { instrument, .. } => *instrument,
             Command::Modify { instrument, .. } => *instrument,
             Command::ForceClose { instrument, .. } => *instrument,
+            Command::Halt { instrument, .. } => *instrument,
+            Command::Resume { instrument, .. } => *instrument,
+            Command::HaltUser { instrument, .. } => *instrument,
+            Command::ResumeUser { instrument, .. } => *instrument,
+            Command::Batch(cmds) => cmds.first().map_or(InstrumentId(0), |c| c.instrument()),
         }
     }
 
@@ -108,6 +129,9 @@ pub enum ExecReport {
         aggressor: Side,
         price: Price,
         qty: Qty,
+        /// Authoritative fees (ticks), computed in the matching path.
+        maker_fee: u64,
+        taker_fee: u64,
     },
     Filled { instrument: InstrumentId, order_id: OrderId },
     PartiallyFilled { instrument: InstrumentId, order_id: OrderId, filled: Qty },
@@ -121,6 +145,13 @@ pub enum ExecReport {
     DepthLevel { instrument: InstrumentId, side: Side, level: u8, price: Price, qty: Qty },
     /// Terminates a depth snapshot; carries how many levels each side sent.
     DepthEnd { instrument: InstrumentId, bid_levels: u8, ask_levels: u8 },
+    /// Trading halted on the instrument (ack of [`Command::Halt`]).
+    Halted { instrument: InstrumentId },
+    /// Trading resumed (ack of [`Command::Resume`]).
+    Resumed { instrument: InstrumentId },
+    /// User suspended / unsuspended (acks of HaltUser/ResumeUser).
+    UserHalted { instrument: InstrumentId, user: u64 },
+    UserResumed { instrument: InstrumentId, user: u64 },
 }
 
 /// A function that produces a fresh matching strategy for each new instrument.
@@ -163,6 +194,12 @@ pub struct ExchangeConfig {
     pub stp: SelfTradePolicy,
     /// Static pre-trade limits (max qty / notional / per-user open orders).
     pub risk_limits: Option<RiskLimits>,
+    /// Maker/taker fee schedule (default = zero fees).
+    pub fees: crate::fees::FeeSchedule,
+    /// Idempotent command dedup: reject any command whose id is <= the
+    /// high-water mark (exactly-once under order-system re-send; cursor is
+    /// snapshot-persisted). Requires globally increasing ids (Leaf).
+    pub dedup_commands: bool,
 }
 
 impl Default for ExchangeConfig {
@@ -182,6 +219,8 @@ impl Default for ExchangeConfig {
             snapshot_every: None,
             stp: SelfTradePolicy::Allow,
             risk_limits: None,
+            fees: crate::fees::FeeSchedule::default(),
+            dedup_commands: false,
         }
     }
 }
@@ -246,6 +285,16 @@ impl OrderGateway {
         self.submit(Command::Modify { instrument, order_id, new_price, new_qty, cmd_id })
     }
 
+    /// Convenience: halt trading on an instrument (admin/risk monitor).
+    pub fn halt(&self, instrument: InstrumentId, cmd_id: u64) -> Result<(), Command> {
+        self.submit(Command::Halt { instrument, cmd_id })
+    }
+
+    /// Convenience: resume a halted instrument.
+    pub fn resume(&self, instrument: InstrumentId, cmd_id: u64) -> Result<(), Command> {
+        self.submit(Command::Resume { instrument, cmd_id })
+    }
+
     /// Convenience: force-close a user on an instrument.
     pub fn force_close(
         &self,
@@ -281,6 +330,8 @@ impl ResultSink {
 
 /// Controls the lifecycle of the running matching shards.
 pub struct ExchangeHandle {
+    /// Operational counters (share with a metrics endpoint).
+    pub metrics: Arc<crate::metrics::Metrics>,
     running: Arc<AtomicBool>,
     started: Arc<AtomicBool>,
     parked: Arc<AtomicUsize>,
@@ -328,20 +379,31 @@ impl ExchangeHandle {
 
 /// Build and start an exchange.
 pub fn build(config: ExchangeConfig) -> (OrderGateway, ResultSink, ExchangeHandle) {
-    build_inner(config, true)
+    build_inner(config, true, None)
+}
+
+/// Like [`build`] with a live replication fanout: every journaled command is
+/// simultaneously streamed to attached standbys (see [`crate::replication`]).
+pub fn build_with_rep(
+    config: ExchangeConfig,
+    rep: crate::replication::RepFanout,
+) -> (OrderGateway, ResultSink, ExchangeHandle) {
+    build_inner(config, true, Some(rep))
 }
 
 /// Like [`build`], but shards start **paused** (accepting commands into queues
 /// without processing) until [`ExchangeHandle::start`].
 pub fn build_paused(config: ExchangeConfig) -> (OrderGateway, ResultSink, ExchangeHandle) {
-    build_inner(config, false)
+    build_inner(config, false, None)
 }
 
 fn build_inner(
     config: ExchangeConfig,
     start_now: bool,
+    rep: Option<crate::replication::RepFanout>,
 ) -> (OrderGateway, ResultSink, ExchangeHandle) {
     assert!(config.shards >= 1, "need at least one shard");
+    let metrics = Arc::new(crate::metrics::Metrics::default());
     let running = Arc::new(AtomicBool::new(true));
     let started = Arc::new(AtomicBool::new(start_now));
     let parked = Arc::new(AtomicUsize::new(0));
@@ -362,7 +424,9 @@ fn build_inner(
         // the configured instrument list — the startup memory reservation.
         let mut processor = Processor::new(config.strategy, config.price_guard.clone())
             .with_stp(config.stp)
-            .with_limits(config.risk_limits);
+            .with_limits(config.risk_limits)
+            .with_dedup(config.dedup_commands)
+            .with_fees(config.fees);
         for &inst in &config.instruments {
             if inst.0 as usize % config.shards == shard_id {
                 processor.create_book(inst, config.pool_orders_per_book, config.prefault);
@@ -393,6 +457,10 @@ fn build_inner(
         snap_requests.push(snap_request.clone());
 
         let mut shard = Shard {
+            shard_id: shard_id as u32,
+            rep: rep.clone(),
+            rep_seq: 0,
+            metrics: metrics.clone(),
             processor,
             high_rx,
             normal_rx,
@@ -421,6 +489,7 @@ fn build_inner(
         OrderGateway { shards: shard_tx },
         ResultSink { results: result_rx },
         ExchangeHandle {
+            metrics,
             running,
             started,
             parked,
@@ -446,6 +515,19 @@ pub struct Processor {
     default_pool: (usize, bool),
     stp: SelfTradePolicy,
     limits: Option<RiskLimits>,
+    /// Idempotency: highest command id applied; duplicates are rejected.
+    /// 0-ids bypass (legacy/tests). Persisted in snapshots (exactly-once
+    /// across crash + order-system re-send).
+    dedup: bool,
+    max_cmd_id: u64,
+    fees: crate::fees::FeeSchedule,
+    /// Halted instruments (circuit breaker); command-driven, snapshot-persisted.
+    halted: std::collections::HashSet<InstrumentId>,
+    /// Suspended users (new orders rejected).
+    suspended: std::collections::HashSet<u64>,
+    /// Net positions per (user, instrument), built from the trade stream —
+    /// feeds margin monitoring/forced liquidation. Deterministic under replay.
+    positions: HashMap<(u64, InstrumentId), i64>,
     /// Reusable trade buffer: the New-order hot path allocates nothing.
     trades_buf: Vec<crate::trade::Trade>,
 }
@@ -459,6 +541,12 @@ impl Processor {
             default_pool: (4096, false),
             stp: SelfTradePolicy::Allow,
             limits: None,
+            dedup: false,
+            max_cmd_id: 0,
+            fees: crate::fees::FeeSchedule::default(),
+            halted: std::collections::HashSet::new(),
+            suspended: std::collections::HashSet::new(),
+            positions: HashMap::new(),
             trades_buf: Vec::new(),
         }
     }
@@ -472,6 +560,18 @@ impl Processor {
     /// Set static pre-trade limits (builder style).
     pub fn with_limits(mut self, limits: Option<RiskLimits>) -> Self {
         self.limits = limits;
+        self
+    }
+
+    /// Enable idempotent command dedup (builder style).
+    pub fn with_dedup(mut self, dedup: bool) -> Self {
+        self.dedup = dedup;
+        self
+    }
+
+    /// Set the fee schedule (builder style).
+    pub fn with_fees(mut self, fees: crate::fees::FeeSchedule) -> Self {
+        self.fees = fees;
         self
     }
 
@@ -497,6 +597,16 @@ impl Processor {
         self.engines.get(&instrument)
     }
 
+    /// Net position of `user` on `instrument` (buys +, sells -).
+    pub fn position(&self, user: u64, instrument: InstrumentId) -> i64 {
+        self.positions.get(&(user, instrument)).copied().unwrap_or(0)
+    }
+
+    /// Whether the instrument is currently halted.
+    pub fn is_halted(&self, instrument: InstrumentId) -> bool {
+        self.halted.contains(&instrument)
+    }
+
     /// Export the full state of every engine (snapshot capture).
     pub fn export_state(&self) -> Vec<EngineState> {
         let mut states: Vec<EngineState> = self
@@ -514,6 +624,12 @@ impl Processor {
 
     /// Restore engines from a snapshot. Only valid on a fresh processor.
     pub fn restore_state(&mut self, snap: &Snapshot) {
+        self.max_cmd_id = self.max_cmd_id.max(snap.max_cmd_id);
+        self.halted.extend(snap.halted.iter().map(|&i| InstrumentId(i)));
+        self.suspended.extend(snap.suspended.iter().copied());
+        for &(u, i, q) in &snap.positions {
+            *self.positions.entry((u, InstrumentId(i))).or_insert(0) += q;
+        }
         for e in &snap.engines {
             let engine = self.engine_for(e.instrument);
             engine.restore(e.engine_seq, &e.orders);
@@ -546,7 +662,62 @@ impl Processor {
 
     /// Apply one command, emitting every resulting report through `emit`.
     pub fn process(&mut self, cmd: Command, emit: &mut dyn FnMut(ExecReport)) {
+        // Idempotency gate: every command carries a unique increasing id (New =
+        // order id; Cancel/Modify = cmd_id; ForceClose = close-order id). A
+        // re-sent duplicate (id <= high-water mark) is rejected, never applied
+        // twice. Deterministic under replay: duplicates are journaled too, and
+        // the same gate skips them again.
+        if self.dedup {
+            let (id, inst) = match &cmd {
+                Command::New(o) => (o.id.0, o.instrument),
+                Command::Cancel { cmd_id, instrument, .. } => (*cmd_id, *instrument),
+                Command::Modify { cmd_id, instrument, .. } => (*cmd_id, *instrument),
+                Command::ForceClose { close_order_id, instrument, .. } => {
+                    (close_order_id.0, *instrument)
+                }
+                Command::Halt { cmd_id, instrument } => (*cmd_id, *instrument),
+                Command::Resume { cmd_id, instrument } => (*cmd_id, *instrument),
+                Command::HaltUser { cmd_id, instrument, .. } => (*cmd_id, *instrument),
+                Command::ResumeUser { cmd_id, instrument, .. } => (*cmd_id, *instrument),
+                // Batches are gated per inner command (recursive process call).
+                Command::Batch(_) => (0, InstrumentId(0)),
+            };
+            if id != 0 {
+                if id <= self.max_cmd_id {
+                    emit(ExecReport::Rejected {
+                        instrument: inst,
+                        order_id: OrderId(id),
+                        reason: "duplicate",
+                    });
+                    return;
+                }
+                self.max_cmd_id = id;
+            }
+        }
         match cmd {
+            Command::Batch(cmds) => {
+                // Atomic: the shard is single-threaded, so processing the group
+                // inside one call admits no interleaving.
+                for c in cmds {
+                    self.process(c, emit);
+                }
+            }
+            Command::HaltUser { instrument, user, .. } => {
+                self.suspended.insert(user);
+                emit(ExecReport::UserHalted { instrument, user });
+            }
+            Command::ResumeUser { instrument, user, .. } => {
+                self.suspended.remove(&user);
+                emit(ExecReport::UserResumed { instrument, user });
+            }
+            Command::Halt { instrument, .. } => {
+                self.halted.insert(instrument);
+                emit(ExecReport::Halted { instrument });
+            }
+            Command::Resume { instrument, .. } => {
+                self.halted.remove(&instrument);
+                emit(ExecReport::Resumed { instrument });
+            }
             Command::New(order) => self.process_new(order, emit),
             Command::Cancel { instrument, order_id, .. } => {
                 if self.engine_for(instrument).cancel(order_id) {
@@ -568,6 +739,7 @@ impl Processor {
                     }
                     ModifyOutcome::Requoted(report) => {
                         for t in &report.trades {
+                            let (maker_fee, taker_fee) = self.fees.fees(t.price, t.quantity);
                             emit(ExecReport::Trade {
                                 instrument,
                                 taker: t.taker,
@@ -575,6 +747,8 @@ impl Processor {
                                 aggressor: t.aggressor,
                                 price: t.price,
                                 qty: t.quantity,
+                                maker_fee,
+                                taker_fee,
                             });
                         }
                         let remaining = new_qty.saturating_sub(report.filled);
@@ -611,6 +785,17 @@ impl Processor {
     fn process_new(&mut self, mut order: Order, emit: &mut dyn FnMut(ExecReport)) {
         let instrument = order.instrument;
         let id = order.id;
+
+        // Circuit breaker: a halted instrument accepts no new orders (cancels
+        // and modifies still work so users can pull quotes).
+        if self.halted.contains(&instrument) {
+            emit(ExecReport::Rejected { instrument, order_id: id, reason: "halted" });
+            return;
+        }
+        if order.user != 0 && self.suspended.contains(&order.user) {
+            emit(ExecReport::Rejected { instrument, order_id: id, reason: "user-suspended" });
+            return;
+        }
 
         // Synchronous pre-trade risk, cheapest checks first:
         // 1. static limits (order shape);
@@ -657,6 +842,19 @@ impl Processor {
             }
         }
         for t in &trades {
+            let (maker_fee, taker_fee) = self.fees.fees(t.price, t.quantity);
+            // Position ledger: buyer +qty, seller -qty (net, per user/instrument).
+            let q = t.quantity as i64;
+            let (buyer, seller) = match t.aggressor {
+                Side::Buy => (t.taker_user, t.maker_user),
+                Side::Sell => (t.maker_user, t.taker_user),
+            };
+            if buyer != 0 {
+                *self.positions.entry((buyer, instrument)).or_insert(0) += q;
+            }
+            if seller != 0 {
+                *self.positions.entry((seller, instrument)).or_insert(0) -= q;
+            }
             emit(ExecReport::Trade {
                 instrument,
                 taker: t.taker,
@@ -664,6 +862,8 @@ impl Processor {
                 aggressor: t.aggressor,
                 price: t.price,
                 qty: t.quantity,
+                maker_fee,
+                taker_fee,
             });
         }
         self.trades_buf = trades;
@@ -690,6 +890,12 @@ impl Processor {
 // ---------------------------------------------------------------------------
 
 struct Shard {
+    shard_id: u32,
+    /// Live replication fanout (standby hot-sync); `None` = standalone.
+    rep: Option<crate::replication::RepFanout>,
+    /// Command seq when journaling is off (mirrors the journal seq otherwise).
+    rep_seq: u64,
+    metrics: Arc<crate::metrics::Metrics>,
     processor: Processor,
     high_rx: Consumer<Command>,
     normal_rx: Consumer<Command>,
@@ -872,7 +1078,26 @@ impl Shard {
             return;
         }
         let states = self.processor.export_state();
-        if snapshot::write(path, j.seq(), &states).is_ok() {
+        let halted: Vec<u32> = self.processor.halted.iter().map(|i| i.0).collect();
+        let suspended: Vec<u64> = self.processor.suspended.iter().copied().collect();
+        let positions: Vec<(u64, u32, i64)> = self
+            .processor
+            .positions
+            .iter()
+            .filter(|(_, &q)| q != 0)
+            .map(|(&(u, i), &q)| (u, i.0, q))
+            .collect();
+        if snapshot::write(
+            path,
+            j.seq(),
+            self.processor.max_cmd_id,
+            &halted,
+            &suspended,
+            &positions,
+            &states,
+        )
+        .is_ok()
+        {
             let _ = j.truncate();
         }
         self.last_snapshot = Instant::now();
@@ -887,15 +1112,40 @@ impl Shard {
         worked
     }
 
-    /// Journal the command (in processing order), then apply it.
+    /// Journal the command (in processing order), replicate it, then apply it.
+    /// One serialization point, one seq series: journal and standbys see the
+    /// identical total order.
     fn handle(&mut self, cmd: Command) {
-        if let Some(j) = &mut self.journal {
+        // Batches flatten HERE: each inner command is journaled/replicated as
+        // its own record (the total order stays flat and replayable); atomicity
+        // holds because this thread pops nothing until the loop finishes.
+        if let Command::Batch(cmds) = cmd {
+            for c in cmds {
+                self.handle(c);
+            }
+            return;
+        }
+        if self.journal.is_some() || self.rep.is_some() {
             let mut frame = [0u8; wire::MSG_LEN];
             wire::encode_command(&cmd, &mut frame);
-            let _ = j.append(journal::now_nanos(), &frame);
+            let seq = match &mut self.journal {
+                Some(j) => j.append(journal::now_nanos(), &frame).unwrap_or_else(|_| {
+                    self.rep_seq + 1
+                }),
+                None => self.rep_seq + 1,
+            };
+            self.rep_seq = seq;
+            if let Some(rep) = &self.rep {
+                rep.publish(self.shard_id, seq, &frame);
+            }
+        }
+        if self.rep_seq > 0 {
+            self.metrics.journal_seq.fetch_max(self.rep_seq, Ordering::Relaxed);
         }
         let result_tx = &self.result_tx;
+        let metrics = &self.metrics;
         self.processor.process(cmd, &mut |report| {
+            metrics.record(&report);
             // Backpressure: spin+yield until the order system drains.
             let mut pending = report;
             loop {

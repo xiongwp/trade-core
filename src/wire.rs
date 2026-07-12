@@ -41,13 +41,17 @@ use std::fmt;
 /// Fixed wire frame length in bytes.
 pub const MSG_LEN: usize = 40;
 
-/// Fixed execution-report frame length in bytes.
-pub const REPORT_LEN: usize = 40;
+/// Fixed execution-report frame length in bytes (v2: 56 — adds fee fields).
+pub const REPORT_LEN: usize = 56;
 
 const MT_NEW: u8 = 1;
 const MT_CANCEL: u8 = 2;
 const MT_MODIFY: u8 = 3;
 const MT_FORCE_CLOSE: u8 = 4;
+const MT_HALT: u8 = 5;
+const MT_RESUME: u8 = 6;
+const MT_HALT_USER: u8 = 7;
+const MT_RESUME_USER: u8 = 8;
 
 // Report type codes.
 const RT_ACCEPTED: u8 = 1;
@@ -129,6 +133,8 @@ impl<'a> WireView<'a> {
         match self.buf[3] {
             1 => TimeInForce::Ioc,
             2 => TimeInForce::Fok,
+            3 => TimeInForce::IocBudget,
+            4 => TimeInForce::FokBudget,
             _ => TimeInForce::Gtc,
         }
     }
@@ -167,9 +173,35 @@ impl<'a> WireView<'a> {
                 close_side: self.side(),
                 close_qty: self.qty(),
             }),
+            MT_HALT => Some(Command::Halt {
+                instrument: self.instrument(),
+                cmd_id: self.order_id().0,
+            }),
+            MT_RESUME => Some(Command::Resume {
+                instrument: self.instrument(),
+                cmd_id: self.order_id().0,
+            }),
+            MT_HALT_USER => Some(Command::HaltUser {
+                instrument: self.instrument(),
+                user: self.user(),
+                cmd_id: self.order_id().0,
+            }),
+            MT_RESUME_USER => Some(Command::ResumeUser {
+                instrument: self.instrument(),
+                user: self.user(),
+                cmd_id: self.order_id().0,
+            }),
             _ => None,
         }
     }
+}
+
+/// Encode a Halt/Resume admin frame (cmd_id rides the order-id slot).
+pub fn encode_admin(halt: bool, instrument: InstrumentId, cmd_id: u64, out: &mut [u8; MSG_LEN]) {
+    out.fill(0);
+    out[0] = if halt { MT_HALT } else { MT_RESUME };
+    out[4..8].copy_from_slice(&instrument.0.to_le_bytes());
+    out[8..16].copy_from_slice(&cmd_id.to_le_bytes());
 }
 
 /// Encode a `New` order into a frame.
@@ -188,6 +220,8 @@ pub fn encode_new(order: &Order, out: &mut [u8; MSG_LEN]) {
         TimeInForce::Gtc => 0,
         TimeInForce::Ioc => 1,
         TimeInForce::Fok => 2,
+        TimeInForce::IocBudget => 3,
+        TimeInForce::FokBudget => 4,
     };
     out[4..8].copy_from_slice(&order.instrument.0.to_le_bytes());
     out[8..16].copy_from_slice(&order.id.0.to_le_bytes());
@@ -261,7 +295,33 @@ pub fn encode_command(cmd: &Command, out: &mut [u8; MSG_LEN]) {
         Command::ForceClose { instrument, user, close_order_id, close_side, close_qty } => {
             encode_force_close(*instrument, *user, *close_order_id, *close_side, *close_qty, out)
         }
+        Command::Halt { instrument, cmd_id } => encode_admin(true, *instrument, *cmd_id, out),
+        Command::Resume { instrument, cmd_id } => encode_admin(false, *instrument, *cmd_id, out),
+        Command::HaltUser { instrument, user, cmd_id } => {
+            encode_user_admin(true, *instrument, *user, *cmd_id, out)
+        }
+        Command::ResumeUser { instrument, user, cmd_id } => {
+            encode_user_admin(false, *instrument, *user, *cmd_id, out)
+        }
+        // Batches are flattened at the shard: encode_command is called per inner
+        // command for journal/replication; a Batch itself never reaches here.
+        Command::Batch(_) => out.fill(0),
     }
+}
+
+/// Encode a user-suspend admin frame.
+pub fn encode_user_admin(
+    halt: bool,
+    instrument: InstrumentId,
+    user: u64,
+    cmd_id: u64,
+    out: &mut [u8; MSG_LEN],
+) {
+    out.fill(0);
+    out[0] = if halt { MT_HALT_USER } else { MT_RESUME_USER };
+    out[4..8].copy_from_slice(&instrument.0.to_le_bytes());
+    out[8..16].copy_from_slice(&cmd_id.to_le_bytes());
+    out[32..40].copy_from_slice(&user.to_le_bytes());
 }
 
 /// Encode an execution report into a fixed 40-byte frame for the return path.
@@ -284,15 +344,21 @@ pub fn encode_report(r: &ExecReport, out: &mut [u8; REPORT_LEN]) {
         ExecReport::Accepted { instrument, order_id } => {
             put(RT_ACCEPTED, instrument, order_id, 0, 0, 0, 0)
         }
-        ExecReport::Trade { instrument, taker, maker, aggressor, price, qty } => put(
-            RT_TRADE,
-            instrument,
-            taker,
-            maker.0,
-            price,
-            qty,
-            match aggressor { Side::Buy => 0, Side::Sell => 1 },
-        ),
+        ExecReport::Trade {
+            instrument, taker, maker, aggressor, price, qty, maker_fee, taker_fee,
+        } => {
+            put(
+                RT_TRADE,
+                instrument,
+                taker,
+                maker.0,
+                price,
+                qty,
+                match aggressor { Side::Buy => 0, Side::Sell => 1 },
+            );
+            out[40..48].copy_from_slice(&maker_fee.to_le_bytes());
+            out[48..56].copy_from_slice(&taker_fee.to_le_bytes());
+        }
         ExecReport::Filled { instrument, order_id } => {
             put(RT_FILLED, instrument, order_id, 0, 0, 0, 0)
         }
@@ -332,6 +398,14 @@ pub fn encode_report(r: &ExecReport, out: &mut [u8; REPORT_LEN]) {
             0,
             0,
         ),
+        ExecReport::Halted { instrument } => put(12, instrument, OrderId(0), 0, 0, 0, 0),
+        ExecReport::Resumed { instrument } => put(13, instrument, OrderId(0), 0, 0, 0, 0),
+        ExecReport::UserHalted { instrument, user } => {
+            put(14, instrument, OrderId(0), user, 0, 0, 0)
+        }
+        ExecReport::UserResumed { instrument, user } => {
+            put(15, instrument, OrderId(0), user, 0, 0, 0)
+        }
     }
 }
 
@@ -339,6 +413,8 @@ pub fn encode_report(r: &ExecReport, out: &mut [u8; REPORT_LEN]) {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DecodedReport {
     pub type_code: u8,
+    pub maker_fee: u64,
+    pub taker_fee: u64,
     pub instrument: InstrumentId,
     pub order_id: OrderId,
     pub aux_id: u64,
@@ -352,6 +428,8 @@ pub fn decode_report(buf: &[u8]) -> Option<DecodedReport> {
     let b: &[u8; REPORT_LEN] = buf.get(..REPORT_LEN)?.try_into().ok()?;
     Some(DecodedReport {
         type_code: b[0],
+        maker_fee: u64::from_le_bytes(b[40..48].try_into().unwrap()),
+        taker_fee: u64::from_le_bytes(b[48..56].try_into().unwrap()),
         side: if b[1] == 0 { Side::Buy } else { Side::Sell },
         instrument: InstrumentId(u32::from_le_bytes(b[4..8].try_into().unwrap())),
         order_id: OrderId(u64::from_le_bytes(b[8..16].try_into().unwrap())),
@@ -403,6 +481,8 @@ mod tests {
             aggressor: Side::Sell,
             price: 999,
             qty: 5,
+            maker_fee: 49,
+            taker_fee: 99,
         };
         let mut frame = [0u8; REPORT_LEN];
         encode_report(&r, &mut frame);
@@ -413,6 +493,8 @@ mod tests {
         assert_eq!(d.price, 999);
         assert_eq!(d.qty, 5);
         assert_eq!(d.side, Side::Sell);
+        assert_eq!(d.maker_fee, 49, "fees must survive the wire");
+        assert_eq!(d.taker_fee, 99);
     }
 
     #[test]

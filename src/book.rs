@@ -540,6 +540,25 @@ impl OrderBook {
         index.sweep(price);
     }
 
+    /// Cost (notional) to fill up to `qty` lots best-price-first: returns
+    /// `(fillable_lots, total_cost)` — the FOK_BUDGET precheck.
+    pub fn cost_to_fill(&self, aggressor: Side, qty: Qty) -> (Qty, u128) {
+        let levels = self.side(aggressor.opposite());
+        let mut left = qty;
+        let mut cost: u128 = 0;
+        let mut walk = |px: Price, lv: &Level| {
+            let take = left.min(lv.qty);
+            cost += px as u128 * take as u128;
+            left -= take;
+            left > 0
+        };
+        match aggressor {
+            Side::Buy => levels.walk_asc(&mut walk),
+            Side::Sell => levels.walk_desc(&mut walk),
+        }
+        (qty - left, cost)
+    }
+
     /// Total resting quantity reachable by an aggressor with limit `limit`
     /// (pass `Price::MAX`/`MIN` for market orders).
     pub fn crossable_qty(&self, aggressor: Side, limit: Price) -> Qty {

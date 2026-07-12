@@ -79,6 +79,11 @@ impl PriceGuard {
     /// Returns `Err` to reject; may mutate a market order into a protected
     /// marketable limit.
     pub fn vet(&self, order: &mut Order) -> Result<(), &'static str> {
+        // Budget orders: `price` is a TOTAL budget, not a per-unit price — the
+        // band check does not apply (they only lift existing in-band liquidity).
+        if matches!(order.tif, TimeInForce::IocBudget | TimeInForce::FokBudget) {
+            return Ok(());
+        }
         let reference = self.reference(order.instrument);
         if reference == 0 {
             return Ok(()); // no feed: fail-open (see type-level docs)

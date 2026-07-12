@@ -219,3 +219,150 @@ fn risk_limits_reject_oversize_and_order_count() {
     assert!(rejected_with(5, "max-user-orders"), "{reports:?}");
     assert!(reports.contains(&ExecReport::Resting { instrument: sym, order_id: OrderId(4) }));
 }
+
+/// Idempotent dedup: a re-sent command (same id) must be rejected, never
+/// applied twice; the cursor survives a snapshot round-trip.
+#[test]
+fn duplicate_commands_are_rejected_and_cursor_persists() {
+    use trade_core::exchange::Processor;
+    let mut p = Processor::new(|| Box::new(PriceTimePriority), None).with_dedup(true);
+    let mut reports = Vec::new();
+
+    // New #5 applies; a re-send of #5 is rejected as duplicate.
+    p.process(Command::New(Order::limit(OrderId(5), Side::Sell, 100, 3)), &mut |r| reports.push(r));
+    p.process(Command::New(Order::limit(OrderId(5), Side::Sell, 100, 3)), &mut |r| reports.push(r));
+    assert!(reports.iter().any(|r| matches!(r,
+        ExecReport::Rejected { reason, .. } if *reason == "duplicate")));
+    assert_eq!(p.engine(InstrumentId(0)).unwrap().book().len(), 1, "applied once");
+
+    // A cancel with a fresh cmd_id works; re-sending it is rejected.
+    reports.clear();
+    p.process(Command::Cancel { instrument: InstrumentId(0), order_id: OrderId(5), cmd_id: 6 },
+        &mut |r| reports.push(r));
+    p.process(Command::Cancel { instrument: InstrumentId(0), order_id: OrderId(5), cmd_id: 6 },
+        &mut |r| reports.push(r));
+    assert!(matches!(reports[0], ExecReport::Cancelled { .. }));
+    assert!(matches!(reports[1], ExecReport::Rejected { reason: "duplicate", .. }));
+
+    // Cursor persists through snapshot: a fresh processor restored from it
+    // still rejects old ids.
+    let dir = temp_dir("dedup");
+    let path = dir.join("s.bin");
+    trade_core::snapshot::write(&path, 0, 6, &[], &[], &[], &p.export_state()).unwrap();
+    let snap = trade_core::snapshot::load(&path).unwrap();
+    let mut p2 = Processor::new(|| Box::new(PriceTimePriority), None).with_dedup(true);
+    p2.restore_state(&snap);
+    reports.clear();
+    p2.process(Command::New(Order::limit(OrderId(4), Side::Buy, 99, 1)), &mut |r| reports.push(r));
+    assert!(matches!(reports[0], ExecReport::Rejected { reason: "duplicate", .. }),
+        "restored cursor must still gate old ids");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Fees are computed in the matching path and carried on every trade report.
+#[test]
+fn trade_reports_carry_authoritative_fees() {
+    let cfg = ExchangeConfig {
+        fees: trade_core::fees::FeeSchedule { maker_bps: 10, taker_bps: 20 },
+        ..ExchangeConfig::default()
+    };
+    let (gw, sink, handle) = build(cfg);
+    gw.new_order(Order::limit(OrderId(1), Side::Sell, 1000, 3)).unwrap();
+    gw.new_order(Order::limit(OrderId(2), Side::Buy, 1000, 3)).unwrap();
+    let reports = drain_all(&sink);
+    handle.shutdown();
+    // notional 3000: maker 10bps = 3, taker 20bps = 6.
+    assert!(reports.iter().any(|r| matches!(r,
+        ExecReport::Trade { maker_fee: 3, taker_fee: 6, qty: 3, .. })),
+        "expected fee-bearing trade; got {reports:?}");
+}
+
+/// Circuit breaker: Halt rejects new orders (cancels still work), Resume
+/// restores trading; positions accrue from the trade stream.
+#[test]
+fn halt_resume_and_position_ledger() {
+    let (gw, sink, handle) = build(ExchangeConfig::default());
+    let sym = InstrumentId(0);
+
+    // Trade 5 lots: user 7 sells to user 8 -> positions -5 / +5.
+    gw.new_order(Order::limit(OrderId(1), Side::Sell, 100, 5).by(7)).unwrap();
+    gw.new_order(Order::limit(OrderId(2), Side::Buy, 100, 5).by(8)).unwrap();
+    gw.new_order(Order::limit(OrderId(3), Side::Sell, 101, 4).by(7)).unwrap(); // rests
+    let _ = drain_all(&sink);
+
+    // Halt: new orders rejected, cancel of the resting quote still allowed.
+    // (Drain between steps: admin/cancel ride the high-priority queue and would
+    // otherwise overtake the queued New — that priority is by design.)
+    gw.halt(sym, 100).unwrap();
+    let mut reports = drain_all(&sink);
+    gw.new_order(Order::limit(OrderId(4), Side::Buy, 101, 1).by(8)).unwrap();
+    gw.cancel(sym, OrderId(3), 101).unwrap();
+    reports.extend(drain_all(&sink));
+    // Resume: trading works again.
+    gw.resume(sym, 102).unwrap();
+    gw.new_order(Order::limit(OrderId(5), Side::Buy, 100, 1).by(8)).unwrap();
+    reports.extend(drain_all(&sink));
+    handle.shutdown();
+
+    assert!(reports.contains(&ExecReport::Halted { instrument: sym }));
+    assert!(reports.iter().any(|r| matches!(r,
+        ExecReport::Rejected { order_id: OrderId(4), reason: "halted", .. })),
+        "halted instrument must reject new orders: {reports:?}");
+    assert!(reports.iter().any(|r| matches!(r,
+        ExecReport::Cancelled { order_id: OrderId(3), .. })),
+        "cancels must still work while halted");
+    assert!(reports.contains(&ExecReport::Resumed { instrument: sym }));
+    assert!(reports.iter().any(|r| matches!(r,
+        ExecReport::Resting { order_id: OrderId(5), .. })),
+        "trading must work after resume");
+
+    // Position ledger (processor-level check).
+    let mut p = trade_core::exchange::Processor::new(|| Box::new(PriceTimePriority), None);
+    p.process(Command::New(Order::limit(OrderId(1), Side::Sell, 100, 5).by(7)), &mut |_| {});
+    p.process(Command::New(Order::limit(OrderId(2), Side::Buy, 100, 5).by(8)), &mut |_| {});
+    assert_eq!(p.position(7, sym), -5);
+    assert_eq!(p.position(8, sym), 5);
+}
+
+/// exchange-core parity: user suspension and atomic command batches.
+#[test]
+fn user_suspend_and_atomic_batch() {
+    let (gw, sink, handle) = build(ExchangeConfig::default());
+    let sym = InstrumentId(0);
+
+    // Suspend user 7: their new orders reject, others trade normally.
+    gw.submit(Command::HaltUser { instrument: sym, user: 7, cmd_id: 1 }).unwrap();
+    let mut reports = drain_all(&sink);
+    gw.new_order(Order::limit(OrderId(2), Side::Sell, 100, 5).by(7)).unwrap();
+    gw.new_order(Order::limit(OrderId(3), Side::Sell, 100, 5).by(8)).unwrap();
+    reports.extend(drain_all(&sink));
+    gw.submit(Command::ResumeUser { instrument: sym, user: 7, cmd_id: 4 }).unwrap();
+    reports.extend(drain_all(&sink));
+    gw.new_order(Order::limit(OrderId(5), Side::Sell, 101, 5).by(7)).unwrap();
+    reports.extend(drain_all(&sink));
+
+    assert!(reports.contains(&ExecReport::UserHalted { instrument: sym, user: 7 }));
+    assert!(reports.iter().any(|r| matches!(r,
+        ExecReport::Rejected { order_id: OrderId(2), reason: "user-suspended", .. })));
+    assert!(reports.iter().any(|r| matches!(r,
+        ExecReport::Resting { order_id: OrderId(3), .. })));
+    assert!(reports.iter().any(|r| matches!(r,
+        ExecReport::Resting { order_id: OrderId(5), .. })),
+        "resumed user must trade again: {reports:?}");
+
+    // Atomic batch: quote replace (cancel old + place two new) as one group —
+    // a marketable order queued behind it sees the FINISHED quote, never the gap.
+    gw.submit(Command::Batch(vec![
+        Command::Cancel { instrument: sym, order_id: OrderId(3), cmd_id: 6 },
+        Command::New(Order::limit(OrderId(7), Side::Sell, 100, 5).by(8)),
+        Command::New(Order::limit(OrderId(8), Side::Buy, 99, 5).by(8)),
+    ])).unwrap();
+    let reports = drain_all(&sink);
+    handle.shutdown();
+    assert!(reports.iter().any(|r| matches!(r,
+        ExecReport::Cancelled { order_id: OrderId(3), .. })));
+    assert!(reports.iter().any(|r| matches!(r,
+        ExecReport::Resting { order_id: OrderId(7), .. })));
+    assert!(reports.iter().any(|r| matches!(r,
+        ExecReport::Resting { order_id: OrderId(8), .. })));
+}

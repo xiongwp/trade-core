@@ -39,7 +39,7 @@ use crate::order::Order;
 use crate::types::*;
 
 const MAGIC: &[u8; 4] = b"TCS1";
-const VERSION: u32 = 1;
+const VERSION: u32 = 3; // v3: + halted instruments + position ledger
 const ORDER_ENC: usize = 56;
 
 fn encode_order(o: &Order, out: &mut [u8; ORDER_ENC]) {
@@ -58,6 +58,8 @@ fn encode_order(o: &Order, out: &mut [u8; ORDER_ENC]) {
         TimeInForce::Gtc => 0,
         TimeInForce::Ioc => 1,
         TimeInForce::Fok => 2,
+        TimeInForce::IocBudget => 3,
+        TimeInForce::FokBudget => 4,
     };
     out[23] = 0; // pad
     out[24..32].copy_from_slice(&o.price.to_le_bytes());
@@ -76,6 +78,8 @@ fn decode_order(b: &[u8; ORDER_ENC]) -> Order {
         tif: match b[22] {
             1 => TimeInForce::Ioc,
             2 => TimeInForce::Fok,
+            3 => TimeInForce::IocBudget,
+            4 => TimeInForce::FokBudget,
             _ => TimeInForce::Gtc,
         },
         price: u64::from_le_bytes(b[24..32].try_into().unwrap()),
@@ -97,15 +101,46 @@ pub struct EngineState {
 pub struct Snapshot {
     /// Journal sequence at capture time; replay records with seq > this.
     pub journal_seq: u64,
+    /// Idempotency high-water mark: highest command id seen (dedup cursor).
+    pub max_cmd_id: u64,
+    /// Halted instruments (circuit breaker state must survive snapshots).
+    pub halted: Vec<u32>,
+    /// Suspended users.
+    pub suspended: Vec<u64>,
+    /// Position ledger entries (user, instrument, net qty).
+    pub positions: Vec<(u64, u32, i64)>,
     pub engines: Vec<EngineState>,
 }
 
 /// Write a snapshot **atomically**: temp file, fsync, rename over `path`.
-pub fn write(path: &Path, journal_seq: u64, engines: &[EngineState]) -> io::Result<()> {
+pub fn write(
+    path: &Path,
+    journal_seq: u64,
+    max_cmd_id: u64,
+    halted: &[u32],
+    suspended: &[u64],
+    positions: &[(u64, u32, i64)],
+    engines: &[EngineState],
+) -> io::Result<()> {
     let mut buf: Vec<u8> = Vec::with_capacity(4096);
     buf.extend_from_slice(MAGIC);
     buf.extend_from_slice(&VERSION.to_le_bytes());
     buf.extend_from_slice(&journal_seq.to_le_bytes());
+    buf.extend_from_slice(&max_cmd_id.to_le_bytes());
+    buf.extend_from_slice(&(halted.len() as u32).to_le_bytes());
+    for h in halted {
+        buf.extend_from_slice(&h.to_le_bytes());
+    }
+    buf.extend_from_slice(&(suspended.len() as u32).to_le_bytes());
+    for s in suspended {
+        buf.extend_from_slice(&s.to_le_bytes());
+    }
+    buf.extend_from_slice(&(positions.len() as u32).to_le_bytes());
+    for (u, i, q) in positions {
+        buf.extend_from_slice(&u.to_le_bytes());
+        buf.extend_from_slice(&i.to_le_bytes());
+        buf.extend_from_slice(&q.to_le_bytes());
+    }
     buf.extend_from_slice(&(engines.len() as u32).to_le_bytes());
     let mut rec = [0u8; ORDER_ENC];
     for e in engines {
@@ -149,9 +184,35 @@ pub fn load(path: &Path) -> io::Result<Snapshot> {
         return Err(corrupt("unsupported version"));
     }
     let journal_seq = u64::from_le_bytes(buf[8..16].try_into().unwrap());
-    let engine_count = u32::from_le_bytes(buf[16..20].try_into().unwrap()) as usize;
-
-    let mut pos = 20;
+    let max_cmd_id = u64::from_le_bytes(buf[16..24].try_into().unwrap());
+    let mut pos = 24;
+    let n_halt = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+    pos += 4;
+    let mut halted = Vec::with_capacity(n_halt);
+    for _ in 0..n_halt {
+        halted.push(u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()));
+        pos += 4;
+    }
+    let n_susp = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+    pos += 4;
+    let mut suspended = Vec::with_capacity(n_susp);
+    for _ in 0..n_susp {
+        suspended.push(u64::from_le_bytes(buf[pos..pos + 8].try_into().unwrap()));
+        pos += 8;
+    }
+    let n_pos = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+    pos += 4;
+    let mut positions = Vec::with_capacity(n_pos);
+    for _ in 0..n_pos {
+        positions.push((
+            u64::from_le_bytes(buf[pos..pos + 8].try_into().unwrap()),
+            u32::from_le_bytes(buf[pos + 8..pos + 12].try_into().unwrap()),
+            i64::from_le_bytes(buf[pos + 12..pos + 20].try_into().unwrap()),
+        ));
+        pos += 20;
+    }
+    let engine_count = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+    pos += 4;
     let mut engines = Vec::with_capacity(engine_count);
     for _ in 0..engine_count {
         if pos + 20 > body_len {
@@ -173,7 +234,7 @@ pub fn load(path: &Path) -> io::Result<Snapshot> {
         }
         engines.push(EngineState { instrument, engine_seq, orders });
     }
-    Ok(Snapshot { journal_seq, engines })
+    Ok(Snapshot { journal_seq, max_cmd_id, halted, suspended, positions, engines })
 }
 
 #[cfg(test)]
@@ -194,10 +255,14 @@ mod tests {
                 Order::limit(OrderId(2), Side::Sell, 101, 3).on(InstrumentId(7)).by(22),
             ],
         }];
-        write(&path, 1000, &engines).unwrap();
+        write(&path, 1000, 555, &[7], &[42], &[(9, 7, -3)], &engines).unwrap();
 
         let snap = load(&path).unwrap();
         assert_eq!(snap.journal_seq, 1000);
+        assert_eq!(snap.max_cmd_id, 555);
+        assert_eq!(snap.halted, vec![7]);
+        assert_eq!(snap.suspended, vec![42]);
+        assert_eq!(snap.positions, vec![(9, 7, -3)]);
         assert_eq!(snap.engines.len(), 1);
         let e = &snap.engines[0];
         assert_eq!(e.instrument, InstrumentId(7));

@@ -231,3 +231,48 @@ fn aggregates_stay_truthful_after_cancel_and_reduce() {
     assert_eq!(r.status, OrderStatus::Filled);
     assert!(e.book().is_empty());
 }
+
+/// exchange-core parity: budget (notional-capped) order types.
+#[test]
+fn budget_orders_ioc_and_fok() {
+    // Asks: 5@100 then 5@110.
+    let mk = || {
+        let mut e = MatchingEngine::with_strategy(PriceTimePriority);
+        e.submit(Order::limit(OrderId(1), Side::Sell, 100, 5));
+        e.submit(Order::limit(OrderId(2), Side::Sell, 110, 5));
+        e
+    };
+
+    // IOC_BUDGET buy, budget 750 for qty 10: 5@100 (500) + floor(250/110)=2@110.
+    let mut e = mk();
+    let mut o = Order::limit(OrderId(9), Side::Buy, 750, 10).with_tif(TimeInForce::IocBudget);
+    o.price = 750; // price field = TOTAL budget
+    let r = e.submit(o);
+    assert_eq!(r.filled, 7, "budget caps spend: {r:?}");
+    let spend: u64 = r.trades.iter().map(|t| t.price * t.quantity).sum();
+    assert!(spend <= 750, "spend {spend} must fit budget");
+    assert!(!r.resting, "budget orders never rest");
+
+    // FOK_BUDGET buy: full qty 10 costs 1050 — budget 900 rejects, 1100 fills.
+    let mut e = mk();
+    let mut o = Order::limit(OrderId(9), Side::Buy, 900, 10).with_tif(TimeInForce::FokBudget);
+    o.price = 900;
+    assert_eq!(e.submit(o).status, OrderStatus::Rejected);
+    let mut o = Order::limit(OrderId(9), Side::Buy, 1100, 10).with_tif(TimeInForce::FokBudget);
+    o.price = 1100;
+    let r = e.submit(o);
+    assert_eq!(r.status, OrderStatus::Filled);
+    assert_eq!(r.filled, 10);
+
+    // SELL IOC_BUDGET: bids 5@100, 5@90; qty 10, budget 950 -> implied floor 95:
+    // fills only the 100-level, remainder cancelled.
+    let mut e = MatchingEngine::with_strategy(PriceTimePriority);
+    e.submit(Order::limit(OrderId(1), Side::Buy, 100, 5));
+    e.submit(Order::limit(OrderId(2), Side::Buy, 90, 5));
+    let mut o = Order::limit(OrderId(9), Side::Sell, 950, 10).with_tif(TimeInForce::IocBudget);
+    o.price = 950;
+    let r = e.submit(o);
+    assert_eq!(r.filled, 5);
+    assert!(r.trades.iter().all(|t| t.price >= 95));
+    assert!(!r.resting);
+}

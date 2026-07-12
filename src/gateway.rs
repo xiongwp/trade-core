@@ -103,6 +103,20 @@ pub fn serve_with_md(
     sink: ResultSink,
     running: Arc<AtomicBool>,
 ) -> io::Result<()> {
+    serve_rate_limited(listener, md_listener, gateway, sink, running, 0)
+}
+
+/// [`serve_with_md`] plus an intake **rate limit** (commands/second; 0 = off):
+/// a token bucket in the read loop throttles a misbehaving order system by
+/// back-pressuring TCP instead of flooding the matching queues.
+pub fn serve_rate_limited(
+    listener: TcpListener,
+    md_listener: Option<TcpListener>,
+    gateway: OrderGateway,
+    sink: ResultSink,
+    running: Arc<AtomicBool>,
+    max_cmds_per_sec: u64,
+) -> io::Result<()> {
     let local = listener.local_addr()?;
     eprintln!("[gateway] listening on {local}, awaiting order-system connection…");
 
@@ -123,7 +137,7 @@ pub fn serve_with_md(
         thread::spawn(move || report_writer(write_stream, sink, fanout, writer_running));
 
     // Order intake loop on this thread (single producer into the gateway).
-    let read_result = read_loop(stream, &gateway, &running);
+    let read_result = read_loop(stream, &gateway, &running, max_cmds_per_sec);
 
     // Tell the writer to finish and join it.
     running.store(false, Ordering::Release);
@@ -136,7 +150,11 @@ fn read_loop<S: Read>(
     mut stream: S,
     gateway: &OrderGateway,
     running: &AtomicBool,
+    max_cmds_per_sec: u64,
 ) -> io::Result<()> {
+    // Token bucket: refill each second; sleep (TCP backpressure) when drained.
+    let mut window = std::time::Instant::now();
+    let mut budget = max_cmds_per_sec;
     // One buffer, reused for the life of the connection. Sized for a batch of
     // frames; partial trailing frames are compacted to the front.
     let mut buf = vec![0u8; MSG_LEN * 512];
@@ -153,6 +171,17 @@ fn read_loop<S: Read>(
         // Decode every complete frame sitting in the buffer, in place.
         let mut off = 0;
         while filled - off >= MSG_LEN {
+            if max_cmds_per_sec > 0 {
+                if budget == 0 {
+                    let elapsed = window.elapsed();
+                    if elapsed < Duration::from_secs(1) {
+                        thread::sleep(Duration::from_secs(1) - elapsed);
+                    }
+                    window = std::time::Instant::now();
+                    budget = max_cmds_per_sec;
+                }
+                budget -= 1;
+            }
             if let Some(view) = WireView::parse(&buf[off..off + MSG_LEN]) {
                 if let Some(cmd) = view.to_command() {
                     dispatch(gateway, cmd);

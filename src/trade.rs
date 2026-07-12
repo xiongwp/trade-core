@@ -21,6 +21,9 @@ pub struct Trade {
     pub quantity: Qty,
     /// Engine sequence number at which the trade occurred.
     pub timestamp: Timestamp,
+    /// Owning users (position tracking); 0 = unattributed.
+    pub maker_user: u64,
+    pub taker_user: u64,
 }
 
 /// The terminal (or resting) state of a submitted order.

@@ -190,6 +190,38 @@ impl MatchingEngine {
         order.remaining = order.quantity;
         self.stp_cancelled.clear();
 
+        // Budget orders: `price` carries the TOTAL notional budget.
+        let mut budget_left: u128 = u128::MAX;
+        if matches!(order.tif, TimeInForce::IocBudget | TimeInForce::FokBudget) {
+            let budget = order.price;
+            match order.side {
+                // Sells: a linear proceeds floor is exactly a limit at
+                // ceil(budget/qty) — convert (see TimeInForce docs).
+                Side::Sell => {
+                    let q = order.quantity.max(1);
+                    order.price = (budget + q - 1) / q; // ceil (MSRV 1.70)
+                    order.tif = if order.tif == TimeInForce::FokBudget {
+                        TimeInForce::Fok
+                    } else {
+                        TimeInForce::Ioc
+                    };
+                }
+                // Buys: genuinely notional-capped — cross at any price while
+                // cumulative spend fits the budget.
+                Side::Buy => {
+                    budget_left = budget as u128;
+                    order.price = Price::MAX;
+                    if order.tif == TimeInForce::FokBudget {
+                        let (fillable, cost) = self.book.cost_to_fill(Side::Buy, order.quantity);
+                        if fillable < order.quantity || cost > budget_left {
+                            return (order.id, OrderStatus::Rejected, 0, false);
+                        }
+                        order.tif = TimeInForce::IocBudget; // precheck passed: will fill fully
+                    }
+                }
+            }
+        }
+
         // Fill-or-kill: reject up front unless the whole quantity can fill now.
         if order.tif == TimeInForce::Fok
             && self.book.crossable_qty(order.side, order.price) < order.remaining
@@ -197,7 +229,7 @@ impl MatchingEngine {
             return (order.id, OrderStatus::Rejected, 0, false);
         }
 
-        let taker_stopped = self.cross(&mut order, trades);
+        let taker_stopped = self.cross(&mut order, trades, &mut budget_left);
         if taker_stopped {
             // STP cancelled the incoming remainder: never rests, reports as
             // partially filled / cancelled depending on what already traded.
@@ -216,7 +248,12 @@ impl MatchingEngine {
     /// to the strategy, until the aggressor is exhausted or no crossable price
     /// remains. Mutates `order.remaining`; appends executions to `trades`.
     /// Returns `true` if STP cancelled the taker's remainder.
-    fn cross(&mut self, order: &mut Order, trades: &mut Vec<Trade>) -> bool {
+    fn cross(
+        &mut self,
+        order: &mut Order,
+        trades: &mut Vec<Trade>,
+        budget_left: &mut u128,
+    ) -> bool {
         let taker = order.side;
         let maker_side = taker.opposite();
 
@@ -237,13 +274,17 @@ impl MatchingEngine {
                 }
             }
 
+            // Budget cap: lots affordable at this level (u128 / px, saturated).
+            let affordable = (*budget_left / (px.max(1) as u128)).min(order.remaining as u128) as Qty;
+            if affordable == 0 {
+                break; // budget exhausted
+            }
             // FIFO-style strategies only consume the level's front: cap the
             // view at the aggressor's quantity so deep levels stay O(fill).
             if self.strategy.full_level_required() {
                 self.book.level_view_into(maker_side, px, &mut self.view_buf);
             } else {
-                self.book
-                    .level_view_capped(maker_side, px, order.remaining, &mut self.view_buf);
+                self.book.level_view_capped(maker_side, px, affordable, &mut self.view_buf);
             }
 
             // Self-trade prevention: does this level hold the taker's own order?
@@ -282,14 +323,14 @@ impl MatchingEngine {
 
             self.alloc_buf.clear();
             self.strategy
-                .allocate_into(&self.view_buf, order.remaining, &mut self.alloc_buf);
+                .allocate_into(&self.view_buf, affordable, &mut self.alloc_buf);
             debug_assert!(
                 self.strategy
-                    .validate(&self.view_buf, order.remaining, &self.alloc_buf)
+                    .validate(&self.view_buf, affordable, &self.alloc_buf)
                     .is_ok(),
                 "strategy {} violated the allocation contract: {:?}",
                 self.strategy.name(),
-                self.strategy.validate(&self.view_buf, order.remaining, &self.alloc_buf)
+                self.strategy.validate(&self.view_buf, affordable, &self.alloc_buf)
             );
             if self.alloc_buf.is_empty() {
                 break;
@@ -300,6 +341,7 @@ impl MatchingEngine {
                 if a.qty == 0 {
                     continue;
                 }
+                let maker_user = self.view_buf.iter().find(|r| r.id == a.id).map_or(0, |r| r.user);
                 trades.push(Trade {
                     taker: order.id,
                     maker: a.id,
@@ -307,8 +349,11 @@ impl MatchingEngine {
                     price: px,
                     quantity: a.qty,
                     timestamp: self.seq,
+                    maker_user,
+                    taker_user: order.user,
                 });
                 order.remaining -= a.qty;
+                *budget_left = budget_left.saturating_sub(px as u128 * a.qty as u128);
                 self.fills_buf.push((a.id, a.qty));
             }
 
@@ -334,7 +379,9 @@ impl MatchingEngine {
                 // Market orders and IOC/FOK limits never rest.
                 (OrderType::Market, _)
                 | (OrderType::Limit, TimeInForce::Ioc)
-                | (OrderType::Limit, TimeInForce::Fok) => {
+                | (OrderType::Limit, TimeInForce::Fok)
+                | (OrderType::Limit, TimeInForce::IocBudget)
+                | (OrderType::Limit, TimeInForce::FokBudget) => {
                     let status = if filled > 0 {
                         OrderStatus::PartiallyFilled
                     } else {

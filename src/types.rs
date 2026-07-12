@@ -90,4 +90,12 @@ pub enum TimeInForce {
     Ioc,
     /// Fill-or-kill: fill the entire quantity immediately, or reject the whole order.
     Fok,
+    /// IOC with a **total-notional budget** (exchange-core `IOC_BUDGET`): the
+    /// order's `price` field carries the budget, not a per-unit price. Buys
+    /// fill best-first while cumulative spend stays within budget; sells are
+    /// equivalent to IOC at the implied floor `ceil(budget/qty)`.
+    IocBudget,
+    /// FOK with a total-notional budget (`FOK_BUDGET`): fill the entire
+    /// quantity only if total cost <= budget (buy) / proceeds >= budget (sell).
+    FokBudget,
 }

@@ -299,3 +299,70 @@ fn price_guard_rejects_spikes_and_protects_market_orders() {
         "protected market order must never trade beyond the band; got {reports:?}"
     );
 }
+
+/// Hot-standby failover: a standby consuming the live replication stream must
+/// hold byte-identical books to the primary at promotion time.
+#[test]
+fn standby_replica_matches_primary_state() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use trade_core::replication;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let fanout = replication::RepFanout::accept_on(listener, running.clone());
+
+    // Journal too: the journal and the replication stream are two consumers of
+    // the SAME executed total order — they must agree exactly.
+    let dir = temp_dir("rep");
+    let cfg = ExchangeConfig {
+        shards: 1,
+        journal_dir: Some(dir.clone()),
+        journal_flush: Duration::from_millis(5),
+        ..ExchangeConfig::default()
+    };
+    let (gw, sink, handle) = trade_core::exchange::build_with_rep(cfg, fanout.clone());
+
+    // Standby attaches, then the primary processes a mixed flow.
+    let applied = std::sync::Arc::new(AtomicU64::new(0));
+    let standby = replication::spawn_replica(
+        addr,
+        || Box::new(PriceTimePriority),
+        applied.clone(),
+    );
+    std::thread::sleep(Duration::from_millis(100)); // let it attach
+
+    let n = 2000u64;
+    for cmd in random_flow(n) {
+        gw.submit(cmd).expect("queue sized for test");
+    }
+    let _ = drain_all(&sink);
+
+    // Wait until the standby has applied every command, then "fail" the primary.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while applied.load(Ordering::Acquire) < n && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(applied.load(Ordering::Acquire), n, "standby must keep up");
+    fanout.close_all(); // simulate primary death -> standby promotes
+    let replica = standby.join().unwrap().unwrap();
+    handle.shutdown();
+
+    // Ground truth = replay of the primary's journal: the EXECUTED total
+    // order (queue-priority interleaving included). Standby must match it —
+    // not the submission order, which priority queues legitimately reorder.
+    let summary = replay_journal(
+        &dir.join("journal-shard-0.bin"),
+        || Box::new(PriceTimePriority),
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(summary.commands, n);
+    assert_eq!(
+        replica.processors[&0].state_fingerprint(),
+        summary.processor.state_fingerprint(),
+        "promoted standby must hold byte-identical books"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

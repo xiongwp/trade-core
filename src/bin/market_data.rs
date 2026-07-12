@@ -34,6 +34,9 @@ use trade_core::{InstrumentId, Price, Qty};
 const CHART_HTML: &str = include_str!("../../assets/kline.html");
 const RT_TRADE: u8 = 2;
 
+/// (ts, price, qty, maker_fee, taker_fee), newest last.
+type TradeRing = std::collections::VecDeque<(u64, Price, Qty, u64, u64)>;
+
 // ---------------------------------------------------------------------------
 // Shared state
 // ---------------------------------------------------------------------------
@@ -55,6 +58,9 @@ struct DepthStore {
 struct State {
     agg: KlineAggregator,
     depth: DepthStore,
+    /// Recent trades per instrument (newest last), bounded ring:
+    /// (ts, price, qty, maker_fee, taker_fee).
+    trades: HashMap<InstrumentId, TradeRing>,
 }
 
 fn now_sec() -> u64 {
@@ -89,7 +95,14 @@ fn feed_loop(md_addr: String, state: Arc<Mutex<State>>) {
                     while filled - off >= REPORT_LEN {
                         if let Some(r) = wire::decode_report(&buf[off..off + REPORT_LEN]) {
                             match r.type_code {
-                                RT_TRADE => st.agg.on_trade(r.instrument, ts, r.price, r.qty),
+                                RT_TRADE => {
+                                    st.agg.on_trade(r.instrument, ts, r.price, r.qty);
+                                    let dq = st.trades.entry(r.instrument).or_default();
+                                    dq.push_back((ts, r.price, r.qty, r.maker_fee, r.taker_fee));
+                                    if dq.len() > 1000 {
+                                        dq.pop_front();
+                                    }
+                                }
                                 RT_DEPTH_LEVEL => {
                                     let d = st.depth.pending.entry(r.instrument).or_default();
                                     let side = if r.side == trade_core::Side::Buy {
@@ -392,6 +405,27 @@ fn handle_http(mut stream: TcpStream, state: &Arc<Mutex<State>>) {
             let body = candles_json(&state.lock().unwrap(), symbol, interval, limit);
             respond(&mut stream, "200 OK", "application/json", body.as_bytes());
         }
+        "/api/trades" => {
+            // Recent executions: [[ts,price,qty,maker_fee,taker_fee],...] oldest first.
+            let symbol = query_param(query, "symbol")
+                .and_then(|v| v.parse().ok())
+                .map(InstrumentId)
+                .unwrap_or(InstrumentId(1));
+            let limit: usize =
+                query_param(query, "limit").and_then(|v| v.parse().ok()).unwrap_or(100);
+            let st = state.lock().unwrap();
+            let empty = TradeRing::new();
+            let dq = st.trades.get(&symbol).unwrap_or(&empty);
+            let body = format!(
+                "[{}]",
+                dq.iter()
+                    .skip(dq.len().saturating_sub(limit.min(1000)))
+                    .map(|(t, p, q, mf, tf)| format!("[{t},{p},{q},{mf},{tf}]"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            respond(&mut stream, "200 OK", "application/json", body.as_bytes());
+        }
         "/api/depth" => {
             let symbol = query_param(query, "symbol")
                 .and_then(|v| v.parse().ok())
@@ -426,7 +460,11 @@ fn main() {
         })
         .unwrap_or_else(|| KlineAggregator::new(2000));
 
-    let state = Arc::new(Mutex::new(State { agg, depth: DepthStore::default() }));
+    let state = Arc::new(Mutex::new(State {
+        agg,
+        depth: DepthStore::default(),
+        trades: HashMap::new(),
+    }));
 
     // Feed thread.
     let feed_state = state.clone();

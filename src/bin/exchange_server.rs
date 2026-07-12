@@ -96,8 +96,12 @@ fn main() {
         // Snapshot every 30 s: recovery replays at most 30 s of journal, and the
         // journal file never grows past one snapshot interval.
         snapshot_every: Some(Duration::from_secs(30)),
+        // Maker/taker fees: 10/20 bps demo schedule (account system settles these).
+        fees: trade_core::fees::FeeSchedule { maker_bps: 10, taker_bps: 20 },
         // Reject an order that would trade against the same user's resting order.
         stp: trade_core::SelfTradePolicy::CancelTaker,
+        // Order-system re-sends after reconnect are deduped by the id cursor.
+        dedup_commands: true,
         risk_limits: Some(trade_core::RiskLimits {
             max_order_qty: 1_000_000,
             max_notional: 10_000_000_000,
@@ -105,11 +109,17 @@ fn main() {
         }),
     });
 
+    trade_core::metrics::serve(
+        format!("{}:9102", addr.rsplit_once(':').map(|(h, _)| h).unwrap_or("0.0.0.0")),
+        handle.metrics.clone(),
+    );
     let running = Arc::new(AtomicBool::new(true));
     let listener = std::net::TcpListener::bind(&addr).expect("bind order port");
     let md_listener = (md_addr != "none")
         .then(|| std::net::TcpListener::bind(&md_addr).expect("bind market-data port"));
-    match gateway::serve_with_md(listener, md_listener, gw, sink, running) {
+    // Intake throttle: 0 = unlimited (tune per deployment).
+    let rate: u64 = std::env::var("TC_MAX_CMDS_PER_SEC").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    match gateway::serve_rate_limited(listener, md_listener, gw, sink, running, rate) {
         Ok(()) => eprintln!("[server] connection closed, shutting down"),
         Err(e) => eprintln!("[server] error: {e}"),
     }
