@@ -1,0 +1,441 @@
+//! A fixed-size binary wire protocol with **zero-copy, parse-in-place** decoding.
+//!
+//! Every inbound command is a fixed [`MSG_LEN`]-byte, little-endian frame. The
+//! decoder ([`WireView`]) *borrows* the network receive buffer and reads fields
+//! directly from it — no intermediate owned message struct, no heap allocation on
+//! the parse path. The same frame format doubles as the **journal record body**,
+//! so a replayed journal goes through the identical decode path as live traffic.
+//!
+//! ## A note on "zero-copy from the NIC"
+//!
+//! True kernel-bypass ingest (reading frames straight out of NIC RX rings) needs
+//! DPDK / AF_XDP / `io_uring` with registered buffers — OS/hardware specific.
+//! This module is the software half: frames parsed in place over reusable
+//! buffers. A bypass driver plugs in by handing its RX slices to
+//! [`WireView::parse`]; the decode path does not change.
+//!
+//! ## Frame layout (little-endian, 40 bytes)
+//!
+//! | off | size | field                                                    |
+//! |-----|------|----------------------------------------------------------|
+//! | 0   | 1    | msg type (1=New, 2=Cancel, 3=Modify, 4=ForceClose)       |
+//! | 1   | 1    | side (0=Buy, 1=Sell) — close side for ForceClose         |
+//! | 2   | 1    | order type (0=Limit, 1=Market)                           |
+//! | 3   | 1    | time-in-force (0=GTC, 1=IOC, 2=FOK)                      |
+//! | 4   | 4    | instrument id (u32)                                      |
+//! | 8   | 8    | order id (u64) — close-order id for ForceClose           |
+//! | 16  | 8    | price (u64) — new price for Modify                       |
+//! | 24  | 8    | quantity (u64) — new qty for Modify, close qty for FC    |
+//! | 32  | 8    | user id (u64)                                            |
+
+use crate::exchange::{Command, ExecReport};
+use crate::order::Order;
+use crate::types::*;
+use std::fmt;
+
+/// Fixed wire frame length in bytes.
+pub const MSG_LEN: usize = 40;
+
+/// Fixed execution-report frame length in bytes.
+pub const REPORT_LEN: usize = 40;
+
+const MT_NEW: u8 = 1;
+const MT_CANCEL: u8 = 2;
+const MT_MODIFY: u8 = 3;
+const MT_FORCE_CLOSE: u8 = 4;
+
+// Report type codes.
+const RT_ACCEPTED: u8 = 1;
+const RT_TRADE: u8 = 2;
+const RT_FILLED: u8 = 3;
+const RT_PARTIAL: u8 = 4;
+const RT_RESTING: u8 = 5;
+const RT_CANCELLED: u8 = 6;
+const RT_REJECTED: u8 = 7;
+const RT_MODIFIED: u8 = 8;
+const RT_NOTFOUND: u8 = 9;
+
+/// A borrowed view over one wire frame. Reads fields in place; copies nothing.
+#[derive(Clone, Copy)]
+pub struct WireView<'a> {
+    buf: &'a [u8; MSG_LEN],
+}
+
+impl<'a> WireView<'a> {
+    /// Interpret the first [`MSG_LEN`] bytes of `buf` as a frame, or `None` if it
+    /// is too short. Borrows `buf`; performs no copy or allocation.
+    #[inline]
+    pub fn parse(buf: &'a [u8]) -> Option<WireView<'a>> {
+        let arr: &[u8; MSG_LEN] = buf.get(..MSG_LEN)?.try_into().ok()?;
+        Some(WireView { buf: arr })
+    }
+
+    #[inline]
+    fn u32_at(&self, off: usize) -> u32 {
+        u32::from_le_bytes(self.buf[off..off + 4].try_into().unwrap())
+    }
+    #[inline]
+    fn u64_at(&self, off: usize) -> u64 {
+        u64::from_le_bytes(self.buf[off..off + 8].try_into().unwrap())
+    }
+
+    #[inline]
+    pub fn msg_type(&self) -> u8 {
+        self.buf[0]
+    }
+    #[inline]
+    pub fn instrument(&self) -> InstrumentId {
+        InstrumentId(self.u32_at(4))
+    }
+    #[inline]
+    pub fn order_id(&self) -> OrderId {
+        OrderId(self.u64_at(8))
+    }
+    #[inline]
+    pub fn price(&self) -> Price {
+        self.u64_at(16)
+    }
+    #[inline]
+    pub fn qty(&self) -> Qty {
+        self.u64_at(24)
+    }
+    #[inline]
+    pub fn user(&self) -> u64 {
+        self.u64_at(32)
+    }
+
+    fn side(&self) -> Side {
+        match self.buf[1] {
+            0 => Side::Buy,
+            _ => Side::Sell,
+        }
+    }
+    fn order_type(&self) -> OrderType {
+        match self.buf[2] {
+            1 => OrderType::Market,
+            _ => OrderType::Limit,
+        }
+    }
+    fn tif(&self) -> TimeInForce {
+        match self.buf[3] {
+            1 => TimeInForce::Ioc,
+            2 => TimeInForce::Fok,
+            _ => TimeInForce::Gtc,
+        }
+    }
+
+    /// Materialise the frame into an engine [`Command`].
+    pub fn to_command(&self) -> Option<Command> {
+        match self.msg_type() {
+            MT_NEW => {
+                let mut order = match self.order_type() {
+                    OrderType::Market => Order::market(self.order_id(), self.side(), self.qty()),
+                    OrderType::Limit => {
+                        Order::limit(self.order_id(), self.side(), self.price(), self.qty())
+                    }
+                };
+                order.instrument = self.instrument();
+                order.user = self.user();
+                order.tif = self.tif();
+                Some(Command::New(order))
+            }
+            MT_CANCEL => Some(Command::Cancel {
+                instrument: self.instrument(),
+                order_id: self.order_id(),
+            }),
+            MT_MODIFY => Some(Command::Modify {
+                instrument: self.instrument(),
+                order_id: self.order_id(),
+                new_price: self.price(),
+                new_qty: self.qty(),
+            }),
+            MT_FORCE_CLOSE => Some(Command::ForceClose {
+                instrument: self.instrument(),
+                user: self.user(),
+                close_order_id: self.order_id(),
+                close_side: self.side(),
+                close_qty: self.qty(),
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// Encode a `New` order into a frame.
+pub fn encode_new(order: &Order, out: &mut [u8; MSG_LEN]) {
+    out.fill(0);
+    out[0] = MT_NEW;
+    out[1] = match order.side {
+        Side::Buy => 0,
+        Side::Sell => 1,
+    };
+    out[2] = match order.order_type {
+        OrderType::Limit => 0,
+        OrderType::Market => 1,
+    };
+    out[3] = match order.tif {
+        TimeInForce::Gtc => 0,
+        TimeInForce::Ioc => 1,
+        TimeInForce::Fok => 2,
+    };
+    out[4..8].copy_from_slice(&order.instrument.0.to_le_bytes());
+    out[8..16].copy_from_slice(&order.id.0.to_le_bytes());
+    out[16..24].copy_from_slice(&order.price.to_le_bytes());
+    out[24..32].copy_from_slice(&order.quantity.to_le_bytes());
+    out[32..40].copy_from_slice(&order.user.to_le_bytes());
+}
+
+/// Encode a `Cancel` frame.
+pub fn encode_cancel(instrument: InstrumentId, order_id: OrderId, out: &mut [u8; MSG_LEN]) {
+    out.fill(0);
+    out[0] = MT_CANCEL;
+    out[4..8].copy_from_slice(&instrument.0.to_le_bytes());
+    out[8..16].copy_from_slice(&order_id.0.to_le_bytes());
+}
+
+/// Encode a `Modify` frame.
+pub fn encode_modify(
+    instrument: InstrumentId,
+    order_id: OrderId,
+    new_price: Price,
+    new_qty: Qty,
+    out: &mut [u8; MSG_LEN],
+) {
+    out.fill(0);
+    out[0] = MT_MODIFY;
+    out[4..8].copy_from_slice(&instrument.0.to_le_bytes());
+    out[8..16].copy_from_slice(&order_id.0.to_le_bytes());
+    out[16..24].copy_from_slice(&new_price.to_le_bytes());
+    out[24..32].copy_from_slice(&new_qty.to_le_bytes());
+}
+
+/// Encode a `ForceClose` frame: cancel all of `user`'s resting orders on
+/// `instrument`, then (if `close_qty > 0`) submit a protected market order of
+/// `close_qty` on `close_side` with id `close_order_id`.
+pub fn encode_force_close(
+    instrument: InstrumentId,
+    user: u64,
+    close_order_id: OrderId,
+    close_side: Side,
+    close_qty: Qty,
+    out: &mut [u8; MSG_LEN],
+) {
+    out.fill(0);
+    out[0] = MT_FORCE_CLOSE;
+    out[1] = match close_side {
+        Side::Buy => 0,
+        Side::Sell => 1,
+    };
+    out[4..8].copy_from_slice(&instrument.0.to_le_bytes());
+    out[8..16].copy_from_slice(&close_order_id.0.to_le_bytes());
+    out[24..32].copy_from_slice(&close_qty.to_le_bytes());
+    out[32..40].copy_from_slice(&user.to_le_bytes());
+}
+
+/// Encode any [`Command`] into a frame (used by the journal so that replay goes
+/// through the same decode path as live traffic).
+pub fn encode_command(cmd: &Command, out: &mut [u8; MSG_LEN]) {
+    match cmd {
+        Command::New(order) => encode_new(order, out),
+        Command::Cancel { instrument, order_id } => encode_cancel(*instrument, *order_id, out),
+        Command::Modify { instrument, order_id, new_price, new_qty } => {
+            encode_modify(*instrument, *order_id, *new_price, *new_qty, out)
+        }
+        Command::ForceClose { instrument, user, close_order_id, close_side, close_qty } => {
+            encode_force_close(*instrument, *user, *close_order_id, *close_side, *close_qty, out)
+        }
+    }
+}
+
+/// Encode an execution report into a fixed 40-byte frame for the return path.
+///
+/// Layout (little-endian): `[0]=type, [1]=side, [4..8]=instrument,
+/// [8..16]=order_id, [16..24]=aux_id (maker for trades), [24..32]=price,
+/// [32..40]=qty` (qty carries trade size / filled / remaining per type).
+pub fn encode_report(r: &ExecReport, out: &mut [u8; REPORT_LEN]) {
+    out.fill(0);
+    let mut put = |ty: u8, inst: InstrumentId, oid: OrderId, aux: u64, price: u64, qty: u64, side: u8| {
+        out[0] = ty;
+        out[1] = side;
+        out[4..8].copy_from_slice(&inst.0.to_le_bytes());
+        out[8..16].copy_from_slice(&oid.0.to_le_bytes());
+        out[16..24].copy_from_slice(&aux.to_le_bytes());
+        out[24..32].copy_from_slice(&price.to_le_bytes());
+        out[32..40].copy_from_slice(&qty.to_le_bytes());
+    };
+    match *r {
+        ExecReport::Accepted { instrument, order_id } => {
+            put(RT_ACCEPTED, instrument, order_id, 0, 0, 0, 0)
+        }
+        ExecReport::Trade { instrument, taker, maker, aggressor, price, qty } => put(
+            RT_TRADE,
+            instrument,
+            taker,
+            maker.0,
+            price,
+            qty,
+            match aggressor { Side::Buy => 0, Side::Sell => 1 },
+        ),
+        ExecReport::Filled { instrument, order_id } => {
+            put(RT_FILLED, instrument, order_id, 0, 0, 0, 0)
+        }
+        ExecReport::PartiallyFilled { instrument, order_id, filled } => {
+            put(RT_PARTIAL, instrument, order_id, 0, 0, filled, 0)
+        }
+        ExecReport::Resting { instrument, order_id } => {
+            put(RT_RESTING, instrument, order_id, 0, 0, 0, 0)
+        }
+        ExecReport::Cancelled { instrument, order_id } => {
+            put(RT_CANCELLED, instrument, order_id, 0, 0, 0, 0)
+        }
+        ExecReport::Rejected { instrument, order_id, .. } => {
+            put(RT_REJECTED, instrument, order_id, 0, 0, 0, 0)
+        }
+        ExecReport::Modified { instrument, order_id, remaining } => {
+            put(RT_MODIFIED, instrument, order_id, 0, 0, remaining, 0)
+        }
+        ExecReport::NotFound { instrument, order_id } => {
+            put(RT_NOTFOUND, instrument, order_id, 0, 0, 0, 0)
+        }
+    }
+}
+
+/// A decoded execution report (owned; the return path is not latency-critical).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DecodedReport {
+    pub type_code: u8,
+    pub instrument: InstrumentId,
+    pub order_id: OrderId,
+    pub aux_id: u64,
+    pub price: Price,
+    pub qty: Qty,
+    pub side: Side,
+}
+
+/// Decode a 40-byte report frame, or `None` if the buffer is too short.
+pub fn decode_report(buf: &[u8]) -> Option<DecodedReport> {
+    let b: &[u8; REPORT_LEN] = buf.get(..REPORT_LEN)?.try_into().ok()?;
+    Some(DecodedReport {
+        type_code: b[0],
+        side: if b[1] == 0 { Side::Buy } else { Side::Sell },
+        instrument: InstrumentId(u32::from_le_bytes(b[4..8].try_into().unwrap())),
+        order_id: OrderId(u64::from_le_bytes(b[8..16].try_into().unwrap())),
+        aux_id: u64::from_le_bytes(b[16..24].try_into().unwrap()),
+        price: u64::from_le_bytes(b[24..32].try_into().unwrap()),
+        qty: u64::from_le_bytes(b[32..40].try_into().unwrap()),
+    })
+}
+
+impl fmt::Display for DecodedReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.type_code {
+            RT_ACCEPTED => write!(f, "ACCEPTED   {} {}", self.instrument, self.order_id),
+            RT_TRADE => write!(
+                f,
+                "TRADE      {} taker {} x maker #{} : {} @ {} ({})",
+                self.instrument, self.order_id, self.aux_id, self.qty, self.price, self.side
+            ),
+            RT_FILLED => write!(f, "FILLED     {} {}", self.instrument, self.order_id),
+            RT_PARTIAL => write!(
+                f,
+                "PARTIAL    {} {} filled {}",
+                self.instrument, self.order_id, self.qty
+            ),
+            RT_RESTING => write!(f, "RESTING    {} {}", self.instrument, self.order_id),
+            RT_CANCELLED => write!(f, "CANCELLED  {} {}", self.instrument, self.order_id),
+            RT_REJECTED => write!(f, "REJECTED   {} {}", self.instrument, self.order_id),
+            RT_MODIFIED => write!(
+                f,
+                "MODIFIED   {} {} remaining {}",
+                self.instrument, self.order_id, self.qty
+            ),
+            RT_NOTFOUND => write!(f, "NOTFOUND   {} {}", self.instrument, self.order_id),
+            other => write!(f, "UNKNOWN({other})"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn report_round_trips() {
+        let r = ExecReport::Trade {
+            instrument: InstrumentId(2),
+            taker: OrderId(10),
+            maker: OrderId(20),
+            aggressor: Side::Sell,
+            price: 999,
+            qty: 5,
+        };
+        let mut frame = [0u8; REPORT_LEN];
+        encode_report(&r, &mut frame);
+        let d = decode_report(&frame).unwrap();
+        assert_eq!(d.type_code, RT_TRADE);
+        assert_eq!(d.order_id, OrderId(10));
+        assert_eq!(d.aux_id, 20);
+        assert_eq!(d.price, 999);
+        assert_eq!(d.qty, 5);
+        assert_eq!(d.side, Side::Sell);
+    }
+
+    #[test]
+    fn new_order_round_trips_zero_copy() {
+        let order = Order::limit(OrderId(42), Side::Buy, 1234, 77)
+            .on(InstrumentId(7))
+            .by(555)
+            .with_tif(TimeInForce::Ioc);
+        let mut frame = [0u8; MSG_LEN];
+        encode_new(&order, &mut frame);
+
+        let view = WireView::parse(&frame).unwrap();
+        assert_eq!(view.msg_type(), MT_NEW);
+        assert_eq!(view.user(), 555);
+        match view.to_command().unwrap() {
+            Command::New(o) => {
+                assert_eq!(o.id, OrderId(42));
+                assert_eq!(o.price, 1234);
+                assert_eq!(o.quantity, 77);
+                assert_eq!(o.instrument, InstrumentId(7));
+                assert_eq!(o.user, 555);
+                assert_eq!(o.tif, TimeInForce::Ioc);
+            }
+            other => panic!("expected New, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cancel_modify_force_close_round_trip() {
+        let mut frame = [0u8; MSG_LEN];
+        encode_cancel(InstrumentId(3), OrderId(9), &mut frame);
+        assert!(matches!(
+            WireView::parse(&frame).unwrap().to_command().unwrap(),
+            Command::Cancel { instrument: InstrumentId(3), order_id: OrderId(9) }
+        ));
+
+        encode_modify(InstrumentId(1), OrderId(5), 500, 12, &mut frame);
+        assert!(matches!(
+            WireView::parse(&frame).unwrap().to_command().unwrap(),
+            Command::Modify { order_id: OrderId(5), new_price: 500, new_qty: 12, .. }
+        ));
+
+        encode_force_close(InstrumentId(4), 777, OrderId(88), Side::Sell, 250, &mut frame);
+        match WireView::parse(&frame).unwrap().to_command().unwrap() {
+            Command::ForceClose { instrument, user, close_order_id, close_side, close_qty } => {
+                assert_eq!(instrument, InstrumentId(4));
+                assert_eq!(user, 777);
+                assert_eq!(close_order_id, OrderId(88));
+                assert_eq!(close_side, Side::Sell);
+                assert_eq!(close_qty, 250);
+            }
+            other => panic!("expected ForceClose, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn short_buffer_is_rejected() {
+        let short = [0u8; MSG_LEN - 1];
+        assert!(WireView::parse(&short).is_none());
+    }
+}

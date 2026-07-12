@@ -1,0 +1,38 @@
+[package]
+name = "trade-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+description = "A commercial-grade order matching engine core with pluggable price matching strategies."
+license = "MIT OR Apache-2.0"
+repository = "https://example.com/trade-core"
+keywords = ["trading", "matching-engine", "order-book", "exchange", "finance"]
+categories = ["finance", "data-structures"]
+
+[lib]
+name = "trade_core"
+path = "src/lib.rs"
+
+[[example]]
+name = "demo"
+path = "examples/demo.rs"
+
+[[bench]]
+name = "throughput"
+path = "benches/throughput.rs"
+harness = false
+
+[[bench]]
+name = "cluster_throughput"
+path = "benches/cluster_throughput.rs"
+harness = false
+
+[[bench]]
+name = "latency"
+path = "benches/latency.rs"
+harness = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
