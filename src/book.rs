@@ -137,7 +137,7 @@ struct LevelIndex {
     base: Price,
     /// Dense per-tick levels; `levels[price - base]` — allocated lazily.
     levels: Vec<Level>,
-    /// Occupancy bitmap: bit i set <=> levels[i] non-empty.
+    /// Logical occupancy bitmap: bit i set <=> levels[i].live > 0.
     l0: [u64; W_WORDS],
     /// Summary bitmap: bit w set <=> l0[w] != 0.
     l1: [u64; L1_WORDS],
@@ -163,13 +163,11 @@ impl Default for LevelIndex {
 impl LevelIndex {
     #[inline]
     fn idx(&self, price: Price) -> Option<usize> {
-        if price >= self.base {
-            let i = (price - self.base) as usize;
-            if i < WINDOW {
-                return Some(i);
-            }
+        if self.base == Price::MAX || price < self.base {
+            return None;
         }
-        None
+        let delta = price - self.base;
+        (delta < WINDOW as u64).then_some(delta as usize)
     }
 
     #[inline]
@@ -190,67 +188,119 @@ impl LevelIndex {
     /// Append `slot` (a live order of `remaining` lots) to the level at
     /// `price`, creating the level if needed and updating its aggregates.
     fn push(&mut self, price: Price, slot: u32, remaining: Qty) {
+        assert!(remaining > 0, "cannot rest a zero-quantity order");
         if self.base == Price::MAX {
-            // Centre the window on the first price seen.
+            // Centre the window on the first price seen. Near Price::MAX the
+            // nominal upper half of the window is simply unreachable.
             self.base = price.saturating_sub((WINDOW / 2) as u64);
             self.levels.resize(WINDOW, Level::default());
         }
         match self.idx(price) {
             Some(i) => {
-                if self.levels[i].orders.is_empty() {
+                if self.levels[i].live == 0 {
                     self.set_bit(i);
-                    self.in_window += 1;
+                    self.in_window = self
+                        .in_window
+                        .checked_add(1)
+                        .expect("in-window level count overflow");
                 }
                 let lv = &mut self.levels[i];
                 lv.orders.push_back(slot);
-                lv.qty += remaining;
-                lv.live += 1;
+                lv.qty = lv.qty.checked_add(remaining).expect("level quantity overflow");
+                lv.live = lv.live.checked_add(1).expect("level order-count overflow");
             }
             None => {
                 let lv = self.overflow.entry(price).or_default();
                 lv.orders.push_back(slot);
-                lv.qty += remaining;
-                lv.live += 1;
+                lv.qty = lv.qty.checked_add(remaining).expect("level quantity overflow");
+                lv.live = lv.live.checked_add(1).expect("level order-count overflow");
             }
         }
     }
 
-    /// The (non-empty) level at `price`.
+    /// The logically non-empty level at `price`.
     #[inline]
     fn get(&self, price: Price) -> Option<&Level> {
         match self.idx(price) {
             Some(i) => {
                 let lv = self.levels.get(i)?;
-                (!lv.orders.is_empty()).then_some(lv)
+                (lv.live > 0).then_some(lv)
             }
-            None => self.overflow.get(&price),
+            None => self.overflow.get(&price).filter(|lv| lv.live > 0),
         }
     }
 
-    /// Mutable access; pair with [`Self::sweep`] after possibly emptying it.
+    /// Mutable access to a logically non-empty level.
     #[inline]
     fn get_mut(&mut self, price: Price) -> Option<&mut Level> {
         match self.idx(price) {
             Some(i) => {
                 let lv = self.levels.get_mut(i)?;
-                (!lv.orders.is_empty()).then_some(lv)
+                (lv.live > 0).then_some(lv)
             }
-            None => self.overflow.get_mut(&price),
+            None => self.overflow.get_mut(&price).filter(|lv| lv.live > 0),
         }
     }
 
-    /// Reconcile bookkeeping after mutating the level at `price`.
-    fn sweep(&mut self, price: Price) {
+    /// Reclaim dead slots and make logical occupancy match `live`.
+    ///
+    /// Cancels remain O(1) in the normal case. A full scan happens only when a
+    /// level becomes empty, or when tombstones dominate a sufficiently large
+    /// queue; that bounds retained pool slots without making every cancel O(n).
+    fn maintain_level(&mut self, price: Price, pool: &mut OrderPool) {
+        const COMPACT_MIN_SLOTS: usize = 1024;
+
+        fn reclaim(lv: &mut Level, pool: &mut OrderPool) {
+            while let Some(&front) = lv.orders.front() {
+                if pool.get(front).remaining != 0 {
+                    break;
+                }
+                lv.orders.pop_front();
+                pool.release(front);
+            }
+
+            if lv.live == 0 {
+                debug_assert_eq!(lv.qty, 0, "empty level has non-zero aggregate quantity");
+                for slot in lv.orders.drain(..) {
+                    debug_assert_eq!(pool.get(slot).remaining, 0);
+                    pool.release(slot);
+                }
+                lv.qty = 0;
+                return;
+            }
+
+            let live = lv.live as usize;
+            if lv.orders.len() >= COMPACT_MIN_SLOTS
+                && lv.orders.len() > live.saturating_mul(2)
+            {
+                lv.orders.retain(|&slot| {
+                    let dead = pool.get(slot).remaining == 0;
+                    if dead {
+                        pool.release(slot);
+                    }
+                    !dead
+                });
+            }
+        }
+
         match self.idx(price) {
             Some(i) => {
-                if self.levels.get(i).is_some_and(|lv| lv.orders.is_empty()) && self.bit(i) {
+                reclaim(&mut self.levels[i], pool);
+                if self.levels[i].live == 0 && self.bit(i) {
                     self.clear_bit(i);
-                    self.in_window -= 1;
+                    self.in_window = self
+                        .in_window
+                        .checked_sub(1)
+                        .expect("in-window level count underflow");
                 }
             }
             None => {
-                if self.overflow.get(&price).is_some_and(|lv| lv.orders.is_empty()) {
-                    self.overflow.remove(&price);
+                if let Some(lv) = self.overflow.get_mut(&price) {
+                    reclaim(lv, pool);
+                }
+                if self.overflow.get(&price).is_some_and(|lv| lv.live == 0) {
+                    let removed = self.overflow.remove(&price);
+                    debug_assert!(removed.is_some_and(|lv| lv.orders.is_empty()));
                 }
             }
         }
@@ -285,7 +335,9 @@ impl LevelIndex {
 
     /// Lowest occupied price across window and overflow.
     fn min_price(&self) -> Option<Price> {
-        let w = self.window_min().map(|i| self.base + i as u64);
+        let w = self
+            .window_min()
+            .and_then(|i| self.base.checked_add(i as u64));
         let o = self.overflow.keys().next().copied();
         match (w, o) {
             (Some(a), Some(b)) => Some(a.min(b)),
@@ -295,7 +347,9 @@ impl LevelIndex {
 
     /// Highest occupied price across window and overflow.
     fn max_price(&self) -> Option<Price> {
-        let w = self.window_max().map(|i| self.base + i as u64);
+        let w = self
+            .window_max()
+            .and_then(|i| self.base.checked_add(i as u64));
         let o = self.overflow.keys().next_back().copied();
         match (w, o) {
             (Some(a), Some(b)) => Some(a.max(b)),
@@ -314,14 +368,15 @@ impl LevelIndex {
             let mut bits = self.l0[w];
             while bits != 0 {
                 let i = w * 64 + bits.trailing_zeros() as usize;
-                if !f(self.base + i as u64, &self.levels[i]) {
+                let px = self.base.checked_add(i as u64).expect("occupied price overflow");
+                if !f(px, &self.levels[i]) {
                     return;
                 }
                 bits &= bits - 1;
             }
         }
-        if self.base != Price::MAX {
-            for (px, lv) in self.overflow.range(self.base + WINDOW as u64..) {
+        if let Some(window_end) = self.base.checked_add(WINDOW as u64) {
+            for (px, lv) in self.overflow.range(window_end..) {
                 if !f(*px, lv) {
                     return;
                 }
@@ -331,8 +386,8 @@ impl LevelIndex {
 
     /// Visit occupied levels in descending price order until `f` returns false.
     fn walk_desc(&self, mut f: impl FnMut(Price, &Level) -> bool) {
-        if self.base != Price::MAX {
-            for (px, lv) in self.overflow.range(self.base + WINDOW as u64..).rev() {
+        if let Some(window_end) = self.base.checked_add(WINDOW as u64) {
+            for (px, lv) in self.overflow.range(window_end..).rev() {
                 if !f(*px, lv) {
                     return;
                 }
@@ -342,7 +397,8 @@ impl LevelIndex {
             let mut bits = self.l0[w];
             while bits != 0 {
                 let i = w * 64 + 63 - bits.leading_zeros() as usize;
-                if !f(self.base + i as u64, &self.levels[i]) {
+                let px = self.base.checked_add(i as u64).expect("occupied price overflow");
+                if !f(px, &self.levels[i]) {
                     return;
                 }
                 bits &= !(1u64 << (i % 64));
@@ -358,8 +414,8 @@ impl LevelIndex {
 
 /// A price-time ordered limit order book over a slab pool.
 ///
-/// Each side maps price -> time-ordered `Vec<u32>` of pool slots. Bids are read
-/// highest-first, asks lowest-first. A location index gives O(log n) cancels.
+/// Each side maps price -> time-ordered pool slots. Bids are read highest-first,
+/// asks lowest-first. The location index gives average O(1) cancel lookup.
 #[derive(Debug, Default)]
 pub struct OrderBook {
     pool: OrderPool,
@@ -398,17 +454,52 @@ impl OrderBook {
         if user == 0 {
             return;
         }
-        let e = user_counts.entry(user).or_insert(0);
-        *e = e.saturating_add_signed(delta);
-        if *e == 0 {
-            user_counts.remove(&user);
+        match delta {
+            1 => {
+                let e = user_counts.entry(user).or_insert(0);
+                *e = e.checked_add(1).expect("per-user order count overflow");
+            }
+            -1 => {
+                let remove = {
+                    let e = user_counts
+                        .get_mut(&user)
+                        .expect("missing per-user count for live order");
+                    *e = e.checked_sub(1).expect("per-user order count underflow");
+                    *e == 0
+                };
+                if remove {
+                    user_counts.remove(&user);
+                }
+            }
+            _ => panic!("unsupported user-count delta {delta}"),
         }
     }
 
-    /// Every resting order (arbitrary iteration order; sort by `timestamp` to
-    /// reconstruct queue priority — used by snapshots).
+    /// Every resting order in arbitrary HashMap iteration order.
+    ///
+    /// Do not reconstruct FIFO by sorting only on an external timestamp. Use
+    /// [`Self::snapshot_orders`] to preserve each price level's exact queue.
     pub fn iter_orders(&self) -> impl Iterator<Item = &Order> + '_ {
         self.locate.values().map(|loc| self.pool.get(loc.slot))
+    }
+
+    /// Copy live orders in deterministic per-level FIFO order for snapshots.
+    /// Re-inserting this vector in order preserves queue priority at each price.
+    pub fn snapshot_orders(&self) -> Vec<Order> {
+        let mut out = Vec::with_capacity(self.len());
+        let mut copy_level = |_price: Price, lv: &Level| {
+            for &slot in &lv.orders {
+                let order = self.pool.get(slot);
+                if order.remaining > 0 {
+                    out.push(*order);
+                }
+            }
+            true
+        };
+        self.bids.walk_asc(&mut copy_level);
+        self.asks.walk_asc(&mut copy_level);
+        debug_assert_eq!(out.len(), self.len());
+        out
     }
 
     /// Pool statistics: (reserved slots, live orders).
@@ -509,21 +600,13 @@ impl OrderBook {
             Side::Buy => &mut self.bids,
             Side::Sell => &mut self.asks,
         };
-        if let Some(lv) = index.get_mut(price) {
-            // Reclaim tombstones at the front (cancelled orders, O(1) each).
-            while let Some(&front) = lv.orders.front() {
-                if pool.get(front).remaining == 0 {
-                    lv.orders.pop_front();
-                    pool.release(front);
-                } else {
-                    break;
-                }
-            }
+        index.maintain_level(price, pool);
+        if let Some(lv) = index.get(price) {
             let mut covered: Qty = 0;
-            for &i in lv.orders.iter() {
+            for &i in &lv.orders {
                 let o = pool.get(i);
                 if o.remaining == 0 {
-                    continue; // mid-level tombstone; reclaimed when it reaches the front
+                    continue; // retained middle tombstone; compaction is amortised
                 }
                 out.push(RestingOrder {
                     id: o.id,
@@ -531,13 +614,14 @@ impl OrderBook {
                     timestamp: o.timestamp,
                     user: o.user,
                 });
-                covered = covered.saturating_add(o.remaining);
+                covered = covered
+                    .checked_add(o.remaining)
+                    .expect("covered level quantity overflow");
                 if covered >= cap_qty {
                     break;
                 }
             }
         }
-        index.sweep(price);
     }
 
     /// Cost (notional) to fill up to `qty` lots best-price-first: returns
@@ -548,8 +632,11 @@ impl OrderBook {
         let mut cost: u128 = 0;
         let mut walk = |px: Price, lv: &Level| {
             let take = left.min(lv.qty);
-            cost += px as u128 * take as u128;
-            left -= take;
+            let notional = (px as u128)
+                .checked_mul(take as u128)
+                .expect("fill notional overflow");
+            cost = cost.checked_add(notional).expect("total fill cost overflow");
+            left = left.checked_sub(take).expect("fill quantity underflow");
             left > 0
         };
         match aggressor {
@@ -569,38 +656,61 @@ impl OrderBook {
                 if px > limit {
                     return false;
                 }
-                sum += lv.qty;
+                sum = sum.checked_add(lv.qty).expect("crossable quantity overflow");
                 true
             }),
             Side::Sell => levels.walk_desc(|px, lv| {
                 if px < limit {
                     return false;
                 }
-                sum += lv.qty;
+                sum = sum.checked_add(lv.qty).expect("crossable quantity overflow");
                 true
             }),
         }
         sum
     }
 
-    /// Insert a resting order into its price level (allocating a pool slot).
-    pub fn insert(&mut self, order: Order) {
-        debug_assert!(
-            !self.locate.contains_key(&order.id),
-            "duplicate resting order {}",
-            order.id
+    /// Try to insert a resting order. Returns `false` for a duplicate id or a
+    /// zero-quantity order, without modifying the book.
+    pub fn try_insert(&mut self, order: Order) -> bool {
+        if order.remaining == 0 || self.locate.contains_key(&order.id) {
+            return false;
+        }
+        let (id, side, price, user, remaining) = (
+            order.id,
+            order.side,
+            order.price,
+            order.user,
+            order.remaining,
         );
-        let (id, side, price, user) = (order.id, order.side, order.price, order.user);
         let slot = self.pool.alloc(order);
         self.locate.insert(id, Loc { slot });
-        self.side_mut(side).push(price, slot, order.remaining);
+        match side {
+            Side::Buy => self.bids.push(price, slot, remaining),
+            Side::Sell => self.asks.push(price, slot, remaining),
+        }
         Self::count_user(&mut self.user_counts, user, 1);
+        true
     }
 
-    /// Apply fills produced by a strategy against the resting `side` at `price`:
-    /// reduce each maker, drop fully-filled makers (recycling their slots), and
-    /// remove the level if it empties.
+    /// Insert a resting order, panicking instead of silently corrupting the
+    /// book if the id is duplicated or the quantity is zero.
+    pub fn insert(&mut self, order: Order) {
+        let id = order.id;
+        assert!(self.try_insert(order), "invalid or duplicate resting order {id}");
+    }
+
+    /// Apply fills produced by a strategy against the resting `side` at `price`.
+    ///
+    /// Maker ids are resolved through `locate`, so both FIFO and non-FIFO
+    /// strategies are O(number of fills), excluding amortised tombstone cleanup.
+    /// Invalid fills assert instead of wrapping/underflowing. If batch rejection
+    /// must be transactional, validate the complete strategy output beforehand.
     pub fn apply_fills(&mut self, side: Side, price: Price, fills: &[(OrderId, Qty)]) {
+        if fills.is_empty() {
+            return;
+        }
+
         let pool = &mut self.pool;
         let locate = &mut self.locate;
         let user_counts = &mut self.user_counts;
@@ -609,68 +719,58 @@ impl OrderBook {
             Side::Sell => &mut self.asks,
         };
 
-        if let Some(lv) = index.get_mut(price) {
-            let Level { orders, qty, live } = lv;
-            // Fast path: FIFO fills consume the level's *front prefix*, so
-            // apply them with O(1) pop_front instead of an O(level) retain —
-            // vital when a hot level holds tens of thousands of orders.
-            let mut applied = 0;
-            for &(id, q) in fills {
-                // Discard tombstoned fronts (cancelled, awaiting reclaim).
-                while let Some(&front) = orders.front() {
-                    if pool.get(front).remaining == 0 {
-                        orders.pop_front();
-                        pool.release(front);
-                    } else {
-                        break;
-                    }
-                }
-                let Some(&front) = orders.front() else { break };
-                let o = pool.get_mut(front);
-                if o.id != id {
-                    break; // not a prefix fill (pro-rata / size-priority)
-                }
-                debug_assert!(q <= o.remaining, "over-fill of {}", o.id);
-                o.remaining -= q;
-                *qty -= q;
-                applied += 1;
-                if o.remaining == 0 {
-                    locate.remove(&o.id);
-                    Self::count_user(user_counts, o.user, -1);
-                    *live -= 1;
-                    pool.release(front);
-                    orders.pop_front();
-                } else {
-                    break; // partially-filled front stays; prefix ends here
+        assert!(index.get(price).is_some(), "fill references a missing price level");
+
+        for &(id, fill_qty) in fills {
+            assert!(fill_qty > 0, "zero-size fill for order {id}");
+            let loc = locate
+                .get(&id)
+                .copied()
+                .unwrap_or_else(|| panic!("fill references non-resting order {id}"));
+
+            let (maker_side, maker_price, maker_user, old_remaining) = {
+                let order = pool.get(loc.slot);
+                (order.side, order.price, order.user, order.remaining)
+            };
+            assert!(
+                maker_side == side && maker_price == price,
+                "fill for order {id} targets the wrong price level"
+            );
+            assert!(
+                fill_qty <= old_remaining,
+                "over-fill of order {id}: fill={fill_qty}, remaining={old_remaining}"
+            );
+
+            {
+                let lv = index
+                    .get_mut(price)
+                    .expect("price level disappeared while applying fills");
+                lv.qty = lv
+                    .qty
+                    .checked_sub(fill_qty)
+                    .expect("level quantity underflow");
+                if fill_qty == old_remaining {
+                    lv.live = lv.live.checked_sub(1).expect("level live-count underflow");
                 }
             }
-            // General path for whatever the prefix pass didn't cover.
-            if applied < fills.len() {
-                let rest = &fills[applied..];
-                orders.retain(|&i| {
-                    let o = pool.get_mut(i);
-                    // Fills per level are few here: linear scan, no allocation.
-                    if let Some(&(_, q)) = rest.iter().find(|(id, _)| *id == o.id) {
-                        debug_assert!(q <= o.remaining, "over-fill of {}", o.id);
-                        o.remaining -= q;
-                        *qty -= q;
-                    }
-                    if o.remaining == 0 {
-                        // A fill-kill still holds its locate entry; a tombstone
-                        // (cancelled earlier) does not — don't double-count.
-                        if locate.remove(&o.id).is_some() {
-                            Self::count_user(user_counts, o.user, -1);
-                            *live -= 1;
-                        }
-                        pool.release(i);
-                        false
-                    } else {
-                        true
-                    }
-                });
+
+            let fully_filled = {
+                let order = pool.get_mut(loc.slot);
+                order.remaining = order
+                    .remaining
+                    .checked_sub(fill_qty)
+                    .expect("maker quantity underflow");
+                order.remaining == 0
+            };
+
+            if fully_filled {
+                let removed = locate.remove(&id);
+                assert!(removed.is_some(), "lost locate entry for filled order {id}");
+                Self::count_user(user_counts, maker_user, -1);
             }
         }
-        index.sweep(price);
+
+        index.maintain_level(price, pool);
     }
 
     /// Borrow a resting order by id, or `None` if it is not on the book.
@@ -693,34 +793,45 @@ impl OrderBook {
         if new_remaining > o.remaining {
             return false;
         }
-        let delta = o.remaining - new_remaining;
+        let delta = o
+            .remaining
+            .checked_sub(new_remaining)
+            .expect("order reduction underflow");
         let (side, price) = (o.side, o.price);
         o.remaining = new_remaining;
         // Keep the level aggregate truthful (depth/FOK read lv.qty, not orders).
         if let Some(lv) = self.side_mut(side).get_mut(price) {
-            lv.qty -= delta;
+            lv.qty = lv.qty.checked_sub(delta).expect("level quantity underflow");
         }
         true
     }
 
-    /// Cancel a resting order by id. Returns the removed order, or `None` if it
-    /// was not resting. The slot is recycled.
+    /// Cancel a resting order by id. The normal path is O(1); tombstones are
+    /// reclaimed at the front, when a level empties, or by amortised compaction.
     pub fn cancel(&mut self, id: OrderId) -> Option<Order> {
         let loc = self.locate.remove(&id)?;
         let order = *self.pool.get(loc.slot);
-        // Keep the level aggregates truthful at cancel time: the tombstone
-        // contributes nothing from this instant, even though its deque entry
-        // is reclaimed lazily (reclaim paths do NOT re-subtract).
-        if let Some(lv) = self.side_mut(order.side).get_mut(order.price) {
-            lv.qty -= order.remaining;
-            lv.live -= 1;
-        }
-        // **Tombstone, O(1).** Scanning a deep level for the entry's position
-        // is O(level) — the 20M-order stress test showed cancels grinding on
-        // million-order levels. Instead the order is marked dead in place
-        // (remaining = 0); the matching path discards tombstones lazily as it
-        // walks level fronts, releasing the slots then.
+        assert!(order.remaining > 0, "locate points at a tombstoned order {id}");
+
+        // Mark dead before maintenance so any physical reclamation sees a
+        // tombstone. Aggregate quantity/live-count change exactly once here.
         self.pool.get_mut(loc.slot).remaining = 0;
+        let (index, pool) = match order.side {
+            Side::Buy => (&mut self.bids, &mut self.pool),
+            Side::Sell => (&mut self.asks, &mut self.pool),
+        };
+        {
+            let lv = index
+                .get_mut(order.price)
+                .expect("cancel references a missing price level");
+            lv.qty = lv
+                .qty
+                .checked_sub(order.remaining)
+                .expect("level quantity underflow on cancel");
+            lv.live = lv.live.checked_sub(1).expect("level live-count underflow");
+        }
+        index.maintain_level(order.price, pool);
+
         Self::count_user(&mut self.user_counts, order.user, -1);
         Some(order)
     }
