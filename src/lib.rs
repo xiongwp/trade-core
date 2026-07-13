@@ -36,6 +36,7 @@
 //! ```
 
 pub mod affinity;
+pub mod asset_log;
 pub mod book;
 pub mod cluster;
 pub mod engine;

@@ -74,7 +74,11 @@ fn decode_order(b: &[u8; ORDER_ENC]) -> Order {
         instrument: InstrumentId(u32::from_le_bytes(b[8..12].try_into().unwrap())),
         user: u64::from_le_bytes(b[12..20].try_into().unwrap()),
         side: if b[20] == 0 { Side::Buy } else { Side::Sell },
-        order_type: if b[21] == 1 { OrderType::Market } else { OrderType::Limit },
+        order_type: if b[21] == 1 {
+            OrderType::Market
+        } else {
+            OrderType::Limit
+        },
         tif: match b[22] {
             1 => TimeInForce::Ioc,
             2 => TimeInForce::Fok,
@@ -113,40 +117,42 @@ pub struct Snapshot {
     pub engines: Vec<EngineState>,
 }
 
+/// Borrowed state supplied when atomically writing a snapshot.
+pub struct SnapshotData<'a> {
+    pub journal_seq: u64,
+    pub max_cmd_id: u64,
+    pub max_admin_id: u64,
+    pub halted: &'a [u32],
+    pub suspended: &'a [u64],
+    pub positions: &'a [(u64, u32, i64)],
+    pub engines: &'a [EngineState],
+}
+
 /// Write a snapshot **atomically**: temp file, fsync, rename over `path`.
-pub fn write(
-    path: &Path,
-    journal_seq: u64,
-    max_cmd_id: u64,
-    max_admin_id: u64,
-    halted: &[u32],
-    suspended: &[u64],
-    positions: &[(u64, u32, i64)],
-    engines: &[EngineState],
-) -> io::Result<()> {
+pub fn write(path: &Path, data: SnapshotData<'_>) -> io::Result<()> {
     let mut buf: Vec<u8> = Vec::with_capacity(4096);
     buf.extend_from_slice(MAGIC);
     buf.extend_from_slice(&VERSION.to_le_bytes());
-    buf.extend_from_slice(&journal_seq.to_le_bytes());
-    buf.extend_from_slice(&max_cmd_id.to_le_bytes());
-    buf.extend_from_slice(&max_admin_id.to_le_bytes());
-    buf.extend_from_slice(&(halted.len() as u32).to_le_bytes());
-    for h in halted {
+    buf.extend_from_slice(&data.journal_seq.to_le_bytes());
+    buf.extend_from_slice(&data.max_cmd_id.to_le_bytes());
+    buf.extend_from_slice(&data.max_admin_id.to_le_bytes());
+    buf.extend_from_slice(&(data.halted.len() as u32).to_le_bytes());
+    for h in data.halted {
         buf.extend_from_slice(&h.to_le_bytes());
     }
-    buf.extend_from_slice(&(suspended.len() as u32).to_le_bytes());
-    for s in suspended {
+    buf.extend_from_slice(&(data.suspended.len() as u32).to_le_bytes());
+    for s in data.suspended {
         buf.extend_from_slice(&s.to_le_bytes());
     }
-    buf.extend_from_slice(&(positions.len() as u32).to_le_bytes());
-    for (u, i, q) in positions {
+    buf.extend_from_slice(&(data.positions.len() as u32).to_le_bytes());
+    for (u, i, q) in data.positions {
         buf.extend_from_slice(&u.to_le_bytes());
         buf.extend_from_slice(&i.to_le_bytes());
         buf.extend_from_slice(&q.to_le_bytes());
     }
-    buf.extend_from_slice(&(engines.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&(data.engines.len() as u32).to_le_bytes());
     let mut rec = [0u8; ORDER_ENC];
-    for e in engines {
+    for e in data.engines {
         buf.extend_from_slice(&e.instrument.0.to_le_bytes());
         buf.extend_from_slice(&e.engine_seq.to_le_bytes());
         buf.extend_from_slice(&(e.orders.len() as u64).to_le_bytes());
@@ -160,7 +166,11 @@ pub fn write(
 
     let tmp = path.with_extension("tmp");
     {
-        let mut f = OpenOptions::new().create(true).write(true).truncate(true).open(&tmp)?;
+        let mut f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)?;
         f.write_all(&buf)?;
         f.sync_all()?; // durable before it can become "the" snapshot
     }
@@ -222,8 +232,7 @@ pub fn load(path: &Path) -> io::Result<Snapshot> {
         if pos + 20 > body_len {
             return Err(corrupt("truncated engine header"));
         }
-        let instrument =
-            InstrumentId(u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()));
+        let instrument = InstrumentId(u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()));
         let engine_seq = u64::from_le_bytes(buf[pos + 4..pos + 12].try_into().unwrap());
         let n = u64::from_le_bytes(buf[pos + 12..pos + 20].try_into().unwrap()) as usize;
         pos += 20;
@@ -236,9 +245,21 @@ pub fn load(path: &Path) -> io::Result<Snapshot> {
             orders.push(decode_order(rec));
             pos += ORDER_ENC;
         }
-        engines.push(EngineState { instrument, engine_seq, orders });
+        engines.push(EngineState {
+            instrument,
+            engine_seq,
+            orders,
+        });
     }
-    Ok(Snapshot { journal_seq, max_cmd_id, max_admin_id, halted, suspended, positions, engines })
+    Ok(Snapshot {
+        journal_seq,
+        max_cmd_id,
+        max_admin_id,
+        halted,
+        suspended,
+        positions,
+        engines,
+    })
 }
 
 #[cfg(test)]
@@ -255,11 +276,27 @@ mod tests {
             instrument: InstrumentId(7),
             engine_seq: 42,
             orders: vec![
-                Order::limit(OrderId(1), Side::Buy, 99, 5).on(InstrumentId(7)).by(11),
-                Order::limit(OrderId(2), Side::Sell, 101, 3).on(InstrumentId(7)).by(22),
+                Order::limit(OrderId(1), Side::Buy, 99, 5)
+                    .on(InstrumentId(7))
+                    .by(11),
+                Order::limit(OrderId(2), Side::Sell, 101, 3)
+                    .on(InstrumentId(7))
+                    .by(22),
             ],
         }];
-        write(&path, 1000, 555, 556, &[7], &[42], &[(9, 7, -3)], &engines).unwrap();
+        write(
+            &path,
+            SnapshotData {
+                journal_seq: 1000,
+                max_cmd_id: 555,
+                max_admin_id: 556,
+                halted: &[7],
+                suspended: &[42],
+                positions: &[(9, 7, -3)],
+                engines: &engines,
+            },
+        )
+        .unwrap();
 
         let snap = load(&path).unwrap();
         assert_eq!(snap.journal_seq, 1000);

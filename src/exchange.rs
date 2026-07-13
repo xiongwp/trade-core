@@ -82,14 +82,28 @@ pub enum Command {
     /// orders are rejected while halted; cancels/modifies still work. Journaled
     /// like every command, so replay reproduces halt windows exactly — price
     /// triggers live in the (external) risk monitor, which SENDS this command.
-    Halt { instrument: InstrumentId, cmd_id: u64 },
+    Halt {
+        instrument: InstrumentId,
+        cmd_id: u64,
+    },
     /// Admin: resume trading on a halted instrument.
-    Resume { instrument: InstrumentId, cmd_id: u64 },
+    Resume {
+        instrument: InstrumentId,
+        cmd_id: u64,
+    },
     /// Admin: suspend a **user** (all their new orders rejected; cancels still
     /// work). exchange-core's user-suspend, command-driven and journaled.
-    HaltUser { instrument: InstrumentId, user: u64, cmd_id: u64 },
+    HaltUser {
+        instrument: InstrumentId,
+        user: u64,
+        cmd_id: u64,
+    },
     /// Admin: lift a user suspension.
-    ResumeUser { instrument: InstrumentId, user: u64, cmd_id: u64 },
+    ResumeUser {
+        instrument: InstrumentId,
+        user: u64,
+        cmd_id: u64,
+    },
     /// A group of commands applied **atomically** (no other command from any
     /// queue interleaves): all must target this shard's instruments. Each inner
     /// command is journaled/replicated individually, preserving the total order.
@@ -121,7 +135,10 @@ impl Command {
 /// An asynchronous execution notification from the matching side.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecReport {
-    Accepted { instrument: InstrumentId, order_id: OrderId },
+    Accepted {
+        instrument: InstrumentId,
+        order_id: OrderId,
+    },
     Trade {
         instrument: InstrumentId,
         taker: OrderId,
@@ -133,25 +150,69 @@ pub enum ExecReport {
         maker_fee: u64,
         taker_fee: u64,
     },
-    Filled { instrument: InstrumentId, order_id: OrderId },
-    PartiallyFilled { instrument: InstrumentId, order_id: OrderId, filled: Qty },
-    Resting { instrument: InstrumentId, order_id: OrderId },
-    Cancelled { instrument: InstrumentId, order_id: OrderId },
-    Rejected { instrument: InstrumentId, order_id: OrderId, reason: &'static str },
-    Modified { instrument: InstrumentId, order_id: OrderId, remaining: Qty },
-    NotFound { instrument: InstrumentId, order_id: OrderId },
+    Filled {
+        instrument: InstrumentId,
+        order_id: OrderId,
+    },
+    PartiallyFilled {
+        instrument: InstrumentId,
+        order_id: OrderId,
+        filled: Qty,
+    },
+    Resting {
+        instrument: InstrumentId,
+        order_id: OrderId,
+    },
+    Cancelled {
+        instrument: InstrumentId,
+        order_id: OrderId,
+    },
+    Rejected {
+        instrument: InstrumentId,
+        order_id: OrderId,
+        reason: &'static str,
+    },
+    Modified {
+        instrument: InstrumentId,
+        order_id: OrderId,
+        remaining: Qty,
+    },
+    NotFound {
+        instrument: InstrumentId,
+        order_id: OrderId,
+    },
     /// One level of a depth-of-market snapshot (market-data feed). `level` is
     /// 0 = best. A snapshot is a run of `DepthLevel`s closed by `DepthEnd`.
-    DepthLevel { instrument: InstrumentId, side: Side, level: u8, price: Price, qty: Qty },
+    DepthLevel {
+        instrument: InstrumentId,
+        side: Side,
+        level: u8,
+        price: Price,
+        qty: Qty,
+    },
     /// Terminates a depth snapshot; carries how many levels each side sent.
-    DepthEnd { instrument: InstrumentId, bid_levels: u8, ask_levels: u8 },
+    DepthEnd {
+        instrument: InstrumentId,
+        bid_levels: u8,
+        ask_levels: u8,
+    },
     /// Trading halted on the instrument (ack of [`Command::Halt`]).
-    Halted { instrument: InstrumentId },
+    Halted {
+        instrument: InstrumentId,
+    },
     /// Trading resumed (ack of [`Command::Resume`]).
-    Resumed { instrument: InstrumentId },
+    Resumed {
+        instrument: InstrumentId,
+    },
     /// User suspended / unsuspended (acks of HaltUser/ResumeUser).
-    UserHalted { instrument: InstrumentId, user: u64 },
-    UserResumed { instrument: InstrumentId, user: u64 },
+    UserHalted {
+        instrument: InstrumentId,
+        user: u64,
+    },
+    UserResumed {
+        instrument: InstrumentId,
+        user: u64,
+    },
 }
 
 /// A function that produces a fresh matching strategy for each new instrument.
@@ -238,10 +299,22 @@ struct ShardTx {
     normal: Producer<Command>,
 }
 
+/// The two priority lanes dedicated to one configured instrument. A shard
+/// owns many of these mailboxes, but no mailbox is shared by two instruments.
+struct InstrumentRx {
+    high: Consumer<Command>,
+    normal: Consumer<Command>,
+}
+
 /// The order system's handle for sending commands into the matching side.
 /// Single-producer: drive it from one gateway/IO thread.
 pub struct OrderGateway {
     shards: Vec<ShardTx>,
+    /// Pre-configured assets get an independent pair of SPSC queues. The
+    /// fallback shard queues retain backwards compatibility for dynamically
+    /// created books in library users; production servers configure every
+    /// locally owned asset at startup.
+    instruments: HashMap<InstrumentId, ShardTx>,
 }
 
 impl OrderGateway {
@@ -254,6 +327,13 @@ impl OrderGateway {
     /// the high-priority queue; new orders to the normal queue. Returns
     /// `Err(cmd)` if the target queue is full (backpressure).
     pub fn submit(&self, cmd: Command) -> Result<(), Command> {
+        if let Some(tx) = self.instruments.get(&cmd.instrument()) {
+            return if cmd.is_high_priority() {
+                tx.high.push(cmd)
+            } else {
+                tx.normal.push(cmd)
+            };
+        }
         let idx = self.shard_of(cmd.instrument());
         let tx = &self.shards[idx];
         if cmd.is_high_priority() {
@@ -269,8 +349,17 @@ impl OrderGateway {
     }
 
     /// Convenience: cancel a resting order.
-    pub fn cancel(&self, instrument: InstrumentId, order_id: OrderId, cmd_id: u64) -> Result<(), Command> {
-        self.submit(Command::Cancel { instrument, order_id, cmd_id })
+    pub fn cancel(
+        &self,
+        instrument: InstrumentId,
+        order_id: OrderId,
+        cmd_id: u64,
+    ) -> Result<(), Command> {
+        self.submit(Command::Cancel {
+            instrument,
+            order_id,
+            cmd_id,
+        })
     }
 
     /// Convenience: amend a resting order.
@@ -282,7 +371,13 @@ impl OrderGateway {
         new_qty: Qty,
         cmd_id: u64,
     ) -> Result<(), Command> {
-        self.submit(Command::Modify { instrument, order_id, new_price, new_qty, cmd_id })
+        self.submit(Command::Modify {
+            instrument,
+            order_id,
+            new_price,
+            new_qty,
+            cmd_id,
+        })
     }
 
     /// Convenience: halt trading on an instrument (admin/risk monitor).
@@ -304,7 +399,13 @@ impl OrderGateway {
         close_side: Side,
         close_qty: Qty,
     ) -> Result<(), Command> {
-        self.submit(Command::ForceClose { instrument, user, close_order_id, close_side, close_qty })
+        self.submit(Command::ForceClose {
+            instrument,
+            user,
+            close_order_id,
+            close_side,
+            close_qty,
+        })
     }
 }
 
@@ -408,6 +509,7 @@ fn build_inner(
     let started = Arc::new(AtomicBool::new(start_now));
     let parked = Arc::new(AtomicUsize::new(0));
     let mut shard_tx = Vec::with_capacity(config.shards);
+    let mut instrument_tx = HashMap::with_capacity(config.instruments.len());
     let mut result_rx = Vec::with_capacity(config.shards);
     let mut threads = Vec::with_capacity(config.shards);
     let mut snap_requests = Vec::with_capacity(config.shards);
@@ -417,8 +519,36 @@ fn build_inner(
         let (normal_tx, normal_rx) = lockfree::channel::<Command>(config.queue_capacity);
         let (res_tx, res_rx) = lockfree::channel::<ExecReport>(config.queue_capacity);
 
-        shard_tx.push(ShardTx { high: high_tx, normal: normal_tx });
+        shard_tx.push(ShardTx {
+            high: high_tx,
+            normal: normal_tx,
+        });
         result_rx.push(res_rx);
+
+        // Each configured asset has its own two-lane intake mailbox. The
+        // number of matching threads stays bounded by `shards`; a worker
+        // multiplexes the mailboxes it owns, preserving isolation without one
+        // thread per asset.
+        let mut instrument_rx = Vec::new();
+        for &inst in &config.instruments {
+            if inst.0 as usize % config.shards == shard_id {
+                let (inst_high_tx, inst_high_rx) =
+                    lockfree::channel::<Command>(config.queue_capacity);
+                let (inst_normal_tx, inst_normal_rx) =
+                    lockfree::channel::<Command>(config.queue_capacity);
+                instrument_tx.insert(
+                    inst,
+                    ShardTx {
+                        high: inst_high_tx,
+                        normal: inst_normal_tx,
+                    },
+                );
+                instrument_rx.push(InstrumentRx {
+                    high: inst_high_rx,
+                    normal: inst_normal_rx,
+                });
+            }
+        }
 
         // Pre-create books (and their memory pools) for this shard's share of
         // the configured instrument list — the startup memory reservation.
@@ -464,6 +594,8 @@ fn build_inner(
             processor,
             high_rx,
             normal_rx,
+            instrument_rx,
+            next_instrument: 0,
             result_tx: res_tx,
             journal: journal_w,
             snapshot_path,
@@ -486,7 +618,10 @@ fn build_inner(
     }
 
     (
-        OrderGateway { shards: shard_tx },
+        OrderGateway {
+            shards: shard_tx,
+            instruments: instrument_tx,
+        },
         ResultSink { results: result_rx },
         ExchangeHandle {
             metrics,
@@ -593,9 +728,9 @@ impl Processor {
         let factory = self.factory;
         let (pool, prefault) = self.default_pool;
         let stp = self.stp;
-        self.engines.entry(instrument).or_insert_with(|| {
-            MatchingEngine::with_pool(factory(), pool, prefault).with_stp(stp)
-        })
+        self.engines
+            .entry(instrument)
+            .or_insert_with(|| MatchingEngine::with_pool(factory(), pool, prefault).with_stp(stp))
     }
 
     /// Read-only view of an instrument's engine (diagnostics, tests).
@@ -605,7 +740,10 @@ impl Processor {
 
     /// Net position of `user` on `instrument` (buys +, sells -).
     pub fn position(&self, user: u64, instrument: InstrumentId) -> i64 {
-        self.positions.get(&(user, instrument)).copied().unwrap_or(0)
+        self.positions
+            .get(&(user, instrument))
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Whether the instrument is currently halted.
@@ -632,7 +770,8 @@ impl Processor {
     pub fn restore_state(&mut self, snap: &Snapshot) {
         self.max_new_id = self.max_new_id.max(snap.max_cmd_id);
         self.max_admin_id = self.max_admin_id.max(snap.max_admin_id);
-        self.halted.extend(snap.halted.iter().map(|&i| InstrumentId(i)));
+        self.halted
+            .extend(snap.halted.iter().map(|&i| InstrumentId(i)));
         self.suspended.extend(snap.suspended.iter().copied());
         for &(u, i, q) in &snap.positions {
             *self.positions.entry((u, InstrumentId(i))).or_insert(0) += q;
@@ -678,20 +817,34 @@ impl Processor {
             // (id, instrument, is_admin_stream)
             let (id, inst, admin) = match &cmd {
                 Command::New(o) => (o.id.0, o.instrument, false),
-                Command::Cancel { cmd_id, instrument, .. } => (*cmd_id, *instrument, true),
-                Command::Modify { cmd_id, instrument, .. } => (*cmd_id, *instrument, true),
-                Command::ForceClose { close_order_id, instrument, .. } => {
-                    (close_order_id.0, *instrument, true)
-                }
+                Command::Cancel {
+                    cmd_id, instrument, ..
+                } => (*cmd_id, *instrument, true),
+                Command::Modify {
+                    cmd_id, instrument, ..
+                } => (*cmd_id, *instrument, true),
+                Command::ForceClose {
+                    close_order_id,
+                    instrument,
+                    ..
+                } => (close_order_id.0, *instrument, true),
                 Command::Halt { cmd_id, instrument } => (*cmd_id, *instrument, true),
                 Command::Resume { cmd_id, instrument } => (*cmd_id, *instrument, true),
-                Command::HaltUser { cmd_id, instrument, .. } => (*cmd_id, *instrument, true),
-                Command::ResumeUser { cmd_id, instrument, .. } => (*cmd_id, *instrument, true),
+                Command::HaltUser {
+                    cmd_id, instrument, ..
+                } => (*cmd_id, *instrument, true),
+                Command::ResumeUser {
+                    cmd_id, instrument, ..
+                } => (*cmd_id, *instrument, true),
                 // Batches are gated per inner command (recursive process call).
                 Command::Batch(_) => (0, InstrumentId(0), false),
             };
             if id != 0 {
-                let cursor = if admin { &mut self.max_admin_id } else { &mut self.max_new_id };
+                let cursor = if admin {
+                    &mut self.max_admin_id
+                } else {
+                    &mut self.max_new_id
+                };
                 if id <= *cursor {
                     emit(ExecReport::Rejected {
                         instrument: inst,
@@ -711,11 +864,15 @@ impl Processor {
                     self.process(c, emit);
                 }
             }
-            Command::HaltUser { instrument, user, .. } => {
+            Command::HaltUser {
+                instrument, user, ..
+            } => {
                 self.suspended.insert(user);
                 emit(ExecReport::UserHalted { instrument, user });
             }
-            Command::ResumeUser { instrument, user, .. } => {
+            Command::ResumeUser {
+                instrument, user, ..
+            } => {
                 self.suspended.remove(&user);
                 emit(ExecReport::UserResumed { instrument, user });
             }
@@ -728,24 +885,50 @@ impl Processor {
                 emit(ExecReport::Resumed { instrument });
             }
             Command::New(order) => self.process_new(order, emit),
-            Command::Cancel { instrument, order_id, .. } => {
+            Command::Cancel {
+                instrument,
+                order_id,
+                ..
+            } => {
                 if self.engine_for(instrument).cancel(order_id) {
-                    emit(ExecReport::Cancelled { instrument, order_id });
+                    emit(ExecReport::Cancelled {
+                        instrument,
+                        order_id,
+                    });
                 } else {
-                    emit(ExecReport::NotFound { instrument, order_id });
+                    emit(ExecReport::NotFound {
+                        instrument,
+                        order_id,
+                    });
                 }
             }
-            Command::Modify { instrument, order_id, new_price, new_qty, .. } => {
-                match self.engine_for(instrument).modify(order_id, new_price, new_qty) {
-                    ModifyOutcome::NotFound => {
-                        emit(ExecReport::NotFound { instrument, order_id })
-                    }
-                    ModifyOutcome::Reduced { order_id, remaining } => {
-                        emit(ExecReport::Modified { instrument, order_id, remaining })
-                    }
-                    ModifyOutcome::Cancelled { order_id } => {
-                        emit(ExecReport::Cancelled { instrument, order_id })
-                    }
+            Command::Modify {
+                instrument,
+                order_id,
+                new_price,
+                new_qty,
+                ..
+            } => {
+                match self
+                    .engine_for(instrument)
+                    .modify(order_id, new_price, new_qty)
+                {
+                    ModifyOutcome::NotFound => emit(ExecReport::NotFound {
+                        instrument,
+                        order_id,
+                    }),
+                    ModifyOutcome::Reduced {
+                        order_id,
+                        remaining,
+                    } => emit(ExecReport::Modified {
+                        instrument,
+                        order_id,
+                        remaining,
+                    }),
+                    ModifyOutcome::Cancelled { order_id } => emit(ExecReport::Cancelled {
+                        instrument,
+                        order_id,
+                    }),
                     ModifyOutcome::Requoted(report) => {
                         for t in &report.trades {
                             let (maker_fee, taker_fee) = self.fees.fees(t.price, t.quantity);
@@ -762,22 +945,39 @@ impl Processor {
                         }
                         let remaining = new_qty.saturating_sub(report.filled);
                         match report.status {
-                            OrderStatus::Filled => {
-                                emit(ExecReport::Filled { instrument, order_id })
-                            }
+                            OrderStatus::Filled => emit(ExecReport::Filled {
+                                instrument,
+                                order_id,
+                            }),
                             OrderStatus::Resting | OrderStatus::PartiallyFilled => {
-                                emit(ExecReport::Modified { instrument, order_id, remaining })
+                                emit(ExecReport::Modified {
+                                    instrument,
+                                    order_id,
+                                    remaining,
+                                })
                             }
-                            _ => emit(ExecReport::Cancelled { instrument, order_id }),
+                            _ => emit(ExecReport::Cancelled {
+                                instrument,
+                                order_id,
+                            }),
                         }
                     }
                 }
             }
-            Command::ForceClose { instrument, user, close_order_id, close_side, close_qty } => {
+            Command::ForceClose {
+                instrument,
+                user,
+                close_order_id,
+                close_side,
+                close_qty,
+            } => {
                 // 1. Pull every resting order of the user.
                 let cancelled = self.engine_for(instrument).cancel_all_for_user(user);
                 for order_id in cancelled {
-                    emit(ExecReport::Cancelled { instrument, order_id });
+                    emit(ExecReport::Cancelled {
+                        instrument,
+                        order_id,
+                    });
                 }
                 // 2. Flatten the position with a protected market order.
                 if close_qty > 0 {
@@ -798,11 +998,19 @@ impl Processor {
         // Circuit breaker: a halted instrument accepts no new orders (cancels
         // and modifies still work so users can pull quotes).
         if self.halted.contains(&instrument) {
-            emit(ExecReport::Rejected { instrument, order_id: id, reason: "halted" });
+            emit(ExecReport::Rejected {
+                instrument,
+                order_id: id,
+                reason: "halted",
+            });
             return;
         }
         if order.user != 0 && self.suspended.contains(&order.user) {
-            emit(ExecReport::Rejected { instrument, order_id: id, reason: "user-suspended" });
+            emit(ExecReport::Rejected {
+                instrument,
+                order_id: id,
+                reason: "user-suspended",
+            });
             return;
         }
 
@@ -810,7 +1018,11 @@ impl Processor {
         // 1. static limits (order shape);
         if let Some(limits) = &self.limits {
             if let Err(reason) = limits.check_static(&order) {
-                emit(ExecReport::Rejected { instrument, order_id: id, reason });
+                emit(ExecReport::Rejected {
+                    instrument,
+                    order_id: id,
+                    reason,
+                });
                 return;
             }
         }
@@ -818,14 +1030,21 @@ impl Processor {
         //    protected marketable limits);
         if let Some(guard) = &self.guard {
             if let Err(reason) = guard.vet(&mut order) {
-                emit(ExecReport::Rejected { instrument, order_id: id, reason });
+                emit(ExecReport::Rejected {
+                    instrument,
+                    order_id: id,
+                    reason,
+                });
                 return;
             }
         }
         // 3. per-user open-order cap (needs book state).
         if let Some(limits) = self.limits {
             if limits.max_user_orders > 0 && order.user != 0 {
-                let open = self.engine_for(instrument).book().user_open_orders(order.user);
+                let open = self
+                    .engine_for(instrument)
+                    .book()
+                    .user_open_orders(order.user);
                 if open >= limits.max_user_orders {
                     emit(ExecReport::Rejected {
                         instrument,
@@ -837,7 +1056,10 @@ impl Processor {
             }
         }
 
-        emit(ExecReport::Accepted { instrument, order_id: id });
+        emit(ExecReport::Accepted {
+            instrument,
+            order_id: id,
+        });
         // Zero-allocation submit: trades land in the processor's scratch buffer.
         let mut trades = std::mem::take(&mut self.trades_buf);
         trades.clear();
@@ -847,7 +1069,10 @@ impl Processor {
         if self.stp != SelfTradePolicy::Allow {
             let engine = self.engines.get(&instrument).expect("engine exists");
             for &order_id in engine.stp_cancelled() {
-                emit(ExecReport::Cancelled { instrument, order_id });
+                emit(ExecReport::Cancelled {
+                    instrument,
+                    order_id,
+                });
             }
         }
         for t in &trades {
@@ -877,14 +1102,23 @@ impl Processor {
         }
         self.trades_buf = trades;
         match status {
-            OrderStatus::Filled => emit(ExecReport::Filled { instrument, order_id: id }),
+            OrderStatus::Filled => emit(ExecReport::Filled {
+                instrument,
+                order_id: id,
+            }),
             OrderStatus::PartiallyFilled => emit(ExecReport::PartiallyFilled {
                 instrument,
                 order_id: id,
                 filled,
             }),
-            OrderStatus::Resting => emit(ExecReport::Resting { instrument, order_id: id }),
-            OrderStatus::Cancelled => emit(ExecReport::Cancelled { instrument, order_id: id }),
+            OrderStatus::Resting => emit(ExecReport::Resting {
+                instrument,
+                order_id: id,
+            }),
+            OrderStatus::Cancelled => emit(ExecReport::Cancelled {
+                instrument,
+                order_id: id,
+            }),
             OrderStatus::Rejected => emit(ExecReport::Rejected {
                 instrument,
                 order_id: id,
@@ -908,6 +1142,8 @@ struct Shard {
     processor: Processor,
     high_rx: Consumer<Command>,
     normal_rx: Consumer<Command>,
+    instrument_rx: Vec<InstrumentRx>,
+    next_instrument: usize,
     result_tx: Producer<ExecReport>,
     journal: Option<JournalWriter>,
     snapshot_path: Option<PathBuf>,
@@ -959,7 +1195,8 @@ impl Shard {
             // Then a bounded batch of new orders, re-checking high in between.
             let mut n = 0;
             while n < NORMAL_BATCH {
-                match self.normal_rx.pop() {
+                let cmd = self.pop_next_normal();
+                match cmd {
                     Some(cmd) => {
                         self.handle(cmd);
                         worked = true;
@@ -977,6 +1214,10 @@ impl Shard {
                 if !self.running.load(Ordering::Acquire)
                     && self.high_rx.is_empty()
                     && self.normal_rx.is_empty()
+                    && self
+                        .instrument_rx
+                        .iter()
+                        .all(|rx| rx.high.is_empty() && rx.normal.is_empty())
                 {
                     break;
                 }
@@ -1098,13 +1339,15 @@ impl Shard {
             .collect();
         if snapshot::write(
             path,
-            j.seq(),
-            self.processor.max_new_id,
-            self.processor.max_admin_id,
-            &halted,
-            &suspended,
-            &positions,
-            &states,
+            snapshot::SnapshotData {
+                journal_seq: j.seq(),
+                max_cmd_id: self.processor.max_new_id,
+                max_admin_id: self.processor.max_admin_id,
+                halted: &halted,
+                suspended: &suspended,
+                positions: &positions,
+                engines: &states,
+            },
         )
         .is_ok()
         {
@@ -1119,7 +1362,28 @@ impl Shard {
             self.handle(cmd);
             worked = true;
         }
+        for index in 0..self.instrument_rx.len() {
+            while let Some(cmd) = self.instrument_rx[index].high.pop() {
+                self.handle(cmd);
+                worked = true;
+            }
+        }
         worked
+    }
+
+    /// Fair round-robin across configured asset queues, then the legacy shard
+    /// queue. A hot instrument therefore cannot monopolize a worker's intake
+    /// budget and starve unrelated assets on the same machine.
+    fn pop_next_normal(&mut self) -> Option<Command> {
+        let len = self.instrument_rx.len();
+        for _ in 0..len {
+            let index = self.next_instrument % len;
+            self.next_instrument = (self.next_instrument + 1) % len;
+            if let Some(cmd) = self.instrument_rx[index].normal.pop() {
+                return Some(cmd);
+            }
+        }
+        self.normal_rx.pop()
     }
 
     /// Journal the command (in processing order), replicate it, then apply it.
@@ -1139,9 +1403,9 @@ impl Shard {
             let mut frame = [0u8; wire::MSG_LEN];
             wire::encode_command(&cmd, &mut frame);
             let seq = match &mut self.journal {
-                Some(j) => j.append(journal::now_nanos(), &frame).unwrap_or_else(|_| {
-                    self.rep_seq + 1
-                }),
+                Some(j) => j
+                    .append(journal::now_nanos(), &frame)
+                    .unwrap_or_else(|_| self.rep_seq + 1),
                 None => self.rep_seq + 1,
             };
             self.rep_seq = seq;
@@ -1150,7 +1414,9 @@ impl Shard {
             }
         }
         if self.rep_seq > 0 {
-            self.metrics.journal_seq.fetch_max(self.rep_seq, Ordering::Relaxed);
+            self.metrics
+                .journal_seq
+                .fetch_max(self.rep_seq, Ordering::Relaxed);
         }
         let result_tx = &self.result_tx;
         let metrics = &self.metrics;
@@ -1218,7 +1484,12 @@ pub fn replay_journal(
     }
 
     let fingerprint = fingerprint_reports(&reports);
-    Ok(ReplaySummary { commands, reports, fingerprint, processor })
+    Ok(ReplaySummary {
+        commands,
+        reports,
+        fingerprint,
+        processor,
+    })
 }
 
 /// Fast crash recovery: **snapshot + journal tail**.
