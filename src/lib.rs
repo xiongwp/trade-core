@@ -49,6 +49,7 @@ pub mod lockfree;
 pub mod metrics;
 pub mod order;
 pub mod replication;
+pub mod raft_log;
 pub mod risk;
 pub mod sharding;
 pub mod snapshot;

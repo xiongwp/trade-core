@@ -27,6 +27,37 @@ use trade_core::strategy::{PriceTimePriority, ProRata, SizePriority};
 use trade_core::types::InstrumentId;
 use trade_core::OrderPool;
 
+fn configured_instruments() -> Vec<InstrumentId> {
+    let spec = std::env::var("TC_INSTRUMENTS").unwrap_or_else(|_| "0-15".to_string());
+    let mut instruments = Vec::new();
+    for token in spec.split(',').filter(|s| !s.is_empty()) {
+        let (start, end) = match token.split_once('-') {
+            Some((start, end)) => (
+                start
+                    .parse::<u32>()
+                    .expect("invalid TC_INSTRUMENTS range start"),
+                end.parse::<u32>()
+                    .expect("invalid TC_INSTRUMENTS range end"),
+            ),
+            None => {
+                let value = token
+                    .parse::<u32>()
+                    .expect("invalid TC_INSTRUMENTS instrument id");
+                (value, value)
+            }
+        };
+        assert!(start <= end, "TC_INSTRUMENTS range start exceeds end");
+        instruments.extend((start..=end).map(InstrumentId));
+    }
+    instruments.sort_unstable();
+    instruments.dedup();
+    assert!(
+        !instruments.is_empty(),
+        "TC_INSTRUMENTS must select at least one instrument"
+    );
+    instruments
+}
+
 fn strategy_by_name(name: &str) -> Option<StrategyFactory> {
     match name {
         "price-time" => Some(|| Box::new(PriceTimePriority)),
@@ -55,8 +86,9 @@ fn main() {
     };
 
     // Pre-listed instruments: their books and memory pools are reserved at
-    // startup. The pool budget is split evenly across them.
-    let instruments: Vec<InstrumentId> = (0..16).map(InstrumentId).collect();
+    // startup. Configure a machine's ownership with TC_INSTRUMENTS, e.g.
+    // `1-5000` on node A and `5001-10000` on node B.
+    let instruments = configured_instruments();
     let slot = OrderPool::slot_bytes();
     let pool_orders_per_book = (pool_mb * 1024 * 1024) / slot / instruments.len().max(1);
     eprintln!(
@@ -97,7 +129,10 @@ fn main() {
         // journal file never grows past one snapshot interval.
         snapshot_every: Some(Duration::from_secs(30)),
         // Maker/taker fees: 10/20 bps demo schedule (account system settles these).
-        fees: trade_core::fees::FeeSchedule { maker_bps: 10, taker_bps: 20 },
+        fees: trade_core::fees::FeeSchedule {
+            maker_bps: 10,
+            taker_bps: 20,
+        },
         // Reject an order that would trade against the same user's resting order.
         stp: trade_core::SelfTradePolicy::CancelTaker,
         // Order-system re-sends after reconnect are deduped by the id cursor.
@@ -109,8 +144,16 @@ fn main() {
         }),
     });
 
+    // Standalone mode becomes ready once recovery/build has completed. The
+    // clustered runtime will hold this false until the node has a current
+    // quorum and a fully replayed committed log.
+    handle.metrics.set_ready(true);
+
     trade_core::metrics::serve(
-        format!("{}:9102", addr.rsplit_once(':').map(|(h, _)| h).unwrap_or("0.0.0.0")),
+        format!(
+            "{}:9102",
+            addr.rsplit_once(':').map(|(h, _)| h).unwrap_or("0.0.0.0")
+        ),
         handle.metrics.clone(),
     );
     let running = Arc::new(AtomicBool::new(true));
@@ -118,7 +161,10 @@ fn main() {
     let md_listener = (md_addr != "none")
         .then(|| std::net::TcpListener::bind(&md_addr).expect("bind market-data port"));
     // Intake throttle: 0 = unlimited (tune per deployment).
-    let rate: u64 = std::env::var("TC_MAX_CMDS_PER_SEC").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let rate: u64 = std::env::var("TC_MAX_CMDS_PER_SEC")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     match gateway::serve_rate_limited(listener, md_listener, gw, sink, running, rate) {
         Ok(()) => eprintln!("[server] connection closed, shutting down"),
         Err(e) => eprintln!("[server] error: {e}"),

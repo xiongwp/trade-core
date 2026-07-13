@@ -1,0 +1,5 @@
+[env]
+# raft-proto 0.7's generator rejects protoc's current `35.x` version string.
+# Route its version probe through the repository wrapper while still invoking
+# the system compiler for all real work.
+PROTOC = { value = "scripts/protoc-compat.sh", relative = true }

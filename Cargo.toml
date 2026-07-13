@@ -50,3 +50,6 @@ harness = false
 lto = "thin"
 codegen-units = 1
 panic = "abort"
+
+[dependencies]
+raft = "0.7.0"

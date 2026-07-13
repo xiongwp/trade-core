@@ -1,9 +1,9 @@
 //! Operational metrics, Prometheus text exposition — counters incremented at
 //! the shard's single emit point (lock-free atomics; ~1 ns per report).
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::exchange::ExecReport;
@@ -17,6 +17,13 @@ pub struct Metrics {
     pub rejects: AtomicU64,
     pub modifies: AtomicU64,
     pub journal_seq: AtomicU64,
+    /// Readiness is controlled by the process lifecycle (and, in clustered
+    /// mode, by the Raft runtime once it has joined a quorum).
+    ready: AtomicBool,
+    pub raft_role: AtomicU64,
+    pub raft_term: AtomicU64,
+    pub raft_leader_id: AtomicU64,
+    pub raft_commit_index: AtomicU64,
 }
 
 impl Metrics {
@@ -58,8 +65,35 @@ impl Metrics {
             c("modifies", "Orders modified", self.modifies.load(Ordering::Relaxed)),
             c("journal_seq", "Max journal seq (total order head)",
               self.journal_seq.load(Ordering::Relaxed)),
+            format!("# HELP tc_ready Service readiness (1 = ready)\n# TYPE tc_ready gauge\ntc_ready {}\n",
+                self.ready.load(Ordering::Relaxed) as u8),
+            format!("# HELP tc_raft_role Raft role (0 = follower, 1 = candidate, 2 = leader)\n# TYPE tc_raft_role gauge\ntc_raft_role {}\n",
+                self.raft_role.load(Ordering::Relaxed)),
+            format!("# HELP tc_raft_term Current Raft term\n# TYPE tc_raft_term gauge\ntc_raft_term {}\n",
+                self.raft_term.load(Ordering::Relaxed)),
+            format!("# HELP tc_raft_leader_id Current Raft leader id (0 = unknown)\n# TYPE tc_raft_leader_id gauge\ntc_raft_leader_id {}\n",
+                self.raft_leader_id.load(Ordering::Relaxed)),
+            format!("# HELP tc_raft_commit_index Highest Raft entry committed by quorum\n# TYPE tc_raft_commit_index gauge\ntc_raft_commit_index {}\n",
+                self.raft_commit_index.load(Ordering::Relaxed)),
         ]
         .concat()
+    }
+
+    pub fn set_ready(&self, ready: bool) {
+        self.ready.store(ready, Ordering::Release);
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
+    }
+
+    /// Update the Raft gauges from the runtime's single event-loop thread.
+    pub fn set_raft_state(&self, role: u64, term: u64, leader_id: u64, commit_index: u64) {
+        self.raft_role.store(role, Ordering::Relaxed);
+        self.raft_term.store(term, Ordering::Relaxed);
+        self.raft_leader_id.store(leader_id, Ordering::Relaxed);
+        self.raft_commit_index
+            .store(commit_index, Ordering::Relaxed);
     }
 }
 
@@ -75,10 +109,30 @@ pub fn serve(addr: String, metrics: Arc<Metrics>) {
             };
             eprintln!("[metrics] Prometheus on http://{addr}/metrics");
             for mut s in listener.incoming().flatten() {
-                let body = metrics.render();
+                let mut request = [0u8; 1024];
+                let n = s.read(&mut request).unwrap_or(0);
+                let line = std::str::from_utf8(&request[..n])
+                    .ok()
+                    .and_then(|r| r.lines().next())
+                    .unwrap_or("");
+                let (status, content_type, body) = if line.starts_with("GET /healthz ") {
+                    ("200 OK", "text/plain", "ok\n".to_string())
+                } else if line.starts_with("GET /readyz ") {
+                    if metrics.is_ready() {
+                        ("200 OK", "text/plain", "ready\n".to_string())
+                    } else {
+                        (
+                            "503 Service Unavailable",
+                            "text/plain",
+                            "not ready\n".to_string(),
+                        )
+                    }
+                } else {
+                    ("200 OK", "text/plain; version=0.0.4", metrics.render())
+                };
                 let _ = s.write_all(
                     format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\n\
+                        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\n\
                          Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
                     )
@@ -97,11 +151,18 @@ mod tests {
     #[test]
     fn counters_tally_and_render() {
         let m = Metrics::default();
-        m.record(&ExecReport::Accepted { instrument: InstrumentId(1), order_id: OrderId(1) });
-        m.record(&ExecReport::Cancelled { instrument: InstrumentId(1), order_id: OrderId(1) });
+        m.record(&ExecReport::Accepted {
+            instrument: InstrumentId(1),
+            order_id: OrderId(1),
+        });
+        m.record(&ExecReport::Cancelled {
+            instrument: InstrumentId(1),
+            order_id: OrderId(1),
+        });
         let text = m.render();
         assert!(text.contains("tc_orders_accepted 1"));
         assert!(text.contains("tc_cancels 1"));
         assert!(text.contains("# TYPE tc_trades counter"));
+        assert!(text.contains("tc_raft_commit_index 0"));
     }
 }
