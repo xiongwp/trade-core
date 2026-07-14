@@ -276,6 +276,11 @@ impl RaftNode {
         self.node.raft.raft_log.committed
     }
 
+    #[inline]
+    pub fn last_index(&self) -> u64 {
+        self.node.raft.raft_log.last_index()
+    }
+
     /// Starts an election. Production nodes normally reach this through ticks;
     /// this method is also useful for deterministic bootstrap tests.
     pub fn campaign(&mut self) -> Result<(), raft::Error> {

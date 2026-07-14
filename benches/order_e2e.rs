@@ -1,5 +1,6 @@
 //! Concurrent load against the real persistent order HTTP API. Every request
-//! uses a unique order id and waits for the 202 response after MySQL commits.
+//! uses a unique order id and waits for the 202 response after Kafka confirms
+//! durable ingress. MySQL/outbox/Raft completion is measured separately.
 //!
 //! Run: cargo bench --bench order_e2e -- [ADDR TOKEN REQUESTS CONCURRENCY ASSETS]
 
@@ -123,7 +124,7 @@ fn main() {
         "accepted={ok}, errors={errors}, elapsed={elapsed:.2?}, throughput={:.0} requests/s",
         ok as f64 / elapsed.as_secs_f64()
     );
-    println!("HTTP+MySQL latency: p50={p50:.2}ms p95={p95:.2}ms p99={p99:.2}ms");
+    println!("HTTP+Kafka latency: p50={p50:.2}ms p95={p95:.2}ms p99={p99:.2}ms");
     for sample in error_samples.lock().unwrap().iter() {
         println!("error sample: {sample}");
     }

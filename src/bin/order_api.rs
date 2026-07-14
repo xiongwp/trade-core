@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{Shutdown, TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -579,7 +579,6 @@ struct PendingCommand {
     category_id: u32,
     category_seq: u64,
     command_id: u64,
-    user_id: u64,
     shard_db: u32,
     shard_table: u32,
     frame: Vec<u8>,
@@ -595,9 +594,9 @@ fn next_pending(
     let lanes = workers.div_ceil(DB_COUNT as usize);
     let db = format!("order_db_{shard_db}");
     let mut shard = store.shard(shard_db).get_conn()?;
-    let row: Option<(u32, u64, u64, u64, u32)> = shard.exec_first(
+    let row: Option<(u32, u64, u64, u32)> = shard.exec_first(
         format!(
-            "SELECT category_id,category_seq,command_id,user_id,shard_table
+            "SELECT category_id,category_seq,command_id,shard_table
          FROM {db}.command_locations_by_category loc
          WHERE status='PENDING'
            AND MOD(FLOOR(category_id / 10),:lanes)=:lane
@@ -613,7 +612,7 @@ fn next_pending(
         ),
         params! {"lanes" => lanes as u64, "lane" => lane as u64},
     )?;
-    let Some((category_id, category_seq, command_id, user_id, shard_table)) = row else {
+    let Some((category_id, category_seq, command_id, shard_table)) = row else {
         return Ok(None);
     };
     let frame: Option<Vec<u8>> = shard.exec_first(
@@ -624,7 +623,6 @@ fn next_pending(
         category_id,
         category_seq,
         command_id,
-        user_id,
         shard_db,
         shard_table,
         frame,
@@ -665,6 +663,9 @@ fn dispatch_forever(
     worker_id: usize,
     workers: usize,
 ) {
+    let mut matcher = MatcherConnection::new(matchers);
+    let mut dispatched = 0u64;
+    let mut last_report = std::time::Instant::now();
     loop {
         let command = match next_pending(&store, worker_id, workers) {
             Ok(Some(command)) => command,
@@ -686,13 +687,20 @@ fn dispatch_forever(
             std::thread::sleep(Duration::from_millis(100));
             continue;
         }
-        let delivered = forward(&matchers, &command.frame)
+        let delivered = matcher
+            .send(&command.frame)
             .and_then(|()| mark_sent(&store, &command).map_err(std::io::Error::other));
         match delivered {
-            Ok(()) => eprintln!(
-                "[order-api] dispatched category={} seq={} command_id={} user_id={}",
-                command.category_id, command.category_seq, command.command_id, command.user_id
-            ),
+            Ok(()) => {
+                dispatched += 1;
+                if last_report.elapsed() >= Duration::from_secs(5) {
+                    eprintln!(
+                        "[order-dispatch-{worker_id}] delivered={dispatched} last_category={} last_seq={}",
+                        command.category_id, command.category_seq
+                    );
+                    last_report = std::time::Instant::now();
+                }
+            }
             Err(error) => {
                 eprintln!(
                     "[order-api] preserving category={} seq={} for retry: {error}",
@@ -777,53 +785,63 @@ fn is_leader(metrics_addr: &str) -> bool {
         && response.lines().any(|line| line.trim() == "tc_raft_role 2")
 }
 
-fn forward(targets: &[MatcherTarget], frame: &[u8]) -> std::io::Result<()> {
-    for target in targets {
-        if target
-            .metrics_addr
-            .as_deref()
-            .is_some_and(|metrics| !is_leader(metrics))
-        {
-            continue;
-        }
-        let Ok(mut stream) = TcpStream::connect(&target.order_addr) else {
-            continue;
-        };
-        stream.set_nodelay(true)?;
-        stream.set_read_timeout(Some(Duration::from_millis(750)))?;
-        if stream.write_all(frame).is_ok() && wait_for_gateway_report(&mut stream).is_ok() {
-            return Ok(());
-        }
-    }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::NotConnected,
-        "no reachable Raft leader",
-    ))
+struct MatcherConnection {
+    targets: Vec<MatcherTarget>,
+    stream: Option<TcpStream>,
 }
 
-fn wait_for_gateway_report(stream: &mut TcpStream) -> std::io::Result<()> {
-    let mut first = [0u8; 1];
-    match stream.read(&mut first) {
-        Ok(0) => Err(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "gateway closed before report",
-        )),
-        Ok(_) => {
-            let _ = stream.shutdown(Shutdown::Both);
-            Ok(())
+impl MatcherConnection {
+    fn new(targets: Vec<MatcherTarget>) -> Self {
+        Self {
+            targets,
+            stream: None,
         }
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-            ) =>
-        {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "gateway did not return report before timeout",
-            ))
+    }
+
+    fn connect(&mut self) -> std::io::Result<()> {
+        for target in &self.targets {
+            if target
+                .metrics_addr
+                .as_deref()
+                .is_some_and(|metrics| !is_leader(metrics))
+            {
+                continue;
+            }
+            let Ok(stream) = TcpStream::connect(&target.order_addr) else {
+                continue;
+            };
+            stream.set_nodelay(true)?;
+            stream.set_read_timeout(Some(Duration::from_millis(750)))?;
+            stream.set_write_timeout(Some(Duration::from_millis(750)))?;
+            self.stream = Some(stream);
+            return Ok(());
         }
-        Err(error) => Err(error),
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            "no reachable Raft leader",
+        ))
+    }
+
+    fn send(&mut self, frame: &[u8]) -> std::io::Result<()> {
+        for _ in 0..2 {
+            if self.stream.is_none() {
+                self.connect()?;
+            }
+            let stream = self.stream.as_mut().expect("connected matcher stream");
+            let mut ack = [0u8; 9];
+            if stream.write_all(frame).is_ok()
+                && stream.read_exact(&mut ack).is_ok()
+                && ack[0] == 1
+                && u64::from_be_bytes(ack[1..].try_into().expect("Raft ACK index")) > 0
+            {
+                return Ok(());
+            }
+            self.stream = None;
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionAborted,
+            "Raft leader connection failed before quorum commit acknowledgement",
+        ))
     }
 }
 

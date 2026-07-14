@@ -3,7 +3,7 @@
 //! Usage: `raft-node NODE_ID RAFT_ADDR PEERS ORDER_ADDR DATA_DIR`.
 //! Client frames reach the matching queue only through committed Raft entries.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -21,6 +21,11 @@ use trade_core::raft_log::{ClusterConfig, RaftNode, CLUSTER_SIZE};
 use trade_core::wire::{self, MSG_LEN};
 
 const PROPOSAL_BATCH: usize = 512;
+
+struct ProposalRequest {
+    command: trade_core::Command,
+    committed: mpsc::SyncSender<u64>,
+}
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -66,6 +71,8 @@ fn main() {
         .spawn(move || {
             let mut node = RaftNode::open(config, state_path).expect("open durable raft state");
             let mut pending = Vec::new();
+            let mut commit_waiters = BTreeMap::new();
+            let mut was_leader = false;
             let mut last_tick = Instant::now();
             while runtime_running.load(Ordering::Acquire) {
                 while let Ok(message) = message_rx.try_recv() {
@@ -82,6 +89,11 @@ fn main() {
                     last_tick = Instant::now();
                 }
                 let leader = node.is_leader();
+                if was_leader && !leader {
+                    pending.clear();
+                    commit_waiters.clear();
+                }
+                was_leader = leader;
                 runtime_accepting.store(leader, Ordering::Release);
                 runtime_metrics.set_raft_state(
                     leader as u64 * 2,
@@ -91,15 +103,20 @@ fn main() {
                 );
                 runtime_metrics.set_ready(node.leader_id() != 0);
                 if leader && !pending.is_empty() {
-                    let frames = pending
-                        .drain(..)
-                        .map(|command| {
+                    let requests = pending.drain(..).collect::<Vec<ProposalRequest>>();
+                    let frames = requests
+                        .iter()
+                        .map(|request| {
                             let mut frame = [0u8; MSG_LEN];
-                            wire::encode_command(&command, &mut frame);
+                            wire::encode_command(&request.command, &mut frame);
                             frame.to_vec()
                         })
                         .collect::<Vec<_>>();
                     node.propose_batch(frames).expect("leader proposal batch");
+                    let first_index = node.last_index() + 1 - requests.len() as u64;
+                    for (offset, request) in requests.into_iter().enumerate() {
+                        commit_waiters.insert(first_index + offset as u64, request.committed);
+                    }
                 }
                 for message in node.take_outbound() {
                     if let Some(addr) = runtime_peers.get(&message.to) {
@@ -107,6 +124,9 @@ fn main() {
                     }
                 }
                 for (index, payload) in node.take_committed() {
+                    if let Some(waiter) = commit_waiters.remove(&index) {
+                        let _ = waiter.send(index);
+                    }
                     let Some(command) =
                         wire::WireView::parse(&payload).and_then(|view| view.to_command())
                     else {
@@ -151,7 +171,16 @@ fn main() {
                 thread::sleep(Duration::from_millis(2));
             }
             if ingress_running.load(Ordering::Acquire) {
-                proposal_tx.send(command).expect("raft runtime stopped");
+                let (committed_tx, committed_rx) = mpsc::sync_channel(1);
+                proposal_tx
+                    .send(ProposalRequest {
+                        command,
+                        committed: committed_tx,
+                    })
+                    .expect("raft runtime stopped");
+                committed_rx.recv_timeout(Duration::from_secs(10)).ok()
+            } else {
+                None
             }
         },
     )

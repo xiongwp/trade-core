@@ -58,14 +58,13 @@ fn main() {
     let mut reader = writer.try_clone().expect("clone Raft ingress socket");
     reader.set_read_timeout(Some(Duration::from_secs(120))).ok();
     let ack_reader = std::thread::spawn(move || {
-        let mut ack = [0u8; 8192];
+        let mut ack = [0u8; 9];
         let mut received = 0u64;
         while received < commands {
-            let need = ((commands - received) as usize).min(ack.len());
-            let n = reader.read(&mut ack[..need]).expect("read ingress ACKs");
-            assert!(n > 0, "Raft ingress closed before all ACKs");
-            assert!(ack[..n].iter().all(|v| *v == 1), "invalid ingress ACK");
-            received += n as u64;
+            reader.read_exact(&mut ack).expect("read committed ACK");
+            assert_eq!(ack[0], 1, "invalid committed ACK");
+            assert!(u64::from_be_bytes(ack[1..].try_into().unwrap()) > commit_before);
+            received += 1;
         }
     });
 

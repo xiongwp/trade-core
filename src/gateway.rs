@@ -138,13 +138,17 @@ pub fn serve_forever(
     running: Arc<AtomicBool>,
     max_cmds_per_sec: u64,
 ) -> io::Result<()> {
+    let gateway = Mutex::new(gateway);
     serve_committed_forever(
         listener,
         md_listener,
         sink,
         running,
         max_cmds_per_sec,
-        move |cmd| dispatch(&gateway, cmd),
+        move |cmd| {
+            dispatch(&gateway.lock().expect("gateway lock"), cmd);
+            Some(0)
+        },
     )
 }
 
@@ -185,7 +189,7 @@ pub fn serve_committed_forever<F>(
     submit: F,
 ) -> io::Result<()>
 where
-    F: Fn(Command),
+    F: Fn(Command) -> Option<u64> + Send + Sync + 'static,
 {
     let fanout = md_listener.map(|l| {
         eprintln!(
@@ -199,9 +203,25 @@ where
         .name("md-report-drain".into())
         .spawn(move || report_fanout_drain(sink, fanout, report_running))
         .expect("spawn market-data report drain");
+    let submit = Arc::new(submit);
+    let local = listener.local_addr()?;
+    eprintln!("[gateway] committed ingress listening on {local}");
     while running.load(Ordering::Acquire) {
-        let session_running = Arc::new(AtomicBool::new(true));
-        serve_one_ingress_ack(&listener, session_running, max_cmds_per_sec, &submit)?;
+        let (stream, peer) = listener.accept()?;
+        stream.set_nodelay(true).ok();
+        let session_running = running.clone();
+        let session_submit = submit.clone();
+        thread::spawn(move || {
+            eprintln!("[gateway] committed client connected from {peer}");
+            if let Err(error) = read_loop_ack(
+                stream,
+                session_submit.as_ref(),
+                &session_running,
+                max_cmds_per_sec,
+            ) {
+                eprintln!("[gateway] committed client {peer} disconnected: {error}");
+            }
+        });
     }
     Ok(())
 }
@@ -285,27 +305,6 @@ where
     read_result.map(|()| sink)
 }
 
-fn serve_one_ingress_ack<F>(
-    listener: &TcpListener,
-    running: Arc<AtomicBool>,
-    max_cmds_per_sec: u64,
-    submit: &F,
-) -> io::Result<()>
-where
-    F: Fn(Command),
-{
-    let local = listener.local_addr()?;
-    eprintln!("[gateway] listening on {local}, awaiting order-system connection…");
-
-    let (mut stream, peer) = listener.accept()?;
-    stream.set_nodelay(true).ok();
-    eprintln!("[gateway] order system connected from {peer}");
-
-    let result = read_loop_ack(&mut stream, submit, &running, max_cmds_per_sec);
-    running.store(false, Ordering::Release);
-    result
-}
-
 /// Read frames into a reusable buffer and decode each in place.
 fn read_loop<S: Read, F: Fn(Command)>(
     mut stream: S,
@@ -369,7 +368,7 @@ fn read_loop<S: Read, F: Fn(Command)>(
 /// has been handed to the committed ingress. Execution reports are drained by a
 /// process-wide background fanout in the Raft runtime, so short-lived clients
 /// cannot starve market-data consumers.
-fn read_loop_ack<S: Read + Write, F: Fn(Command)>(
+fn read_loop_ack<S: Read + Write, F: Fn(Command) -> Option<u64>>(
     mut stream: S,
     submit: &F,
     running: &AtomicBool,
@@ -403,8 +402,16 @@ fn read_loop_ack<S: Read + Write, F: Fn(Command)>(
             }
             if let Some(view) = WireView::parse(&buf[off..off + MSG_LEN]) {
                 if let Some(cmd) = view.to_command() {
-                    submit(cmd);
-                    stream.write_all(&[1])?;
+                    let Some(index) = submit(cmd) else {
+                        return Err(io::Error::new(
+                            io::ErrorKind::NotConnected,
+                            "command was not committed by this leader",
+                        ));
+                    };
+                    let mut ack = [0u8; 9];
+                    ack[0] = 1;
+                    ack[1..].copy_from_slice(&index.to_be_bytes());
+                    stream.write_all(&ack)?;
                 }
             }
             off += MSG_LEN;

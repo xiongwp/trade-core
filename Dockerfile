@@ -29,9 +29,6 @@ COPY --from=build /src/target/release/order_load /usr/local/bin/order_load
 COPY --from=build /src/target/release/raft-sim /usr/local/bin/raft-sim
 COPY --from=build /src/target/release/raft-node /usr/local/bin/raft-node
 
-# Journal + snapshots live here; mount a volume to survive container restarts
-# (the server recovers state from snapshot + journal on startup).
-VOLUME /data/journal
 EXPOSE 9001 9101 8080
 
 # Positional args: ADDR SHARDS STRATEGY JOURNAL_DIR POOL_MB BAND_BPS MD_ADDR
