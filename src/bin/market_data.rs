@@ -23,7 +23,7 @@
 //!   GET /api/depth?symbol=1 {"bids":[[p,q],…],"asks":[[p,q],…]}
 //!   GET /ws?symbol=1&interval=1s   WebSocket: {"candles":…,"depth":…} pushes
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -40,7 +40,7 @@ const TRADE_HTML: &str = include_str!("../../assets/trade.html");
 const RT_TRADE: u8 = 2;
 
 /// (ts, price, qty, maker_fee, taker_fee), newest last.
-type TradeRing = std::collections::VecDeque<(u64, Price, Qty, u64, u64)>;
+type TradeRing = VecDeque<(u64, Price, Qty, u64, u64)>;
 
 // ---------------------------------------------------------------------------
 // Shared state
@@ -66,6 +66,52 @@ struct State {
     /// Recent trades per instrument (newest last), bounded ring:
     /// (ts, price, qty, maker_fee, taker_fee).
     trades: HashMap<InstrumentId, TradeRing>,
+    seen_reports: ReportDeduper,
+}
+
+#[derive(Default)]
+struct ReportDeduper {
+    set: HashSet<ReportKey>,
+    order: VecDeque<ReportKey>,
+}
+
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+struct ReportKey {
+    type_code: u8,
+    side: u8,
+    instrument: u32,
+    order_id: u64,
+    aux_id: u64,
+    price: u64,
+    qty: u64,
+    maker_fee: u64,
+    taker_fee: u64,
+}
+
+impl ReportDeduper {
+    fn insert(&mut self, r: wire::DecodedReport) -> bool {
+        let key = ReportKey {
+            type_code: r.type_code,
+            side: if r.side == Side::Buy { 0 } else { 1 },
+            instrument: r.instrument.0,
+            order_id: r.order_id.0,
+            aux_id: r.aux_id,
+            price: r.price,
+            qty: r.qty,
+            maker_fee: r.maker_fee,
+            taker_fee: r.taker_fee,
+        };
+        if !self.set.insert(key) {
+            return false;
+        }
+        self.order.push_back(key);
+        while self.order.len() > 100_000 {
+            if let Some(old) = self.order.pop_front() {
+                self.set.remove(&old);
+            }
+        }
+        true
+    }
 }
 
 fn now_sec() -> u64 {
@@ -114,6 +160,10 @@ fn feed_one(md_addr: String, state: Arc<Mutex<State>>) {
                     let mut st = state.lock().unwrap();
                     while filled - off >= REPORT_LEN {
                         if let Some(r) = wire::decode_report(&buf[off..off + REPORT_LEN]) {
+                            if r.type_code == RT_TRADE && !st.seen_reports.insert(r) {
+                                off += REPORT_LEN;
+                                continue;
+                            }
                             match r.type_code {
                                 RT_TRADE => {
                                     st.agg.on_trade(r.instrument, ts, r.price, r.qty);
@@ -720,6 +770,7 @@ fn main() {
         agg,
         depth: DepthStore::default(),
         trades: HashMap::new(),
+        seen_reports: ReportDeduper::default(),
     }));
 
     // Feed thread.
