@@ -34,6 +34,7 @@ use std::time::Duration;
 
 use std::time::Instant;
 
+use crate::asset_log::AssetJournalSet;
 use crate::engine::{MatchingEngine, SelfTradePolicy};
 use crate::journal::{self, JournalReader, JournalWriter};
 use crate::lockfree::{self, Consumer, Producer};
@@ -108,6 +109,14 @@ pub enum Command {
     /// queue interleaves): all must target this shard's instruments. Each inner
     /// command is journaled/replicated individually, preserving the total order.
     Batch(Vec<Command>),
+}
+
+/// Intake metadata carried alongside a command. Raft entries retain their
+/// consensus index through the queue so a shard can durably advance its local
+/// recovery watermark only after both WALs contain the command.
+struct QueuedCommand {
+    command: Command,
+    raft_index: Option<u64>,
 }
 
 impl Command {
@@ -295,15 +304,15 @@ const NORMAL_BATCH: usize = 32;
 // ---------------------------------------------------------------------------
 
 struct ShardTx {
-    high: Producer<Command>,
-    normal: Producer<Command>,
+    high: Producer<QueuedCommand>,
+    normal: Producer<QueuedCommand>,
 }
 
 /// The two priority lanes dedicated to one configured instrument. A shard
 /// owns many of these mailboxes, but no mailbox is shared by two instruments.
 struct InstrumentRx {
-    high: Consumer<Command>,
-    normal: Consumer<Command>,
+    high: Consumer<QueuedCommand>,
+    normal: Consumer<QueuedCommand>,
 }
 
 /// The order system's handle for sending commands into the matching side.
@@ -327,19 +336,31 @@ impl OrderGateway {
     /// the high-priority queue; new orders to the normal queue. Returns
     /// `Err(cmd)` if the target queue is full (backpressure).
     pub fn submit(&self, cmd: Command) -> Result<(), Command> {
-        if let Some(tx) = self.instruments.get(&cmd.instrument()) {
-            return if cmd.is_high_priority() {
-                tx.high.push(cmd)
+        self.submit_with_raft_index(cmd, None)
+    }
+
+    /// Submit a command that has already crossed the Raft quorum. Its index is
+    /// persisted with the local application watermark before matching.
+    pub fn submit_committed(&self, raft_index: u64, cmd: Command) -> Result<(), Command> {
+        self.submit_with_raft_index(cmd, Some(raft_index))
+    }
+
+    fn submit_with_raft_index(&self, cmd: Command, raft_index: Option<u64>) -> Result<(), Command> {
+        let queued = QueuedCommand { command: cmd, raft_index };
+        let instrument = queued.command.instrument();
+        if let Some(tx) = self.instruments.get(&instrument) {
+            return if queued.command.is_high_priority() {
+                tx.high.push(queued).map_err(|queued| queued.command)
             } else {
-                tx.normal.push(cmd)
+                tx.normal.push(queued).map_err(|queued| queued.command)
             };
         }
-        let idx = self.shard_of(cmd.instrument());
+        let idx = self.shard_of(instrument);
         let tx = &self.shards[idx];
-        if cmd.is_high_priority() {
-            tx.high.push(cmd)
+        if queued.command.is_high_priority() {
+            tx.high.push(queued).map_err(|queued| queued.command)
         } else {
-            tx.normal.push(cmd)
+            tx.normal.push(queued).map_err(|queued| queued.command)
         }
     }
 
@@ -515,8 +536,8 @@ fn build_inner(
     let mut snap_requests = Vec::with_capacity(config.shards);
 
     for shard_id in 0..config.shards {
-        let (high_tx, high_rx) = lockfree::channel::<Command>(config.queue_capacity);
-        let (normal_tx, normal_rx) = lockfree::channel::<Command>(config.queue_capacity);
+        let (high_tx, high_rx) = lockfree::channel::<QueuedCommand>(config.queue_capacity);
+        let (normal_tx, normal_rx) = lockfree::channel::<QueuedCommand>(config.queue_capacity);
         let (res_tx, res_rx) = lockfree::channel::<ExecReport>(config.queue_capacity);
 
         shard_tx.push(ShardTx {
@@ -533,9 +554,9 @@ fn build_inner(
         for &inst in &config.instruments {
             if inst.0 as usize % config.shards == shard_id {
                 let (inst_high_tx, inst_high_rx) =
-                    lockfree::channel::<Command>(config.queue_capacity);
+                    lockfree::channel::<QueuedCommand>(config.queue_capacity);
                 let (inst_normal_tx, inst_normal_rx) =
-                    lockfree::channel::<Command>(config.queue_capacity);
+                    lockfree::channel::<QueuedCommand>(config.queue_capacity);
                 instrument_tx.insert(
                     inst,
                     ShardTx {
@@ -566,6 +587,7 @@ fn build_inner(
         // Journal + snapshot + fsync thread for this shard. On startup, any
         // existing snapshot + journal is recovered into the processor first.
         let mut journal_w = None;
+        let mut asset_journal = None;
         let mut snapshot_path = None;
         if let Some(dir) = &config.journal_dir {
             std::fs::create_dir_all(dir).expect("create journal dir");
@@ -580,6 +602,10 @@ fn build_inner(
                 journal::spawn_fsyncer(fh, config.journal_fsync, running.clone());
             }
             journal_w = Some(w);
+            asset_journal = Some(
+                AssetJournalSet::open(dir.join("assets"), config.journal_flush)
+                    .expect("open per-asset journals"),
+            );
             snapshot_path = Some(spath);
         }
 
@@ -598,6 +624,7 @@ fn build_inner(
             next_instrument: 0,
             result_tx: res_tx,
             journal: journal_w,
+            asset_journal,
             snapshot_path,
             snapshot_every: config.snapshot_every,
             last_snapshot: Instant::now(),
@@ -1140,12 +1167,16 @@ struct Shard {
     rep_seq: u64,
     metrics: Arc<crate::metrics::Metrics>,
     processor: Processor,
-    high_rx: Consumer<Command>,
-    normal_rx: Consumer<Command>,
+    high_rx: Consumer<QueuedCommand>,
+    normal_rx: Consumer<QueuedCommand>,
     instrument_rx: Vec<InstrumentRx>,
     next_instrument: usize,
     result_tx: Producer<ExecReport>,
     journal: Option<JournalWriter>,
+    /// Portable WALs written per asset alongside the legacy shard journal.
+    /// They provide the migration/replay unit while shard snapshots retain the
+    /// existing fast restart path during the transition.
+    asset_journal: Option<AssetJournalSet>,
     snapshot_path: Option<PathBuf>,
     snapshot_every: Option<Duration>,
     last_snapshot: Instant,
@@ -1240,6 +1271,9 @@ impl Shard {
         }
         if let Some(j) = &mut self.journal {
             let _ = j.flush();
+        }
+        if let Some(j) = &mut self.asset_journal {
+            let _ = j.flush_all();
         }
         if is_parked {
             self.parked.fetch_sub(1, Ordering::Release);
@@ -1374,7 +1408,7 @@ impl Shard {
     /// Fair round-robin across configured asset queues, then the legacy shard
     /// queue. A hot instrument therefore cannot monopolize a worker's intake
     /// budget and starve unrelated assets on the same machine.
-    fn pop_next_normal(&mut self) -> Option<Command> {
+    fn pop_next_normal(&mut self) -> Option<QueuedCommand> {
         let len = self.instrument_rx.len();
         for _ in 0..len {
             let index = self.next_instrument % len;
@@ -1389,15 +1423,36 @@ impl Shard {
     /// Journal the command (in processing order), replicate it, then apply it.
     /// One serialization point, one seq series: journal and standbys see the
     /// identical total order.
-    fn handle(&mut self, cmd: Command) {
+    fn handle(&mut self, queued: QueuedCommand) {
+        let started = Instant::now();
+        let QueuedCommand {
+            command: cmd,
+            raft_index,
+        } = queued;
         // Batches flatten HERE: each inner command is journaled/replicated as
         // its own record (the total order stays flat and replayable); atomicity
         // holds because this thread pops nothing until the loop finishes.
         if let Command::Batch(cmds) = cmd {
             for c in cmds {
-                self.handle(c);
+                self.handle(QueuedCommand { command: c, raft_index });
             }
             return;
+        }
+        if let Some(asset_journal) = &mut self.asset_journal {
+            // The asset WAL is intentionally appended before matching. A
+            // failure is fail-closed: processing a command that cannot be
+            // replayed on a destination node would make migration unsafe.
+            let append = match raft_index {
+                Some(index) => asset_journal.append_committed(index, &cmd),
+                None => asset_journal.append(&cmd),
+            };
+            if let Err(error) = append {
+                self.metrics
+                    .asset_wal_errors
+                    .fetch_add(1, Ordering::Relaxed);
+                eprintln!("[asset-journal] event=append_failed action=reject error={error}");
+                return;
+            }
         }
         if self.journal.is_some() || self.rep.is_some() {
             let mut frame = [0u8; wire::MSG_LEN];
@@ -1409,6 +1464,16 @@ impl Shard {
                 None => self.rep_seq + 1,
             };
             self.rep_seq = seq;
+            if raft_index.is_some() {
+                if let Some(journal) = &mut self.journal {
+                    journal.sync_data().expect("sync raft command journal");
+                }
+                if let Some(asset_journal) = &self.asset_journal {
+                    asset_journal
+                        .mark_raft_applied(cmd.instrument(), raft_index.unwrap())
+                        .expect("persist raft application watermark");
+                }
+            }
             if let Some(rep) = &self.rep {
                 rep.publish(self.shard_id, seq, &frame);
             }
@@ -1434,6 +1499,8 @@ impl Shard {
                 }
             }
         });
+        self.metrics
+            .record_command_latency(started.elapsed().as_nanos() as u64);
     }
 }
 

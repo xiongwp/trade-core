@@ -1,0 +1,43 @@
+# Five durable Raft matching members. Each node owns its own Raft state and
+# matching journals under /data. Put a leader-aware TCP load balancer in front
+# of raft-1..raft-5:9001 in a real environment; this file publishes each
+# endpoint separately so failover can be observed without hiding the leader.
+services:
+  raft-1:
+    build: .
+    image: trade-core-node
+    command: ["exec raft-node 1 raft-1:7001 1@raft-1:7001,2@raft-2:7002,3@raft-3:7003,4@raft-4:7004,5@raft-5:7005 0.0.0.0:9001 /data"]
+    ports: ["9301:9001", "9201:9102"]
+    volumes: ["raft-1-data:/data"]
+    restart: unless-stopped
+  raft-2:
+    image: trade-core-node
+    command: ["exec raft-node 2 raft-2:7002 1@raft-1:7001,2@raft-2:7002,3@raft-3:7003,4@raft-4:7004,5@raft-5:7005 0.0.0.0:9001 /data"]
+    ports: ["9302:9001", "9202:9102"]
+    volumes: ["raft-2-data:/data"]
+    restart: unless-stopped
+  raft-3:
+    image: trade-core-node
+    command: ["exec raft-node 3 raft-3:7003 1@raft-1:7001,2@raft-2:7002,3@raft-3:7003,4@raft-4:7004,5@raft-5:7005 0.0.0.0:9001 /data"]
+    ports: ["9303:9001", "9203:9102"]
+    volumes: ["raft-3-data:/data"]
+    restart: unless-stopped
+  raft-4:
+    image: trade-core-node
+    command: ["exec raft-node 4 raft-4:7004 1@raft-1:7001,2@raft-2:7002,3@raft-3:7003,4@raft-4:7004,5@raft-5:7005 0.0.0.0:9001 /data"]
+    ports: ["9304:9001", "9204:9102"]
+    volumes: ["raft-4-data:/data"]
+    restart: unless-stopped
+  raft-5:
+    image: trade-core-node
+    command: ["exec raft-node 5 raft-5:7005 1@raft-1:7001,2@raft-2:7002,3@raft-3:7003,4@raft-4:7004,5@raft-5:7005 0.0.0.0:9001 /data"]
+    ports: ["9305:9001", "9205:9102"]
+    volumes: ["raft-5-data:/data"]
+    restart: unless-stopped
+
+volumes:
+  raft-1-data:
+  raft-2-data:
+  raft-3-data:
+  raft-4-data:
+  raft-5-data:

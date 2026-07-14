@@ -165,7 +165,7 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
-    match gateway::serve_rate_limited(listener, md_listener, gw, sink, running, rate) {
+    match gateway::serve_forever(listener, md_listener, gw, sink, running, rate) {
         Ok(()) => eprintln!("[server] connection closed, shutting down"),
         Err(e) => eprintln!("[server] error: {e}"),
     }

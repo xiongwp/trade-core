@@ -53,3 +53,17 @@ panic = "abort"
 
 [dependencies]
 raft = "0.7.0"
+protobuf = "2.28"
+mysql = "25"
+
+[[bin]]
+name = "raft-sim"
+path = "src/bin/raft_sim.rs"
+
+[[bin]]
+name = "raft-node"
+path = "src/bin/raft_node.rs"
+
+[[bin]]
+name = "order-api"
+path = "src/bin/order_api.rs"

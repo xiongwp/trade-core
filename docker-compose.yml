@@ -1,12 +1,18 @@
-# One-click deployment of the three separately deployed services:
+# One-click local deployment. The included file starts five durable Raft
+# members as well; their order endpoints are published on 9301..9305 and
+# metrics on 9201..9205.
+include:
+  - path: docker-compose.raft.yml
+
+# The standalone services remain available for UI development while the
+# leader-aware order ingress is being wired to the Raft cluster.
 #
 #   trade-core   — the matching node (orders :9001, market-data fanout :9101)
-#   market-data  — K-lines + depth ladder + chart UI/WS    http://localhost:8080
-#   order        — the order system (demo flow generator; swap in your real
-#                  order system — it speaks the same 40-byte TCP protocol)
+#   market-data  — K-lines + depth ladder + chart UI/WS    http://localhost:8081
+#   order        — persistent order API (10 MySQL databases x 100 tables)
 #
 #   docker compose up --build
-#   open http://localhost:8080     # candlesticks + depth, WebSocket push
+#   open http://localhost:8081     # candlesticks + depth, WebSocket push
 
 services:
   trade-core:
@@ -25,22 +31,150 @@ services:
 
   market-data:
     image: trade-core-node
+    command: ["exec market-data raft-1:9101,raft-2:9101,raft-3:9101,raft-4:9101,raft-5:9101 0.0.0.0:8080 /data/md"]
+    environment:
+      # Development default only. Set TC_ADMIN_TOKEN to a secret in production.
+      TC_ADMIN_TOKEN: ${TC_ADMIN_TOKEN:-local-admin-token}
+      # Demo trading-terminal credential; replace with user authentication.
+      TC_TRADING_TOKEN: ${TC_TRADING_TOKEN:-local-trading-token}
+      TC_ORDER_API_ADDR: order:9200
+      TC_ORDER_API_TOKEN: ${TC_ORDER_API_TOKEN:-local-order-api-token}
     depends_on:
-      - trade-core
-    command: ["exec market-data trade-core:9101 0.0.0.0:8080 /data/md"]
+      - raft-1
+      - raft-2
+      - raft-3
+      - raft-4
+      - raft-5
     ports:
-      - "8080:8080"   # chart UI + JSON API + WebSocket
+      - "8081:8080"   # chart UI + JSON API + WebSocket (8080 is in use locally)
     volumes:
       - market-data-history:/data/md
     restart: unless-stopped
 
+  mysql-control:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-local-root-password}
+    volumes:
+      - order-mysql-control:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+      start_period: 10s
+    restart: unless-stopped
+
+  mysql-order-0:
+    image: mysql:8.4
+    environment: { MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD:-local-root-password}" }
+    volumes: ["order-mysql-0:/var/lib/mysql"]
+    healthcheck: { test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"], interval: 3s, timeout: 3s, retries: 40, start_period: 10s }
+    restart: unless-stopped
+  mysql-order-1:
+    image: mysql:8.4
+    environment: { MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD:-local-root-password}" }
+    volumes: ["order-mysql-1:/var/lib/mysql"]
+    healthcheck: { test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"], interval: 3s, timeout: 3s, retries: 40, start_period: 10s }
+    restart: unless-stopped
+  mysql-order-2:
+    image: mysql:8.4
+    environment: { MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD:-local-root-password}" }
+    volumes: ["order-mysql-2:/var/lib/mysql"]
+    healthcheck: { test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"], interval: 3s, timeout: 3s, retries: 40, start_period: 10s }
+    restart: unless-stopped
+  mysql-order-3:
+    image: mysql:8.4
+    environment: { MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD:-local-root-password}" }
+    volumes: ["order-mysql-3:/var/lib/mysql"]
+    healthcheck: { test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"], interval: 3s, timeout: 3s, retries: 40, start_period: 10s }
+    restart: unless-stopped
+  mysql-order-4:
+    image: mysql:8.4
+    environment: { MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD:-local-root-password}" }
+    volumes: ["order-mysql-4:/var/lib/mysql"]
+    healthcheck: { test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"], interval: 3s, timeout: 3s, retries: 40, start_period: 10s }
+    restart: unless-stopped
+  mysql-order-5:
+    image: mysql:8.4
+    environment: { MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD:-local-root-password}" }
+    volumes: ["order-mysql-5:/var/lib/mysql"]
+    healthcheck: { test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"], interval: 3s, timeout: 3s, retries: 40, start_period: 10s }
+    restart: unless-stopped
+  mysql-order-6:
+    image: mysql:8.4
+    environment: { MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD:-local-root-password}" }
+    volumes: ["order-mysql-6:/var/lib/mysql"]
+    healthcheck: { test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"], interval: 3s, timeout: 3s, retries: 40, start_period: 10s }
+    restart: unless-stopped
+  mysql-order-7:
+    image: mysql:8.4
+    environment: { MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD:-local-root-password}" }
+    volumes: ["order-mysql-7:/var/lib/mysql"]
+    healthcheck: { test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"], interval: 3s, timeout: 3s, retries: 40, start_period: 10s }
+    restart: unless-stopped
+  mysql-order-8:
+    image: mysql:8.4
+    environment: { MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD:-local-root-password}" }
+    volumes: ["order-mysql-8:/var/lib/mysql"]
+    healthcheck: { test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"], interval: 3s, timeout: 3s, retries: 40, start_period: 10s }
+    restart: unless-stopped
+  mysql-order-9:
+    image: mysql:8.4
+    environment: { MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD:-local-root-password}" }
+    volumes: ["order-mysql-9:/var/lib/mysql"]
+    healthcheck: { test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"], interval: 3s, timeout: 3s, retries: 40, start_period: 10s }
+    restart: unless-stopped
+
   order:
+    build: .
     image: trade-core-node
     depends_on:
-      - trade-core
-    command: ["exec order trade-core:9001 300"]
+      mysql-control:
+        condition: service_healthy
+      mysql-order-0:
+        condition: service_healthy
+      mysql-order-1:
+        condition: service_healthy
+      mysql-order-2:
+        condition: service_healthy
+      mysql-order-3:
+        condition: service_healthy
+      mysql-order-4:
+        condition: service_healthy
+      mysql-order-5:
+        condition: service_healthy
+      mysql-order-6:
+        condition: service_healthy
+      mysql-order-7:
+        condition: service_healthy
+      mysql-order-8:
+        condition: service_healthy
+      mysql-order-9:
+        condition: service_healthy
+      trade-core:
+        condition: service_started
+    command: ["exec order-api"]
+    environment:
+      TC_ORDER_MYSQL_CONTROL_URL: mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-control:3306/mysql
+      TC_ORDER_MYSQL_SHARD_URLS: mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-0:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-1:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-2:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-3:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-4:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-5:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-6:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-7:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-8:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-9:3306/mysql
+      TC_RAFT_MATCHERS: raft-1:9001@raft-1:9102,raft-2:9001@raft-2:9102,raft-3:9001@raft-3:9102,raft-4:9001@raft-4:9102,raft-5:9001@raft-5:9102
+      TC_ORDER_API_TOKEN: ${TC_ORDER_API_TOKEN:-local-order-api-token}
+    ports:
+      - "9200:9200"
     restart: unless-stopped
 
 volumes:
   trade-core-journal:
   market-data-history:
+  order-mysql-control:
+  order-mysql-0:
+  order-mysql-1:
+  order-mysql-2:
+  order-mysql-3:
+  order-mysql-4:
+  order-mysql-5:
+  order-mysql-6:
+  order-mysql-7:
+  order-mysql-8:
+  order-mysql-9:

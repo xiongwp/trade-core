@@ -13,12 +13,17 @@
 //! generates the DDL names; actual SQL execution belongs to the order-system
 //! service and its connection pools.
 
+use crate::types::InstrumentId;
+
 /// Number of physical databases.
 pub const DB_COUNT: u64 = 10;
 /// Tables per database.
 pub const TABLES_PER_DB: u64 = 100;
 /// Total shard slots.
 pub const SLOTS: u64 = DB_COUNT * TABLES_PER_DB;
+/// Default number of instruments in one ordering category. With the default,
+/// instruments 1..=1000 share one ordered stream, 1001..=2000 the next, etc.
+pub const DEFAULT_ASSET_CATEGORY_SIZE: u32 = 1_000;
 
 /// Where a user's rows live.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -69,6 +74,13 @@ pub fn all_tables() -> impl Iterator<Item = (String, String)> {
     })
 }
 
+/// Route an instrument into the ordering category used by the order outbox.
+#[inline]
+pub fn asset_category(instrument: InstrumentId, category_size: u32) -> u32 {
+    let size = category_size.max(1);
+    instrument.0.saturating_sub(1) / size
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,5 +117,13 @@ mod tests {
     #[test]
     fn table_enumeration_is_complete() {
         assert_eq!(all_tables().count() as u64, SLOTS);
+    }
+
+    #[test]
+    fn instruments_route_to_ordering_categories() {
+        assert_eq!(asset_category(InstrumentId(1), 1_000), 0);
+        assert_eq!(asset_category(InstrumentId(1_000), 1_000), 0);
+        assert_eq!(asset_category(InstrumentId(1_001), 1_000), 1);
+        assert_eq!(asset_category(InstrumentId(0), 1_000), 0);
     }
 }

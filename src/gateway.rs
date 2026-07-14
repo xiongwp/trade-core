@@ -117,13 +117,157 @@ pub fn serve_rate_limited(
     running: Arc<AtomicBool>,
     max_cmds_per_sec: u64,
 ) -> io::Result<()> {
-    let local = listener.local_addr()?;
-    eprintln!("[gateway] listening on {local}, awaiting order-system connection…");
+    serve_rate_limited_with(
+        listener,
+        md_listener,
+        sink,
+        running,
+        max_cmds_per_sec,
+        move |cmd| dispatch(&gateway, cmd),
+    )
+}
 
+/// Persistent standalone gateway. This is the production-friendly counterpart
+/// to [`serve_rate_limited`]: a client disconnect does not terminate the
+/// matching process, so HTTP/API gateways may use short-lived TCP forwards.
+pub fn serve_forever(
+    listener: TcpListener,
+    md_listener: Option<TcpListener>,
+    gateway: OrderGateway,
+    sink: ResultSink,
+    running: Arc<AtomicBool>,
+    max_cmds_per_sec: u64,
+) -> io::Result<()> {
+    serve_committed_forever(
+        listener,
+        md_listener,
+        sink,
+        running,
+        max_cmds_per_sec,
+        move |cmd| dispatch(&gateway, cmd),
+    )
+}
+
+/// Serve the wire protocol while handing decoded commands to a consensus
+/// ingress. The callback must return only after it has durably accepted the
+/// command (or wait for capacity); the production Raft node uses this to keep
+/// uncommitted client commands out of the matching queues.
+pub fn serve_committed_rate_limited<F>(
+    listener: TcpListener,
+    md_listener: Option<TcpListener>,
+    sink: ResultSink,
+    running: Arc<AtomicBool>,
+    max_cmds_per_sec: u64,
+    submit: F,
+) -> io::Result<()>
+where
+    F: Fn(Command),
+{
+    serve_rate_limited_with(
+        listener,
+        md_listener,
+        sink,
+        running,
+        max_cmds_per_sec,
+        submit,
+    )
+}
+
+/// Persistent committed ingress for a long-running matching member. A client
+/// disconnect ends only that TCP session; Raft, journals and the next session
+/// continue with the already committed state.
+pub fn serve_committed_forever<F>(
+    listener: TcpListener,
+    md_listener: Option<TcpListener>,
+    sink: ResultSink,
+    running: Arc<AtomicBool>,
+    max_cmds_per_sec: u64,
+    submit: F,
+) -> io::Result<()>
+where
+    F: Fn(Command),
+{
     let fanout = md_listener.map(|l| {
-        eprintln!("[gateway] market-data fanout on {}", l.local_addr().unwrap());
+        eprintln!(
+            "[gateway] market-data fanout on {}",
+            l.local_addr().unwrap()
+        );
         MdFanout::accept_on(l, running.clone())
     });
+    let report_running = running.clone();
+    thread::Builder::new()
+        .name("md-report-drain".into())
+        .spawn(move || report_fanout_drain(sink, fanout, report_running))
+        .expect("spawn market-data report drain");
+    while running.load(Ordering::Acquire) {
+        let session_running = Arc::new(AtomicBool::new(true));
+        serve_one_ingress_ack(
+            &listener,
+            session_running,
+            max_cmds_per_sec,
+            &submit,
+        )?;
+    }
+    Ok(())
+}
+
+fn serve_rate_limited_with<F>(
+    listener: TcpListener,
+    md_listener: Option<TcpListener>,
+    sink: ResultSink,
+    running: Arc<AtomicBool>,
+    max_cmds_per_sec: u64,
+    submit: F,
+) -> io::Result<()>
+where
+    F: Fn(Command),
+{
+    serve_one(
+        &listener,
+        md_listener.as_ref(),
+        sink,
+        running,
+        max_cmds_per_sec,
+        &submit,
+    )
+    .map(|_| ())
+}
+
+fn serve_one<F>(
+    listener: &TcpListener,
+    md_listener: Option<&TcpListener>,
+    sink: ResultSink,
+    running: Arc<AtomicBool>,
+    max_cmds_per_sec: u64,
+    submit: &F,
+) -> io::Result<ResultSink>
+where
+    F: Fn(Command),
+{
+    let fanout = md_listener.map(|l| {
+        let l = l.try_clone().expect("clone market-data listener");
+        eprintln!(
+            "[gateway] market-data fanout on {}",
+            l.local_addr().unwrap()
+        );
+        MdFanout::accept_on(l, running.clone())
+    });
+    serve_one_with_fanout(listener, fanout, sink, running, max_cmds_per_sec, submit)
+}
+
+fn serve_one_with_fanout<F>(
+    listener: &TcpListener,
+    fanout: Option<MdFanout>,
+    sink: ResultSink,
+    running: Arc<AtomicBool>,
+    max_cmds_per_sec: u64,
+    submit: &F,
+) -> io::Result<ResultSink>
+where
+    F: Fn(Command),
+{
+    let local = listener.local_addr()?;
+    eprintln!("[gateway] listening on {local}, awaiting order-system connection…");
 
     let (stream, peer) = listener.accept()?;
     stream.set_nodelay(true).ok();
@@ -133,22 +277,44 @@ pub fn serve_rate_limited(
 
     // Async report feedback loop on its own thread (single consumer of results).
     let writer_running = running.clone();
-    let writer =
-        thread::spawn(move || report_writer(write_stream, sink, fanout, writer_running));
+    let writer = thread::spawn(move || report_writer(write_stream, sink, fanout, writer_running));
 
     // Order intake loop on this thread (single producer into the gateway).
-    let read_result = read_loop(stream, &gateway, &running, max_cmds_per_sec);
+    let read_result = read_loop(stream, submit, &running, max_cmds_per_sec);
 
     // Tell the writer to finish and join it.
     running.store(false, Ordering::Release);
-    let _ = writer.join();
-    read_result
+    let sink = writer
+        .join()
+        .unwrap_or_else(|_| panic!("report writer panicked"));
+    read_result.map(|()| sink)
+}
+
+fn serve_one_ingress_ack<F>(
+    listener: &TcpListener,
+    running: Arc<AtomicBool>,
+    max_cmds_per_sec: u64,
+    submit: &F,
+) -> io::Result<()>
+where
+    F: Fn(Command),
+{
+    let local = listener.local_addr()?;
+    eprintln!("[gateway] listening on {local}, awaiting order-system connection…");
+
+    let (mut stream, peer) = listener.accept()?;
+    stream.set_nodelay(true).ok();
+    eprintln!("[gateway] order system connected from {peer}");
+
+    let result = read_loop_ack(&mut stream, submit, &running, max_cmds_per_sec);
+    running.store(false, Ordering::Release);
+    result
 }
 
 /// Read frames into a reusable buffer and decode each in place.
-fn read_loop<S: Read>(
+fn read_loop<S: Read, F: Fn(Command)>(
     mut stream: S,
-    gateway: &OrderGateway,
+    submit: &F,
     running: &AtomicBool,
     max_cmds_per_sec: u64,
 ) -> io::Result<()> {
@@ -184,7 +350,7 @@ fn read_loop<S: Read>(
             }
             if let Some(view) = WireView::parse(&buf[off..off + MSG_LEN]) {
                 if let Some(cmd) = view.to_command() {
-                    dispatch(gateway, cmd);
+                    submit(cmd);
                 }
             }
             off += MSG_LEN;
@@ -197,6 +363,62 @@ fn read_loop<S: Read>(
         }
         // Guard against a full buffer with no complete frame (shouldn't happen
         // with fixed frames, but keeps the loop total).
+        if filled == buf.len() {
+            buf.resize(buf.len() * 2, 0);
+        }
+    }
+    Ok(())
+}
+
+/// Read fixed-size command frames and acknowledge each decoded command after it
+/// has been handed to the committed ingress. Execution reports are drained by a
+/// process-wide background fanout in the Raft runtime, so short-lived clients
+/// cannot starve market-data consumers.
+fn read_loop_ack<S: Read + Write, F: Fn(Command)>(
+    mut stream: S,
+    submit: &F,
+    running: &AtomicBool,
+    max_cmds_per_sec: u64,
+) -> io::Result<()> {
+    let mut window = std::time::Instant::now();
+    let mut budget = max_cmds_per_sec;
+    let mut buf = vec![0u8; MSG_LEN * 512];
+    let mut filled = 0usize;
+
+    while running.load(Ordering::Acquire) {
+        let n = stream.read(&mut buf[filled..])?;
+        if n == 0 {
+            eprintln!("[gateway] peer closed connection");
+            break;
+        }
+        filled += n;
+
+        let mut off = 0;
+        while filled - off >= MSG_LEN {
+            if max_cmds_per_sec > 0 {
+                if budget == 0 {
+                    let elapsed = window.elapsed();
+                    if elapsed < Duration::from_secs(1) {
+                        thread::sleep(Duration::from_secs(1) - elapsed);
+                    }
+                    window = std::time::Instant::now();
+                    budget = max_cmds_per_sec;
+                }
+                budget -= 1;
+            }
+            if let Some(view) = WireView::parse(&buf[off..off + MSG_LEN]) {
+                if let Some(cmd) = view.to_command() {
+                    submit(cmd);
+                    stream.write_all(&[1])?;
+                }
+            }
+            off += MSG_LEN;
+        }
+
+        if off > 0 {
+            buf.copy_within(off..filled, 0);
+            filled -= off;
+        }
         if filled == buf.len() {
             buf.resize(buf.len() * 2, 0);
         }
@@ -225,7 +447,7 @@ fn report_writer<S: Write>(
     sink: ResultSink,
     fanout: Option<MdFanout>,
     running: Arc<AtomicBool>,
-) {
+) -> ResultSink {
     let mut out: Vec<u8> = Vec::with_capacity(REPORT_LEN * 256);
     loop {
         out.clear();
@@ -243,12 +465,41 @@ fn report_writer<S: Write>(
             thread::sleep(Duration::from_micros(100));
             continue;
         }
+        if let Some(f) = &fanout {
+            f.broadcast(&out);
+        }
         if stream.write_all(&out).is_err() {
             break;
+        }
+    }
+    let _ = stream.flush();
+    sink
+}
+
+fn report_fanout_drain(
+    sink: ResultSink,
+    fanout: Option<MdFanout>,
+    running: Arc<AtomicBool>,
+) -> ResultSink {
+    let mut out: Vec<u8> = Vec::with_capacity(REPORT_LEN * 256);
+    loop {
+        out.clear();
+        sink.poll(|report| {
+            let mut frame = [0u8; REPORT_LEN];
+            wire::encode_report(&report, &mut frame);
+            out.extend_from_slice(&frame);
+        });
+
+        if out.is_empty() {
+            if !running.load(Ordering::Acquire) {
+                break;
+            }
+            thread::sleep(Duration::from_micros(100));
+            continue;
         }
         if let Some(f) = &fanout {
             f.broadcast(&out);
         }
     }
-    let _ = stream.flush();
+    sink
 }

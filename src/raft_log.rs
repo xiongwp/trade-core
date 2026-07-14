@@ -6,11 +6,16 @@
 //! shards. Consequently, no order may be matched before its log entry appears
 //! in [`RaftNode::take_committed`].
 //!
-//! The core is transport-neutral: the production transport persists and sends
-//! [`raft::prelude::Message`] values; the in-memory storage used here makes the
-//! consensus state machine directly unit-testable.
+//! The core is transport-neutral: [`RaftNode::open`] persists and restores its
+//! consensus state, while [`RaftNode::new`] retains an in-memory mode for
+//! deterministic unit tests.
 
-use raft::eraftpb::ConfState;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::Path;
+
+use protobuf::Message as PbMessage;
+use raft::eraftpb::{ConfState, HardState};
 use raft::prelude::{Entry, Message};
 use raft::storage::MemStorage;
 use raft::{Config, RawNode, StateRole};
@@ -57,22 +62,163 @@ pub enum ProposeError {
     Raft,
 }
 
+const STORAGE_HEADER: [u8; 8] = *b"TCRF\x01\0\0\0";
+const HARD_STATE_RECORD: u8 = 1;
+const ENTRY_RECORD: u8 = 2;
+
+/// Append-only durable state for one Raft member.
+///
+/// Records are checksummed and each [`RaftNode::drive`] synchronizes the batch
+/// before its messages are exposed to the transport. A corrupt or torn tail is
+/// rejected at startup: consensus must not guess at a vote or commit index.
+struct DurableRaftLog {
+    file: File,
+}
+
+impl DurableRaftLog {
+    fn open(path: &Path) -> io::Result<(Self, Vec<Entry>, HardState)> {
+        let mut read = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
+        if read.metadata()?.len() == 0 {
+            read.write_all(&STORAGE_HEADER)?;
+            read.sync_all()?;
+        }
+        read.seek(SeekFrom::Start(0))?;
+        let mut header = [0u8; STORAGE_HEADER.len()];
+        read.read_exact(&mut header)?;
+        if header != STORAGE_HEADER {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "raft state header/version mismatch",
+            ));
+        }
+
+        let mut entries = Vec::new();
+        let mut hard_state = HardState::default();
+        loop {
+            let mut kind = [0u8; 1];
+            match read.read_exact(&mut kind) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(error) => return Err(error),
+            }
+            let mut length_bytes = [0u8; 4];
+            read.read_exact(&mut length_bytes)?;
+            let length = u32::from_le_bytes(length_bytes) as usize;
+            if length > 16 * 1024 * 1024 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "raft state record is too large",
+                ));
+            }
+            let mut payload = vec![0; length];
+            read.read_exact(&mut payload)?;
+            let mut checksum = [0u8; 8];
+            read.read_exact(&mut checksum)?;
+            let mut protected = Vec::with_capacity(5 + payload.len());
+            protected.push(kind[0]);
+            protected.extend_from_slice(&length_bytes);
+            protected.extend_from_slice(&payload);
+            if crate::journal::fnv1a(&protected) != u64::from_le_bytes(checksum) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "raft state checksum mismatch",
+                ));
+            }
+            match kind[0] {
+                HARD_STATE_RECORD => hard_state = HardState::parse_from_bytes(&payload).map_err(proto_error)?,
+                ENTRY_RECORD => entries.push(Entry::parse_from_bytes(&payload).map_err(proto_error)?),
+                _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "unknown raft state record")),
+            }
+        }
+        let file = OpenOptions::new().append(true).open(path)?;
+        Ok((Self { file }, entries, hard_state))
+    }
+
+    fn persist(&mut self, entries: &[Entry], hard_state: Option<&HardState>) -> io::Result<()> {
+        if let Some(hard_state) = hard_state {
+            self.write_record(HARD_STATE_RECORD, &hard_state.write_to_bytes().map_err(proto_error)?)?;
+        }
+        for entry in entries {
+            self.write_record(ENTRY_RECORD, &entry.write_to_bytes().map_err(proto_error)?)?;
+        }
+        if hard_state.is_some() || !entries.is_empty() {
+            self.file.sync_data()?;
+        }
+        Ok(())
+    }
+
+    fn write_record(&mut self, kind: u8, payload: &[u8]) -> io::Result<()> {
+        let length = u32::try_from(payload.len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "raft record too large"))?;
+        let mut protected = Vec::with_capacity(5 + payload.len());
+        protected.push(kind);
+        protected.extend_from_slice(&length.to_le_bytes());
+        protected.extend_from_slice(payload);
+        self.file.write_all(&protected)?;
+        self.file.write_all(&crate::journal::fnv1a(&protected).to_le_bytes())
+    }
+}
+
+fn proto_error(error: protobuf::ProtobufError) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error)
+}
+
 /// A transport-neutral Raft command-log node.
 ///
-/// `MemStorage` is intentionally private. The runtime adapter persists every
-/// `Ready` record before sending `take_outbound()` messages; keeping that
-/// adapter separate prevents consensus code from reaching into matching state.
+/// `MemStorage` is intentionally private. [`RaftNode::open`] persists every
+/// `Ready` record before exposing `take_outbound()` messages; keeping matching
+/// outside this type prevents consensus code from reaching into book state.
 pub struct RaftNode {
     node: RawNode<MemStorage>,
     store: MemStorage,
     outbound: Vec<Message>,
     committed: Vec<(u64, Vec<u8>)>,
+    durable: Option<DurableRaftLog>,
 }
 
 impl RaftNode {
     pub fn new(cluster: ClusterConfig) -> Result<Self, raft::Error> {
-        let store =
-            MemStorage::new_with_conf_state(ConfState::from((cluster.voters.to_vec(), vec![])));
+        Self::with_storage(cluster, None, Vec::new(), HardState::default())
+    }
+
+    /// Open a real member from a durable state file. The file holds Raft's
+    /// term, vote, commit index and all un-compacted entries, not just a copy
+    /// of application commands.
+    pub fn open(cluster: ClusterConfig, path: impl AsRef<Path>) -> io::Result<Self> {
+        let (durable, entries, hard_state) = DurableRaftLog::open(path.as_ref())?;
+        // Raft's durable commit index can be ahead of the local matching
+        // state machine when a process dies after quorum commit but before it
+        // reaches a shard. Re-expose that committed prefix on startup; the
+        // application dispatcher is responsible for idempotent application.
+        let recovered_committed = entries
+            .iter()
+            .filter(|entry| entry.index <= hard_state.commit && !entry.data.is_empty())
+            .map(|entry| (entry.index, entry.data.to_vec()))
+            .collect();
+        let mut node = Self::with_storage(cluster, Some(durable), entries, hard_state)
+            .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+        node.committed = recovered_committed;
+        Ok(node)
+    }
+
+    fn with_storage(
+        cluster: ClusterConfig,
+        durable: Option<DurableRaftLog>,
+        entries: Vec<Entry>,
+        hard_state: HardState,
+    ) -> Result<Self, raft::Error> {
+        let store = MemStorage::new_with_conf_state(ConfState::from((cluster.voters.to_vec(), vec![])));
+        if !entries.is_empty() {
+            store.wl().append(&entries)?;
+        }
+        if hard_state != HardState::default() {
+            store.wl().set_hardstate(hard_state);
+        }
         let cfg = Config {
             id: cluster.node_id,
             election_tick: cluster.election_tick,
@@ -87,6 +233,7 @@ impl RaftNode {
             store,
             outbound: Vec::new(),
             committed: Vec::new(),
+            durable,
         })
     }
 
@@ -103,6 +250,16 @@ impl RaftNode {
     #[inline]
     pub fn leader_id(&self) -> u64 {
         self.node.raft.leader_id
+    }
+
+    #[inline]
+    pub fn term(&self) -> u64 {
+        self.node.raft.term
+    }
+
+    #[inline]
+    pub fn commit_index(&self) -> u64 {
+        self.node.raft.raft_log.committed
     }
 
     /// Starts an election. Production nodes normally reach this through ticks;
@@ -153,6 +310,11 @@ impl RaftNode {
     fn drive(&mut self) {
         while self.node.has_ready() {
             let mut ready = self.node.ready();
+            if let Some(durable) = &mut self.durable {
+                durable
+                    .persist(ready.entries(), ready.hs())
+                    .expect("persist raft Ready before transport");
+            }
             if !ready.entries().is_empty() {
                 self.store
                     .wl()
@@ -196,17 +358,30 @@ mod tests {
     }
 
     fn pump(nodes: &mut [RaftNode]) {
+        pump_active(nodes, &[true; CLUSTER_SIZE]);
+    }
+
+    fn pump_active(nodes: &mut [RaftNode], active: &[bool; CLUSTER_SIZE]) {
         for _ in 0..200 {
             let mut messages = Vec::new();
-            for n in nodes.iter_mut() {
-                messages.extend(n.take_outbound());
+            for (index, n) in nodes.iter_mut().enumerate() {
+                if active[index] {
+                    messages.extend(n.take_outbound());
+                }
             }
             if messages.is_empty() {
                 return;
             }
             for message in messages {
-                let target = nodes.iter_mut().find(|n| n.id() == message.to).unwrap();
-                target.step(message).unwrap();
+                if let Some((index, target)) = nodes
+                    .iter_mut()
+                    .enumerate()
+                    .find(|(_, n)| n.id() == message.to)
+                {
+                    if active[index] {
+                        target.step(message).unwrap();
+                    }
+                }
             }
         }
         panic!("raft message pump did not quiesce");
@@ -231,5 +406,118 @@ mod tests {
     fn follower_cannot_accept_client_commands() {
         let mut follower = node(2);
         assert_eq!(follower.propose(vec![1]), Err(ProposeError::NotLeader));
+    }
+
+    #[test]
+    fn surviving_quorum_elects_a_new_leader_and_commits_after_leader_failure() {
+        let mut nodes = (1..=5).map(node).collect::<Vec<_>>();
+        nodes[0].campaign().unwrap();
+        pump(&mut nodes);
+        nodes[0].propose(b"before-failure".to_vec()).unwrap();
+        pump(&mut nodes);
+        for node in &mut nodes {
+            assert_eq!(node.take_committed(), vec![(2, b"before-failure".to_vec())]);
+        }
+
+        // Node 1 is a hard machine failure: no tick, no outbound delivery and
+        // no inbound delivery. Four surviving voters still exceed quorum.
+        let active = [false, true, true, true, true];
+        for _ in 0..100 {
+            for (index, node) in nodes.iter_mut().enumerate() {
+                if active[index] {
+                    node.tick();
+                }
+            }
+            pump_active(&mut nodes, &active);
+            if nodes
+                .iter()
+                .enumerate()
+                .any(|(index, n)| active[index] && n.is_leader())
+            {
+                break;
+            }
+        }
+        let leader = nodes
+            .iter()
+            .enumerate()
+            .find(|(index, n)| active[*index] && n.is_leader())
+            .map(|(index, _)| index)
+            .expect("surviving quorum must elect a leader");
+        nodes[leader].propose(b"after-failure".to_vec()).unwrap();
+        pump_active(&mut nodes, &active);
+        for (index, node) in nodes.iter_mut().enumerate() {
+            if active[index] {
+                let committed = node.take_committed();
+                assert_eq!(committed.len(), 1);
+                assert!(committed[0].0 > 2, "new leader may append a no-op first");
+                assert_eq!(committed[0].1, b"after-failure".to_vec());
+            }
+        }
+    }
+
+    #[test]
+    fn durable_member_restores_term_commit_and_entries_after_restart() {
+        let path = std::env::temp_dir().join(format!(
+            "tc-raft-state-{}-{}.bin",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_file(&path);
+        let config = ClusterConfig::new(1, VOTERS).unwrap();
+        let mut leader = RaftNode::open(config.clone(), &path).unwrap();
+        let mut followers = (2..=5).map(node).collect::<Vec<_>>();
+
+        leader.campaign().unwrap();
+        for _ in 0..20 {
+            let messages = leader.take_outbound();
+            if messages.is_empty() {
+                break;
+            }
+            for message in messages {
+                let target = followers.iter_mut().find(|n| n.id() == message.to).unwrap();
+                target.step(message).unwrap();
+            }
+            for follower in &mut followers {
+                for message in follower.take_outbound() {
+                    if message.to == leader.id() {
+                        leader.step(message).unwrap();
+                    }
+                }
+            }
+        }
+        assert!(leader.is_leader());
+        leader.propose(b"durable-order".to_vec()).unwrap();
+        for _ in 0..20 {
+            let messages = leader.take_outbound();
+            if messages.is_empty() {
+                break;
+            }
+            for message in messages {
+                let target = followers.iter_mut().find(|n| n.id() == message.to).unwrap();
+                target.step(message).unwrap();
+            }
+            for follower in &mut followers {
+                for message in follower.take_outbound() {
+                    if message.to == leader.id() {
+                        leader.step(message).unwrap();
+                    }
+                }
+            }
+        }
+        let term = leader.term();
+        let commit = leader.commit_index();
+        assert!(term > 0);
+        assert!(commit >= 2);
+        drop(leader);
+
+        let restored = RaftNode::open(config, &path).unwrap();
+        assert_eq!(restored.term(), term);
+        assert_eq!(restored.commit_index(), commit);
+        assert_eq!(
+            restored.committed,
+            vec![(2, b"durable-order".to_vec())],
+            "a committed entry must be re-delivered to the matching state machine after restart"
+        );
+        std::fs::remove_file(path).ok();
     }
 }

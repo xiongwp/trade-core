@@ -6,7 +6,7 @@
 //! commands may enter these logs; this module is the durable per-asset view.
 
 use std::collections::HashMap;
-use std::io;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -23,6 +23,16 @@ pub struct AssetLogMeta {
     pub records: u64,
     pub last_seq: u64,
     pub fingerprint: u64,
+}
+
+/// Deterministic result of replaying a single asset WAL. The fingerprint is
+/// over the emitted matching reports, so it detects a book that appears valid
+/// but produced a different fill sequence.
+pub struct AssetReplaySummary {
+    pub meta: AssetLogMeta,
+    pub reports: Vec<crate::exchange::ExecReport>,
+    pub fingerprint: u64,
+    pub processor: Processor,
 }
 
 /// Owns lazily-opened WAL writers for the instruments local to one machine.
@@ -78,6 +88,37 @@ impl AssetJournalSet {
         }
         Ok(())
     }
+
+    /// Persist a Raft-committed asset command before the matching engine
+    /// mutates memory. The caller advances the application watermark only
+    /// after its shard journal is durable too.
+    pub fn append_committed(&mut self, raft_index: u64, command: &Command) -> io::Result<u64> {
+        let instrument = command.instrument();
+        let seq = self.append(command)?;
+        let writer = self.writers.get_mut(&instrument).expect("writer opened by append");
+        writer.sync_data()?;
+        let _ = raft_index;
+        Ok(seq)
+    }
+
+    pub fn mark_raft_applied(&self, instrument: InstrumentId, raft_index: u64) -> io::Result<()> {
+        write_applied_index(&self.root, instrument, raft_index)
+    }
+}
+
+/// Highest Raft entry durably represented in the local asset and shard logs.
+/// A missing watermark means that recovery must re-submit every committed
+/// entry for this asset.
+pub fn applied_raft_index(root: &Path, instrument: InstrumentId) -> io::Result<u64> {
+    let path = applied_path(root, instrument);
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    let mut bytes = [0u8; 8];
+    file.read_exact(&mut bytes)?;
+    Ok(u64::from_le_bytes(bytes))
 }
 
 /// Read and validate an asset WAL. Sequence gaps or malformed commands are a
@@ -156,8 +197,53 @@ pub fn replay_fresh(
     Ok((processor, meta))
 }
 
+/// Replay one asset and retain the matching output for recovery verification.
+pub fn replay_with_reports(
+    root: &Path,
+    instrument: InstrumentId,
+    strategy: StrategyFactory,
+) -> io::Result<AssetReplaySummary> {
+    let mut processor = Processor::new(strategy, None);
+    let mut reports = Vec::new();
+    for record in JournalReader::open(&asset_path(root, instrument))? {
+        let command = wire::WireView::parse(&record.frame)
+            .and_then(|view| view.to_command())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid asset command"))?;
+        processor.process(command, &mut |report| reports.push(report));
+    }
+    let mut bytes = Vec::with_capacity(reports.len() * crate::wire::REPORT_LEN);
+    for report in &reports {
+        let mut frame = [0u8; crate::wire::REPORT_LEN];
+        wire::encode_report(report, &mut frame);
+        bytes.extend_from_slice(&frame);
+    }
+    Ok(AssetReplaySummary {
+        meta: inspect(root, instrument)?,
+        fingerprint: journal::fnv1a(&bytes),
+        reports,
+        processor,
+    })
+}
+
 fn asset_path(root: &Path, instrument: InstrumentId) -> PathBuf {
     root.join(format!("asset-{:010}.wal", instrument.0))
+}
+
+fn applied_path(root: &Path, instrument: InstrumentId) -> PathBuf {
+    root.join(format!("asset-{:010}.applied", instrument.0))
+}
+
+fn write_applied_index(root: &Path, instrument: InstrumentId, raft_index: u64) -> io::Result<()> {
+    let path = applied_path(root, instrument);
+    let current = applied_raft_index(root, instrument)?;
+    if raft_index <= current {
+        return Ok(());
+    }
+    let temp = path.with_extension("applied.tmp");
+    let mut file = std::fs::File::create(&temp)?;
+    file.write_all(&raft_index.to_le_bytes())?;
+    file.sync_all()?;
+    std::fs::rename(temp, path)
 }
 
 fn last_seq(path: &Path) -> io::Result<u64> {
@@ -207,6 +293,23 @@ mod tests {
         assert_eq!(replayed, meta);
         assert_eq!(processor.engine(btc).unwrap().book().len(), 1);
         assert!(processor.engine(eth).is_none());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn cross_asset_batch_is_rejected_before_it_can_reach_a_wal() {
+        let root = std::env::temp_dir().join(format!("tc-asset-log-batch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut logs = AssetJournalSet::open(&root, Duration::from_millis(1)).unwrap();
+        let btc = InstrumentId(1);
+        let eth = InstrumentId(2);
+        let command = Command::Batch(vec![
+            Command::New(Order::limit(OrderId(1), Side::Buy, 100, 1).on(btc)),
+            Command::New(Order::limit(OrderId(2), Side::Sell, 100, 1).on(eth)),
+        ]);
+        let error = logs.append(&command).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(!logs.path_for(btc).exists());
         std::fs::remove_dir_all(&root).ok();
     }
 }

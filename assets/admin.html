@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>trade-core operations</title>
+<style>
+:root { --bg:#101418; --panel:#181f26; --line:#2b3640; --text:#e8edf2; --muted:#93a1af; --green:#40c98b; --amber:#f0b44d; }
+* { box-sizing:border-box; } body { margin:0; background:var(--bg); color:var(--text); font:14px system-ui,-apple-system,sans-serif; }
+header { height:56px; display:flex; align-items:center; padding:0 24px; border-bottom:1px solid var(--line); background:#141a20; }
+header strong { font-size:16px; } header span { margin-left:12px; color:var(--muted); } header a { margin-left:auto; color:#a7c7ff; text-decoration:none; }
+main { max-width:1400px; margin:0 auto; padding:24px; } h1 { margin:0 0 20px; font-size:22px; font-weight:650; }
+.summary { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; margin-bottom:24px; }
+.metric { border:1px solid var(--line); background:var(--panel); padding:16px; border-radius:6px; } .metric label { color:var(--muted); display:block; margin-bottom:8px; } .metric strong { font-size:26px; }
+.healthy { color:var(--green); } .bar { display:flex; align-items:center; margin-bottom:12px; } .bar h2 { margin:0; font-size:16px; } .bar span { margin-left:10px; color:var(--muted); } .bar input { margin-left:auto; width:220px; background:#11161b; border:1px solid var(--line); border-radius:4px; color:var(--text); padding:8px; } .auth { display:flex; gap:8px; margin-bottom:18px; } .auth input { flex:1; max-width:400px; background:#11161b; border:1px solid var(--line); border-radius:4px; color:var(--text); padding:8px; } button { border:1px solid #3976c5; background:#1d4f8d; border-radius:4px; color:white; padding:8px 12px; cursor:pointer; }
+table { width:100%; border-collapse:collapse; background:var(--panel); border:1px solid var(--line); } th,td { padding:12px; border-bottom:1px solid var(--line); text-align:right; white-space:nowrap; } th { color:var(--muted); font-size:12px; font-weight:600; } th:first-child,td:first-child { text-align:left; } tr:last-child td { border-bottom:0; } .empty { color:var(--muted); text-align:center; padding:28px; }
+footer { color:var(--muted); padding-top:14px; font-size:12px; } @media(max-width:700px){ main{padding:16px}.summary{grid-template-columns:1fr}.bar{align-items:flex-start;gap:8px;flex-wrap:wrap}.bar input{margin-left:0;width:100%}table{font-size:12px}th,td{padding:9px} }
+</style>
+</head>
+<body>
+<header><strong>trade-core</strong><span>Operations</span><a href="/">Market data</a></header>
+<main>
+<h1>Venue Operations <span class="healthy" id="status">LIVE</span></h1>
+<div class="auth"><input id="token" type="password" autocomplete="off" placeholder="Admin bearer token"><button id="connect">Connect</button></div>
+<section class="summary"><div class="metric"><label>Active assets</label><strong id="assets">-</strong></div><div class="metric"><label>Recent trades retained</label><strong id="trades">-</strong></div><div class="metric"><label>Recent volume retained</label><strong id="volume">-</strong></div></section>
+<div class="bar"><h2>Asset Operations</h2><span id="updated">Loading...</span><input id="filter" placeholder="Filter instrument"></div>
+<table><thead><tr><th>Instrument</th><th>Recent trades</th><th>Recent volume</th><th>Bid levels</th><th>Ask levels</th><th>Last trade</th></tr></thead><tbody id="rows"></tbody></table>
+<footer>Read-only dashboard. Trading controls require an authenticated, audited control plane.</footer>
+</main>
+<script>
+const n = v => Number(v).toLocaleString(); let data=[];
+function draw(){const q=document.getElementById('filter').value.trim(); const rows=data.filter(x=>!q||String(x.instrument).includes(q)); const body=document.getElementById('rows'); body.innerHTML=rows.length?rows.map(x=>`<tr><td>${x.instrument}</td><td>${n(x.trades)}</td><td>${n(x.volume)}</td><td>${x.bid_levels}</td><td>${x.ask_levels}</td><td>${x.last_trade?new Date(x.last_trade*1000).toLocaleTimeString():'-'}</td></tr>`).join(''):'<tr><td class="empty" colspan="6">No matching assets</td></tr>';}
+async function load(){try{const token=document.getElementById('token').value; if(!token){document.getElementById('status').textContent='AUTH REQUIRED';return;} const r=await fetch('/api/admin/overview',{headers:{Authorization:'Bearer '+token}}); if(!r.ok)throw Error(); const d=await r.json(); data=d.instruments; document.getElementById('assets').textContent=n(d.assets); document.getElementById('trades').textContent=n(d.recent_trades); document.getElementById('volume').textContent=n(d.recent_volume); document.getElementById('updated').textContent='Updated '+new Date().toLocaleTimeString(); document.getElementById('status').textContent='LIVE'; draw();}catch(_){document.getElementById('status').textContent='ACCESS DENIED';}}
+document.getElementById('filter').addEventListener('input',draw); document.getElementById('connect').addEventListener('click',load); setInterval(load,2000);
+</script>
+</body>
+</html>

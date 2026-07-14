@@ -1,0 +1,21 @@
+services:
+  raft-1:
+    build: .
+    image: trade-core-node
+    command: ["exec raft-sim 1 raft-1:7001 1@raft-1:7001,2@raft-2:7002,3@raft-3:7003,4@raft-4:7004,5@raft-5:7005"]
+  raft-2:
+    image: trade-core-node
+    depends_on: [raft-1]
+    command: ["exec raft-sim 2 raft-2:7002 1@raft-1:7001,2@raft-2:7002,3@raft-3:7003,4@raft-4:7004,5@raft-5:7005"]
+  raft-3:
+    image: trade-core-node
+    depends_on: [raft-1]
+    command: ["exec raft-sim 3 raft-3:7003 1@raft-1:7001,2@raft-2:7002,3@raft-3:7003,4@raft-4:7004,5@raft-5:7005"]
+  raft-4:
+    image: trade-core-node
+    depends_on: [raft-1]
+    command: ["exec raft-sim 4 raft-4:7004 1@raft-1:7001,2@raft-2:7002,3@raft-3:7003,4@raft-4:7004,5@raft-5:7005"]
+  raft-5:
+    image: trade-core-node
+    depends_on: [raft-1]
+    command: ["exec raft-sim 5 raft-5:7005 1@raft-1:7001,2@raft-2:7002,3@raft-3:7003,4@raft-4:7004,5@raft-5:7005"]

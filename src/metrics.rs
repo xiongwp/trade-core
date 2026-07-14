@@ -24,6 +24,10 @@ pub struct Metrics {
     pub raft_term: AtomicU64,
     pub raft_leader_id: AtomicU64,
     pub raft_commit_index: AtomicU64,
+    pub command_latency_ns_total: AtomicU64,
+    pub command_latency_ns_max: AtomicU64,
+    pub command_latency_samples: AtomicU64,
+    pub asset_wal_errors: AtomicU64,
 }
 
 impl Metrics {
@@ -75,6 +79,10 @@ impl Metrics {
                 self.raft_leader_id.load(Ordering::Relaxed)),
             format!("# HELP tc_raft_commit_index Highest Raft entry committed by quorum\n# TYPE tc_raft_commit_index gauge\ntc_raft_commit_index {}\n",
                 self.raft_commit_index.load(Ordering::Relaxed)),
+            c("command_latency_ns_total", "Total matching command processing time in nanoseconds", self.command_latency_ns_total.load(Ordering::Relaxed)),
+            c("command_latency_samples", "Matching command latency samples", self.command_latency_samples.load(Ordering::Relaxed)),
+            format!("# HELP tc_command_latency_ns_max Maximum matching command processing time in nanoseconds\n# TYPE tc_command_latency_ns_max gauge\ntc_command_latency_ns_max {}\n", self.command_latency_ns_max.load(Ordering::Relaxed)),
+            c("asset_wal_errors", "Per-asset WAL append failures", self.asset_wal_errors.load(Ordering::Relaxed)),
         ]
         .concat()
     }
@@ -94,6 +102,14 @@ impl Metrics {
         self.raft_leader_id.store(leader_id, Ordering::Relaxed);
         self.raft_commit_index
             .store(commit_index, Ordering::Relaxed);
+    }
+
+    pub fn record_command_latency(&self, elapsed_ns: u64) {
+        self.command_latency_ns_total
+            .fetch_add(elapsed_ns, Ordering::Relaxed);
+        self.command_latency_ns_max
+            .fetch_max(elapsed_ns, Ordering::Relaxed);
+        self.command_latency_samples.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -164,5 +180,18 @@ mod tests {
         assert!(text.contains("tc_cancels 1"));
         assert!(text.contains("# TYPE tc_trades counter"));
         assert!(text.contains("tc_raft_commit_index 0"));
+    }
+
+    #[test]
+    fn latency_and_asset_wal_metrics_render() {
+        let m = Metrics::default();
+        m.record_command_latency(100);
+        m.record_command_latency(250);
+        m.asset_wal_errors.fetch_add(1, Ordering::Relaxed);
+        let text = m.render();
+        assert!(text.contains("tc_command_latency_ns_total 350"));
+        assert!(text.contains("tc_command_latency_samples 2"));
+        assert!(text.contains("tc_command_latency_ns_max 250"));
+        assert!(text.contains("tc_asset_wal_errors 1"));
     }
 }

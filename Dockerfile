@@ -1,21 +1,33 @@
 # trade-core matching node — multi-stage build, zero crate dependencies so the
 # build is just this repo's compilation.
 FROM rust:1-slim AS build
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends pkg-config libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY Cargo.toml ./
+COPY Cargo.lock ./
 COPY src ./src
 COPY assets ./assets
 COPY benches ./benches
 COPY examples ./examples
 RUN cargo build --release \
-    --bin trade-core --bin order --bin market-data --bin order_client --bin order_load
+    --bin raft-sim \
+    --bin raft-node \
+    --bin trade-core --bin order --bin order-api --bin market-data --bin order_client --bin order_load
 
 FROM debian:stable-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libssl3 \
+    && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/target/release/trade-core /usr/local/bin/trade-core
 COPY --from=build /src/target/release/order /usr/local/bin/order
+COPY --from=build /src/target/release/order-api /usr/local/bin/order-api
 COPY --from=build /src/target/release/market-data /usr/local/bin/market-data
 COPY --from=build /src/target/release/order_client /usr/local/bin/order_client
 COPY --from=build /src/target/release/order_load /usr/local/bin/order_load
+COPY --from=build /src/target/release/raft-sim /usr/local/bin/raft-sim
+COPY --from=build /src/target/release/raft-node /usr/local/bin/raft-node
 
 # Journal + snapshots live here; mount a volume to survive container restarts
 # (the server recovers state from snapshot + journal on startup).

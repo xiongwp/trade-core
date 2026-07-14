@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>trade-core trading terminal</title>
+<style>
+:root{--bg:#101418;--panel:#181f26;--line:#2b3640;--text:#e8edf2;--muted:#93a1af;--green:#40c98b;--red:#ee6b6e;--blue:#3976c5}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px system-ui,-apple-system,sans-serif}header{height:56px;display:flex;align-items:center;padding:0 24px;border-bottom:1px solid var(--line);background:#141a20}header strong{font-size:16px}header span{margin-left:12px;color:var(--muted)}header a{margin-left:auto;color:#a7c7ff;text-decoration:none}main{max-width:1120px;margin:0 auto;padding:24px}.grid{display:grid;grid-template-columns:minmax(0,1.1fr) minmax(300px,.9fr);gap:16px}.panel{border:1px solid var(--line);background:var(--panel);padding:18px;border-radius:6px}h1{font-size:22px;margin:0 0 20px}h2{font-size:16px;margin:0 0 14px}.token{display:flex;gap:8px;margin-bottom:16px}.token input{max-width:430px;flex:1}.fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.full{grid-column:1/-1}label{display:grid;gap:6px;color:var(--muted);font-size:12px}input,select{width:100%;background:#11161b;border:1px solid var(--line);border-radius:4px;color:var(--text);padding:9px;font:inherit}button{border:1px solid var(--blue);background:#1d4f8d;border-radius:4px;color:white;padding:10px 14px;cursor:pointer;font:inherit}.sell{background:#8b3238;border-color:#b84d55}.actions{display:flex;gap:8px;margin-top:16px}.status{min-height:22px;margin:14px 0;color:var(--muted)}.ok{color:var(--green)}.err{color:var(--red)}table{width:100%;border-collapse:collapse}th,td{padding:9px;border-bottom:1px solid var(--line);text-align:right}th{font-size:12px;color:var(--muted);font-weight:600}th:first-child,td:first-child{text-align:left}@media(max-width:760px){main{padding:16px}.grid{grid-template-columns:1fr}.fields{grid-template-columns:1fr}.full{grid-column:auto}}
+</style>
+</head>
+<body>
+<header><strong>trade-core</strong><span>Trading Terminal</span><a href="/">Market data</a><a href="/admin" style="margin-left:16px">Operations</a></header>
+<main>
+<h1>Order Entry</h1>
+<div class="token"><input id="token" type="password" placeholder="Trading bearer token" autocomplete="off"><button id="save">Connect</button></div>
+<div class="grid">
+<section class="panel"><h2>Limit Order</h2><div class="fields">
+<label>Instrument<input id="instrument" type="number" min="0" value="1"></label>
+<label>User ID<input id="user" type="number" min="1" value="1001"></label>
+<label>Price<input id="price" type="number" min="1" value="1000"></label>
+<label>Quantity<input id="qty" type="number" min="1" value="1"></label>
+</div><div class="actions"><button id="buy">Buy</button><button class="sell" id="sell">Sell</button></div><p class="status" id="status">Enter a token to submit orders.</p></section>
+<section class="panel"><h2>Cancel Order</h2><div class="fields"><label>Instrument<input id="cancelInstrument" type="number" min="0" value="1"></label><label>User ID<input id="cancelUser" type="number" min="1" value="1001"></label><label class="full">Order ID<input id="cancelOrder" type="number" min="1"></label></div><div class="actions"><button id="cancel">Cancel</button></div></section>
+</div>
+<section class="panel" style="margin-top:16px"><h2>Recent Trade Feed</h2><table><thead><tr><th>Time</th><th>Price</th><th>Quantity</th><th>Maker fee</th><th>Taker fee</th></tr></thead><tbody id="trades"><tr><td colspan="5">Select an instrument</td></tr></tbody></table></section>
+</main>
+<script>
+let sequence=0;const el=id=>document.getElementById(id);const value=id=>el(id).value;const id=()=>String(Date.now()*1000000+(sequence++%1000000));function setStatus(message,kind=''){el('status').textContent=message;el('status').className='status '+kind}function token(){return value('token').trim()}async function post(path,params){if(!token())throw Error('Trading token is required');const r=await fetch(path+'?'+new URLSearchParams(params),{method:'POST',headers:{Authorization:'Bearer '+token()}});if(!r.ok){let d={};try{d=await r.json()}catch(_){}throw Error(d.error||'Request failed')}return r.json()}async function submit(side){const orderId=id();try{await post('/api/trade/order',{instrument:value('instrument'),user:value('user'),price:value('price'),qty:value('qty'),side,order_id:orderId});el('cancelOrder').value=orderId;el('cancelUser').value=value('user');setStatus(`${side.toUpperCase()} order ${orderId} accepted for gateway delivery.`,'ok')}catch(e){setStatus(e.message,'err')}}async function cancel(){try{await post('/api/trade/cancel',{instrument:value('cancelInstrument'),user:value('cancelUser'),order_id:value('cancelOrder'),cmd_id:id()});setStatus(`Cancel ${value('cancelOrder')} accepted for gateway delivery.`,'ok')}catch(e){setStatus(e.message,'err')}}async function loadTrades(){const sym=value('instrument');try{const r=await fetch('/api/trades?symbol='+encodeURIComponent(sym)+'&limit=12');const rows=await r.json();el('trades').innerHTML=rows.length?rows.slice().reverse().map(x=>`<tr><td>${new Date(x[0]*1000).toLocaleTimeString()}</td><td>${x[1]}</td><td>${x[2]}</td><td>${x[3]}</td><td>${x[4]}</td></tr>`).join(''):'<tr><td colspan="5">No trades yet</td></tr>'}catch(_){}}el('save').onclick=()=>setStatus(token()?'Connected.':'Trading token is required.',token()?'ok':'err');el('buy').onclick=()=>submit('buy');el('sell').onclick=()=>submit('sell');el('cancel').onclick=cancel;el('instrument').onchange=loadTrades;setInterval(loadTrades,1500);loadTrades();
+</script>
+</body>
+</html>

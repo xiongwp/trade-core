@@ -15,6 +15,9 @@
 //!
 //! Endpoints:
 //!   GET /                   chart UI
+//!   GET /admin              operations dashboard
+//!   GET /trade              authenticated order-entry terminal
+//!   GET /api/admin/overview operational asset summary
 //!   GET /api/symbols        [1,2,…]
 //!   GET /api/candles?symbol=1&interval=1m&limit=120
 //!   GET /api/depth?symbol=1 {"bids":[[p,q],…],"asks":[[p,q],…]}
@@ -29,9 +32,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use trade_core::kline::KlineAggregator;
 use trade_core::wire::{self, REPORT_LEN, RT_DEPTH_END, RT_DEPTH_LEVEL};
-use trade_core::{InstrumentId, Price, Qty};
+use trade_core::{InstrumentId, Order, OrderId, Price, Qty, Side};
 
 const CHART_HTML: &str = include_str!("../../assets/kline.html");
+const ADMIN_HTML: &str = include_str!("../../assets/admin.html");
+const TRADE_HTML: &str = include_str!("../../assets/trade.html");
 const RT_TRADE: u8 = 2;
 
 /// (ts, price, qty, maker_fee, taker_fee), newest last.
@@ -64,14 +69,29 @@ struct State {
 }
 
 fn now_sec() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
 // Feed: subscribe to trade-core's fanout, ingest trades + depth
 // ---------------------------------------------------------------------------
 
-fn feed_loop(md_addr: String, state: Arc<Mutex<State>>) {
+fn feed_loop(md_addrs: String, state: Arc<Mutex<State>>) {
+    for md_addr in md_addrs
+        .split(',')
+        .map(str::trim)
+        .filter(|addr| !addr.is_empty())
+    {
+        let state = state.clone();
+        let md_addr = md_addr.to_string();
+        std::thread::spawn(move || feed_one(md_addr, state));
+    }
+}
+
+fn feed_one(md_addr: String, state: Arc<Mutex<State>>) {
     loop {
         let mut sock = match TcpStream::connect(&md_addr) {
             Ok(s) => s,
@@ -161,12 +181,50 @@ fn candles_json(st: &State, sym: InstrumentId, interval: &str, limit: usize) -> 
     s
 }
 
+/// Read-only operating summary. Commands are deliberately absent until the
+/// control plane has authentication, authorization and an immutable audit log.
+fn admin_overview_json(st: &State) -> String {
+    let instruments = st.agg.instruments();
+    let mut rows = Vec::with_capacity(instruments.len());
+    let mut total_trades = 0usize;
+    let mut total_volume = 0u64;
+    for instrument in instruments {
+        let trades = st.trades.get(&instrument);
+        let trade_count = trades.map_or(0, |q| q.len());
+        let volume = trades.map_or(0, |q| q.iter().map(|(_, _, qty, _, _)| *qty).sum());
+        let last_trade = trades
+            .and_then(|q| q.back().map(|(ts, _, _, _, _)| *ts))
+            .unwrap_or(0);
+        let depth = st.depth.live.get(&instrument);
+        let bid_levels = depth.map_or(0, |d| d.bids.len());
+        let ask_levels = depth.map_or(0, |d| d.asks.len());
+        total_trades += trade_count;
+        total_volume += volume;
+        rows.push(format!(
+            "{{\"instrument\":{},\"trades\":{trade_count},\"volume\":{volume},\"last_trade\":{last_trade},\"bid_levels\":{bid_levels},\"ask_levels\":{ask_levels}}}",
+            instrument.0
+        ));
+    }
+    format!(
+        "{{\"assets\":{},\"recent_trades\":{total_trades},\"recent_volume\":{total_volume},\"instruments\":[{}]}}",
+        rows.len(),
+        rows.join(",")
+    )
+}
+
 fn depth_json(st: &State, sym: InstrumentId) -> String {
     let d = st.depth.live.get(&sym).cloned().unwrap_or_default();
     let fmt = |v: &[(Price, Qty)]| {
-        v.iter().map(|(p, q)| format!("[{p},{q}]")).collect::<Vec<_>>().join(",")
+        v.iter()
+            .map(|(p, q)| format!("[{p},{q}]"))
+            .collect::<Vec<_>>()
+            .join(",")
     };
-    format!("{{\"bids\":[{}],\"asks\":[{}]}}", fmt(&d.bids), fmt(&d.asks))
+    format!(
+        "{{\"bids\":[{}],\"asks\":[{}]}}",
+        fmt(&d.bids),
+        fmt(&d.asks)
+    )
 }
 
 fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
@@ -182,8 +240,13 @@ fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
 
 /// SHA-1 (needed only for the WS handshake accept key — not for security).
 fn sha1(data: &[u8]) -> [u8; 20] {
-    let (mut h0, mut h1, mut h2, mut h3, mut h4) =
-        (0x67452301u32, 0xEFCDAB89u32, 0x98BADCFEu32, 0x10325476u32, 0xC3D2E1F0u32);
+    let (mut h0, mut h1, mut h2, mut h3, mut h4) = (
+        0x67452301u32,
+        0xEFCDAB89u32,
+        0x98BADCFEu32,
+        0x10325476u32,
+        0xC3D2E1F0u32,
+    );
     let ml = (data.len() as u64) * 8;
     let mut msg = data.to_vec();
     msg.push(0x80);
@@ -240,8 +303,16 @@ fn base64(data: &[u8]) -> String {
         let n = u32::from_be_bytes([0, b[0], b[1], b[2]]);
         s.push(T[(n >> 18 & 63) as usize] as char);
         s.push(T[(n >> 12 & 63) as usize] as char);
-        s.push(if c.len() > 1 { T[(n >> 6 & 63) as usize] as char } else { '=' });
-        s.push(if c.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+        s.push(if c.len() > 1 {
+            T[(n >> 6 & 63) as usize] as char
+        } else {
+            '='
+        });
+        s.push(if c.len() > 2 {
+            T[(n & 63) as usize] as char
+        } else {
+            '='
+        });
     }
     s
 }
@@ -273,7 +344,7 @@ fn ws_drain_client(stream: &mut TcpStream) -> std::io::Result<bool> {
             if e.kind() == std::io::ErrorKind::WouldBlock
                 || e.kind() == std::io::ErrorKind::TimedOut =>
         {
-            return Ok(true) // nothing pending
+            return Ok(true); // nothing pending
         }
         Err(e) => return Err(e),
         Ok(0) => return Ok(false),
@@ -353,46 +424,156 @@ fn respond(stream: &mut TcpStream, status: &str, ctype: &str, body: &[u8]) {
     let _ = stream.write_all(body);
 }
 
-fn handle_http(mut stream: TcpStream, state: &Arc<Mutex<State>>) {
+fn handle_http(
+    mut stream: TcpStream,
+    state: &Arc<Mutex<State>>,
+    admin_token: Option<&str>,
+    trading_token: Option<&str>,
+    order_api: &str,
+    order_api_token: &str,
+) {
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
     let mut reader = BufReader::new(stream.try_clone().expect("clone"));
     let mut line = String::new();
     if reader.read_line(&mut line).is_err() {
         return;
     }
+    let method = line.split_whitespace().next().unwrap_or("GET");
     let path_full = line.split_whitespace().nth(1).unwrap_or("/").to_string();
-    let (path, query) = path_full.split_once('?').unwrap_or((path_full.as_str(), ""));
+    let (path, query) = path_full
+        .split_once('?')
+        .unwrap_or((path_full.as_str(), ""));
 
     // Read headers (needed for the WS key).
     let mut ws_key = None;
+    let mut authorization = None;
     let mut hl = String::new();
     while reader.read_line(&mut hl).is_ok() && hl.trim() != "" {
         if let Some((k, v)) = hl.split_once(':') {
             if k.eq_ignore_ascii_case("sec-websocket-key") {
                 ws_key = Some(v.trim().to_string());
             }
+            if k.eq_ignore_ascii_case("authorization") {
+                authorization = Some(v.trim().to_string());
+            }
         }
         hl.clear();
     }
 
     match path {
-        "/" | "/index.html" => {
-            respond(&mut stream, "200 OK", "text/html; charset=utf-8", CHART_HTML.as_bytes())
-        }
+        "/" | "/index.html" => respond(
+            &mut stream,
+            "200 OK",
+            "text/html; charset=utf-8",
+            CHART_HTML.as_bytes(),
+        ),
+        "/admin" | "/admin/" => respond(
+            &mut stream,
+            "200 OK",
+            "text/html; charset=utf-8",
+            ADMIN_HTML.as_bytes(),
+        ),
+        "/trade" | "/trade/" => respond(
+            &mut stream,
+            "200 OK",
+            "text/html; charset=utf-8",
+            TRADE_HTML.as_bytes(),
+        ),
         "/ws" => {
             if let Some(key) = ws_key {
                 let _ = ws_session(stream, &key, query, state);
             } else {
-                respond(&mut stream, "400 Bad Request", "text/plain", b"expected websocket");
+                respond(
+                    &mut stream,
+                    "400 Bad Request",
+                    "text/plain",
+                    b"expected websocket",
+                );
             }
         }
         "/api/symbols" => {
             let syms = state.lock().unwrap().agg.instruments();
             let body = format!(
                 "[{}]",
-                syms.iter().map(|s| s.0.to_string()).collect::<Vec<_>>().join(",")
+                syms.iter()
+                    .map(|s| s.0.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
             );
             respond(&mut stream, "200 OK", "application/json", body.as_bytes());
+        }
+        "/api/admin/overview" => match admin_access(authorization.as_deref(), admin_token) {
+            Ok(()) => {
+                let body = admin_overview_json(&state.lock().unwrap());
+                respond(&mut stream, "200 OK", "application/json", body.as_bytes());
+            }
+            Err((status, message)) => {
+                respond(&mut stream, status, "application/json", message.as_bytes());
+            }
+        },
+        "/api/trade/order" if method == "POST" => {
+            match admin_access(authorization.as_deref(), trading_token) {
+                Ok(()) => match new_order_from_query(query) {
+                    Ok(order) => {
+                        let _ = order;
+                        match forward_order_api(order_api, "/orders", query, order_api_token) {
+                            Ok(()) => respond(
+                                &mut stream,
+                                "202 Accepted",
+                                "application/json",
+                                b"{\"accepted\":true}",
+                            ),
+                            Err(error) => respond(
+                                &mut stream,
+                                "503 Service Unavailable",
+                                "application/json",
+                                format!("{{\"error\":\"{error}\"}}").as_bytes(),
+                            ),
+                        }
+                    }
+                    Err(message) => respond(
+                        &mut stream,
+                        "400 Bad Request",
+                        "application/json",
+                        message.as_bytes(),
+                    ),
+                },
+                Err((status, message)) => {
+                    respond(&mut stream, status, "application/json", message.as_bytes())
+                }
+            }
+        }
+        "/api/trade/cancel" if method == "POST" => {
+            match admin_access(authorization.as_deref(), trading_token) {
+                Ok(()) => match cancel_from_query(query) {
+                    Ok((instrument, order_id, cmd_id)) => {
+                        let _ = (instrument, order_id, cmd_id);
+                        match forward_order_api(order_api, "/cancels", query, order_api_token) {
+                            Ok(()) => respond(
+                                &mut stream,
+                                "202 Accepted",
+                                "application/json",
+                                b"{\"accepted\":true}",
+                            ),
+                            Err(error) => respond(
+                                &mut stream,
+                                "503 Service Unavailable",
+                                "application/json",
+                                format!("{{\"error\":\"{error}\"}}").as_bytes(),
+                            ),
+                        }
+                    }
+                    Err(message) => respond(
+                        &mut stream,
+                        "400 Bad Request",
+                        "application/json",
+                        message.as_bytes(),
+                    ),
+                },
+                Err((status, message)) => {
+                    respond(&mut stream, status, "application/json", message.as_bytes())
+                }
+            }
         }
         "/api/candles" => {
             let symbol = query_param(query, "symbol")
@@ -400,8 +581,9 @@ fn handle_http(mut stream: TcpStream, state: &Arc<Mutex<State>>) {
                 .map(InstrumentId)
                 .unwrap_or(InstrumentId(1));
             let interval = query_param(query, "interval").unwrap_or("1m");
-            let limit: usize =
-                query_param(query, "limit").and_then(|v| v.parse().ok()).unwrap_or(120);
+            let limit: usize = query_param(query, "limit")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(120);
             let body = candles_json(&state.lock().unwrap(), symbol, interval, limit);
             respond(&mut stream, "200 OK", "application/json", body.as_bytes());
         }
@@ -411,8 +593,9 @@ fn handle_http(mut stream: TcpStream, state: &Arc<Mutex<State>>) {
                 .and_then(|v| v.parse().ok())
                 .map(InstrumentId)
                 .unwrap_or(InstrumentId(1));
-            let limit: usize =
-                query_param(query, "limit").and_then(|v| v.parse().ok()).unwrap_or(100);
+            let limit: usize = query_param(query, "limit")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(100);
             let st = state.lock().unwrap();
             let empty = TradeRing::new();
             let dq = st.trades.get(&symbol).unwrap_or(&empty);
@@ -438,11 +621,84 @@ fn handle_http(mut stream: TcpStream, state: &Arc<Mutex<State>>) {
     }
 }
 
+fn required_query<T: std::str::FromStr>(query: &str, key: &str) -> Result<T, String> {
+    query_param(query, key)
+        .ok_or_else(|| format!("{{\"error\":\"missing {key}\"}}"))?
+        .parse()
+        .map_err(|_| format!("{{\"error\":\"invalid {key}\"}}"))
+}
+
+fn new_order_from_query(query: &str) -> Result<Order, String> {
+    let side = match query_param(query, "side") {
+        Some("buy") => Side::Buy,
+        Some("sell") => Side::Sell,
+        _ => return Err("{\"error\":\"side must be buy or sell\"}".into()),
+    };
+    let instrument = InstrumentId(required_query(query, "instrument")?);
+    let order_id = OrderId(required_query(query, "order_id")?);
+    let price = required_query(query, "price")?;
+    let qty = required_query(query, "qty")?;
+    let user = required_query(query, "user")?;
+    Ok(Order::limit(order_id, side, price, qty)
+        .on(instrument)
+        .by(user))
+}
+
+fn cancel_from_query(query: &str) -> Result<(InstrumentId, OrderId, u64), String> {
+    Ok((
+        InstrumentId(required_query(query, "instrument")?),
+        OrderId(required_query(query, "order_id")?),
+        required_query(query, "cmd_id")?,
+    ))
+}
+
+fn forward_order_api(order_api: &str, path: &str, query: &str, token: &str) -> std::io::Result<()> {
+    let mut stream = TcpStream::connect(order_api)?;
+    stream.set_nodelay(true)?;
+    stream.write_all(format!("POST {path}?{query} HTTP/1.1\r\nHost: order-api\r\nAuthorization: Bearer {token}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes())?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    if response.starts_with("HTTP/1.1 202") {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "order API rejected request",
+        ))
+    }
+}
+
+fn admin_access<'a>(
+    authorization: Option<&str>,
+    configured: Option<&'a str>,
+) -> Result<(), (&'a str, String)> {
+    let Some(token) = configured.filter(|token| !token.is_empty()) else {
+        return Err((
+            "503 Service Unavailable",
+            "{\"error\":\"admin access is not configured\"}".into(),
+        ));
+    };
+    let expected = format!("Bearer {token}");
+    if authorization == Some(expected.as_str()) {
+        Ok(())
+    } else {
+        Err((
+            "401 Unauthorized",
+            "{\"error\":\"admin authorization required\"}".into(),
+        ))
+    }
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let md_addr = args.next().unwrap_or_else(|| "127.0.0.1:9101".to_string());
     let http_addr = args.next().unwrap_or_else(|| "0.0.0.0:8080".to_string());
     let data_dir = args.next().unwrap_or_else(|| "./md-data".to_string());
+    let admin_token = std::env::var("TC_ADMIN_TOKEN").ok();
+    let trading_token = std::env::var("TC_TRADING_TOKEN").ok();
+    let order_api =
+        std::env::var("TC_ORDER_API_ADDR").unwrap_or_else(|_| "127.0.0.1:9200".to_string());
+    let order_api_token = std::env::var("TC_ORDER_API_TOKEN").expect("TC_ORDER_API_TOKEN");
 
     // Load persisted candle history, if any.
     let persist: Option<PathBuf> = (data_dir != "none").then(|| {
@@ -491,6 +747,19 @@ fn main() {
     eprintln!("[md] chart UI + API + WS on http://{http_addr}/");
     for stream in listener.incoming().flatten() {
         let state = state.clone();
-        std::thread::spawn(move || handle_http(stream, &state));
+        let admin_token = admin_token.clone();
+        let trading_token = trading_token.clone();
+        let order_api = order_api.clone();
+        let order_api_token = order_api_token.clone();
+        std::thread::spawn(move || {
+            handle_http(
+                stream,
+                &state,
+                admin_token.as_deref(),
+                trading_token.as_deref(),
+                &order_api,
+                &order_api_token,
+            )
+        });
     }
 }
