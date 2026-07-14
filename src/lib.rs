@@ -49,6 +49,7 @@ pub mod kline;
 pub mod lockfree;
 pub mod metrics;
 pub mod order;
+pub mod order_queue;
 pub mod raft_log;
 pub mod replication;
 pub mod risk;

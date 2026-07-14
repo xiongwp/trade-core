@@ -1,13 +1,13 @@
-//! Order-system database sharding: **10 databases × 100 tables** by user id.
+//! Order-system database sharding: **10 databases × 100 tables** by asset
+//! category.
 //!
-//! The order system persists orders/positions per user. To spread load it
-//! shards by `user_id` into 1000 slots mapped onto 10 physical databases of 100
-//! tables each. The mapping must be:
+//! Orders for one category stay together so Kafka partition order, the MySQL
+//! outbox and the matching route all share the same ownership boundary.
 //!
 //! * **deterministic** — every service instance routes the same user to the
 //!   same table, forever (resharding is a data migration, not a code change);
-//! * **uniform** — user ids may be sequential (Leaf-style), so the slot is
-//!   taken from a mixed hash rather than raw modulo of possibly-skewed ids.
+//! * **stable** — changing category ownership is an explicit migration rather
+//!   than a side effect of adding users.
 //!
 //! This module is the *routing layer* only — it computes where a row lives and
 //! generates the DDL names; actual SQL execution belongs to the order-system
@@ -25,7 +25,7 @@ pub const SLOTS: u64 = DB_COUNT * TABLES_PER_DB;
 /// instruments 1..=1000 share one ordered stream, 1001..=2000 the next, etc.
 pub const DEFAULT_ASSET_CATEGORY_SIZE: u32 = 1_000;
 
-/// Where a user's rows live.
+/// Where an asset category's rows live.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ShardRoute {
     /// 0..10
@@ -42,25 +42,19 @@ impl ShardRoute {
 
     /// Physical table name, e.g. `orders_042`.
     pub fn table_name(&self) -> String {
-        format!("orders_{:03}", self.table)
+        format!("asset_orders_{:03}", self.table)
     }
 }
 
-/// Mix the user id so sequential ids spread uniformly (splitmix64 finalizer).
+/// Route a category to one of 1,000 stable slots. Consecutive categories are
+/// striped across databases first, then tables, spreading early deployments
+/// that have fewer than 1,000 categories across all ten MySQL instances.
 #[inline]
-fn mix(mut x: u64) -> u64 {
-    x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-    x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
-    x ^ (x >> 31)
-}
-
-/// Route a user id to its database and table.
-#[inline]
-pub fn route(user_id: u64) -> ShardRoute {
-    let slot = mix(user_id) % SLOTS;
+pub fn route_category(category_id: u32) -> ShardRoute {
+    let slot = category_id as u64 % SLOTS;
     ShardRoute {
-        db: (slot / TABLES_PER_DB) as u32,
-        table: (slot % TABLES_PER_DB) as u32,
+        db: (slot % DB_COUNT) as u32,
+        table: (slot / DB_COUNT) as u32,
     }
 }
 
@@ -89,32 +83,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn routing_is_deterministic_and_in_range() {
-        for uid in [0u64, 1, 42, 1_000_000, u64::MAX] {
-            let a = route(uid);
-            let b = route(uid);
+    fn category_routing_is_deterministic_and_in_range() {
+        for category in [0u32, 1, 42, 999, u32::MAX] {
+            let a = route_category(category);
+            let b = route_category(category);
             assert_eq!(a, b);
             assert!(a.db < DB_COUNT as u32);
             assert!(a.table < TABLES_PER_DB as u32);
         }
-        assert_eq!(route(7).db_name().len(), "order_db_X".len());
-        assert_eq!(route(7).table_name().len(), "orders_XXX".len());
+        assert_eq!(route_category(7).db_name().len(), "order_db_X".len());
+        assert_eq!(
+            route_category(7).table_name().len(),
+            "asset_orders_XXX".len()
+        );
     }
 
     #[test]
-    fn sequential_users_spread_uniformly() {
-        // 100k sequential user ids (the Leaf-id worst case for raw modulo)
-        // should land near-uniformly across the 1000 slots.
+    fn sequential_categories_stripe_evenly_across_databases() {
         let mut per_db = [0u64; DB_COUNT as usize];
-        let n = 100_000u64;
-        for uid in 0..n {
-            per_db[route(uid).db as usize] += 1;
+        let n = 1_000u32;
+        for category in 0..n {
+            per_db[route_category(category).db as usize] += 1;
         }
-        let expect = n / DB_COUNT;
-        for (db, &count) in per_db.iter().enumerate() {
-            let dev = count.abs_diff(expect) as f64 / expect as f64;
-            assert!(dev < 0.05, "db {db} skewed: {count} vs {expect}");
-        }
+        assert!(per_db.iter().all(|count| *count == 100));
+        assert_eq!(route_category(0), ShardRoute { db: 0, table: 0 });
+        assert_eq!(route_category(10), ShardRoute { db: 0, table: 1 });
     }
 
     #[test]

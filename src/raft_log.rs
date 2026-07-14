@@ -287,12 +287,25 @@ impl RaftNode {
     /// Propose one already-encoded command. It becomes observable to matching
     /// only after quorum commit, via [`Self::take_committed`].
     pub fn propose(&mut self, command: Vec<u8>) -> Result<(), ProposeError> {
+        self.propose_batch(std::iter::once(command))
+    }
+
+    /// Append a bounded group of commands and persist the resulting Ready once.
+    /// The runtime uses this to amortize fsync without weakening durability:
+    /// replication messages are still exposed only after the whole batch is on
+    /// stable storage.
+    pub fn propose_batch<I>(&mut self, commands: I) -> Result<(), ProposeError>
+    where
+        I: IntoIterator<Item = Vec<u8>>,
+    {
         if !self.is_leader() {
             return Err(ProposeError::NotLeader);
         }
-        self.node
-            .propose(Vec::new(), command)
-            .map_err(|_| ProposeError::Raft)?;
+        for command in commands {
+            self.node
+                .propose(Vec::new(), command)
+                .map_err(|_| ProposeError::Raft)?;
+        }
         self.drive();
         Ok(())
     }

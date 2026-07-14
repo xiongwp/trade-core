@@ -17,10 +17,23 @@ fn percentile(values: &mut [u64], p: f64) -> u64 {
 fn main() {
     let mut args = std::env::args().skip(1);
     let addr = args.next().unwrap_or_else(|| "127.0.0.1:9200".into());
-    let token = args.next().unwrap_or_else(|| "local-order-api-token".into());
-    let requests = args.next().and_then(|v| v.parse().ok()).unwrap_or(10_000u64);
-    let concurrency = args.next().and_then(|v| v.parse().ok()).unwrap_or(32usize).max(1);
-    let assets = args.next().and_then(|v| v.parse().ok()).unwrap_or(10_000u32).max(1);
+    let token = args
+        .next()
+        .unwrap_or_else(|| "local-order-api-token".into());
+    let requests = args
+        .next()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10_000u64);
+    let concurrency = args
+        .next()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(32usize)
+        .max(1);
+    let assets = args
+        .next()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10_000u32)
+        .max(1);
     let base = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -31,6 +44,7 @@ fn main() {
     let accepted = Arc::new(AtomicU64::new(0));
     let failed = Arc::new(AtomicU64::new(0));
     let latencies = Arc::new(Mutex::new(Vec::with_capacity(requests as usize)));
+    let error_samples = Arc::new(Mutex::new(Vec::<String>::new()));
     let start_barrier = Arc::new(Barrier::new(concurrency + 1));
     let mut workers = Vec::with_capacity(concurrency);
 
@@ -41,6 +55,7 @@ fn main() {
         let accepted = accepted.clone();
         let failed = failed.clone();
         let latencies = latencies.clone();
+        let error_samples = error_samples.clone();
         let barrier = start_barrier.clone();
         workers.push(std::thread::spawn(move || {
             barrier.wait();
@@ -65,12 +80,23 @@ fn main() {
                     stream.write_all(request.as_bytes())?;
                     let mut response = String::new();
                     stream.read_to_string(&mut response)?;
-                    Ok(response.starts_with("HTTP/1.1 202"))
+                    Ok(response)
                 });
                 local_latencies.push(started.elapsed().as_nanos() as u64);
                 match result {
-                    Ok(true) => { accepted.fetch_add(1, Ordering::Relaxed); }
-                    _ => { failed.fetch_add(1, Ordering::Relaxed); }
+                    Ok(response) if response.starts_with("HTTP/1.1 202") => {
+                        accepted.fetch_add(1, Ordering::Relaxed);
+                    }
+                    failure => {
+                        failed.fetch_add(1, Ordering::Relaxed);
+                        let mut samples = error_samples.lock().unwrap();
+                        if samples.len() < 10 {
+                            samples.push(match failure {
+                                Ok(response) => response.replace(['\r', '\n'], " "),
+                                Err(error) => format!("I/O error: {error}"),
+                            });
+                        }
+                    }
                 }
             }
             latencies.lock().unwrap().extend(local_latencies);
@@ -98,5 +124,8 @@ fn main() {
         ok as f64 / elapsed.as_secs_f64()
     );
     println!("HTTP+MySQL latency: p50={p50:.2}ms p95={p95:.2}ms p99={p99:.2}ms");
+    for sample in error_samples.lock().unwrap().iter() {
+        println!("error sample: {sample}");
+    }
     assert_eq!(errors, 0, "order API returned errors");
 }

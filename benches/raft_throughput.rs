@@ -33,8 +33,15 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let order_addr = args.next().unwrap_or_else(|| "127.0.0.1:9305".into());
     let metrics_addr = args.next().unwrap_or_else(|| "127.0.0.1:9205".into());
-    let commands = args.next().and_then(|v| v.parse().ok()).unwrap_or(100_000u64);
-    let assets = args.next().and_then(|v| v.parse().ok()).unwrap_or(10_000u32).max(1);
+    let commands = args
+        .next()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100_000u64);
+    let assets = args
+        .next()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10_000u32)
+        .max(1);
 
     let role = metric(&metrics_addr, "tc_raft_role").expect("read leader role");
     assert_eq!(role, 2, "{metrics_addr} is not the current leader");
@@ -49,9 +56,7 @@ fn main() {
     let mut writer = TcpStream::connect(&order_addr).expect("connect Raft leader ingress");
     writer.set_nodelay(true).ok();
     let mut reader = writer.try_clone().expect("clone Raft ingress socket");
-    reader
-        .set_read_timeout(Some(Duration::from_secs(120)))
-        .ok();
+    reader.set_read_timeout(Some(Duration::from_secs(120))).ok();
     let ack_reader = std::thread::spawn(move || {
         let mut ack = [0u8; 8192];
         let mut received = 0u64;

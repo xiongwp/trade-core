@@ -62,10 +62,10 @@ fn main() {
     let mut frame = [0u8; MSG_LEN];
     for i in 1..=total {
         let user = rng.range(1, 100_000);
-        let route = sharding::route(user);
-        let slot = route.db as usize * TABLES_PER_DB as usize + route.table as usize;
-
         let sym = InstrumentId(1 + (rng.next() % 4) as u32);
+        let category = sharding::asset_category(sym, 1);
+        let route = sharding::route_category(category);
+        let slot = route.db as usize * TABLES_PER_DB as usize + route.table as usize;
         if i > 1000 && rng.next() % 7 == 0 {
             // Cancel an earlier order (may be already gone -> NotFound, fine).
             wire::encode_cancel(sym, OrderId(rng.range(1, i - 1)), i, &mut frame);

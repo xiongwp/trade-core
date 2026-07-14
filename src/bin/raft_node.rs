@@ -20,6 +20,8 @@ use trade_core::gateway;
 use trade_core::raft_log::{ClusterConfig, RaftNode, CLUSTER_SIZE};
 use trade_core::wire::{self, MSG_LEN};
 
+const PROPOSAL_BATCH: usize = 512;
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let id: u64 = args
@@ -69,7 +71,10 @@ fn main() {
                 while let Ok(message) = message_rx.try_recv() {
                     node.step(message).expect("step raft message");
                 }
-                while let Ok(command) = proposal_rx.try_recv() {
+                while pending.len() < PROPOSAL_BATCH {
+                    let Ok(command) = proposal_rx.try_recv() else {
+                        break;
+                    };
                     pending.push(command);
                 }
                 if last_tick.elapsed() >= Duration::from_millis(100) {
@@ -85,12 +90,16 @@ fn main() {
                     node.commit_index(),
                 );
                 runtime_metrics.set_ready(node.leader_id() != 0);
-                if leader {
-                    for command in pending.drain(..) {
-                        let mut frame = [0u8; MSG_LEN];
-                        wire::encode_command(&command, &mut frame);
-                        node.propose(frame.to_vec()).expect("leader proposal");
-                    }
+                if leader && !pending.is_empty() {
+                    let frames = pending
+                        .drain(..)
+                        .map(|command| {
+                            let mut frame = [0u8; MSG_LEN];
+                            wire::encode_command(&command, &mut frame);
+                            frame.to_vec()
+                        })
+                        .collect::<Vec<_>>();
+                    node.propose_batch(frames).expect("leader proposal batch");
                 }
                 for message in node.take_outbound() {
                     if let Some(addr) = runtime_peers.get(&message.to) {

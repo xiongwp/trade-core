@@ -15,6 +15,44 @@ include:
 #   open http://localhost:8081     # candlesticks + depth, WebSocket push
 
 services:
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v26.1.12
+    command:
+      - redpanda
+      - start
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
+      - --rpc-addr=redpanda:33145
+      - --advertise-rpc-addr=redpanda:33145
+      - --mode=dev-container
+      - --smp=1
+      - --default-log-level=warn
+    ports:
+      - "19092:19092"
+      - "19644:9644"
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD", "rpk", "cluster", "info", "--brokers=127.0.0.1:9092"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+      start_period: 10s
+    restart: unless-stopped
+
+  redpanda-init:
+    image: docker.redpanda.com/redpandadata/redpanda:v26.1.12
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        rpk topic create --if-not-exists --brokers=redpanda:9092
+        --partitions=${TC_ORDER_KAFKA_PARTITIONS_PER_TOPIC:-64} --replicas=1
+        orders-g0 orders-g1 orders-g2 orders-g3
+    restart: "no"
+
   trade-core:
     build: .
     image: trade-core-node
@@ -49,20 +87,6 @@ services:
       - "8081:8080"   # chart UI + JSON API + WebSocket (8080 is in use locally)
     volumes:
       - market-data-history:/data/md
-    restart: unless-stopped
-
-  mysql-control:
-    image: mysql:8.4
-    environment:
-      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-local-root-password}
-    volumes:
-      - order-mysql-control:/var/lib/mysql
-    healthcheck:
-      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
-      interval: 3s
-      timeout: 3s
-      retries: 40
-      start_period: 10s
     restart: unless-stopped
 
   mysql-order-0:
@@ -130,8 +154,8 @@ services:
     build: .
     image: trade-core-node
     depends_on:
-      mysql-control:
-        condition: service_healthy
+      redpanda-init:
+        condition: service_completed_successfully
       mysql-order-0:
         condition: service_healthy
       mysql-order-1:
@@ -156,20 +180,26 @@ services:
         condition: service_started
     command: ["exec order-api"]
     environment:
-      TC_ORDER_MYSQL_CONTROL_URL: mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-control:3306/mysql
       TC_ORDER_MYSQL_SHARD_URLS: mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-0:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-1:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-2:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-3:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-4:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-5:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-6:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-7:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-8:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-9:3306/mysql
       TC_RAFT_MATCHERS: raft-1:9001@raft-1:9102,raft-2:9001@raft-2:9102,raft-3:9001@raft-3:9102,raft-4:9001@raft-4:9102,raft-5:9001@raft-5:9102
       TC_ORDER_API_TOKEN: ${TC_ORDER_API_TOKEN:-local-order-api-token}
       TC_ORDER_CATEGORY_SIZE: ${TC_ORDER_CATEGORY_SIZE:-1000}
       TC_ORDER_DISPATCH_WORKERS: ${TC_ORDER_DISPATCH_WORKERS:-16}
+      TC_ORDER_KAFKA_BROKERS: redpanda:9092
+      TC_ORDER_KAFKA_TOPICS: ${TC_ORDER_KAFKA_TOPICS:-orders-g0,orders-g1,orders-g2,orders-g3}
+      TC_ORDER_KAFKA_PARTITIONS_PER_TOPIC: ${TC_ORDER_KAFKA_PARTITIONS_PER_TOPIC:-64}
+      TC_ORDER_KAFKA_CONSUMERS: ${TC_ORDER_KAFKA_CONSUMERS:-8}
+      TC_ORDER_KAFKA_ROUTE_VERSION: ${TC_ORDER_KAFKA_ROUTE_VERSION:-1}
+      TC_ORDER_BATCH_SIZE: ${TC_ORDER_BATCH_SIZE:-500}
+      TC_ORDER_BATCH_LINGER_MS: ${TC_ORDER_BATCH_LINGER_MS:-2}
     ports:
       - "9200:9200"
     restart: unless-stopped
 
 volumes:
+  redpanda-data:
   trade-core-journal:
   market-data-history:
-  order-mysql-control:
   order-mysql-0:
   order-mysql-1:
   order-mysql-2:
