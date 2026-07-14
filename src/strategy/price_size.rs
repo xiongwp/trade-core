@@ -34,7 +34,10 @@ impl MatchingStrategy for SizePriority {
             let r = &resting[i];
             let fill = remaining.min(r.remaining);
             if fill > 0 {
-                out.push(Allocation { id: r.id, qty: fill });
+                out.push(Allocation {
+                    id: r.id,
+                    qty: fill,
+                });
                 remaining -= fill;
             }
         }

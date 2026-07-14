@@ -226,7 +226,11 @@ fn aggregates_stay_truthful_after_cancel_and_reduce() {
 
     // FOK reads the aggregate: 5 lots must be rejected, 3 must fill fully.
     let r = e.submit(Order::limit(OrderId(3), Side::Buy, 100, 5).with_tif(TimeInForce::Fok));
-    assert_eq!(r.status, OrderStatus::Rejected, "phantom liquidity must not fool FOK");
+    assert_eq!(
+        r.status,
+        OrderStatus::Rejected,
+        "phantom liquidity must not fool FOK"
+    );
     let r = e.submit(Order::limit(OrderId(4), Side::Buy, 100, 3).with_tif(TimeInForce::Fok));
     assert_eq!(r.status, OrderStatus::Filled);
     assert!(e.book().is_empty());

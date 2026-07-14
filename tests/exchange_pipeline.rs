@@ -12,7 +12,10 @@ fn collect(sink: &trade_core::ResultSink, want: usize) -> Vec<ExecReport> {
     let deadline = Instant::now() + Duration::from_secs(5);
     while got.len() < want && Instant::now() < deadline {
         let n = sink.poll(|r| {
-            if !matches!(r, ExecReport::DepthLevel { .. } | ExecReport::DepthEnd { .. }) {
+            if !matches!(
+                r,
+                ExecReport::DepthLevel { .. } | ExecReport::DepthEnd { .. }
+            ) {
                 got.push(r);
             }
         });
@@ -37,23 +40,31 @@ fn matches_across_multiple_assets_independently() {
     let btc = InstrumentId(202);
 
     // Resting asks on two different instruments.
-    gw.new_order(Order::limit(OrderId(1), Side::Sell, 100, 10).on(aapl)).unwrap();
-    gw.new_order(Order::limit(OrderId(2), Side::Sell, 5000, 3).on(btc)).unwrap();
+    gw.new_order(Order::limit(OrderId(1), Side::Sell, 100, 10).on(aapl))
+        .unwrap();
+    gw.new_order(Order::limit(OrderId(2), Side::Sell, 5000, 3).on(btc))
+        .unwrap();
     // Aggressors on each.
-    gw.new_order(Order::limit(OrderId(3), Side::Buy, 100, 10).on(aapl)).unwrap();
-    gw.new_order(Order::limit(OrderId(4), Side::Buy, 5000, 3).on(btc)).unwrap();
+    gw.new_order(Order::limit(OrderId(3), Side::Buy, 100, 10).on(aapl))
+        .unwrap();
+    gw.new_order(Order::limit(OrderId(4), Side::Buy, 5000, 3).on(btc))
+        .unwrap();
 
     // Full lifecycle = 10 reports: 4 Accepted + 2 Resting + 2 Trade + 2 Filled.
     let reports = collect(&sink, 10);
     handle.shutdown();
 
     // A trade printed on each instrument, isolated from the other.
-    let aapl_trade = reports.iter().any(|r| matches!(
+    let aapl_trade = reports.iter().any(|r| {
+        matches!(
         r, ExecReport::Trade { instrument, price, qty, .. }
-        if *instrument == aapl && *price == 100 && *qty == 10));
-    let btc_trade = reports.iter().any(|r| matches!(
+        if *instrument == aapl && *price == 100 && *qty == 10)
+    });
+    let btc_trade = reports.iter().any(|r| {
+        matches!(
         r, ExecReport::Trade { instrument, price, qty, .. }
-        if *instrument == btc && *price == 5000 && *qty == 3));
+        if *instrument == btc && *price == 5000 && *qty == 3)
+    });
     assert!(aapl_trade, "expected an AAPL trade; got {reports:?}");
     assert!(btc_trade, "expected a BTC trade; got {reports:?}");
 }
@@ -63,18 +74,29 @@ fn async_results_report_full_lifecycle() {
     let (gw, sink, handle) = build(ExchangeConfig::default());
     let sym = InstrumentId(0);
 
-    gw.new_order(Order::limit(OrderId(1), Side::Sell, 100, 5)).unwrap();
-    gw.new_order(Order::limit(OrderId(2), Side::Buy, 100, 5)).unwrap();
+    gw.new_order(Order::limit(OrderId(1), Side::Sell, 100, 5))
+        .unwrap();
+    gw.new_order(Order::limit(OrderId(2), Side::Buy, 100, 5))
+        .unwrap();
 
     let reports = collect(&sink, 5);
     handle.shutdown();
 
-    assert!(reports.contains(&ExecReport::Accepted { instrument: sym, order_id: OrderId(1) }));
-    assert!(reports.contains(&ExecReport::Resting { instrument: sym, order_id: OrderId(1) }));
+    assert!(reports.contains(&ExecReport::Accepted {
+        instrument: sym,
+        order_id: OrderId(1)
+    }));
+    assert!(reports.contains(&ExecReport::Resting {
+        instrument: sym,
+        order_id: OrderId(1)
+    }));
     assert!(reports.iter().any(|r| matches!(
         r, ExecReport::Trade { taker, maker, qty, .. }
         if *taker == OrderId(2) && *maker == OrderId(1) && *qty == 5)));
-    assert!(reports.contains(&ExecReport::Filled { instrument: sym, order_id: OrderId(2) }));
+    assert!(reports.contains(&ExecReport::Filled {
+        instrument: sym,
+        order_id: OrderId(2)
+    }));
 }
 
 #[test]
@@ -89,15 +111,20 @@ fn cancel_takes_priority_over_queued_new_orders() {
     let sym = InstrumentId(0);
 
     // Rest a maker and confirm it is actually on the book.
-    gw.new_order(Order::limit(OrderId(1), Side::Sell, 100, 1_000)).unwrap();
+    gw.new_order(Order::limit(OrderId(1), Side::Sell, 100, 1_000))
+        .unwrap();
     let acked = collect(&sink, 2); // Accepted + Resting
-    assert!(acked.contains(&ExecReport::Resting { instrument: sym, order_id: OrderId(1) }));
+    assert!(acked.contains(&ExecReport::Resting {
+        instrument: sym,
+        order_id: OrderId(1)
+    }));
 
     // Quiesce the shard, THEN stage a wall of crossing buys (normal queue) and a
     // cancel of the resting maker (high queue). Nothing is draining yet.
     handle.pause();
     for i in 0..500u64 {
-        gw.new_order(Order::limit(OrderId(1000 + i), Side::Buy, 100, 1)).unwrap();
+        gw.new_order(Order::limit(OrderId(1000 + i), Side::Buy, 100, 1))
+            .unwrap();
     }
     gw.cancel(sym, OrderId(1), 2000).unwrap();
 
@@ -124,7 +151,9 @@ fn cancel_takes_priority_over_queued_new_orders() {
     let maker_cancelled = reports
         .iter()
         .any(|r| matches!(r, ExecReport::Cancelled { order_id, .. } if *order_id == OrderId(1)));
-    let any_trade = reports.iter().any(|r| matches!(r, ExecReport::Trade { .. }));
+    let any_trade = reports
+        .iter()
+        .any(|r| matches!(r, ExecReport::Trade { .. }));
     assert!(maker_cancelled, "maker #1 should have been cancelled");
     assert!(
         !any_trade,
@@ -137,7 +166,8 @@ fn modify_reduce_keeps_priority_and_reports_modified() {
     let (gw, sink, handle) = build(ExchangeConfig::default());
     let sym = InstrumentId(0);
 
-    gw.new_order(Order::limit(OrderId(1), Side::Sell, 100, 10)).unwrap();
+    gw.new_order(Order::limit(OrderId(1), Side::Sell, 100, 10))
+        .unwrap();
     let _ = collect(&sink, 2);
     // Reduce 10 -> 4 at same price: keeps priority, reports Modified.
     gw.modify(sym, OrderId(1), 100, 4, 2001).unwrap();

@@ -177,15 +177,7 @@ fn persist(store: &OrderStore, order: &Order) -> Result<CategorySequence, mysql:
             ),
             params! {"id" => order.id.0, "frame" => frame.to_vec()},
         )?;
-        enqueue_command(
-            &mut tx,
-            route,
-            seq,
-            order.id.0,
-            order.user,
-            &db,
-            &frame,
-        )?;
+        enqueue_command(&mut tx, route, seq, order.id.0, order.user, &db, &frame)?;
         tx.commit()
     })();
     if let Err(error) = result {
@@ -238,7 +230,8 @@ fn persist_cancel(
 
 #[derive(Debug)]
 struct PendingCommand {
-    submission_seq: u64,
+    category_id: u32,
+    category_seq: u64,
     command_id: u64,
     user_id: u64,
     shard_db: u32,
@@ -246,22 +239,40 @@ struct PendingCommand {
     frame: Vec<u8>,
 }
 
-fn next_pending(store: &OrderStore) -> mysql::Result<Option<PendingCommand>> {
+fn next_pending(
+    store: &OrderStore,
+    worker_id: usize,
+    workers: usize,
+) -> mysql::Result<Option<PendingCommand>> {
     let mut control = store.control.get_conn()?;
-    let row: Option<(u64, u64, u64, u32, u32)> = control.query_first(
-        "SELECT submission_seq,command_id,user_id,shard_db,shard_table FROM order_control.command_locations WHERE status='PENDING' ORDER BY submission_seq LIMIT 1",
+    let row: Option<(u32, u64, u64, u64, u32, u32)> = control.exec_first(
+        "SELECT category_id,category_seq,command_id,user_id,shard_db,shard_table
+         FROM order_control.command_locations_by_category loc
+         WHERE status='PENDING'
+           AND MOD(category_id,:workers)=:worker
+           AND NOT EXISTS (
+             SELECT 1
+             FROM order_control.command_locations_by_category prev
+             WHERE prev.category_id=loc.category_id
+               AND prev.category_seq < loc.category_seq
+               AND prev.status IN ('RESERVED','PENDING')
+           )
+         ORDER BY category_id,category_seq
+         LIMIT 1",
+        params! {"workers" => workers as u64, "worker" => worker_id as u64},
     )?;
-    let Some((submission_seq, command_id, user_id, shard_db, shard_table)) = row else {
+    let Some((category_id, category_seq, command_id, user_id, shard_db, shard_table)) = row else {
         return Ok(None);
     };
     let db = format!("order_db_{shard_db}");
     let mut shard = store.shard(shard_db).get_conn()?;
     let frame: Option<Vec<u8>> = shard.exec_first(
-        format!("SELECT frame FROM {db}.command_outbox_{shard_table:03} WHERE submission_seq=:seq AND status='PENDING'"),
-        params! {"seq" => submission_seq},
+        format!("SELECT frame FROM {db}.command_outbox_cat_{shard_table:03} WHERE category_id=:category AND category_seq=:seq AND status='PENDING'"),
+        params! {"category" => category_id, "seq" => category_seq},
     )?;
     Ok(frame.map(|frame| PendingCommand {
-        submission_seq,
+        category_id,
+        category_seq,
         command_id,
         user_id,
         shard_db,
@@ -276,10 +287,10 @@ fn mark_sent(store: &OrderStore, command: &PendingCommand) -> mysql::Result<()> 
     let mut shard_tx = shard.start_transaction(TxOpts::default())?;
     shard_tx.exec_drop(
         format!(
-            "UPDATE {db}.command_outbox_{:03} SET status='SENT' WHERE submission_seq=:seq AND status='PENDING'",
+            "UPDATE {db}.command_outbox_cat_{:03} SET status='SENT' WHERE category_id=:category AND category_seq=:seq AND status='PENDING'",
             command.shard_table
         ),
-        params! {"seq" => command.submission_seq},
+        params! {"category" => command.category_id, "seq" => command.category_seq},
     )?;
     shard_tx.exec_drop(
         format!(
@@ -290,16 +301,23 @@ fn mark_sent(store: &OrderStore, command: &PendingCommand) -> mysql::Result<()> 
     shard_tx.commit()?;
     let mut control = store.control.get_conn()?;
     control.exec_drop(
-        "UPDATE order_control.command_locations SET status='SENT' WHERE submission_seq=:seq AND status='PENDING'",
-        params! {"seq" => command.submission_seq},
+        "UPDATE order_control.command_locations_by_category SET status='SENT' WHERE category_id=:category AND category_seq=:seq AND status='PENDING'",
+        params! {"category" => command.category_id, "seq" => command.category_seq},
     )
 }
 
 /// This is the only path from order persistence to matching. It dispatches the
-/// smallest durable submission sequence and never skips it after a retry.
-fn dispatch_forever(store: OrderStore, matchers: Vec<MatcherTarget>) {
+/// smallest durable sequence for each asset category and never skips it after a
+/// retry. Different categories are partitioned across workers and run in
+/// parallel, which is the scaling path for multi-million TPS.
+fn dispatch_forever(
+    store: OrderStore,
+    matchers: Vec<MatcherTarget>,
+    worker_id: usize,
+    workers: usize,
+) {
     loop {
-        let command = match next_pending(&store) {
+        let command = match next_pending(&store, worker_id, workers) {
             Ok(Some(command)) => command,
             Ok(None) => {
                 std::thread::sleep(Duration::from_millis(5));
@@ -313,8 +331,8 @@ fn dispatch_forever(store: OrderStore, matchers: Vec<MatcherTarget>) {
         };
         if command.frame.len() != wire::MSG_LEN {
             eprintln!(
-                "[order-api] invalid frame at submission_seq={}",
-                command.submission_seq
+                "[order-api] invalid frame at category={} seq={}",
+                command.category_id, command.category_seq
             );
             std::thread::sleep(Duration::from_millis(100));
             continue;
@@ -323,13 +341,13 @@ fn dispatch_forever(store: OrderStore, matchers: Vec<MatcherTarget>) {
             .and_then(|()| mark_sent(&store, &command).map_err(std::io::Error::other));
         match delivered {
             Ok(()) => eprintln!(
-                "[order-api] dispatched submission_seq={} command_id={} user_id={}",
-                command.submission_seq, command.command_id, command.user_id
+                "[order-api] dispatched category={} seq={} command_id={} user_id={}",
+                command.category_id, command.category_seq, command.command_id, command.user_id
             ),
             Err(error) => {
                 eprintln!(
-                    "[order-api] preserving submission_seq={} for retry: {error}",
-                    command.submission_seq
+                    "[order-api] preserving category={} seq={} for retry: {error}",
+                    command.category_id, command.category_seq
                 );
                 std::thread::sleep(Duration::from_millis(100));
             }
@@ -367,6 +385,7 @@ fn open_when_ready(control_url: &str, shard_urls: &[String]) -> OrderStore {
             let store = OrderStore {
                 control,
                 shards: Arc::new(shards),
+                category_size: category_size(),
             };
             bootstrap(&store).map(|()| store)
         });
@@ -378,6 +397,22 @@ fn open_when_ready(control_url: &str, shard_urls: &[String]) -> OrderStore {
             }
         }
     }
+}
+
+fn category_size() -> u32 {
+    std::env::var("TC_ORDER_CATEGORY_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_ASSET_CATEGORY_SIZE)
+}
+
+fn dispatcher_workers() -> usize {
+    std::env::var("TC_ORDER_DISPATCH_WORKERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(8)
 }
 
 fn is_leader(metrics_addr: &str) -> bool {
@@ -505,11 +540,12 @@ fn handle(mut stream: TcpStream, store: Arc<OrderStore>, token: &str) {
         }
     };
     match persisted {
-        Ok(submission_seq) => respond(
+        Ok(seq) => respond(
             &mut stream,
             "202 Accepted",
             &format!(
-                "{{\"accepted\":true,\"status\":\"PENDING\",\"submission_seq\":{submission_seq}}}"
+                "{{\"accepted\":true,\"status\":\"PENDING\",\"category_id\":{},\"category_seq\":{}}}",
+                seq.category_id, seq.category_seq
             ),
         ),
         Err(error) => respond(
@@ -528,14 +564,23 @@ fn main() {
     let matchers = parse_matchers();
     let token = std::env::var("TC_ORDER_API_TOKEN").expect("TC_ORDER_API_TOKEN");
     let store = open_when_ready(&control_url, &shard_urls);
-    let dispatch_store = store.clone();
-    std::thread::Builder::new()
-        .name("order-outbox-dispatcher".into())
-        .spawn(move || dispatch_forever(dispatch_store, matchers))
-        .expect("spawn order outbox dispatcher");
+    let workers = dispatcher_workers();
+    eprintln!(
+        "[order-api] category_size={} dispatch_workers={workers}",
+        store.category_size
+    );
+    for worker_id in 0..workers {
+        let dispatch_store = store.clone();
+        let worker_matchers = matchers.clone();
+        std::thread::Builder::new()
+            .name(format!("order-outbox-dispatcher-{worker_id}"))
+            .spawn(move || dispatch_forever(dispatch_store, worker_matchers, worker_id, workers))
+            .expect("spawn order outbox dispatcher");
+    }
     let listener = TcpListener::bind("0.0.0.0:9200").expect("bind order API");
+    let shared_store = Arc::new(store);
     for stream in listener.incoming().flatten() {
-        let store = Arc::new(store.clone());
+        let store = shared_store.clone();
         let token = token.clone();
         std::thread::spawn(move || handle(stream, store, &token));
     }

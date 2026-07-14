@@ -37,9 +37,8 @@ mod imp {
         }
         let mut set = CpuSet { bits: [0; 16] };
         set.bits[core / 64] |= 1u64 << (core % 64);
-        let rc = unsafe {
-            pthread_setaffinity_np(pthread_self(), std::mem::size_of::<CpuSet>(), &set)
-        };
+        let rc =
+            unsafe { pthread_setaffinity_np(pthread_self(), std::mem::size_of::<CpuSet>(), &set) };
         if rc == 0 {
             Ok(())
         } else {
@@ -58,12 +57,7 @@ mod imp {
 
     extern "C" {
         fn mach_thread_self() -> u32;
-        fn thread_policy_set(
-            thread: u32,
-            flavor: u32,
-            policy_info: *mut i32,
-            count: u32,
-        ) -> i32;
+        fn thread_policy_set(thread: u32, flavor: u32, policy_info: *mut i32, count: u32) -> i32;
     }
 
     pub fn pin_current_thread(core: usize) -> Result<(), String> {
@@ -79,9 +73,11 @@ mod imp {
         };
         match kr {
             0 => Ok(()),
-            46 => Err("macOS kernel does not support thread affinity on this hardware \
+            46 => Err(
+                "macOS kernel does not support thread affinity on this hardware \
                        (KERN_NOT_SUPPORTED — expected on Apple Silicon); running unpinned"
-                .to_string()),
+                    .to_string(),
+            ),
             other => Err(format!("thread_policy_set failed: kern_return {other}")),
         }
     }

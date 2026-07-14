@@ -174,7 +174,13 @@ impl MatchingEngine {
     pub fn submit(&mut self, order: Order) -> SubmitReport {
         let mut trades = Vec::new();
         let (order_id, status, filled, resting) = self.submit_into(order, &mut trades);
-        SubmitReport { order_id, status, filled, trades, resting }
+        SubmitReport {
+            order_id,
+            status,
+            filled,
+            trades,
+            resting,
+        }
     }
 
     /// Allocation-free submit: trades are **appended** to the caller's reusable
@@ -275,16 +281,19 @@ impl MatchingEngine {
             }
 
             // Budget cap: lots affordable at this level (u128 / px, saturated).
-            let affordable = (*budget_left / (px.max(1) as u128)).min(order.remaining as u128) as Qty;
+            let affordable =
+                (*budget_left / (px.max(1) as u128)).min(order.remaining as u128) as Qty;
             if affordable == 0 {
                 break; // budget exhausted
             }
             // FIFO-style strategies only consume the level's front: cap the
             // view at the aggressor's quantity so deep levels stay O(fill).
             if self.strategy.full_level_required() {
-                self.book.level_view_into(maker_side, px, &mut self.view_buf);
+                self.book
+                    .level_view_into(maker_side, px, &mut self.view_buf);
             } else {
-                self.book.level_view_capped(maker_side, px, affordable, &mut self.view_buf);
+                self.book
+                    .level_view_capped(maker_side, px, affordable, &mut self.view_buf);
             }
 
             // Self-trade prevention: does this level hold the taker's own order?
@@ -330,7 +339,8 @@ impl MatchingEngine {
                     .is_ok(),
                 "strategy {} violated the allocation contract: {:?}",
                 self.strategy.name(),
-                self.strategy.validate(&self.view_buf, affordable, &self.alloc_buf)
+                self.strategy
+                    .validate(&self.view_buf, affordable, &self.alloc_buf)
             );
             if self.alloc_buf.is_empty() {
                 break;
@@ -341,7 +351,11 @@ impl MatchingEngine {
                 if a.qty == 0 {
                     continue;
                 }
-                let maker_user = self.view_buf.iter().find(|r| r.id == a.id).map_or(0, |r| r.user);
+                let maker_user = self
+                    .view_buf
+                    .iter()
+                    .find(|r| r.id == a.id)
+                    .map_or(0, |r| r.user);
                 trades.push(Trade {
                     taker: order.id,
                     maker: a.id,

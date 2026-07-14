@@ -49,8 +49,8 @@ pub mod kline;
 pub mod lockfree;
 pub mod metrics;
 pub mod order;
-pub mod replication;
 pub mod raft_log;
+pub mod replication;
 pub mod risk;
 pub mod sharding;
 pub mod snapshot;
@@ -62,18 +62,16 @@ pub mod wire;
 pub use book::{OrderBook, OrderPool};
 pub use engine::{MatchingEngine, SelfTradePolicy};
 pub use exchange::{
-    build as build_exchange, recover_into, replay_journal, Command, ExchangeConfig,
-    ExchangeHandle, ExecReport, OrderGateway, ResultSink,
+    build as build_exchange, recover_into, replay_journal, Command, ExchangeConfig, ExchangeHandle,
+    ExecReport, OrderGateway, ResultSink,
 };
-pub use risk::{PriceGuard, RiskLimits};
 pub use order::Order;
+pub use risk::{PriceGuard, RiskLimits};
 pub use strategy::{
     Allocation, MatchingStrategy, PriceTimePriority, ProRata, RestingOrder, SizePriority,
 };
 pub use trade::{ModifyOutcome, OrderStatus, SubmitReport, Trade};
-pub use types::{
-    InstrumentId, OrderId, OrderType, Price, Qty, Side, Timestamp, TimeInForce,
-};
+pub use types::{InstrumentId, OrderId, OrderType, Price, Qty, Side, TimeInForce, Timestamp};
 
 /// Glob-importable common items.
 pub mod prelude {
@@ -81,7 +79,5 @@ pub mod prelude {
     pub use crate::order::Order;
     pub use crate::strategy::{MatchingStrategy, PriceTimePriority, ProRata, SizePriority};
     pub use crate::trade::{ModifyOutcome, OrderStatus, SubmitReport, Trade};
-    pub use crate::types::{
-        InstrumentId, OrderId, OrderType, Price, Qty, Side, TimeInForce,
-    };
+    pub use crate::types::{InstrumentId, OrderId, OrderType, Price, Qty, Side, TimeInForce};
 }

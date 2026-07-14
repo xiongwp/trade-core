@@ -115,7 +115,10 @@ pub struct KlineAggregator {
 
 impl KlineAggregator {
     pub fn new(cap: usize) -> Self {
-        KlineAggregator { series: HashMap::new(), cap }
+        KlineAggregator {
+            series: HashMap::new(),
+            cap,
+        }
     }
 
     /// Ingest one trade print.
@@ -165,7 +168,10 @@ impl KlineAggregator {
             .get(&instrument)
             .map(|s| {
                 let dq = &s[idx];
-                dq.iter().skip(dq.len().saturating_sub(limit)).copied().collect()
+                dq.iter()
+                    .skip(dq.len().saturating_sub(limit))
+                    .copied()
+                    .collect()
             })
             .unwrap_or_default()
     }
@@ -193,7 +199,15 @@ impl KlineAggregator {
             for dq in series {
                 buf.extend_from_slice(&(dq.len() as u32).to_le_bytes());
                 for c in dq {
-                    for v in [c.start, c.open, c.high, c.low, c.close, c.volume, c.trades as u64] {
+                    for v in [
+                        c.start,
+                        c.open,
+                        c.high,
+                        c.low,
+                        c.close,
+                        c.volume,
+                        c.trades as u64,
+                    ] {
                         buf.extend_from_slice(&v.to_le_bytes());
                     }
                 }
@@ -284,11 +298,17 @@ mod tests {
         let monday = 4 * 86_400;
         // Any moment that week maps to that Monday…
         assert_eq!(bucket_start(Interval::Week, monday), monday);
-        assert_eq!(bucket_start(Interval::Week, monday + 6 * 86_400 + 3600), monday);
+        assert_eq!(
+            bucket_start(Interval::Week, monday + 6 * 86_400 + 3600),
+            monday
+        );
         // …and the Sunday before belongs to the previous week (which began
         // 1969-12-29, before the epoch — clamps into that week's Thursday-start
         // epoch segment; verify the *next* Monday rolls over instead).
-        assert_eq!(bucket_start(Interval::Week, monday + 7 * 86_400), monday + 7 * 86_400);
+        assert_eq!(
+            bucket_start(Interval::Week, monday + 7 * 86_400),
+            monday + 7 * 86_400
+        );
     }
 
     #[test]
@@ -317,7 +337,15 @@ mod tests {
         assert_eq!(m.len(), 2);
         assert_eq!(
             m[0],
-            Candle { start: 60, open: 100, high: 130, low: 95, close: 95, volume: 10, trades: 3 }
+            Candle {
+                start: 60,
+                open: 100,
+                high: 130,
+                low: 95,
+                close: 95,
+                volume: 10,
+                trades: 3
+            }
         );
         assert_eq!(m[1].open, 105);
 
@@ -338,7 +366,12 @@ mod tests {
 
         let mut agg = KlineAggregator::new(50);
         for i in 0..500u64 {
-            agg.on_trade(InstrumentId(1 + (i % 3) as u32), 1_700_000_000 + i, 990 + i % 20, 1 + i % 9);
+            agg.on_trade(
+                InstrumentId(1 + (i % 3) as u32),
+                1_700_000_000 + i,
+                990 + i % 20,
+                1 + i % 9,
+            );
         }
         agg.save(&path).unwrap();
         let loaded = KlineAggregator::load(&path).unwrap();
@@ -356,7 +389,10 @@ mod tests {
         let mut bytes = std::fs::read(&path).unwrap();
         bytes[40] ^= 0xFF;
         std::fs::write(&path, &bytes).unwrap();
-        assert!(KlineAggregator::load(&path).is_err(), "corruption must be detected");
+        assert!(
+            KlineAggregator::load(&path).is_err(),
+            "corruption must be detected"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

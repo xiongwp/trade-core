@@ -38,7 +38,10 @@ impl OrderPool {
             slots.resize(capacity, Order::limit(OrderId(0), Side::Buy, 0, 0));
             slots.clear();
         }
-        OrderPool { slots, free: Vec::with_capacity(1024) }
+        OrderPool {
+            slots,
+            free: Vec::with_capacity(1024),
+        }
     }
 
     /// Bytes one order slot occupies.
@@ -206,13 +209,19 @@ impl LevelIndex {
                 }
                 let lv = &mut self.levels[i];
                 lv.orders.push_back(slot);
-                lv.qty = lv.qty.checked_add(remaining).expect("level quantity overflow");
+                lv.qty = lv
+                    .qty
+                    .checked_add(remaining)
+                    .expect("level quantity overflow");
                 lv.live = lv.live.checked_add(1).expect("level order-count overflow");
             }
             None => {
                 let lv = self.overflow.entry(price).or_default();
                 lv.orders.push_back(slot);
-                lv.qty = lv.qty.checked_add(remaining).expect("level quantity overflow");
+                lv.qty = lv
+                    .qty
+                    .checked_add(remaining)
+                    .expect("level quantity overflow");
                 lv.live = lv.live.checked_add(1).expect("level order-count overflow");
             }
         }
@@ -270,9 +279,7 @@ impl LevelIndex {
             }
 
             let live = lv.live as usize;
-            if lv.orders.len() >= COMPACT_MIN_SLOTS
-                && lv.orders.len() > live.saturating_mul(2)
-            {
+            if lv.orders.len() >= COMPACT_MIN_SLOTS && lv.orders.len() > live.saturating_mul(2) {
                 lv.orders.retain(|&slot| {
                     let dead = pool.get(slot).remaining == 0;
                     if dead {
@@ -368,7 +375,10 @@ impl LevelIndex {
             let mut bits = self.l0[w];
             while bits != 0 {
                 let i = w * 64 + bits.trailing_zeros() as usize;
-                let px = self.base.checked_add(i as u64).expect("occupied price overflow");
+                let px = self
+                    .base
+                    .checked_add(i as u64)
+                    .expect("occupied price overflow");
                 if !f(px, &self.levels[i]) {
                     return;
                 }
@@ -397,7 +407,10 @@ impl LevelIndex {
             let mut bits = self.l0[w];
             while bits != 0 {
                 let i = w * 64 + 63 - bits.leading_zeros() as usize;
-                let px = self.base.checked_add(i as u64).expect("occupied price overflow");
+                let px = self
+                    .base
+                    .checked_add(i as u64)
+                    .expect("occupied price overflow");
                 if !f(px, &self.levels[i]) {
                     return;
                 }
@@ -635,7 +648,9 @@ impl OrderBook {
             let notional = (px as u128)
                 .checked_mul(take as u128)
                 .expect("fill notional overflow");
-            cost = cost.checked_add(notional).expect("total fill cost overflow");
+            cost = cost
+                .checked_add(notional)
+                .expect("total fill cost overflow");
             left = left.checked_sub(take).expect("fill quantity underflow");
             left > 0
         };
@@ -656,14 +671,18 @@ impl OrderBook {
                 if px > limit {
                     return false;
                 }
-                sum = sum.checked_add(lv.qty).expect("crossable quantity overflow");
+                sum = sum
+                    .checked_add(lv.qty)
+                    .expect("crossable quantity overflow");
                 true
             }),
             Side::Sell => levels.walk_desc(|px, lv| {
                 if px < limit {
                     return false;
                 }
-                sum = sum.checked_add(lv.qty).expect("crossable quantity overflow");
+                sum = sum
+                    .checked_add(lv.qty)
+                    .expect("crossable quantity overflow");
                 true
             }),
         }
@@ -697,7 +716,10 @@ impl OrderBook {
     /// book if the id is duplicated or the quantity is zero.
     pub fn insert(&mut self, order: Order) {
         let id = order.id;
-        assert!(self.try_insert(order), "invalid or duplicate resting order {id}");
+        assert!(
+            self.try_insert(order),
+            "invalid or duplicate resting order {id}"
+        );
     }
 
     /// Apply fills produced by a strategy against the resting `side` at `price`.
@@ -719,7 +741,10 @@ impl OrderBook {
             Side::Sell => &mut self.asks,
         };
 
-        assert!(index.get(price).is_some(), "fill references a missing price level");
+        assert!(
+            index.get(price).is_some(),
+            "fill references a missing price level"
+        );
 
         for &(id, fill_qty) in fills {
             assert!(fill_qty > 0, "zero-size fill for order {id}");
@@ -811,7 +836,10 @@ impl OrderBook {
     pub fn cancel(&mut self, id: OrderId) -> Option<Order> {
         let loc = self.locate.remove(&id)?;
         let order = *self.pool.get(loc.slot);
-        assert!(order.remaining > 0, "locate points at a tombstoned order {id}");
+        assert!(
+            order.remaining > 0,
+            "locate points at a tombstoned order {id}"
+        );
 
         // Mark dead before maintenance so any physical reclamation sees a
         // tombstone. Aggregate quantity/live-count change exactly once here.

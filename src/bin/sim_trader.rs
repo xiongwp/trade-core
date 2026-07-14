@@ -78,7 +78,11 @@ fn main() {
 
         id += 1;
         let user = rng.range(1, 50);
-        let side = if rng.next() & 1 == 0 { Side::Buy } else { Side::Sell };
+        let side = if rng.next() & 1 == 0 {
+            Side::Buy
+        } else {
+            Side::Sell
+        };
         let qty = rng.range(1, 20);
 
         // 70% passive quotes around the mid, 30% marketable orders that cross
@@ -110,7 +114,12 @@ fn main() {
         // Occasionally cancel something old to keep the books tidy.
         if rng.next() % 16 == 0 {
             id += 1;
-            wire::encode_cancel(sym, OrderId(id - rng.range(2, 200).min(id - 1)), id, &mut frame);
+            wire::encode_cancel(
+                sym,
+                OrderId(id - rng.range(2, 200).min(id - 1)),
+                id,
+                &mut frame,
+            );
             let _ = sock.write_all(&frame);
         }
     }

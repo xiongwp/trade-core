@@ -68,7 +68,10 @@ pub fn route(user_id: u64) -> ShardRoute {
 pub fn all_tables() -> impl Iterator<Item = (String, String)> {
     (0..DB_COUNT).flat_map(|db| {
         (0..TABLES_PER_DB).map(move |table| {
-            let r = ShardRoute { db: db as u32, table: table as u32 };
+            let r = ShardRoute {
+                db: db as u32,
+                table: table as u32,
+            };
             (r.db_name(), r.table_name())
         })
     })

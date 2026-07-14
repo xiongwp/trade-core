@@ -232,7 +232,12 @@ pub fn encode_new(order: &Order, out: &mut [u8; MSG_LEN]) {
 
 /// Encode a `Cancel` frame. `cmd_id` (unique, increasing — same id series as
 /// new orders) rides in the otherwise-unused price slot.
-pub fn encode_cancel(instrument: InstrumentId, order_id: OrderId, cmd_id: u64, out: &mut [u8; MSG_LEN]) {
+pub fn encode_cancel(
+    instrument: InstrumentId,
+    order_id: OrderId,
+    cmd_id: u64,
+    out: &mut [u8; MSG_LEN],
+) {
     out.fill(0);
     out[0] = MT_CANCEL;
     out[4..8].copy_from_slice(&instrument.0.to_le_bytes());
@@ -286,23 +291,44 @@ pub fn encode_force_close(
 pub fn encode_command(cmd: &Command, out: &mut [u8; MSG_LEN]) {
     match cmd {
         Command::New(order) => encode_new(order, out),
-        Command::Cancel { instrument, order_id, cmd_id } => {
-            encode_cancel(*instrument, *order_id, *cmd_id, out)
-        }
-        Command::Modify { instrument, order_id, new_price, new_qty, cmd_id } => {
-            encode_modify(*instrument, *order_id, *new_price, *new_qty, *cmd_id, out)
-        }
-        Command::ForceClose { instrument, user, close_order_id, close_side, close_qty } => {
-            encode_force_close(*instrument, *user, *close_order_id, *close_side, *close_qty, out)
-        }
+        Command::Cancel {
+            instrument,
+            order_id,
+            cmd_id,
+        } => encode_cancel(*instrument, *order_id, *cmd_id, out),
+        Command::Modify {
+            instrument,
+            order_id,
+            new_price,
+            new_qty,
+            cmd_id,
+        } => encode_modify(*instrument, *order_id, *new_price, *new_qty, *cmd_id, out),
+        Command::ForceClose {
+            instrument,
+            user,
+            close_order_id,
+            close_side,
+            close_qty,
+        } => encode_force_close(
+            *instrument,
+            *user,
+            *close_order_id,
+            *close_side,
+            *close_qty,
+            out,
+        ),
         Command::Halt { instrument, cmd_id } => encode_admin(true, *instrument, *cmd_id, out),
         Command::Resume { instrument, cmd_id } => encode_admin(false, *instrument, *cmd_id, out),
-        Command::HaltUser { instrument, user, cmd_id } => {
-            encode_user_admin(true, *instrument, *user, *cmd_id, out)
-        }
-        Command::ResumeUser { instrument, user, cmd_id } => {
-            encode_user_admin(false, *instrument, *user, *cmd_id, out)
-        }
+        Command::HaltUser {
+            instrument,
+            user,
+            cmd_id,
+        } => encode_user_admin(true, *instrument, *user, *cmd_id, out),
+        Command::ResumeUser {
+            instrument,
+            user,
+            cmd_id,
+        } => encode_user_admin(false, *instrument, *user, *cmd_id, out),
         // Batches are flattened at the shard: encode_command is called per inner
         // command for journal/replication; a Batch itself never reaches here.
         Command::Batch(_) => out.fill(0),
@@ -331,21 +357,30 @@ pub fn encode_user_admin(
 /// [32..40]=qty` (qty carries trade size / filled / remaining per type).
 pub fn encode_report(r: &ExecReport, out: &mut [u8; REPORT_LEN]) {
     out.fill(0);
-    let mut put = |ty: u8, inst: InstrumentId, oid: OrderId, aux: u64, price: u64, qty: u64, side: u8| {
-        out[0] = ty;
-        out[1] = side;
-        out[4..8].copy_from_slice(&inst.0.to_le_bytes());
-        out[8..16].copy_from_slice(&oid.0.to_le_bytes());
-        out[16..24].copy_from_slice(&aux.to_le_bytes());
-        out[24..32].copy_from_slice(&price.to_le_bytes());
-        out[32..40].copy_from_slice(&qty.to_le_bytes());
-    };
+    let mut put =
+        |ty: u8, inst: InstrumentId, oid: OrderId, aux: u64, price: u64, qty: u64, side: u8| {
+            out[0] = ty;
+            out[1] = side;
+            out[4..8].copy_from_slice(&inst.0.to_le_bytes());
+            out[8..16].copy_from_slice(&oid.0.to_le_bytes());
+            out[16..24].copy_from_slice(&aux.to_le_bytes());
+            out[24..32].copy_from_slice(&price.to_le_bytes());
+            out[32..40].copy_from_slice(&qty.to_le_bytes());
+        };
     match *r {
-        ExecReport::Accepted { instrument, order_id } => {
-            put(RT_ACCEPTED, instrument, order_id, 0, 0, 0, 0)
-        }
+        ExecReport::Accepted {
+            instrument,
+            order_id,
+        } => put(RT_ACCEPTED, instrument, order_id, 0, 0, 0, 0),
         ExecReport::Trade {
-            instrument, taker, maker, aggressor, price, qty, maker_fee, taker_fee,
+            instrument,
+            taker,
+            maker,
+            aggressor,
+            price,
+            qty,
+            maker_fee,
+            taker_fee,
         } => {
             put(
                 RT_TRADE,
@@ -354,42 +389,68 @@ pub fn encode_report(r: &ExecReport, out: &mut [u8; REPORT_LEN]) {
                 maker.0,
                 price,
                 qty,
-                match aggressor { Side::Buy => 0, Side::Sell => 1 },
+                match aggressor {
+                    Side::Buy => 0,
+                    Side::Sell => 1,
+                },
             );
             out[40..48].copy_from_slice(&maker_fee.to_le_bytes());
             out[48..56].copy_from_slice(&taker_fee.to_le_bytes());
         }
-        ExecReport::Filled { instrument, order_id } => {
-            put(RT_FILLED, instrument, order_id, 0, 0, 0, 0)
-        }
-        ExecReport::PartiallyFilled { instrument, order_id, filled } => {
-            put(RT_PARTIAL, instrument, order_id, 0, 0, filled, 0)
-        }
-        ExecReport::Resting { instrument, order_id } => {
-            put(RT_RESTING, instrument, order_id, 0, 0, 0, 0)
-        }
-        ExecReport::Cancelled { instrument, order_id } => {
-            put(RT_CANCELLED, instrument, order_id, 0, 0, 0, 0)
-        }
-        ExecReport::Rejected { instrument, order_id, .. } => {
-            put(RT_REJECTED, instrument, order_id, 0, 0, 0, 0)
-        }
-        ExecReport::Modified { instrument, order_id, remaining } => {
-            put(RT_MODIFIED, instrument, order_id, 0, 0, remaining, 0)
-        }
-        ExecReport::NotFound { instrument, order_id } => {
-            put(RT_NOTFOUND, instrument, order_id, 0, 0, 0, 0)
-        }
-        ExecReport::DepthLevel { instrument, side, level, price, qty } => put(
+        ExecReport::Filled {
+            instrument,
+            order_id,
+        } => put(RT_FILLED, instrument, order_id, 0, 0, 0, 0),
+        ExecReport::PartiallyFilled {
+            instrument,
+            order_id,
+            filled,
+        } => put(RT_PARTIAL, instrument, order_id, 0, 0, filled, 0),
+        ExecReport::Resting {
+            instrument,
+            order_id,
+        } => put(RT_RESTING, instrument, order_id, 0, 0, 0, 0),
+        ExecReport::Cancelled {
+            instrument,
+            order_id,
+        } => put(RT_CANCELLED, instrument, order_id, 0, 0, 0, 0),
+        ExecReport::Rejected {
+            instrument,
+            order_id,
+            ..
+        } => put(RT_REJECTED, instrument, order_id, 0, 0, 0, 0),
+        ExecReport::Modified {
+            instrument,
+            order_id,
+            remaining,
+        } => put(RT_MODIFIED, instrument, order_id, 0, 0, remaining, 0),
+        ExecReport::NotFound {
+            instrument,
+            order_id,
+        } => put(RT_NOTFOUND, instrument, order_id, 0, 0, 0, 0),
+        ExecReport::DepthLevel {
+            instrument,
+            side,
+            level,
+            price,
+            qty,
+        } => put(
             RT_DEPTH_LEVEL,
             instrument,
             OrderId(0),
             level as u64,
             price,
             qty,
-            match side { Side::Buy => 0, Side::Sell => 1 },
+            match side {
+                Side::Buy => 0,
+                Side::Sell => 1,
+            },
         ),
-        ExecReport::DepthEnd { instrument, bid_levels, ask_levels } => put(
+        ExecReport::DepthEnd {
+            instrument,
+            bid_levels,
+            ask_levels,
+        } => put(
             RT_DEPTH_END,
             instrument,
             OrderId(0),
@@ -528,18 +589,41 @@ mod tests {
         encode_cancel(InstrumentId(3), OrderId(9), 77, &mut frame);
         assert!(matches!(
             WireView::parse(&frame).unwrap().to_command().unwrap(),
-            Command::Cancel { instrument: InstrumentId(3), order_id: OrderId(9), cmd_id: 77 }
+            Command::Cancel {
+                instrument: InstrumentId(3),
+                order_id: OrderId(9),
+                cmd_id: 77
+            }
         ));
 
         encode_modify(InstrumentId(1), OrderId(5), 500, 12, 78, &mut frame);
         assert!(matches!(
             WireView::parse(&frame).unwrap().to_command().unwrap(),
-            Command::Modify { order_id: OrderId(5), new_price: 500, new_qty: 12, cmd_id: 78, .. }
+            Command::Modify {
+                order_id: OrderId(5),
+                new_price: 500,
+                new_qty: 12,
+                cmd_id: 78,
+                ..
+            }
         ));
 
-        encode_force_close(InstrumentId(4), 777, OrderId(88), Side::Sell, 250, &mut frame);
+        encode_force_close(
+            InstrumentId(4),
+            777,
+            OrderId(88),
+            Side::Sell,
+            250,
+            &mut frame,
+        );
         match WireView::parse(&frame).unwrap().to_command().unwrap() {
-            Command::ForceClose { instrument, user, close_order_id, close_side, close_qty } => {
+            Command::ForceClose {
+                instrument,
+                user,
+                close_order_id,
+                close_side,
+                close_qty,
+            } => {
                 assert_eq!(instrument, InstrumentId(4));
                 assert_eq!(user, 777);
                 assert_eq!(close_order_id, OrderId(88));

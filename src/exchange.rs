@@ -346,7 +346,10 @@ impl OrderGateway {
     }
 
     fn submit_with_raft_index(&self, cmd: Command, raft_index: Option<u64>) -> Result<(), Command> {
-        let queued = QueuedCommand { command: cmd, raft_index };
+        let queued = QueuedCommand {
+            command: cmd,
+            raft_index,
+        };
         let instrument = queued.command.instrument();
         if let Some(tx) = self.instruments.get(&instrument) {
             return if queued.command.is_high_priority() {
@@ -1434,7 +1437,10 @@ impl Shard {
         // holds because this thread pops nothing until the loop finishes.
         if let Command::Batch(cmds) = cmd {
             for c in cmds {
-                self.handle(QueuedCommand { command: c, raft_index });
+                self.handle(QueuedCommand {
+                    command: c,
+                    raft_index,
+                });
             }
             return;
         }

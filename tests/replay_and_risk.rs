@@ -25,9 +25,17 @@ fn drain_all(sink: &trade_core::ResultSink) -> Vec<ExecReport> {
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut idle = 0;
     while Instant::now() < deadline && idle < 2000 {
-        if sink.poll(|r| if !matches!(r, ExecReport::DepthLevel { .. } | ExecReport::DepthEnd { .. }) { reports.push(r) }) == 0 {
+        if sink.poll(|r| {
+            if !matches!(
+                r,
+                ExecReport::DepthLevel { .. } | ExecReport::DepthEnd { .. }
+            ) {
+                reports.push(r)
+            }
+        }) == 0
+        {
             idle += 1;
-            std::thread::yield_now();
+            std::thread::sleep(Duration::from_micros(100));
         } else {
             idle = 0;
         }
@@ -66,7 +74,12 @@ fn random_flow(n: u64) -> Vec<trade_core::Command> {
             let side = if r & 1 == 0 { Side::Buy } else { Side::Sell };
             let price = 990 + r % 21;
             let qty = 1 + r % 50;
-            out.push(trade_core::Command::New(Order::limit(OrderId(i), side, price, qty)));
+            out.push(trade_core::Command::New(Order::limit(
+                OrderId(i),
+                side,
+                price,
+                qty,
+            )));
         }
     }
     out
@@ -103,17 +116,12 @@ fn journal_replay_reproduces_identical_results() {
 
     // "Crash" and recover: replay the journal into a fresh processor.
     let journal = dir.join("journal-shard-0.bin");
-    let summary = replay_journal(
-        &journal,
-        || Box::new(PriceTimePriority),
-        None,
-        None,
-    )
-    .unwrap();
+    let summary = replay_journal(&journal, || Box::new(PriceTimePriority), None, None).unwrap();
 
     assert_eq!(summary.commands, 3000);
     assert_eq!(
-        summary.fingerprint, live_fp,
+        summary.fingerprint,
+        live_fp,
         "replay must reproduce the exact live report stream \
          (live {} reports, replay {})",
         live_reports.len(),
@@ -121,7 +129,10 @@ fn journal_replay_reproduces_identical_results() {
     );
     // And the rebuilt book state matches a direct comparison of depth.
     let engine = summary.processor.engine(InstrumentId(0)).unwrap();
-    assert!(!engine.book().is_empty(), "book should have resting orders after replay");
+    assert!(
+        !engine.book().is_empty(),
+        "book should have resting orders after replay"
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -139,7 +150,8 @@ fn replay_until_timestamp_stops_early() {
 
     // First batch.
     for i in 1..=100u64 {
-        gw.new_order(Order::limit(OrderId(i), Side::Sell, 100 + i % 5, 1)).unwrap();
+        gw.new_order(Order::limit(OrderId(i), Side::Sell, 100 + i % 5, 1))
+            .unwrap();
     }
     let _ = drain_all(&sink);
     let cut = trade_core::journal::now_nanos();
@@ -147,7 +159,8 @@ fn replay_until_timestamp_stops_early() {
 
     // Second batch, after the cut point.
     for i in 101..=200u64 {
-        gw.new_order(Order::limit(OrderId(i), Side::Sell, 100 + i % 5, 1)).unwrap();
+        gw.new_order(Order::limit(OrderId(i), Side::Sell, 100 + i % 5, 1))
+            .unwrap();
     }
     let _ = drain_all(&sink);
     handle.shutdown();
@@ -158,7 +171,10 @@ fn replay_until_timestamp_stops_early() {
         replay_journal(&journal, || Box::new(PriceTimePriority), None, Some(cut)).unwrap();
 
     assert_eq!(full.commands, 200);
-    assert_eq!(partial.commands, 100, "time-bounded replay must stop at the cut");
+    assert_eq!(
+        partial.commands, 100,
+        "time-bounded replay must stop at the cut"
+    );
     let engine = partial.processor.engine(InstrumentId(0)).unwrap();
     assert_eq!(engine.book().len(), 100, "state = exactly the first batch");
 
@@ -182,7 +198,8 @@ fn new_modify_cancel_share_one_total_order() {
 
     // Force the exact interleaving by draining between commands so each is
     // processed (and journaled) before the next is enqueued.
-    gw.new_order(Order::limit(OrderId(1), Side::Buy, 100, 10)).unwrap();
+    gw.new_order(Order::limit(OrderId(1), Side::Buy, 100, 10))
+        .unwrap();
     let _ = drain_all(&sink);
     gw.modify(InstrumentId(0), OrderId(1), 101, 10, 2).unwrap();
     let _ = drain_all(&sink);
@@ -193,8 +210,9 @@ fn new_modify_cancel_share_one_total_order() {
     // The journal holds the three commands with strictly increasing seqs, in
     // execution order — Cancel did NOT get its own file or seq series.
     let jpath = dir.join("journal-shard-0.bin");
-    let records: Vec<_> =
-        trade_core::journal::JournalReader::open(&jpath).unwrap().collect();
+    let records: Vec<_> = trade_core::journal::JournalReader::open(&jpath)
+        .unwrap()
+        .collect();
     assert_eq!(records.len(), 3);
     assert!(
         records.windows(2).all(|w| w[1].seq == w[0].seq + 1),
@@ -205,12 +223,14 @@ fn new_modify_cancel_share_one_total_order() {
     let summary = replay_journal(&jpath, || Box::new(PriceTimePriority), None, None).unwrap();
     assert_eq!(summary.commands, 3);
     let engine = summary.processor.engine(InstrumentId(0)).unwrap();
-    assert!(engine.book().is_empty(), "New→Modify→Cancel must leave nothing");
+    assert!(
+        engine.book().is_empty(),
+        "New→Modify→Cancel must leave nothing"
+    );
 
     // Restart continuity: a writer reopened over this journal must CONTINUE
     // the seq series (a restart-at-zero would corrupt the total order).
-    let mut w =
-        trade_core::journal::JournalWriter::open(&jpath, Duration::from_millis(5)).unwrap();
+    let mut w = trade_core::journal::JournalWriter::open(&jpath, Duration::from_millis(5)).unwrap();
     w.resume_from(records.last().unwrap().seq);
     let frame = [1u8; trade_core::wire::MSG_LEN];
     let next = w.append(0, &frame).unwrap();
@@ -226,14 +246,19 @@ fn force_close_cancels_user_orders_and_flattens() {
 
     // User 7 has two resting bids; user 8 provides an ask to close against and
     // a bid that must survive.
-    gw.new_order(Order::limit(OrderId(1), Side::Buy, 99, 10).by(7)).unwrap();
-    gw.new_order(Order::limit(OrderId(2), Side::Buy, 98, 5).by(7)).unwrap();
-    gw.new_order(Order::limit(OrderId(3), Side::Buy, 97, 5).by(8)).unwrap();
-    gw.new_order(Order::limit(OrderId(4), Side::Sell, 101, 20).by(8)).unwrap();
+    gw.new_order(Order::limit(OrderId(1), Side::Buy, 99, 10).by(7))
+        .unwrap();
+    gw.new_order(Order::limit(OrderId(2), Side::Buy, 98, 5).by(7))
+        .unwrap();
+    gw.new_order(Order::limit(OrderId(3), Side::Buy, 97, 5).by(8))
+        .unwrap();
+    gw.new_order(Order::limit(OrderId(4), Side::Sell, 101, 20).by(8))
+        .unwrap();
     let _ = drain_all(&sink);
 
     // Risk decides: force-close user 7, flattening a long of 12 lots.
-    gw.force_close(sym, 7, OrderId(100), Side::Sell, 12).unwrap();
+    gw.force_close(sym, 7, OrderId(100), Side::Sell, 12)
+        .unwrap();
     let reports = drain_all(&sink);
     handle.shutdown();
 
@@ -267,15 +292,19 @@ fn price_guard_rejects_spikes_and_protects_market_orders() {
     let (gw, sink, handle) = build(cfg);
 
     // A thin ask far above the band — spike bait.
-    gw.new_order(Order::limit(OrderId(1), Side::Sell, 1050, 1)).unwrap();
-    gw.new_order(Order::limit(OrderId(2), Side::Sell, 2000, 100)).unwrap(); // out of band
+    gw.new_order(Order::limit(OrderId(1), Side::Sell, 1050, 1))
+        .unwrap();
+    gw.new_order(Order::limit(OrderId(2), Side::Sell, 2000, 100))
+        .unwrap(); // out of band
 
     // An aggressive buy limit way above band: rejected outright.
-    gw.new_order(Order::limit(OrderId(3), Side::Buy, 1500, 10)).unwrap();
+    gw.new_order(Order::limit(OrderId(3), Side::Buy, 1500, 10))
+        .unwrap();
 
     // A market buy for 5: protected — capped at 1050, so it lifts the 1-lot ask
     // at 1050 and cancels the rest instead of walking up to 2000.
-    gw.new_order(Order::market(OrderId(4), Side::Buy, 5)).unwrap();
+    gw.new_order(Order::market(OrderId(4), Side::Buy, 5))
+        .unwrap();
 
     let reports = drain_all(&sink);
     handle.shutdown();
@@ -325,11 +354,7 @@ fn standby_replica_matches_primary_state() {
 
     // Standby attaches, then the primary processes a mixed flow.
     let applied = std::sync::Arc::new(AtomicU64::new(0));
-    let standby = replication::spawn_replica(
-        addr,
-        || Box::new(PriceTimePriority),
-        applied.clone(),
-    );
+    let standby = replication::spawn_replica(addr, || Box::new(PriceTimePriority), applied.clone());
     std::thread::sleep(Duration::from_millis(100)); // let it attach
 
     let n = 2000u64;

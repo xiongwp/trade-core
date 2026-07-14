@@ -41,8 +41,14 @@ fn is_terminal(r: &ExecReport) -> bool {
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let rate: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(1_000_000);
-    let orders: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(2_000_000);
+    let rate: u64 = args
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1_000_000);
+    let orders: u64 = args
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2_000_000);
 
     println!("latency: {orders} orders paced at {rate}/s through the full pipeline");
 
@@ -70,9 +76,12 @@ fn main() {
         // Paced submission.
         if sent < orders && Instant::now() >= next_send {
             sent += 1;
-            let side = if rng.next() & 1 == 0 { Side::Buy } else { Side::Sell };
-            let order =
-                Order::limit(OrderId(sent), side, rng.range(990, 1010), rng.range(1, 50));
+            let side = if rng.next() & 1 == 0 {
+                Side::Buy
+            } else {
+                Side::Sell
+            };
+            let order = Order::limit(OrderId(sent), side, rng.range(990, 1010), rng.range(1, 50));
             send_at[sent as usize] = Some(Instant::now());
             if gw.new_order(order).is_err() {
                 // Backpressure at this rate means the rate is beyond capacity;

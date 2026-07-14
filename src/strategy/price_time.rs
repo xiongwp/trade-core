@@ -30,7 +30,10 @@ impl MatchingStrategy for PriceTimePriority {
             }
             let fill = remaining.min(r.remaining);
             if fill > 0 {
-                out.push(Allocation { id: r.id, qty: fill });
+                out.push(Allocation {
+                    id: r.id,
+                    qty: fill,
+                });
                 remaining -= fill;
             }
         }

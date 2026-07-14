@@ -106,8 +106,10 @@ pub fn run_replica(
 ) -> std::io::Result<Replica> {
     let mut sock = TcpStream::connect(primary_addr)?;
     sock.set_nodelay(true).ok();
-    let mut replica =
-        Replica { processors: HashMap::new(), applied_seq: skip_seq.clone() };
+    let mut replica = Replica {
+        processors: HashMap::new(),
+        applied_seq: skip_seq.clone(),
+    };
 
     let mut buf = vec![0u8; REC_LEN * 1024];
     let mut filled = 0usize;
@@ -118,13 +120,12 @@ pub fn run_replica(
                 filled += n;
                 let mut off = 0;
                 while filled - off >= REC_LEN {
-                    let shard_id =
-                        u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
-                    let seq =
-                        u64::from_le_bytes(buf[off + 4..off + 12].try_into().unwrap());
+                    let shard_id = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+                    let seq = u64::from_le_bytes(buf[off + 4..off + 12].try_into().unwrap());
                     let skip = replica.applied_seq.get(&shard_id).copied().unwrap_or(0);
                     if seq > skip {
-                        if let Some(view) = wire::WireView::parse(&buf[off + 12..off + 12 + MSG_LEN])
+                        if let Some(view) =
+                            wire::WireView::parse(&buf[off + 12..off + 12 + MSG_LEN])
                         {
                             if let Some(cmd) = view.to_command() {
                                 replica

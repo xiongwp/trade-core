@@ -34,10 +34,16 @@ mod tests {
     #[test]
     fn fees_floor_deterministically() {
         // 10 bps maker, 20 bps taker on notional 1000*3 = 3000.
-        let f = FeeSchedule { maker_bps: 10, taker_bps: 20 };
+        let f = FeeSchedule {
+            maker_bps: 10,
+            taker_bps: 20,
+        };
         assert_eq!(f.fees(1000, 3), (3, 6));
         // Flooring: notional 999 * 1 bps = 0.0999 -> 0.
-        let f = FeeSchedule { maker_bps: 1, taker_bps: 1 };
+        let f = FeeSchedule {
+            maker_bps: 1,
+            taker_bps: 1,
+        };
         assert_eq!(f.fees(999, 1), (0, 0));
         // Zero schedule = free trading (default).
         assert_eq!(FeeSchedule::default().fees(1000, 50), (0, 0));

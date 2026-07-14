@@ -201,12 +201,7 @@ where
         .expect("spawn market-data report drain");
     while running.load(Ordering::Acquire) {
         let session_running = Arc::new(AtomicBool::new(true));
-        serve_one_ingress_ack(
-            &listener,
-            session_running,
-            max_cmds_per_sec,
-            &submit,
-        )?;
+        serve_one_ingress_ack(&listener, session_running, max_cmds_per_sec, &submit)?;
     }
     Ok(())
 }

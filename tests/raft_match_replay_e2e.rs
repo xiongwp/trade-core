@@ -80,7 +80,8 @@ fn quorum_committed_orders_replay_to_the_identical_match_result_after_restart() 
     let committed = restarted.take_committed();
     assert_eq!(committed.len(), 2);
 
-    let mut asset_logs = AssetJournalSet::open(root.join("assets"), Duration::from_millis(1)).unwrap();
+    let mut asset_logs =
+        AssetJournalSet::open(root.join("assets"), Duration::from_millis(1)).unwrap();
     let mut live = Processor::new(|| Box::new(PriceTimePriority), None);
     let mut live_reports = Vec::new();
     for (_, payload) in committed {
@@ -92,7 +93,10 @@ fn quorum_committed_orders_replay_to_the_identical_match_result_after_restart() 
     }
     asset_logs.flush_all().unwrap();
 
-    let replay = replay_with_reports(&root.join("assets"), instrument, || Box::new(PriceTimePriority)).unwrap();
+    let replay = replay_with_reports(&root.join("assets"), instrument, || {
+        Box::new(PriceTimePriority)
+    })
+    .unwrap();
     assert_eq!(report_fingerprint(&live_reports), replay.fingerprint);
     assert_eq!(replay.meta.records, 2);
     assert_eq!(replay.processor.engine(instrument).unwrap().book().len(), 0);

@@ -38,9 +38,15 @@ fn client_streams_orders_and_receives_reports_over_tcp() {
     // Send: rest an ask, then a crossing buy, on instrument 7.
     let sym = InstrumentId(7);
     let mut frame = [0u8; MSG_LEN];
-    wire::encode_new(&Order::limit(OrderId(1), Side::Sell, 100, 5).on(sym), &mut frame);
+    wire::encode_new(
+        &Order::limit(OrderId(1), Side::Sell, 100, 5).on(sym),
+        &mut frame,
+    );
     client.write_all(&frame).unwrap();
-    wire::encode_new(&Order::limit(OrderId(2), Side::Buy, 100, 5).on(sym), &mut frame);
+    wire::encode_new(
+        &Order::limit(OrderId(2), Side::Buy, 100, 5).on(sym),
+        &mut frame,
+    );
     client.write_all(&frame).unwrap();
 
     // Read report frames back until we see the taker Filled or time out.
@@ -84,10 +90,13 @@ fn client_streams_orders_and_receives_reports_over_tcp() {
     handle.shutdown();
     let _ = server.join();
 
-    assert!(saw_fill, "expected a Filled report for taker #2; got {reports:?}");
+    assert!(
+        saw_fill,
+        "expected a Filled report for taker #2; got {reports:?}"
+    );
     // A trade at price 100, qty 5, on instrument 7.
-    let trade = reports.iter().any(|r| {
-        r.type_code == 2 && r.instrument == sym && r.price == 100 && r.qty == 5
-    });
+    let trade = reports
+        .iter()
+        .any(|r| r.type_code == 2 && r.instrument == sym && r.price == 100 && r.qty == 5);
     assert!(trade, "expected a TRADE report; got {reports:?}");
 }

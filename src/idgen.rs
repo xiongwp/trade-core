@@ -30,7 +30,9 @@ pub struct MemorySegmentProvider {
 
 impl MemorySegmentProvider {
     pub fn starting_at(start: u64) -> Self {
-        MemorySegmentProvider { max_id: AtomicU64::new(start) }
+        MemorySegmentProvider {
+            max_id: AtomicU64::new(start),
+        }
     }
 }
 
@@ -98,7 +100,9 @@ impl<P: SegmentProvider> LeafIdGen<P> {
         if self.end.load(Ordering::Acquire) != exhausted_end {
             return;
         }
-        let start = next.take().unwrap_or_else(|| self.provider.next_segment(self.step));
+        let start = next
+            .take()
+            .unwrap_or_else(|| self.provider.next_segment(self.step));
         // The cursor is a *forever-monotonic* counter: `fetch_max` (never a
         // plain store) so it can only move forward. Threads spinning on an
         // exhausted segment may have pushed the cursor past `start`; resetting

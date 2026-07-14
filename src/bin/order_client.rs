@@ -18,7 +18,9 @@ use trade_core::wire::{self, MSG_LEN, REPORT_LEN};
 use trade_core::InstrumentId;
 
 fn main() {
-    let addr = std::env::args().nth(1).unwrap_or_else(|| "127.0.0.1:9001".to_string());
+    let addr = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "127.0.0.1:9001".to_string());
     let mut sock = TcpStream::connect(&addr).unwrap_or_else(|e| {
         eprintln!("cannot connect to {addr}: {e}");
         std::process::exit(1);
@@ -35,33 +37,54 @@ fn main() {
 
     // --- Scripted flow ---------------------------------------------------
     // AAPL: rest two asks, cancel one, then a buy crosses the survivor.
-    wire::encode_new(&Order::limit(OrderId(1), Side::Sell, 100, 5).on(aapl), &mut frame);
+    wire::encode_new(
+        &Order::limit(OrderId(1), Side::Sell, 100, 5).on(aapl),
+        &mut frame,
+    );
     send(&frame, &mut sock);
-    wire::encode_new(&Order::limit(OrderId(2), Side::Sell, 100, 5).on(aapl), &mut frame);
+    wire::encode_new(
+        &Order::limit(OrderId(2), Side::Sell, 100, 5).on(aapl),
+        &mut frame,
+    );
     send(&frame, &mut sock);
     wire::encode_cancel(aapl, OrderId(1), 4, &mut frame); // cancel (admin cmd_id 4)
     send(&frame, &mut sock);
-    wire::encode_new(&Order::limit(OrderId(3), Side::Buy, 100, 5).on(aapl), &mut frame);
+    wire::encode_new(
+        &Order::limit(OrderId(3), Side::Buy, 100, 5).on(aapl),
+        &mut frame,
+    );
     send(&frame, &mut sock); // should trade against #2, not the cancelled #1
 
     // BTC: rest a bid, modify it up (loses priority / re-quote), then a sell hits.
     // (The demo server's price guard references 1000, so stay in-band.)
-    wire::encode_new(&Order::limit(OrderId(10), Side::Buy, 1000, 2).on(btc), &mut frame);
+    wire::encode_new(
+        &Order::limit(OrderId(10), Side::Buy, 1000, 2).on(btc),
+        &mut frame,
+    );
     send(&frame, &mut sock);
     wire::encode_modify(btc, OrderId(10), 1001, 2, 14, &mut frame); // raise price (admin cmd_id 14)
     send(&frame, &mut sock);
-    wire::encode_new(&Order::limit(OrderId(11), Side::Sell, 1000, 2).on(btc), &mut frame);
+    wire::encode_new(
+        &Order::limit(OrderId(11), Side::Sell, 1000, 2).on(btc),
+        &mut frame,
+    );
     send(&frame, &mut sock);
 
     // Deliberately fire a buy far through the price band: the anti-spike guard
     // must reject it (watch for REJECTED in the report stream).
-    wire::encode_new(&Order::limit(OrderId(12), Side::Buy, 999_999, 1).on(btc), &mut frame);
+    wire::encode_new(
+        &Order::limit(OrderId(12), Side::Buy, 999_999, 1).on(btc),
+        &mut frame,
+    );
     send(&frame, &mut sock);
 
     // Risk demo: force-close user 42 on BTC (no position: pure cancel sweep).
     // The brief pause lets #13 rest first — force-close rides the high-priority
     // queue and would otherwise overtake it (that priority is the point).
-    wire::encode_new(&Order::limit(OrderId(13), Side::Buy, 990, 3).on(btc).by(42), &mut frame);
+    wire::encode_new(
+        &Order::limit(OrderId(13), Side::Buy, 990, 3).on(btc).by(42),
+        &mut frame,
+    );
     send(&frame, &mut sock);
     std::thread::sleep(Duration::from_millis(50));
     wire::encode_force_close(btc, 42, OrderId(14), Side::Sell, 0, &mut frame);

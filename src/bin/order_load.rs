@@ -43,7 +43,10 @@ impl Rng {
 fn main() {
     let mut args = std::env::args().skip(1);
     let addr = args.next().unwrap_or_else(|| "127.0.0.1:9001".to_string());
-    let total: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(20_000_000);
+    let total: u64 = args
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20_000_000);
 
     // ---- Phase 1: generate and shard into 10 DBs x 100 tables --------------
     println!("[load] phase 1: generating {total} orders into 10 DBs x 100 tables…");
@@ -67,7 +70,11 @@ fn main() {
             // Cancel an earlier order (may be already gone -> NotFound, fine).
             wire::encode_cancel(sym, OrderId(rng.range(1, i - 1)), i, &mut frame);
         } else {
-            let side = if rng.next() & 1 == 0 { Side::Buy } else { Side::Sell };
+            let side = if rng.next() & 1 == 0 {
+                Side::Buy
+            } else {
+                Side::Sell
+            };
             let order = Order::limit(OrderId(i), side, rng.range(990, 1010), rng.range(1, 50))
                 .on(sym)
                 .by(user);
@@ -77,9 +84,15 @@ fn main() {
         flat.push(frame);
     }
     let per_db: Vec<u64> = (0..DB_COUNT as usize)
-        .map(|db| (0..TABLES_PER_DB as usize).map(|t| tables[db * TABLES_PER_DB as usize + t]).sum())
+        .map(|db| {
+            (0..TABLES_PER_DB as usize)
+                .map(|t| tables[db * TABLES_PER_DB as usize + t])
+                .sum()
+        })
         .collect();
-    let (tmin, tmax) = tables.iter().fold((u64::MAX, 0u64), |(lo, hi), &t| (lo.min(t), hi.max(t)));
+    let (tmin, tmax) = tables
+        .iter()
+        .fold((u64::MAX, 0u64), |(lo, hi), &t| (lo.min(t), hi.max(t)));
     println!(
         "[load] generated in {:.1?}; per-DB rows: {:?}",
         t0.elapsed(),

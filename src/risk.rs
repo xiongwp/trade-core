@@ -49,7 +49,10 @@ impl PriceGuard {
     pub fn new(band_bps: u64, instruments: &[InstrumentId]) -> Self {
         PriceGuard {
             band_bps,
-            refs: instruments.iter().map(|&i| (i, AtomicU64::new(0))).collect(),
+            refs: instruments
+                .iter()
+                .map(|&i| (i, AtomicU64::new(0)))
+                .collect(),
         }
     }
 
@@ -71,7 +74,10 @@ impl PriceGuard {
 
     fn band(&self, reference: Price) -> (Price, Price) {
         let delta = reference.saturating_mul(self.band_bps) / 10_000;
-        (reference.saturating_sub(delta), reference.saturating_add(delta))
+        (
+            reference.saturating_sub(delta),
+            reference.saturating_add(delta),
+        )
     }
 
     /// Vet (and possibly adjust) an order before matching.
@@ -213,7 +219,12 @@ mod tests {
         let cmds = mon.evaluate();
         assert_eq!(cmds.len(), 1);
         match &cmds[0] {
-            Command::ForceClose { user, close_side, close_qty, .. } => {
+            Command::ForceClose {
+                user,
+                close_side,
+                close_qty,
+                ..
+            } => {
                 assert_eq!(*user, 7);
                 assert_eq!(*close_side, Side::Sell);
                 assert_eq!(*close_qty, 10);

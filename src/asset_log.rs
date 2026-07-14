@@ -95,7 +95,10 @@ impl AssetJournalSet {
     pub fn append_committed(&mut self, raft_index: u64, command: &Command) -> io::Result<u64> {
         let instrument = command.instrument();
         let seq = self.append(command)?;
-        let writer = self.writers.get_mut(&instrument).expect("writer opened by append");
+        let writer = self
+            .writers
+            .get_mut(&instrument)
+            .expect("writer opened by append");
         writer.sync_data()?;
         let _ = raft_index;
         Ok(seq)

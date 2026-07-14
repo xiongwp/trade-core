@@ -130,9 +130,18 @@ impl DurableRaftLog {
                 ));
             }
             match kind[0] {
-                HARD_STATE_RECORD => hard_state = HardState::parse_from_bytes(&payload).map_err(proto_error)?,
-                ENTRY_RECORD => entries.push(Entry::parse_from_bytes(&payload).map_err(proto_error)?),
-                _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "unknown raft state record")),
+                HARD_STATE_RECORD => {
+                    hard_state = HardState::parse_from_bytes(&payload).map_err(proto_error)?
+                }
+                ENTRY_RECORD => {
+                    entries.push(Entry::parse_from_bytes(&payload).map_err(proto_error)?)
+                }
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "unknown raft state record",
+                    ))
+                }
             }
         }
         let file = OpenOptions::new().append(true).open(path)?;
@@ -141,7 +150,10 @@ impl DurableRaftLog {
 
     fn persist(&mut self, entries: &[Entry], hard_state: Option<&HardState>) -> io::Result<()> {
         if let Some(hard_state) = hard_state {
-            self.write_record(HARD_STATE_RECORD, &hard_state.write_to_bytes().map_err(proto_error)?)?;
+            self.write_record(
+                HARD_STATE_RECORD,
+                &hard_state.write_to_bytes().map_err(proto_error)?,
+            )?;
         }
         for entry in entries {
             self.write_record(ENTRY_RECORD, &entry.write_to_bytes().map_err(proto_error)?)?;
@@ -160,7 +172,8 @@ impl DurableRaftLog {
         protected.extend_from_slice(&length.to_le_bytes());
         protected.extend_from_slice(payload);
         self.file.write_all(&protected)?;
-        self.file.write_all(&crate::journal::fnv1a(&protected).to_le_bytes())
+        self.file
+            .write_all(&crate::journal::fnv1a(&protected).to_le_bytes())
     }
 }
 
@@ -212,7 +225,8 @@ impl RaftNode {
         entries: Vec<Entry>,
         hard_state: HardState,
     ) -> Result<Self, raft::Error> {
-        let store = MemStorage::new_with_conf_state(ConfState::from((cluster.voters.to_vec(), vec![])));
+        let store =
+            MemStorage::new_with_conf_state(ConfState::from((cluster.voters.to_vec(), vec![])));
         if !entries.is_empty() {
             store.wl().append(&entries)?;
         }

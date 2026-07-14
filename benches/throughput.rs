@@ -30,7 +30,11 @@ fn run(name: &str, mut engine: MatchingEngine, orders: u64) {
     let start = Instant::now();
     for _ in 0..orders {
         id += 1;
-        let side = if rng.next() & 1 == 0 { Side::Buy } else { Side::Sell };
+        let side = if rng.next() & 1 == 0 {
+            Side::Buy
+        } else {
+            Side::Sell
+        };
         // Prices cluster around 1000 so orders actually cross and rest.
         let price = rng.range(990, 1010);
         let qty = rng.range(1, 50);
@@ -59,7 +63,15 @@ fn main() {
         .unwrap_or(500_000);
 
     println!("trade-core throughput ({orders} orders/strategy)\n");
-    run("price-time", MatchingEngine::with_strategy(PriceTimePriority), orders);
+    run(
+        "price-time",
+        MatchingEngine::with_strategy(PriceTimePriority),
+        orders,
+    );
     run("pro-rata", MatchingEngine::with_strategy(ProRata), orders);
-    run("size-priority", MatchingEngine::with_strategy(SizePriority), orders);
+    run(
+        "size-priority",
+        MatchingEngine::with_strategy(SizePriority),
+        orders,
+    );
 }

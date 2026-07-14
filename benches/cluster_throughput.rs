@@ -40,10 +40,19 @@ fn generate(node: u64, n: u64) -> Vec<Command> {
                 cmd_id: base + i,
             });
         } else {
-            let side = if rng.next() & 1 == 0 { Side::Buy } else { Side::Sell };
+            let side = if rng.next() & 1 == 0 {
+                Side::Buy
+            } else {
+                Side::Sell
+            };
             let price = rng.range(990, 1010);
             let qty = rng.range(1, 50);
-            out.push(Command::New(Order::limit(OrderId(base + i), side, price, qty)));
+            out.push(Command::New(Order::limit(
+                OrderId(base + i),
+                side,
+                price,
+                qty,
+            )));
         }
     }
     out
@@ -65,7 +74,10 @@ fn is_terminal(r: &ExecReport) -> bool {
 fn main() {
     let mut args = std::env::args().skip(1);
     let nodes: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(4);
-    let per_node: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(1_500_000);
+    let per_node: u64 = args
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1_500_000);
     let journal = args.next().as_deref() == Some("journal");
 
     println!(
@@ -159,6 +171,10 @@ fn main() {
     let target = 5_000_000.0;
     println!(
         "target 5,000,000 orders/s: {}",
-        if rate >= target { "MET ✓" } else { "NOT MET ✗" }
+        if rate >= target {
+            "MET ✓"
+        } else {
+            "NOT MET ✗"
+        }
     );
 }

@@ -26,7 +26,10 @@ fn run(label: &str, strategy: Box<dyn MatchingStrategy>) {
     let report = engine.submit(Order::limit(OrderId(99), Side::Buy, 100, 50));
     println!("Aggressor: BUY 50 @100  ->  filled {}", report.filled);
     for t in &report.trades {
-        println!("   fill: maker {} qty {:>3} @ {}", t.maker, t.quantity, t.price);
+        println!(
+            "   fill: maker {} qty {:>3} @ {}",
+            t.maker, t.quantity, t.price
+        );
     }
     println!("Remaining resting depth (asks):");
     for (px, qty, n) in engine.book().depth(Side::Sell) {
@@ -46,11 +49,17 @@ fn main() {
     engine.submit(Order::limit(OrderId(10), Side::Sell, 100, 5));
     engine.submit(Order::limit(OrderId(11), Side::Sell, 101, 5));
     engine.submit(Order::limit(OrderId(12), Side::Sell, 102, 5));
-    let report = engine
-        .submit(Order::limit(OrderId(20), Side::Buy, 101, 20).with_tif(TimeInForce::Ioc));
-    println!("BUY 20 @101 IOC -> status {:?}, filled {}", report.status, report.filled);
+    let report =
+        engine.submit(Order::limit(OrderId(20), Side::Buy, 101, 20).with_tif(TimeInForce::Ioc));
+    println!(
+        "BUY 20 @101 IOC -> status {:?}, filled {}",
+        report.status, report.filled
+    );
     for t in &report.trades {
-        println!("   fill: maker {} qty {} @ {}", t.maker, t.quantity, t.price);
+        println!(
+            "   fill: maker {} qty {} @ {}",
+            t.maker, t.quantity, t.price
+        );
     }
     println!(
         "VWAP: {:.2} (only prices <=101 were lifted; the 102 ask survived, remainder cancelled)",

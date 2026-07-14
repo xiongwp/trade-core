@@ -93,8 +93,14 @@ unsafe impl<T: Send> Send for Consumer<T> {}
 pub fn channel<T>(capacity: usize) -> (Producer<T>, Consumer<T>) {
     let ring = Arc::new(Ring::with_capacity(capacity));
     (
-        Producer { ring: ring.clone(), cached_head: Cell::new(0) },
-        Consumer { ring, cached_tail: Cell::new(0) },
+        Producer {
+            ring: ring.clone(),
+            cached_head: Cell::new(0),
+        },
+        Consumer {
+            ring,
+            cached_tail: Cell::new(0),
+        },
     )
 }
 
