@@ -1,10 +1,11 @@
-//! Concurrent load against the real persistent order HTTP API. Every request
-//! uses a unique order id and waits for the 202 response after Kafka confirms
-//! durable ingress. MySQL projection/direct Raft completion is measured separately.
+//! Concurrent load against the real persistent order HTTP API. Each worker
+//! reuses one HTTP/1.1 connection; every request uses a unique order id and
+//! waits for the 202 response after Kafka confirms durable ingress. MySQL
+//! projection/direct Raft completion is measured separately.
 //!
 //! Run: cargo bench --bench order_e2e -- [ADDR TOKEN REQUESTS CONCURRENCY ASSETS]
 
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
@@ -13,6 +14,37 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 fn percentile(values: &mut [u64], p: f64) -> u64 {
     values.sort_unstable();
     values[((values.len() as f64 * p) as usize).min(values.len() - 1)]
+}
+
+fn read_response(reader: &mut BufReader<TcpStream>) -> std::io::Result<String> {
+    let mut response = String::new();
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    if line.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "server closed persistent connection",
+        ));
+    }
+    response.push_str(&line);
+    let mut content_length = 0usize;
+    loop {
+        line.clear();
+        reader.read_line(&mut line)?;
+        response.push_str(&line);
+        if line == "\r\n" || line == "\n" {
+            break;
+        }
+        if let Some((key, value)) = line.split_once(':') {
+            if key.eq_ignore_ascii_case("content-length") {
+                content_length = value.trim().parse().unwrap_or(0);
+            }
+        }
+    }
+    let mut body = vec![0; content_length];
+    reader.read_exact(&mut body)?;
+    response.push_str(&String::from_utf8_lossy(&body));
+    Ok(response)
 }
 
 fn main() {
@@ -59,6 +91,9 @@ fn main() {
         let error_samples = error_samples.clone();
         let barrier = start_barrier.clone();
         workers.push(std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(&addr).expect("connect persistent order API");
+            stream.set_nodelay(true).ok();
+            let mut reader = BufReader::new(stream.try_clone().expect("clone order API socket"));
             barrier.wait();
             let mut local_latencies = Vec::new();
             loop {
@@ -74,15 +109,12 @@ fn main() {
                     "/orders?order_id={order_id}&user={user}&instrument={instrument}&side={side}&price=1000&qty=1"
                 );
                 let request = format!(
-                    "POST {path} HTTP/1.1\r\nHost: order-api\r\nAuthorization: Bearer {token}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    "POST {path} HTTP/1.1\r\nHost: order-api\r\nAuthorization: Bearer {token}\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"
                 );
                 let started = Instant::now();
-                let result = TcpStream::connect(&addr).and_then(|mut stream| {
-                    stream.write_all(request.as_bytes())?;
-                    let mut response = String::new();
-                    stream.read_to_string(&mut response)?;
-                    Ok(response)
-                });
+                let result = stream
+                    .write_all(request.as_bytes())
+                    .and_then(|()| read_response(&mut reader));
                 local_latencies.push(started.elapsed().as_nanos() as u64);
                 match result {
                     Ok(response) if response.starts_with("HTTP/1.1 202") => {

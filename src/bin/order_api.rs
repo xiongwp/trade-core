@@ -661,68 +661,122 @@ fn parse_matcher_groups() -> Vec<Vec<MatcherTarget>> {
     }]]
 }
 
-fn respond(stream: &mut TcpStream, status: &str, body: &str) {
-    let _ = stream.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes());
+fn respond(stream: &mut TcpStream, status: &str, body: &str, keep_alive: bool) {
+    let connection = if keep_alive { "keep-alive" } else { "close" };
+    let _ = stream.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: {connection}\r\n\r\n{body}", body.len()).as_bytes());
 }
 
-fn handle(mut stream: TcpStream, store: Arc<OrderStore>, kafka: Arc<KafkaIngress>, token: &str) {
-    let mut reader = BufReader::new(stream.try_clone().expect("clone"));
-    let mut first = String::new();
-    if reader.read_line(&mut first).is_err() {
-        return;
-    }
-    let method = first.split_whitespace().next().unwrap_or("");
-    let uri = first.split_whitespace().nth(1).unwrap_or("/");
-    let (path, query) = uri.split_once('?').unwrap_or((uri, ""));
-    let mut authorized = false;
-    let mut header = String::new();
-    while reader.read_line(&mut header).is_ok() && header.trim() != "" {
-        if let Some((key, value)) = header.split_once(':') {
-            authorized |= key.eq_ignore_ascii_case("authorization")
-                && value.trim() == format!("Bearer {token}");
+fn handle(stream: TcpStream, store: Arc<OrderStore>, kafka: Arc<KafkaIngress>, token: &str) {
+    stream.set_nodelay(true).ok();
+    let mut reader = BufReader::new(stream);
+    loop {
+        let mut first = String::new();
+        match reader.read_line(&mut first) {
+            Ok(0) | Err(_) => return,
+            Ok(_) if first.trim().is_empty() => continue,
+            Ok(_) => {}
         }
-        header.clear();
-    }
-    if !authorized {
-        respond(
-            &mut stream,
-            "401 Unauthorized",
-            "{\"error\":\"unauthorized\"}",
-        );
-        return;
-    }
-    let persisted = match (method, path) {
-        ("POST", "/orders") => order_from_query(query).and_then(|order| {
-            let mut frame = [0u8; wire::MSG_LEN];
-            wire::encode_new(&order, &mut frame);
-            let category = sharding::asset_category(order.instrument, store.category_size);
-            kafka.publish(category, order.user, &frame)
-        }),
-        ("POST", "/cancels") => cancel_from_query(query).and_then(|(i, o, c, u)| {
-            let mut frame = [0u8; wire::MSG_LEN];
-            wire::encode_cancel(i, o, c, &mut frame);
-            let category = sharding::asset_category(i, store.category_size);
-            kafka.publish(category, u, &frame)
-        }),
-        _ => {
-            respond(&mut stream, "404 Not Found", "{\"error\":\"not found\"}");
+        let mut parts = first.split_whitespace();
+        let method = parts.next().unwrap_or("").to_string();
+        let uri = parts.next().unwrap_or("/").to_string();
+        let version = parts.next().unwrap_or("HTTP/1.0");
+        let mut authorized = false;
+        let mut keep_alive = version == "HTTP/1.1";
+        let mut content_length = 0usize;
+        loop {
+            let mut header = String::new();
+            match reader.read_line(&mut header) {
+                Ok(0) | Err(_) => return,
+                Ok(_) if header.trim().is_empty() => break,
+                Ok(_) => {}
+            }
+            if let Some((key, value)) = header.split_once(':') {
+                let value = value.trim();
+                authorized |=
+                    key.eq_ignore_ascii_case("authorization") && value == format!("Bearer {token}");
+                if key.eq_ignore_ascii_case("connection") {
+                    keep_alive = value.eq_ignore_ascii_case("keep-alive");
+                }
+                if key.eq_ignore_ascii_case("content-length") {
+                    content_length = value.parse().unwrap_or(usize::MAX);
+                }
+            }
+        }
+        if content_length > 1 << 20 {
+            respond(
+                reader.get_mut(),
+                "413 Payload Too Large",
+                "{\"error\":\"payload too large\"}",
+                false,
+            );
             return;
         }
-    };
-    match persisted {
-        Ok(seq) => respond(
-            &mut stream,
-            "202 Accepted",
-            &format!(
-                "{{\"accepted\":true,\"status\":\"PENDING\",\"category_id\":{},\"category_seq\":{}}}",
-                seq.category_id, seq.category_seq
+        if content_length > 0 {
+            let mut body = vec![0; content_length];
+            if reader.read_exact(&mut body).is_err() {
+                return;
+            }
+        }
+        if !authorized {
+            respond(
+                reader.get_mut(),
+                "401 Unauthorized",
+                "{\"error\":\"unauthorized\"}",
+                keep_alive,
+            );
+            if !keep_alive {
+                return;
+            }
+            continue;
+        }
+
+        let (path, query) = uri.split_once('?').unwrap_or((&uri, ""));
+        let persisted = match (method.as_str(), path) {
+            ("POST", "/orders") => order_from_query(query).and_then(|order| {
+                let mut frame = [0u8; wire::MSG_LEN];
+                wire::encode_new(&order, &mut frame);
+                let category = sharding::asset_category(order.instrument, store.category_size);
+                kafka.publish(category, order.user, &frame)
+            }),
+            ("POST", "/cancels") => cancel_from_query(query).and_then(|(i, o, c, u)| {
+                let mut frame = [0u8; wire::MSG_LEN];
+                wire::encode_cancel(i, o, c, &mut frame);
+                let category = sharding::asset_category(i, store.category_size);
+                kafka.publish(category, u, &frame)
+            }),
+            _ => {
+                respond(
+                    reader.get_mut(),
+                    "404 Not Found",
+                    "{\"error\":\"not found\"}",
+                    keep_alive,
+                );
+                if !keep_alive {
+                    return;
+                }
+                continue;
+            }
+        };
+        match persisted {
+            Ok(seq) => respond(
+                reader.get_mut(),
+                "202 Accepted",
+                &format!(
+                    "{{\"accepted\":true,\"status\":\"PENDING\",\"category_id\":{},\"category_seq\":{}}}",
+                    seq.category_id, seq.category_seq
+                ),
+                keep_alive,
             ),
-        ),
-        Err(error) => respond(
-            &mut stream,
-            "400 Bad Request",
-            &format!("{{\"error\":\"{error}\"}}"),
-        ),
+            Err(error) => respond(
+                reader.get_mut(),
+                "400 Bad Request",
+                &format!("{{\"error\":\"{error}\"}}"),
+                keep_alive,
+            ),
+        }
+        if !keep_alive {
+            return;
+        }
     }
 }
 
