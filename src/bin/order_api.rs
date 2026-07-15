@@ -21,6 +21,8 @@ use trade_core::sharding::{self, DB_COUNT, DEFAULT_ASSET_CATEGORY_SIZE, TABLES_P
 use trade_core::types::{InstrumentId, OrderId, Side};
 use trade_core::wire;
 
+const BATCH_RECORD_LEN: usize = 8 + wire::MSG_LEN;
+
 #[derive(Clone)]
 struct MatcherTarget {
     order_addr: String,
@@ -175,6 +177,74 @@ impl KafkaIngress {
             category_seq: (offset as u64).saturating_add(1),
         })
     }
+
+    fn publish_batch(&self, records: &[BatchRecord]) -> Result<(), String> {
+        let prepared = records
+            .iter()
+            .map(|record| {
+                let route = self.router.route(record.category_id);
+                (
+                    route.clone(),
+                    record.category_id.to_be_bytes(),
+                    encode_envelope(record.user, route.version, &record.frame),
+                )
+            })
+            .collect::<Vec<_>>();
+        let deliveries = futures::executor::block_on(futures::future::join_all(
+            prepared.iter().map(|(route, key, envelope)| {
+                self.producer.send(
+                    FutureRecord::to(&route.topic)
+                        .partition(route.partition)
+                        .key(key)
+                        .payload(envelope),
+                    Duration::from_secs(5),
+                )
+            }),
+        ));
+        for delivery in deliveries {
+            delivery.map_err(|(error, _)| error.to_string())?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct BatchRecord {
+    category_id: u32,
+    user: u64,
+    frame: [u8; wire::MSG_LEN],
+}
+
+fn decode_batch(body: &[u8], category_size: u32) -> Result<Vec<BatchRecord>, String> {
+    if body.is_empty() || body.len() % BATCH_RECORD_LEN != 0 {
+        return Err(format!(
+            "batch body must contain one or more {BATCH_RECORD_LEN}-byte records"
+        ));
+    }
+    let mut records = Vec::with_capacity(body.len() / BATCH_RECORD_LEN);
+    for chunk in body.chunks_exact(BATCH_RECORD_LEN) {
+        let user = u64::from_le_bytes(chunk[..8].try_into().expect("batch user bytes"));
+        let frame: [u8; wire::MSG_LEN] = chunk[8..]
+            .try_into()
+            .expect("fixed-size batch command frame");
+        let command = wire::WireView::parse(&frame)
+            .and_then(|view| view.to_command())
+            .ok_or_else(|| "batch contains an invalid command frame".to_string())?;
+        if let trade_core::Command::New(order) = &command {
+            if order.user != user {
+                return Err(format!(
+                    "batch user {user} does not match order {} user {}",
+                    order.id.0, order.user
+                ));
+            }
+        }
+        records.push(BatchRecord {
+            category_id: sharding::asset_category(command.instrument(), category_size),
+            user,
+            frame,
+        });
+    }
+    Ok(records)
 }
 
 fn env_number<T>(name: &str, default: T) -> T
@@ -456,6 +526,8 @@ fn run_kafka_consumer(
         .into_iter()
         .map(MatcherConnection::new)
         .collect::<Vec<_>>();
+    let mut consecutive_failures = 0u32;
+    let mut last_failure_log = std::time::Instant::now() - Duration::from_secs(30);
 
     loop {
         let mut batch = Vec::with_capacity(kafka.batch_size);
@@ -494,11 +566,21 @@ fn run_kafka_consumer(
             .and_then(|()| forward_kafka_batch(&mut matchers, &batch))
             .and_then(|()| commit_kafka_batch(&consumer, &batch))
         {
-            Ok(()) => {}
+            Ok(()) => consecutive_failures = 0,
             Err(error) => {
-                eprintln!("[order-kafka-{worker}] batch retained for retry: {error}");
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                if consecutive_failures == 1
+                    || last_failure_log.elapsed() >= Duration::from_secs(30)
+                {
+                    eprintln!(
+                        "[order-kafka-{worker}] batch retained for retry (failure {consecutive_failures}): {error}"
+                    );
+                    last_failure_log = std::time::Instant::now();
+                }
                 rewind_kafka_batch(&consumer, &batch);
-                std::thread::sleep(Duration::from_millis(100));
+                let shift = consecutive_failures.saturating_sub(1).min(6);
+                let backoff_ms = (100u64 << shift).min(5_000);
+                std::thread::sleep(Duration::from_millis(backoff_ms));
             }
         }
     }
@@ -711,12 +793,15 @@ fn handle(stream: TcpStream, store: Arc<OrderStore>, kafka: Arc<KafkaIngress>, t
             );
             return;
         }
-        if content_length > 0 {
+        let body = if content_length > 0 {
             let mut body = vec![0; content_length];
             if reader.read_exact(&mut body).is_err() {
                 return;
             }
-        }
+            body
+        } else {
+            Vec::new()
+        };
         if !authorized {
             respond(
                 reader.get_mut(),
@@ -731,6 +816,37 @@ fn handle(stream: TcpStream, store: Arc<OrderStore>, kafka: Arc<KafkaIngress>, t
         }
 
         let (path, query) = uri.split_once('?').unwrap_or((&uri, ""));
+        if method == "POST" && path == "/commands/batch" {
+            match decode_batch(&body, store.category_size) {
+                Ok(records) => match kafka.publish_batch(&records) {
+                    Ok(()) => respond(
+                        reader.get_mut(),
+                        "202 Accepted",
+                        &format!(
+                            "{{\"accepted\":true,\"status\":\"PENDING\",\"count\":{}}}",
+                            records.len()
+                        ),
+                        keep_alive,
+                    ),
+                    Err(error) => respond(
+                        reader.get_mut(),
+                        "503 Service Unavailable",
+                        &format!("{{\"error\":\"{error}\"}}"),
+                        keep_alive,
+                    ),
+                },
+                Err(error) => respond(
+                    reader.get_mut(),
+                    "400 Bad Request",
+                    &format!("{{\"error\":\"{error}\"}}"),
+                    keep_alive,
+                ),
+            }
+            if !keep_alive {
+                return;
+            }
+            continue;
+        }
         let persisted = match (method.as_str(), path) {
             ("POST", "/orders") => order_from_query(query).and_then(|order| {
                 let mut frame = [0u8; wire::MSG_LEN];
@@ -777,6 +893,50 @@ fn handle(stream: TcpStream, store: Arc<OrderStore>, kafka: Arc<KafkaIngress>, t
         if !keep_alive {
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn batch_order(user: u64, instrument: u32) -> Vec<u8> {
+        let order = Order::limit(OrderId(99), Side::Buy, 1_000, 2)
+            .on(InstrumentId(instrument))
+            .by(user);
+        let mut frame = [0u8; wire::MSG_LEN];
+        wire::encode_new(&order, &mut frame);
+        let mut body = user.to_le_bytes().to_vec();
+        body.extend_from_slice(&frame);
+        body
+    }
+
+    #[test]
+    fn decodes_batch_and_routes_asset_category() {
+        let mut body = batch_order(100_000, 1);
+        body.extend_from_slice(&batch_order(100_001, 2_501));
+
+        let records = decode_batch(&body, 1_000).unwrap();
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].category_id, 0);
+        assert_eq!(records[1].category_id, 2);
+        assert_eq!(records[1].user, 100_001);
+    }
+
+    #[test]
+    fn rejects_partial_batch_record() {
+        assert!(decode_batch(&[0; BATCH_RECORD_LEN - 1], 1_000).is_err());
+    }
+
+    #[test]
+    fn rejects_user_that_differs_from_order() {
+        let mut body = batch_order(100_000, 1);
+        body[..8].copy_from_slice(&100_001u64.to_le_bytes());
+
+        assert!(decode_batch(&body, 1_000)
+            .unwrap_err()
+            .contains("does not match"));
     }
 }
 

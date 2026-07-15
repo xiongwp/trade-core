@@ -61,6 +61,11 @@ name = "order_e2e"
 path = "benches/order_e2e.rs"
 harness = false
 
+[[bench]]
+name = "order_batch_e2e"
+path = "benches/order_batch_e2e.rs"
+harness = false
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
