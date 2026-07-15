@@ -1,5 +1,6 @@
-//! Persistent order system: MySQL 10 databases x 100 asset-sharded tables and
-//! a transactional outbox that forwards durable commands to the matcher.
+//! Persistent order system: Kafka is the ordered source of truth; MySQL is a
+//! 10 databases x 100 asset-sharded query projection, and committed Kafka
+//! records are forwarded directly to the Raft-backed matcher.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -82,12 +83,9 @@ fn bootstrap(store: &OrderStore) -> mysql::Result<()> {
         let mut conn = store.shard(db as u32).get_conn()?;
         let db_name = format!("order_db_{db}");
         conn.query_drop(format!("CREATE DATABASE IF NOT EXISTS {db_name}"))?;
-        conn.query_drop(format!("CREATE TABLE IF NOT EXISTS {db_name}.category_sequences (category_id INT UNSIGNED NOT NULL PRIMARY KEY, next_seq BIGINT UNSIGNED NOT NULL) ENGINE=InnoDB"))?;
-        conn.query_drop(format!("CREATE TABLE IF NOT EXISTS {db_name}.command_locations_by_category (category_id INT UNSIGNED NOT NULL, category_seq BIGINT UNSIGNED NOT NULL, command_id BIGINT UNSIGNED NOT NULL UNIQUE, user_id BIGINT UNSIGNED NOT NULL, shard_table INT UNSIGNED NOT NULL, status VARCHAR(16) NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, PRIMARY KEY(category_id, category_seq), KEY idx_status_category (status, category_id, category_seq)) ENGINE=InnoDB"))?;
-        conn.query_drop(format!("CREATE TABLE IF NOT EXISTS {db_name}.order_outbox (order_id BIGINT UNSIGNED PRIMARY KEY, frame BLOB NOT NULL, status VARCHAR(16) NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB"))?;
+        conn.query_drop(format!("CREATE TABLE IF NOT EXISTS {db_name}.processed_commands (category_id INT UNSIGNED NOT NULL, kafka_partition INT NOT NULL, kafka_offset BIGINT UNSIGNED NOT NULL, command_id BIGINT UNSIGNED NOT NULL UNIQUE, user_id BIGINT UNSIGNED NOT NULL, shard_table INT UNSIGNED NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(category_id,kafka_offset), KEY idx_partition_offset (kafka_partition,kafka_offset)) ENGINE=InnoDB"))?;
         for table in 0..TABLES_PER_DB {
             conn.query_drop(format!("CREATE TABLE IF NOT EXISTS {db_name}.asset_orders_{table:03} (row_seq BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, order_id BIGINT UNSIGNED NOT NULL UNIQUE, category_id INT UNSIGNED NOT NULL, user_id BIGINT UNSIGNED NOT NULL, instrument INT UNSIGNED NOT NULL, side TINYINT NOT NULL, price BIGINT UNSIGNED NOT NULL, qty BIGINT UNSIGNED NOT NULL, status VARCHAR(16) NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, KEY idx_category_row (category_id,row_seq), KEY idx_user_created (user_id,created_at)) ENGINE=InnoDB"))?;
-            conn.query_drop(format!("CREATE TABLE IF NOT EXISTS {db_name}.command_outbox_cat_{table:03} (category_id INT UNSIGNED NOT NULL, category_seq BIGINT UNSIGNED NOT NULL, command_id BIGINT UNSIGNED NOT NULL UNIQUE, user_id BIGINT UNSIGNED NOT NULL, frame BLOB NOT NULL, status VARCHAR(16) NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(category_id, category_seq), KEY idx_status_category (status, category_id, category_seq)) ENGINE=InnoDB"))?;
         }
     }
     Ok(())
@@ -115,13 +113,23 @@ impl KafkaIngress {
             return Ok(None);
         };
         let topics = std::env::var("TC_ORDER_KAFKA_TOPICS")
-            .unwrap_or_else(|_| "orders-g0,orders-g1,orders-g2,orders-g3".into())
-            .split(',')
-            .map(str::trim)
-            .filter(|topic| !topic.is_empty())
-            .map(str::to_string)
-            .collect::<Vec<_>>();
-        let partitions = env_number("TC_ORDER_KAFKA_PARTITIONS_PER_TOPIC", 64u32);
+            .ok()
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|topic| !topic.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|topics| !topics.is_empty())
+            .unwrap_or_else(|| {
+                let count = env_number("TC_ORDER_KAFKA_TOPIC_COUNT", 4usize).max(1);
+                let prefix = std::env::var("TC_ORDER_KAFKA_TOPIC_PREFIX")
+                    .unwrap_or_else(|_| "orders-v2-g".into());
+                (0..count).map(|group| format!("{prefix}{group}")).collect()
+            });
+        let partitions = env_number("TC_ORDER_KAFKA_PARTITIONS_PER_TOPIC", 8u32);
         let version = env_number("TC_ORDER_KAFKA_ROUTE_VERSION", 1u32);
         let producer = ClientConfig::new()
             .set("bootstrap.servers", &brokers)
@@ -177,111 +185,6 @@ where
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(default)
-}
-
-fn reserve_command(
-    tx: &mut mysql::Transaction<'_>,
-    db: &str,
-    route: sharding::ShardRoute,
-    category_id: u32,
-    command_id: u64,
-    user: u64,
-) -> mysql::Result<CategorySequence> {
-    // One upsert takes the row's exclusive lock immediately. INSERT IGNORE
-    // followed by UPDATE caused lock-upgrade deadlocks under hot-category load.
-    tx.exec_drop(
-        format!(
-            "INSERT INTO {db}.category_sequences (category_id,next_seq) VALUES (:category,2)
-         ON DUPLICATE KEY UPDATE next_seq=next_seq+1",
-        ),
-        params! {"category" => category_id},
-    )?;
-    let category_seq: Option<u64> = tx.exec_first(
-        format!("SELECT next_seq-1 FROM {db}.category_sequences WHERE category_id=:category"),
-        params! {"category" => category_id},
-    )?;
-    let category_seq = category_seq.expect("sequence upsert must leave a row");
-    tx.exec_drop(
-        format!("INSERT INTO {db}.command_locations_by_category (category_id,category_seq,command_id,user_id,shard_table,status) VALUES (:category,:seq,:id,:user,:table,'PENDING')"),
-        params! {"category" => category_id, "seq" => category_seq, "id" => command_id, "user" => user, "table" => route.table},
-    )?;
-    Ok(CategorySequence {
-        category_id,
-        category_seq,
-    })
-}
-
-fn enqueue_command(
-    shard_tx: &mut mysql::Transaction<'_>,
-    route: sharding::ShardRoute,
-    seq: CategorySequence,
-    command_id: u64,
-    user: u64,
-    db: &str,
-    frame: &[u8; wire::MSG_LEN],
-) -> mysql::Result<()> {
-    shard_tx.exec_drop(
-        format!("INSERT INTO {db}.command_outbox_cat_{:03} (category_id,category_seq,command_id,user_id,frame,status) VALUES (:category,:seq,:id,:user,:frame,'PENDING')", route.table),
-        params! {"category" => seq.category_id, "seq" => seq.category_seq, "id" => command_id, "user" => user, "frame" => frame.to_vec()},
-    )
-}
-
-fn persist(store: &OrderStore, order: &Order) -> Result<CategorySequence, mysql::Error> {
-    let category_id = sharding::asset_category(order.instrument, store.category_size);
-    let route = sharding::route_category(category_id);
-    let db = route.db_name();
-    let table = route.table_name();
-    let mut frame = [0u8; wire::MSG_LEN];
-    wire::encode_new(order, &mut frame);
-    let mut conn = store.shard(route.db).get_conn()?;
-    let mut tx = conn.start_transaction(TxOpts::default())?;
-    let seq = reserve_command(&mut tx, &db, route, category_id, order.id.0, order.user)?;
-    tx.exec_drop(
-        format!("INSERT INTO {db}.{table} (order_id,category_id,user_id,instrument,side,price,qty,status) VALUES (:id,:category,:user,:instrument,:side,:price,:qty,'PENDING')"),
-        params! {"id" => order.id.0, "category" => category_id, "user" => order.user, "instrument" => order.instrument.0, "side" => if order.side == Side::Buy { 0 } else { 1 }, "price" => order.price, "qty" => order.quantity},
-    )?;
-    tx.exec_drop(
-        format!(
-            "INSERT INTO {db}.order_outbox (order_id,frame,status) VALUES (:id,:frame,'PENDING')"
-        ),
-        params! {"id" => order.id.0, "frame" => frame.to_vec()},
-    )?;
-    enqueue_command(&mut tx, route, seq, order.id.0, order.user, &db, &frame)?;
-    tx.commit()?;
-    Ok(seq)
-}
-
-fn persist_cancel(
-    store: &OrderStore,
-    instrument: InstrumentId,
-    order_id: OrderId,
-    cmd_id: u64,
-    user: u64,
-) -> Result<CategorySequence, mysql::Error> {
-    let category_id = sharding::asset_category(instrument, store.category_size);
-    let route = sharding::route_category(category_id);
-    let db = route.db_name();
-    let table = route.table_name();
-    let mut frame = [0u8; wire::MSG_LEN];
-    wire::encode_cancel(instrument, order_id, cmd_id, &mut frame);
-    let mut conn = store.shard(route.db).get_conn()?;
-    let mut tx = conn.start_transaction(TxOpts::default())?;
-    let seq = reserve_command(&mut tx, &db, route, category_id, cmd_id, user)?;
-    tx.exec_drop(
-        format!(
-            "UPDATE {db}.{table} SET status='CANCEL_PENDING' WHERE order_id=:id AND user_id=:user"
-        ),
-        params! {"id" => order_id.0, "user" => user},
-    )?;
-    tx.exec_drop(
-        format!(
-            "INSERT INTO {db}.order_outbox (order_id,frame,status) VALUES (:id,:frame,'PENDING')"
-        ),
-        params! {"id" => cmd_id, "frame" => frame.to_vec()},
-    )?;
-    enqueue_command(&mut tx, route, seq, cmd_id, user, &db, &frame)?;
-    tx.commit()?;
-    Ok(seq)
 }
 
 #[derive(Clone)]
@@ -346,42 +249,23 @@ fn persist_kafka_batch(store: &OrderStore, records: &[KafkaRecord]) -> Result<()
             .start_transaction(TxOpts::default())
             .map_err(|error| error.to_string())?;
 
-        let mut locations = Vec::with_capacity(records.len() * 6);
-        let mut order_outbox = Vec::with_capacity(records.len() * 2);
+        let mut processed = Vec::with_capacity(records.len() * 6);
         let mut orders_by_table: BTreeMap<u32, Vec<Value>> = BTreeMap::new();
-        let mut commands_by_table: BTreeMap<u32, Vec<Value>> = BTreeMap::new();
         let mut cancels = Vec::new();
 
         for record in records {
             let route = sharding::route_category(record.category_id);
-            let seq = CategorySequence {
-                category_id: record.category_id,
-                category_seq: (record.offset as u64).saturating_add(1),
-            };
             let command = wire::WireView::parse(&record.frame)
                 .and_then(|view| view.to_command())
                 .ok_or_else(|| "invalid Kafka command frame".to_string())?;
             let id = command_id(&command);
-            locations.extend([
-                Value::from(seq.category_id),
-                Value::from(seq.category_seq),
+            processed.extend([
+                Value::from(record.category_id),
+                Value::from(record.partition),
+                Value::from((record.offset as u64).saturating_add(1)),
                 Value::from(id),
                 Value::from(record.user),
                 Value::from(route.table),
-                Value::from("PENDING"),
-            ]);
-            order_outbox.extend([
-                Value::from(id),
-                Value::from(record.frame.to_vec()),
-                Value::from("PENDING"),
-            ]);
-            commands_by_table.entry(route.table).or_default().extend([
-                Value::from(seq.category_id),
-                Value::from(seq.category_seq),
-                Value::from(id),
-                Value::from(record.user),
-                Value::from(record.frame.to_vec()),
-                Value::from("PENDING"),
             ]);
 
             match command {
@@ -406,9 +290,9 @@ fn persist_kafka_batch(store: &OrderStore, records: &[KafkaRecord]) -> Result<()
 
         exec_multi_insert(
             &mut tx,
-            &format!("INSERT IGNORE INTO {db}.command_locations_by_category (category_id,category_seq,command_id,user_id,shard_table,status)"),
+            &format!("INSERT IGNORE INTO {db}.processed_commands (category_id,kafka_partition,kafka_offset,command_id,user_id,shard_table)"),
             6,
-            locations,
+            processed,
         )
         .map_err(|error| error.to_string())?;
         for (table, values) in orders_by_table {
@@ -424,22 +308,6 @@ fn persist_kafka_batch(store: &OrderStore, records: &[KafkaRecord]) -> Result<()
             tx.exec_drop(
                 format!("UPDATE {db}.{table} SET status='CANCEL_PENDING' WHERE order_id=:id AND user_id=:user"),
                 params! {"id" => order_id, "user" => user},
-            )
-            .map_err(|error| error.to_string())?;
-        }
-        exec_multi_insert(
-            &mut tx,
-            &format!("INSERT IGNORE INTO {db}.order_outbox (order_id,frame,status)"),
-            3,
-            order_outbox,
-        )
-        .map_err(|error| error.to_string())?;
-        for (table, values) in commands_by_table {
-            exec_multi_insert(
-                &mut tx,
-                &format!("INSERT IGNORE INTO {db}.command_outbox_cat_{table:03} (category_id,category_seq,command_id,user_id,frame,status)"),
-                6,
-                values,
             )
             .map_err(|error| error.to_string())?;
         }
@@ -499,7 +367,71 @@ fn commit_kafka_batch(consumer: &BaseConsumer, records: &[KafkaRecord]) -> Resul
         .map_err(|error| error.to_string())
 }
 
-fn run_kafka_consumer(store: OrderStore, kafka: KafkaIngress, worker: usize) {
+fn rewind_kafka_batch(consumer: &BaseConsumer, records: &[KafkaRecord]) {
+    let mut offsets: HashMap<(&str, i32), i64> = HashMap::new();
+    for record in records {
+        offsets
+            .entry((&record.topic, record.partition))
+            .and_modify(|offset| *offset = (*offset).min(record.offset))
+            .or_insert(record.offset);
+    }
+    for ((topic, partition), offset) in offsets {
+        let _ = consumer.seek(
+            topic,
+            partition,
+            Offset::Offset(offset),
+            Duration::from_secs(1),
+        );
+    }
+}
+
+fn forward_kafka_batch(
+    matchers: &mut [MatcherConnection],
+    records: &[KafkaRecord],
+) -> Result<(), String> {
+    if matchers.is_empty() {
+        return Err("no Raft groups configured".into());
+    }
+    let mut grouped = (0..matchers.len())
+        .map(|_| Vec::<&KafkaRecord>::new())
+        .collect::<Vec<_>>();
+    for record in records {
+        let group = sharding::raft_group_for_category(record.category_id, matchers.len());
+        grouped[group].push(record);
+    }
+
+    // Independent groups commit concurrently. Records within one group remain
+    // in Kafka poll order; a retry may repeat a committed prefix and is made
+    // exact by the command-id deduplication in that Raft group.
+    std::thread::scope(|scope| {
+        let mut jobs = Vec::new();
+        for (group, (matcher, records)) in matchers.iter_mut().zip(grouped).enumerate() {
+            if records.is_empty() {
+                continue;
+            }
+            jobs.push(scope.spawn(move || -> Result<(), String> {
+                for record in records {
+                    matcher
+                        .send(&record.frame)
+                        .map_err(|error| format!("Raft group {group} commit failed: {error}"))?;
+                }
+                Ok(())
+            }));
+        }
+        for job in jobs {
+            job.join()
+                .map_err(|_| "Raft group forwarding worker panicked".to_string())??;
+        }
+        Ok(())
+    })
+}
+
+fn run_kafka_consumer(
+    store: OrderStore,
+    kafka: KafkaIngress,
+    matcher_groups: Vec<Vec<MatcherTarget>>,
+    worker: usize,
+) {
     let consumer: BaseConsumer = ClientConfig::new()
         .set("bootstrap.servers", &kafka.brokers)
         .set("group.id", "trade-order-persist-v1")
@@ -517,9 +449,13 @@ fn run_kafka_consumer(store: OrderStore, kafka: KafkaIngress, worker: usize) {
         .collect::<Vec<_>>();
     consumer.subscribe(&topics).expect("subscribe order topics");
     eprintln!(
-        "[order-kafka-{worker}] consuming {} queue groups",
+        "[order-kafka-{worker}] direct MySQL+Raft consumer for {} queue groups",
         topics.len()
     );
+    let mut matchers = matcher_groups
+        .into_iter()
+        .map(MatcherConnection::new)
+        .collect::<Vec<_>>();
 
     loop {
         let mut batch = Vec::with_capacity(kafka.batch_size);
@@ -555,157 +491,13 @@ fn run_kafka_consumer(store: OrderStore, kafka: KafkaIngress, worker: usize) {
             }
         }
         match persist_kafka_batch(&store, &batch)
+            .and_then(|()| forward_kafka_batch(&mut matchers, &batch))
             .and_then(|()| commit_kafka_batch(&consumer, &batch))
         {
             Ok(()) => {}
             Err(error) => {
                 eprintln!("[order-kafka-{worker}] batch retained for retry: {error}");
-                for record in &batch {
-                    let _ = consumer.seek(
-                        &record.topic,
-                        record.partition,
-                        Offset::Offset(record.offset),
-                        Duration::from_secs(1),
-                    );
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-        }
-    }
-}
-
-#[derive(Debug)]
-struct PendingCommand {
-    category_id: u32,
-    category_seq: u64,
-    command_id: u64,
-    shard_db: u32,
-    shard_table: u32,
-    frame: Vec<u8>,
-}
-
-fn next_pending(
-    store: &OrderStore,
-    worker_id: usize,
-    workers: usize,
-) -> mysql::Result<Option<PendingCommand>> {
-    let shard_db = (worker_id % DB_COUNT as usize) as u32;
-    let lane = worker_id / DB_COUNT as usize;
-    let lanes = workers.div_ceil(DB_COUNT as usize);
-    let db = format!("order_db_{shard_db}");
-    let mut shard = store.shard(shard_db).get_conn()?;
-    let row: Option<(u32, u64, u64, u32)> = shard.exec_first(
-        format!(
-            "SELECT category_id,category_seq,command_id,shard_table
-         FROM {db}.command_locations_by_category loc
-         WHERE status='PENDING'
-           AND MOD(FLOOR(category_id / 10),:lanes)=:lane
-           AND NOT EXISTS (
-             SELECT 1
-             FROM {db}.command_locations_by_category prev
-             WHERE prev.category_id=loc.category_id
-               AND prev.category_seq < loc.category_seq
-               AND prev.status='PENDING'
-           )
-         ORDER BY category_id,category_seq
-        LIMIT 1"
-        ),
-        params! {"lanes" => lanes as u64, "lane" => lane as u64},
-    )?;
-    let Some((category_id, category_seq, command_id, shard_table)) = row else {
-        return Ok(None);
-    };
-    let frame: Option<Vec<u8>> = shard.exec_first(
-        format!("SELECT frame FROM {db}.command_outbox_cat_{shard_table:03} WHERE category_id=:category AND category_seq=:seq AND status='PENDING'"),
-        params! {"category" => category_id, "seq" => category_seq},
-    )?;
-    Ok(frame.map(|frame| PendingCommand {
-        category_id,
-        category_seq,
-        command_id,
-        shard_db,
-        shard_table,
-        frame,
-    }))
-}
-
-fn mark_sent(store: &OrderStore, command: &PendingCommand) -> mysql::Result<()> {
-    let db = format!("order_db_{}", command.shard_db);
-    let mut shard = store.shard(command.shard_db).get_conn()?;
-    let mut shard_tx = shard.start_transaction(TxOpts::default())?;
-    shard_tx.exec_drop(
-        format!(
-            "UPDATE {db}.command_outbox_cat_{:03} SET status='SENT' WHERE category_id=:category AND category_seq=:seq AND status='PENDING'",
-            command.shard_table
-        ),
-        params! {"category" => command.category_id, "seq" => command.category_seq},
-    )?;
-    shard_tx.exec_drop(
-        format!(
-            "UPDATE {db}.order_outbox SET status='SENT' WHERE order_id=:id AND status='PENDING'",
-        ),
-        params! {"id" => command.command_id},
-    )?;
-    shard_tx.exec_drop(
-        format!("UPDATE {db}.command_locations_by_category SET status='SENT' WHERE category_id=:category AND category_seq=:seq AND status='PENDING'"),
-        params! {"category" => command.category_id, "seq" => command.category_seq},
-    )?;
-    shard_tx.commit()
-}
-
-/// This is the only path from order persistence to matching. It dispatches the
-/// smallest durable sequence for each asset category and never skips it after a
-/// retry. Different categories are partitioned across workers and run in
-/// parallel, which is the scaling path for multi-million TPS.
-fn dispatch_forever(
-    store: OrderStore,
-    matchers: Vec<MatcherTarget>,
-    worker_id: usize,
-    workers: usize,
-) {
-    let mut matcher = MatcherConnection::new(matchers);
-    let mut dispatched = 0u64;
-    let mut last_report = std::time::Instant::now();
-    loop {
-        let command = match next_pending(&store, worker_id, workers) {
-            Ok(Some(command)) => command,
-            Ok(None) => {
-                std::thread::sleep(Duration::from_millis(5));
-                continue;
-            }
-            Err(error) => {
-                eprintln!("[order-api] outbox read failed: {error}");
-                std::thread::sleep(Duration::from_millis(100));
-                continue;
-            }
-        };
-        if command.frame.len() != wire::MSG_LEN {
-            eprintln!(
-                "[order-api] invalid frame at category={} seq={}",
-                command.category_id, command.category_seq
-            );
-            std::thread::sleep(Duration::from_millis(100));
-            continue;
-        }
-        let delivered = matcher
-            .send(&command.frame)
-            .and_then(|()| mark_sent(&store, &command).map_err(std::io::Error::other));
-        match delivered {
-            Ok(()) => {
-                dispatched += 1;
-                if last_report.elapsed() >= Duration::from_secs(5) {
-                    eprintln!(
-                        "[order-dispatch-{worker_id}] delivered={dispatched} last_category={} last_seq={}",
-                        command.category_id, command.category_seq
-                    );
-                    last_report = std::time::Instant::now();
-                }
-            }
-            Err(error) => {
-                eprintln!(
-                    "[order-api] preserving category={} seq={} for retry: {error}",
-                    command.category_id, command.category_seq
-                );
+                rewind_kafka_batch(&consumer, &batch);
                 std::thread::sleep(Duration::from_millis(100));
             }
         }
@@ -762,15 +554,6 @@ fn category_size() -> u32 {
         .and_then(|v| v.parse::<u32>().ok())
         .filter(|v| *v > 0)
         .unwrap_or(DEFAULT_ASSET_CATEGORY_SIZE)
-}
-
-fn dispatcher_workers() -> usize {
-    std::env::var("TC_ORDER_DISPATCH_WORKERS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|v| *v > 0)
-        .map(|workers| workers.div_ceil(DB_COUNT as usize) * DB_COUNT as usize)
-        .unwrap_or(20)
 }
 
 fn is_leader(metrics_addr: &str) -> bool {
@@ -845,38 +628,44 @@ impl MatcherConnection {
     }
 }
 
-fn parse_matchers() -> Vec<MatcherTarget> {
-    if let Ok(value) = std::env::var("TC_RAFT_MATCHERS") {
-        let targets = value
-            .split(',')
-            .filter_map(|item| {
-                let (order_addr, metrics_addr) = item.split_once('@')?;
-                Some(MatcherTarget {
-                    order_addr: order_addr.to_string(),
-                    metrics_addr: Some(metrics_addr.to_string()),
-                })
+fn parse_matcher_list(value: &str) -> Vec<MatcherTarget> {
+    value
+        .split(',')
+        .filter_map(|item| {
+            let (order_addr, metrics_addr) = item.trim().split_once('@')?;
+            Some(MatcherTarget {
+                order_addr: order_addr.to_string(),
+                metrics_addr: Some(metrics_addr.to_string()),
             })
-            .collect::<Vec<_>>();
+        })
+        .collect()
+}
+
+fn parse_matcher_groups() -> Vec<Vec<MatcherTarget>> {
+    if let Ok(value) = std::env::var("TC_RAFT_GROUP_MATCHERS") {
+        let groups = value.split(';').map(parse_matcher_list).collect::<Vec<_>>();
+        if !groups.is_empty() && groups.iter().all(|group| !group.is_empty()) {
+            return groups;
+        }
+        eprintln!("[order-api] ignored invalid TC_RAFT_GROUP_MATCHERS");
+    }
+    if let Ok(value) = std::env::var("TC_RAFT_MATCHERS") {
+        let targets = parse_matcher_list(&value);
         if !targets.is_empty() {
-            return targets;
+            return vec![targets];
         }
     }
-    vec![MatcherTarget {
+    vec![vec![MatcherTarget {
         order_addr: std::env::var("TC_MATCHER_ADDR").unwrap_or_else(|_| "trade-core:9001".into()),
         metrics_addr: None,
-    }]
+    }]]
 }
 
 fn respond(stream: &mut TcpStream, status: &str, body: &str) {
     let _ = stream.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes());
 }
 
-fn handle(
-    mut stream: TcpStream,
-    store: Arc<OrderStore>,
-    kafka: Option<Arc<KafkaIngress>>,
-    token: &str,
-) {
+fn handle(mut stream: TcpStream, store: Arc<OrderStore>, kafka: Arc<KafkaIngress>, token: &str) {
     let mut reader = BufReader::new(stream.try_clone().expect("clone"));
     let mut first = String::new();
     if reader.read_line(&mut first).is_err() {
@@ -904,24 +693,16 @@ fn handle(
     }
     let persisted = match (method, path) {
         ("POST", "/orders") => order_from_query(query).and_then(|order| {
-            if let Some(kafka) = &kafka {
-                let mut frame = [0u8; wire::MSG_LEN];
-                wire::encode_new(&order, &mut frame);
-                let category = sharding::asset_category(order.instrument, store.category_size);
-                kafka.publish(category, order.user, &frame)
-            } else {
-                persist(&store, &order).map_err(|error| error.to_string())
-            }
+            let mut frame = [0u8; wire::MSG_LEN];
+            wire::encode_new(&order, &mut frame);
+            let category = sharding::asset_category(order.instrument, store.category_size);
+            kafka.publish(category, order.user, &frame)
         }),
         ("POST", "/cancels") => cancel_from_query(query).and_then(|(i, o, c, u)| {
-            if let Some(kafka) = &kafka {
-                let mut frame = [0u8; wire::MSG_LEN];
-                wire::encode_cancel(i, o, c, &mut frame);
-                let category = sharding::asset_category(i, store.category_size);
-                kafka.publish(category, u, &frame)
-            } else {
-                persist_cancel(&store, i, o, c, u).map_err(|error| error.to_string())
-            }
+            let mut frame = [0u8; wire::MSG_LEN];
+            wire::encode_cancel(i, o, c, &mut frame);
+            let category = sharding::asset_category(i, store.category_size);
+            kafka.publish(category, u, &frame)
         }),
         _ => {
             respond(&mut stream, "404 Not Found", "{\"error\":\"not found\"}");
@@ -947,37 +728,32 @@ fn handle(
 
 fn main() {
     let shard_urls = parse_shard_urls();
-    let matchers = parse_matchers();
+    let matcher_groups = parse_matcher_groups();
     let token = std::env::var("TC_ORDER_API_TOKEN").expect("TC_ORDER_API_TOKEN");
     let store = open_when_ready(&shard_urls);
-    let kafka = KafkaIngress::from_env().expect("configure Kafka order ingress");
-    let workers = dispatcher_workers();
+    let kafka = KafkaIngress::from_env()
+        .expect("configure Kafka order ingress")
+        .expect("TC_ORDER_KAFKA_BROKERS is required");
     eprintln!(
-        "[order-api] category_size={} dispatch_workers={workers} kafka={}",
+        "[order-api] category_size={} raft_groups={} direct_consumers={} kafka=true",
         store.category_size,
-        kafka.is_some()
+        matcher_groups.len(),
+        kafka.consumers
     );
-    if let Some(kafka) = &kafka {
-        for worker in 0..kafka.consumers {
-            let consumer_store = store.clone();
-            let consumer_kafka = kafka.clone();
-            std::thread::Builder::new()
-                .name(format!("order-kafka-consumer-{worker}"))
-                .spawn(move || run_kafka_consumer(consumer_store, consumer_kafka, worker))
-                .expect("spawn Kafka order consumer");
-        }
-    }
-    for worker_id in 0..workers {
-        let dispatch_store = store.clone();
-        let worker_matchers = matchers.clone();
+    for worker in 0..kafka.consumers {
+        let consumer_store = store.clone();
+        let consumer_kafka = kafka.clone();
+        let worker_matchers = matcher_groups.clone();
         std::thread::Builder::new()
-            .name(format!("order-outbox-dispatcher-{worker_id}"))
-            .spawn(move || dispatch_forever(dispatch_store, worker_matchers, worker_id, workers))
-            .expect("spawn order outbox dispatcher");
+            .name(format!("order-kafka-direct-{worker}"))
+            .spawn(move || {
+                run_kafka_consumer(consumer_store, consumer_kafka, worker_matchers, worker)
+            })
+            .expect("spawn direct Kafka order consumer");
     }
     let listener = TcpListener::bind("0.0.0.0:9200").expect("bind order API");
     let shared_store = Arc::new(store);
-    let shared_kafka = kafka.map(Arc::new);
+    let shared_kafka = Arc::new(kafka);
     for stream in listener.incoming().flatten() {
         let store = shared_store.clone();
         let kafka = shared_kafka.clone();

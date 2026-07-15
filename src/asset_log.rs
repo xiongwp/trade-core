@@ -177,6 +177,7 @@ pub fn replay_into(
     processor: &mut Processor,
 ) -> io::Result<AssetLogMeta> {
     let meta = inspect(root, instrument)?;
+    let mut seen = HashMap::new();
     for record in JournalReader::open(&asset_path(root, instrument))? {
         if record.seq <= after_seq {
             continue;
@@ -184,6 +185,9 @@ pub fn replay_into(
         let command = wire::WireView::parse(&record.frame)
             .and_then(|view| view.to_command())
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid asset command"))?;
+        if !accept_replay_command(&mut seen, &command, &record.frame)? {
+            continue;
+        }
         processor.process(command, &mut |_| {});
     }
     Ok(meta)
@@ -208,10 +212,14 @@ pub fn replay_with_reports(
 ) -> io::Result<AssetReplaySummary> {
     let mut processor = Processor::new(strategy, None);
     let mut reports = Vec::new();
+    let mut seen = HashMap::new();
     for record in JournalReader::open(&asset_path(root, instrument))? {
         let command = wire::WireView::parse(&record.frame)
             .and_then(|view| view.to_command())
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid asset command"))?;
+        if !accept_replay_command(&mut seen, &command, &record.frame)? {
+            continue;
+        }
         processor.process(command, &mut |report| reports.push(report));
     }
     let mut bytes = Vec::with_capacity(reports.len() * crate::wire::REPORT_LEN);
@@ -226,6 +234,28 @@ pub fn replay_with_reports(
         reports,
         processor,
     })
+}
+
+fn accept_replay_command(
+    seen: &mut HashMap<u64, [u8; MSG_LEN]>,
+    command: &Command,
+    frame: &[u8; MSG_LEN],
+) -> io::Result<bool> {
+    let id = command.id();
+    if id == 0 {
+        return Ok(true);
+    }
+    match seen.get(&id) {
+        None => {
+            seen.insert(id, *frame);
+            Ok(true)
+        }
+        Some(original) if original == frame => Ok(false),
+        Some(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("command id {id} has conflicting asset WAL payloads"),
+        )),
+    }
 }
 
 fn asset_path(root: &Path, instrument: InstrumentId) -> PathBuf {
@@ -296,6 +326,55 @@ mod tests {
         assert_eq!(replayed, meta);
         assert_eq!(processor.engine(btc).unwrap().book().len(), 1);
         assert!(processor.engine(eth).is_none());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn replay_skips_only_byte_identical_duplicate_commands() {
+        let root = std::env::temp_dir().join(format!(
+            "tc-asset-log-dedup-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let instrument = InstrumentId(42);
+        let command = Command::New(Order::limit(OrderId(900), Side::Buy, 100, 1).on(instrument));
+        let mut logs = AssetJournalSet::open(&root, Duration::from_millis(1)).unwrap();
+        logs.append(&command).unwrap();
+        logs.append(&command).unwrap();
+        logs.flush_all().unwrap();
+
+        let (processor, meta) =
+            replay_fresh(&root, instrument, || Box::new(PriceTimePriority)).unwrap();
+        assert_eq!(meta.records, 2, "repair does not rewrite the audit WAL");
+        assert_eq!(processor.engine(instrument).unwrap().book().len(), 1);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn replay_rejects_a_command_id_with_different_payloads() {
+        let root = std::env::temp_dir().join(format!(
+            "tc-asset-log-conflict-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let instrument = InstrumentId(43);
+        let mut logs = AssetJournalSet::open(&root, Duration::from_millis(1)).unwrap();
+        logs.append(&Command::New(
+            Order::limit(OrderId(901), Side::Buy, 100, 1).on(instrument),
+        ))
+        .unwrap();
+        logs.append(&Command::New(
+            Order::limit(OrderId(901), Side::Buy, 101, 1).on(instrument),
+        ))
+        .unwrap();
+        logs.flush_all().unwrap();
+
+        let error = replay_fresh(&root, instrument, || Box::new(PriceTimePriority))
+            .err()
+            .expect("conflicting command id must fail recovery");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         std::fs::remove_dir_all(&root).ok();
     }
 

@@ -52,6 +52,11 @@ path = "benches/raft_throughput.rs"
 harness = false
 
 [[bench]]
+name = "raft_idempotency"
+path = "benches/raft_idempotency.rs"
+harness = false
+
+[[bench]]
 name = "order_e2e"
 path = "benches/order_e2e.rs"
 harness = false
@@ -75,6 +80,10 @@ path = "src/bin/raft_sim.rs"
 [[bin]]
 name = "raft-node"
 path = "src/bin/raft_node.rs"
+
+[[bin]]
+name = "raft-multi-node"
+path = "src/bin/raft_multi_node.rs"
 
 [[bin]]
 name = "order-api"

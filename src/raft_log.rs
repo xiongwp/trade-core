@@ -83,7 +83,9 @@ impl DurableRaftLog {
             .create(true)
             .truncate(false)
             .open(path)?;
-        if read.metadata()?.len() == 0 {
+        if read.metadata()?.len() < STORAGE_HEADER.len() as u64 {
+            read.set_len(0)?;
+            read.seek(SeekFrom::Start(0))?;
             read.write_all(&STORAGE_HEADER)?;
             read.sync_all()?;
         }
@@ -100,6 +102,7 @@ impl DurableRaftLog {
         let mut entries = Vec::new();
         let mut hard_state = HardState::default();
         loop {
+            let record_start = read.stream_position()?;
             let mut kind = [0u8; 1];
             match read.read_exact(&mut kind) {
                 Ok(()) => {}
@@ -107,7 +110,9 @@ impl DurableRaftLog {
                 Err(error) => return Err(error),
             }
             let mut length_bytes = [0u8; 4];
-            read.read_exact(&mut length_bytes)?;
+            if !read_or_truncate_torn_tail(&mut read, &mut length_bytes, record_start)? {
+                break;
+            }
             let length = u32::from_le_bytes(length_bytes) as usize;
             if length > 16 * 1024 * 1024 {
                 return Err(io::Error::new(
@@ -116,9 +121,13 @@ impl DurableRaftLog {
                 ));
             }
             let mut payload = vec![0; length];
-            read.read_exact(&mut payload)?;
+            if !read_or_truncate_torn_tail(&mut read, &mut payload, record_start)? {
+                break;
+            }
             let mut checksum = [0u8; 8];
-            read.read_exact(&mut checksum)?;
+            if !read_or_truncate_torn_tail(&mut read, &mut checksum, record_start)? {
+                break;
+            }
             let mut protected = Vec::with_capacity(5 + payload.len());
             protected.push(kind[0]);
             protected.extend_from_slice(&length_bytes);
@@ -134,7 +143,8 @@ impl DurableRaftLog {
                     hard_state = HardState::parse_from_bytes(&payload).map_err(proto_error)?
                 }
                 ENTRY_RECORD => {
-                    entries.push(Entry::parse_from_bytes(&payload).map_err(proto_error)?)
+                    let entry = Entry::parse_from_bytes(&payload).map_err(proto_error)?;
+                    append_recovered_entry(&mut entries, entry)?;
                 }
                 _ => {
                     return Err(io::Error::new(
@@ -144,19 +154,27 @@ impl DurableRaftLog {
                 }
             }
         }
+        if hard_state.commit > entries.last().map(|entry| entry.index).unwrap_or(0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "raft commit index is ahead of the durable log",
+            ));
+        }
         let file = OpenOptions::new().append(true).open(path)?;
         Ok((Self { file }, entries, hard_state))
     }
 
     fn persist(&mut self, entries: &[Entry], hard_state: Option<&HardState>) -> io::Result<()> {
+        for entry in entries {
+            self.write_record(ENTRY_RECORD, &entry.write_to_bytes().map_err(proto_error)?)?;
+        }
+        // A committed HardState may reference these entries, so it must never
+        // precede them in the crash-recoverable record stream.
         if let Some(hard_state) = hard_state {
             self.write_record(
                 HARD_STATE_RECORD,
                 &hard_state.write_to_bytes().map_err(proto_error)?,
             )?;
-        }
-        for entry in entries {
-            self.write_record(ENTRY_RECORD, &entry.write_to_bytes().map_err(proto_error)?)?;
         }
         if hard_state.is_some() || !entries.is_empty() {
             self.file.sync_data()?;
@@ -175,6 +193,47 @@ impl DurableRaftLog {
         self.file
             .write_all(&crate::journal::fnv1a(&protected).to_le_bytes())
     }
+}
+
+fn read_or_truncate_torn_tail(
+    file: &mut File,
+    bytes: &mut [u8],
+    record_start: u64,
+) -> io::Result<bool> {
+    match file.read_exact(bytes) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+            file.set_len(record_start)?;
+            file.sync_all()?;
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn append_recovered_entry(entries: &mut Vec<Entry>, entry: Entry) -> io::Result<()> {
+    if entry.index == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "raft log contains index zero",
+        ));
+    }
+    if let Some(position) = entries
+        .iter()
+        .position(|existing| existing.index >= entry.index)
+    {
+        entries.truncate(position);
+    }
+    if let Some(previous) = entries.last() {
+        if entry.index != previous.index + 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "raft log contains an index gap",
+            ));
+        }
+    }
+    entries.push(entry);
+    Ok(())
 }
 
 fn proto_error(error: protobuf::ProtobufError) -> io::Error {
@@ -230,6 +289,7 @@ impl RaftNode {
         if !entries.is_empty() {
             store.wl().append(&entries)?;
         }
+        let applied = hard_state.commit;
         if hard_state != HardState::default() {
             store.wl().set_hardstate(hard_state);
         }
@@ -239,6 +299,7 @@ impl RaftNode {
             heartbeat_tick: cluster.heartbeat_tick,
             max_size_per_msg: 1024 * 1024,
             max_inflight_msgs: 256,
+            applied,
             ..Default::default()
         };
         let node = RawNode::with_default_logger(&cfg, store.clone())?;
@@ -389,6 +450,14 @@ mod tests {
         RaftNode::new(ClusterConfig::new(id, VOTERS).unwrap()).unwrap()
     }
 
+    fn log_entry(index: u64, term: u64, data: &[u8]) -> Entry {
+        let mut entry = Entry::default();
+        entry.index = index;
+        entry.term = term;
+        entry.data = data.to_vec().into();
+        entry
+    }
+
     fn pump(nodes: &mut [RaftNode]) {
         pump_active(nodes, &[true; CLUSTER_SIZE]);
     }
@@ -438,6 +507,28 @@ mod tests {
     fn follower_cannot_accept_client_commands() {
         let mut follower = node(2);
         assert_eq!(follower.propose(vec![1]), Err(ProposeError::NotLeader));
+    }
+
+    #[test]
+    fn recovery_truncates_an_overwritten_uncommitted_suffix() {
+        let mut entries = vec![
+            log_entry(1, 1, b"one"),
+            log_entry(2, 1, b"old-two"),
+            log_entry(3, 1, b"old-three"),
+        ];
+        append_recovered_entry(&mut entries, log_entry(2, 2, b"new-two")).unwrap();
+        append_recovered_entry(&mut entries, log_entry(3, 2, b"new-three")).unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| (entry.index, entry.term, entry.data.to_vec()))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, 1, b"one".to_vec()),
+                (2, 2, b"new-two".to_vec()),
+                (3, 2, b"new-three".to_vec()),
+            ]
+        );
     }
 
     #[test]
@@ -549,6 +640,37 @@ mod tests {
             restored.committed,
             vec![(2, b"durable-order".to_vec())],
             "a committed entry must be re-delivered to the matching state machine after restart"
+        );
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn recovery_truncates_a_torn_final_record() {
+        let path = std::env::temp_dir().join(format!(
+            "tc-raft-torn-tail-{}-{:?}.bin",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(&STORAGE_HEADER).unwrap();
+        file.write_all(&[ENTRY_RECORD]).unwrap();
+        file.write_all(&100u32.to_le_bytes()).unwrap();
+        file.write_all(b"partial").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let (_durable, entries, hard_state) = DurableRaftLog::open(&path).unwrap();
+        assert!(entries.is_empty());
+        assert_eq!(hard_state, HardState::default());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            STORAGE_HEADER.len() as u64
         );
         std::fs::remove_file(path).ok();
     }

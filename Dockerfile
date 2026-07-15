@@ -14,6 +14,7 @@ COPY examples ./examples
 RUN cargo build --release \
     --bin raft-sim \
     --bin raft-node \
+    --bin raft-multi-node \
     --bin trade-core --bin order --bin order-api --bin market-data --bin order_client --bin order_load
 
 FROM debian:stable-slim
@@ -28,6 +29,7 @@ COPY --from=build /src/target/release/order_client /usr/local/bin/order_client
 COPY --from=build /src/target/release/order_load /usr/local/bin/order_load
 COPY --from=build /src/target/release/raft-sim /usr/local/bin/raft-sim
 COPY --from=build /src/target/release/raft-node /usr/local/bin/raft-node
+COPY --from=build /src/target/release/raft-multi-node /usr/local/bin/raft-multi-node
 
 EXPOSE 9001 9101 8080
 

@@ -120,6 +120,21 @@ struct QueuedCommand {
 }
 
 impl Command {
+    /// Globally unique id used for exact retry suppression and replay repair.
+    pub fn id(&self) -> u64 {
+        match self {
+            Command::New(order) => order.id.0,
+            Command::Cancel { cmd_id, .. }
+            | Command::Modify { cmd_id, .. }
+            | Command::Halt { cmd_id, .. }
+            | Command::Resume { cmd_id, .. }
+            | Command::HaltUser { cmd_id, .. }
+            | Command::ResumeUser { cmd_id, .. } => *cmd_id,
+            Command::ForceClose { close_order_id, .. } => close_order_id.0,
+            Command::Batch(commands) => commands.first().map(Command::id).unwrap_or(0),
+        }
+    }
+
     /// The instrument this command targets (used for shard routing).
     pub fn instrument(&self) -> InstrumentId {
         match self {
@@ -684,6 +699,9 @@ pub struct Processor {
     /// 0-ids bypass (legacy/tests). Persisted in snapshots (exactly-once
     /// across crash + order-system re-send).
     dedup: bool,
+    /// Exact retry protection also closes the crash window between replaying
+    /// the shard journal and advancing the separate Raft application marker.
+    seen_command_ids: std::collections::HashSet<u64>,
     /// Dual dedup cursors — one per intake queue. The high-priority queue
     /// legitimately reorders admin commands ahead of News, so a single cursor
     /// would be poisoned by a jumping cancel and dup-reject every later New.
@@ -712,6 +730,7 @@ impl Processor {
             stp: SelfTradePolicy::Allow,
             limits: None,
             dedup: false,
+            seen_command_ids: std::collections::HashSet::new(),
             max_new_id: 0,
             max_admin_id: 0,
             fees: crate::fees::FeeSchedule::default(),
@@ -838,6 +857,15 @@ impl Processor {
 
     /// Apply one command, emitting every resulting report through `emit`.
     pub fn process(&mut self, cmd: Command, emit: &mut dyn FnMut(ExecReport)) {
+        let exact_id = cmd.id();
+        if exact_id != 0 && !self.seen_command_ids.insert(exact_id) {
+            emit(ExecReport::Rejected {
+                instrument: cmd.instrument(),
+                order_id: OrderId(exact_id),
+                reason: "duplicate",
+            });
+            return;
+        }
         // Idempotency gate: every command carries a unique increasing id (New =
         // order id; Cancel/Modify = cmd_id; ForceClose = close-order id). A
         // re-sent duplicate (id <= high-water mark) is rejected, never applied
@@ -1541,6 +1569,7 @@ pub fn replay_journal(
     let mut processor = Processor::new(strategy, guard);
     let mut reports = Vec::new();
     let mut commands = 0u64;
+    let mut seen = HashMap::new();
 
     for record in JournalReader::open(path)? {
         if let Some(limit) = until_ts {
@@ -1550,6 +1579,9 @@ pub fn replay_journal(
         }
         if let Some(view) = wire::WireView::parse(&record.frame) {
             if let Some(cmd) = view.to_command() {
+                if !accept_replay_command(&mut seen, &cmd, &record.frame)? {
+                    continue;
+                }
                 processor.process(cmd, &mut |r| reports.push(r));
                 commands += 1;
             }
@@ -1596,6 +1628,7 @@ pub fn recover_stats(
     }
     let mut applied = 0u64;
     let mut last_seq = skip_seq;
+    let mut seen = HashMap::new();
     if journal_path.exists() {
         for record in JournalReader::open(journal_path)? {
             last_seq = last_seq.max(record.seq);
@@ -1604,6 +1637,9 @@ pub fn recover_stats(
             }
             if let Some(view) = wire::WireView::parse(&record.frame) {
                 if let Some(cmd) = view.to_command() {
+                    if !accept_replay_command(&mut seen, &cmd, &record.frame)? {
+                        continue;
+                    }
                     // Recovery restores *state*; reports were already delivered
                     // to the order system before the crash, so drop them here.
                     processor.process(cmd, &mut |_| {});
@@ -1613,6 +1649,28 @@ pub fn recover_stats(
         }
     }
     Ok((applied, last_seq))
+}
+
+fn accept_replay_command(
+    seen: &mut HashMap<u64, [u8; wire::MSG_LEN]>,
+    command: &Command,
+    frame: &[u8; wire::MSG_LEN],
+) -> std::io::Result<bool> {
+    let id = command.id();
+    if id == 0 {
+        return Ok(true);
+    }
+    match seen.get(&id) {
+        None => {
+            seen.insert(id, *frame);
+            Ok(true)
+        }
+        Some(original) if original == frame => Ok(false),
+        Some(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("command id {id} has conflicting journal payloads"),
+        )),
+    }
 }
 
 /// FNV-1a fingerprint of a report stream (order-sensitive). Two runs with equal

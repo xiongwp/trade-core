@@ -4,12 +4,9 @@
 include:
   - path: docker-compose.raft.yml
 
-# The standalone services remain available for UI development while the
-# leader-aware order ingress is being wired to the Raft cluster.
-#
-#   trade-core   — the matching node (orders :9001, market-data fanout :9101)
 #   market-data  — K-lines + depth ladder + chart UI/WS    http://localhost:8081
 #   order        — persistent order API (10 MySQL databases x 100 tables)
+#   raft-1..5    — durable matching cluster and market-data fanout
 #
 #   docker compose up --build
 #   open http://localhost:8081     # candlesticks + depth, WebSocket push
@@ -26,6 +23,7 @@ services:
       - --advertise-rpc-addr=redpanda:33145
       - --mode=dev-container
       - --smp=1
+      - --memory=384M
       - --default-log-level=warn
     ports:
       - "19092:19092"
@@ -40,36 +38,69 @@ services:
       start_period: 10s
     restart: unless-stopped
 
+  redpanda-2:
+    image: docker.redpanda.com/redpandadata/redpanda:v26.1.12
+    command:
+      - redpanda
+      - start
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19093
+      - --advertise-kafka-addr=internal://redpanda-2:9092,external://localhost:19093
+      - --rpc-addr=redpanda-2:33145
+      - --advertise-rpc-addr=redpanda-2:33145
+      - --seeds=redpanda:33145
+      - --mode=dev-container
+      - --smp=1
+      - --memory=384M
+      - --default-log-level=warn
+    ports: ["19093:19093", "19645:9644"]
+    volumes: ["redpanda-2-data:/var/lib/redpanda/data"]
+    healthcheck: { test: ["CMD", "rpk", "cluster", "info", "--brokers=127.0.0.1:9092"], interval: 3s, timeout: 3s, retries: 40, start_period: 10s }
+    restart: unless-stopped
+
+  redpanda-3:
+    image: docker.redpanda.com/redpandadata/redpanda:v26.1.12
+    command:
+      - redpanda
+      - start
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19094
+      - --advertise-kafka-addr=internal://redpanda-3:9092,external://localhost:19094
+      - --rpc-addr=redpanda-3:33145
+      - --advertise-rpc-addr=redpanda-3:33145
+      - --seeds=redpanda:33145
+      - --mode=dev-container
+      - --smp=1
+      - --memory=384M
+      - --default-log-level=warn
+    ports: ["19094:19094", "19646:9644"]
+    volumes: ["redpanda-3-data:/var/lib/redpanda/data"]
+    healthcheck: { test: ["CMD", "rpk", "cluster", "info", "--brokers=127.0.0.1:9092"], interval: 3s, timeout: 3s, retries: 40, start_period: 10s }
+    restart: unless-stopped
+
   redpanda-init:
     image: docker.redpanda.com/redpandadata/redpanda:v26.1.12
     depends_on:
       redpanda:
         condition: service_healthy
+      redpanda-2:
+        condition: service_healthy
+      redpanda-3:
+        condition: service_healthy
     entrypoint: ["/bin/sh", "-c"]
     command:
-      - >-
-        rpk topic create --if-not-exists --brokers=redpanda:9092
-        --partitions=${TC_ORDER_KAFKA_PARTITIONS_PER_TOPIC:-64} --replicas=1
-        orders-g0 orders-g1 orders-g2 orders-g3
+      - |
+        set -eu
+        i=0
+        while [ "$$i" -lt "${TC_ORDER_KAFKA_TOPIC_COUNT:-4}" ]; do
+          rpk topic create --if-not-exists --brokers=redpanda:9092 \
+            --partitions=${TC_ORDER_KAFKA_PARTITIONS_PER_TOPIC:-8} --replicas=3 \
+            "orders-v2-g$$i"
+          i=$$((i + 1))
+        done
     restart: "no"
-
-  trade-core:
-    build: .
-    image: trade-core-node
-    ports:
-      - "9001:9001"   # order-system connection
-      - "9101:9101"   # market-data fanout
-    environment:
-      SHARDS: "4"
-      POOL_MB: "1024"       # raise to 3072 in prod
-      BAND_BPS: "1000"      # anti-spike band ±10%
-    volumes:
-      - trade-core-journal:/data/journal
-    restart: unless-stopped
 
   market-data:
     image: trade-core-node
-    command: ["exec market-data raft-1:9101,raft-2:9101,raft-3:9101,raft-4:9101,raft-5:9101 0.0.0.0:8080 /data/md"]
+    command: ["exec market-data raft-1:9101,raft-2:9101,raft-3:9101,raft-4:9101,raft-5:9101,raft-1:9111,raft-2:9111,raft-3:9111,raft-4:9111,raft-5:9111,raft-1:9121,raft-2:9121,raft-3:9121,raft-4:9121,raft-5:9121,raft-1:9131,raft-2:9131,raft-3:9131,raft-4:9131,raft-5:9131 0.0.0.0:8080 /data/md"]
     environment:
       # Development default only. Set TC_ADMIN_TOKEN to a secret in production.
       TC_ADMIN_TOKEN: ${TC_ADMIN_TOKEN:-local-admin-token}
@@ -91,60 +122,70 @@ services:
 
   mysql-order-0:
     image: mysql:8.4
+    command: ["--innodb-buffer-pool-size=64M", "--performance-schema=OFF", "--max-connections=100"]
     environment: { MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD:-local-root-password}" }
     volumes: ["order-mysql-0:/var/lib/mysql"]
     healthcheck: { test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"], interval: 3s, timeout: 3s, retries: 40, start_period: 10s }
     restart: unless-stopped
   mysql-order-1:
     image: mysql:8.4
+    command: ["--innodb-buffer-pool-size=64M", "--performance-schema=OFF", "--max-connections=100"]
     environment: { MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD:-local-root-password}" }
     volumes: ["order-mysql-1:/var/lib/mysql"]
     healthcheck: { test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"], interval: 3s, timeout: 3s, retries: 40, start_period: 10s }
     restart: unless-stopped
   mysql-order-2:
     image: mysql:8.4
+    command: ["--innodb-buffer-pool-size=64M", "--performance-schema=OFF", "--max-connections=100"]
     environment: { MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD:-local-root-password}" }
     volumes: ["order-mysql-2:/var/lib/mysql"]
     healthcheck: { test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"], interval: 3s, timeout: 3s, retries: 40, start_period: 10s }
     restart: unless-stopped
   mysql-order-3:
     image: mysql:8.4
+    command: ["--innodb-buffer-pool-size=64M", "--performance-schema=OFF", "--max-connections=100"]
     environment: { MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD:-local-root-password}" }
     volumes: ["order-mysql-3:/var/lib/mysql"]
     healthcheck: { test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"], interval: 3s, timeout: 3s, retries: 40, start_period: 10s }
     restart: unless-stopped
   mysql-order-4:
     image: mysql:8.4
+    command: ["--innodb-buffer-pool-size=64M", "--performance-schema=OFF", "--max-connections=100"]
     environment: { MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD:-local-root-password}" }
     volumes: ["order-mysql-4:/var/lib/mysql"]
     healthcheck: { test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"], interval: 3s, timeout: 3s, retries: 40, start_period: 10s }
     restart: unless-stopped
   mysql-order-5:
     image: mysql:8.4
+    command: ["--innodb-buffer-pool-size=64M", "--performance-schema=OFF", "--max-connections=100"]
     environment: { MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD:-local-root-password}" }
     volumes: ["order-mysql-5:/var/lib/mysql"]
     healthcheck: { test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"], interval: 3s, timeout: 3s, retries: 40, start_period: 10s }
     restart: unless-stopped
   mysql-order-6:
     image: mysql:8.4
+    command: ["--innodb-buffer-pool-size=64M", "--performance-schema=OFF", "--max-connections=100"]
     environment: { MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD:-local-root-password}" }
     volumes: ["order-mysql-6:/var/lib/mysql"]
     healthcheck: { test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"], interval: 3s, timeout: 3s, retries: 40, start_period: 10s }
     restart: unless-stopped
   mysql-order-7:
     image: mysql:8.4
+    command: ["--innodb-buffer-pool-size=64M", "--performance-schema=OFF", "--max-connections=100"]
     environment: { MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD:-local-root-password}" }
     volumes: ["order-mysql-7:/var/lib/mysql"]
     healthcheck: { test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"], interval: 3s, timeout: 3s, retries: 40, start_period: 10s }
     restart: unless-stopped
   mysql-order-8:
     image: mysql:8.4
+    command: ["--innodb-buffer-pool-size=64M", "--performance-schema=OFF", "--max-connections=100"]
     environment: { MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD:-local-root-password}" }
     volumes: ["order-mysql-8:/var/lib/mysql"]
     healthcheck: { test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"], interval: 3s, timeout: 3s, retries: 40, start_period: 10s }
     restart: unless-stopped
   mysql-order-9:
     image: mysql:8.4
+    command: ["--innodb-buffer-pool-size=64M", "--performance-schema=OFF", "--max-connections=100"]
     environment: { MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD:-local-root-password}" }
     volumes: ["order-mysql-9:/var/lib/mysql"]
     healthcheck: { test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"], interval: 3s, timeout: 3s, retries: 40, start_period: 10s }
@@ -176,18 +217,18 @@ services:
         condition: service_healthy
       mysql-order-9:
         condition: service_healthy
-      trade-core:
-        condition: service_started
     command: ["exec order-api"]
     environment:
       TC_ORDER_MYSQL_SHARD_URLS: mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-0:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-1:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-2:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-3:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-4:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-5:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-6:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-7:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-8:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-9:3306/mysql
-      TC_RAFT_MATCHERS: raft-1:9001@raft-1:9102,raft-2:9001@raft-2:9102,raft-3:9001@raft-3:9102,raft-4:9001@raft-4:9102,raft-5:9001@raft-5:9102
+      TC_RAFT_GROUP_MATCHERS: "raft-1:9001@raft-1:9102,raft-2:9001@raft-2:9102,raft-3:9001@raft-3:9102,raft-4:9001@raft-4:9102,raft-5:9001@raft-5:9102;raft-1:9011@raft-1:9112,raft-2:9011@raft-2:9112,raft-3:9011@raft-3:9112,raft-4:9011@raft-4:9112,raft-5:9011@raft-5:9112;raft-1:9021@raft-1:9122,raft-2:9021@raft-2:9122,raft-3:9021@raft-3:9122,raft-4:9021@raft-4:9122,raft-5:9021@raft-5:9122;raft-1:9031@raft-1:9132,raft-2:9031@raft-2:9132,raft-3:9031@raft-3:9132,raft-4:9031@raft-4:9132,raft-5:9031@raft-5:9132"
       TC_ORDER_API_TOKEN: ${TC_ORDER_API_TOKEN:-local-order-api-token}
       TC_ORDER_CATEGORY_SIZE: ${TC_ORDER_CATEGORY_SIZE:-1000}
-      TC_ORDER_DISPATCH_WORKERS: ${TC_ORDER_DISPATCH_WORKERS:-16}
-      TC_ORDER_KAFKA_BROKERS: redpanda:9092
-      TC_ORDER_KAFKA_TOPICS: ${TC_ORDER_KAFKA_TOPICS:-orders-g0,orders-g1,orders-g2,orders-g3}
-      TC_ORDER_KAFKA_PARTITIONS_PER_TOPIC: ${TC_ORDER_KAFKA_PARTITIONS_PER_TOPIC:-64}
+      TC_ORDER_KAFKA_BROKERS: redpanda:9092,redpanda-2:9092,redpanda-3:9092
+      TC_ORDER_KAFKA_TOPIC_PREFIX: ${TC_ORDER_KAFKA_TOPIC_PREFIX:-orders-v2-g}
+      # Raise to 16+ on production-sized Kafka brokers.
+      TC_ORDER_KAFKA_TOPIC_COUNT: ${TC_ORDER_KAFKA_TOPIC_COUNT:-4}
+      # Laptop-safe default. Production capacity tests override this to 64+.
+      TC_ORDER_KAFKA_PARTITIONS_PER_TOPIC: ${TC_ORDER_KAFKA_PARTITIONS_PER_TOPIC:-8}
       TC_ORDER_KAFKA_CONSUMERS: ${TC_ORDER_KAFKA_CONSUMERS:-8}
       TC_ORDER_KAFKA_ROUTE_VERSION: ${TC_ORDER_KAFKA_ROUTE_VERSION:-1}
       TC_ORDER_BATCH_SIZE: ${TC_ORDER_BATCH_SIZE:-500}
@@ -198,7 +239,8 @@ services:
 
 volumes:
   redpanda-data:
-  trade-core-journal:
+  redpanda-2-data:
+  redpanda-3-data:
   market-data-history:
   order-mysql-0:
   order-mysql-1:

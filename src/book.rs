@@ -40,7 +40,7 @@ impl OrderPool {
         }
         OrderPool {
             slots,
-            free: Vec::with_capacity(1024),
+            free: Vec::with_capacity(capacity.min(1024)),
         }
     }
 

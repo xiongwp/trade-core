@@ -1,6 +1,6 @@
 //! Concurrent load against the real persistent order HTTP API. Every request
 //! uses a unique order id and waits for the 202 response after Kafka confirms
-//! durable ingress. MySQL/outbox/Raft completion is measured separately.
+//! durable ingress. MySQL projection/direct Raft completion is measured separately.
 //!
 //! Run: cargo bench --bench order_e2e -- [ADDR TOKEN REQUESTS CONCURRENCY ASSETS]
 

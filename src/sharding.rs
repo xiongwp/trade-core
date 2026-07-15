@@ -2,7 +2,7 @@
 //! category.
 //!
 //! Orders for one category stay together so Kafka partition order, the MySQL
-//! outbox and the matching route all share the same ownership boundary.
+//! projection and the matching route all share the same ownership boundary.
 //!
 //! * **deterministic** — every service instance routes the same user to the
 //!   same table, forever (resharding is a data migration, not a code change);
@@ -71,11 +71,19 @@ pub fn all_tables() -> impl Iterator<Item = (String, String)> {
     })
 }
 
-/// Route an instrument into the ordering category used by the order outbox.
+/// Route an instrument into its ordered Kafka and persistence category.
 #[inline]
 pub fn asset_category(instrument: InstrumentId, category_size: u32) -> u32 {
     let size = category_size.max(1);
     instrument.0.saturating_sub(1) / size
+}
+
+/// Assign a category to one independent Raft group. This is deliberately the
+/// same striping rule used by the Kafka topic router.
+#[inline]
+pub fn raft_group_for_category(category_id: u32, group_count: usize) -> usize {
+    assert!(group_count > 0, "at least one Raft group is required");
+    category_id as usize % group_count
 }
 
 #[cfg(test)]
@@ -121,5 +129,15 @@ mod tests {
         assert_eq!(asset_category(InstrumentId(1_000), 1_000), 0);
         assert_eq!(asset_category(InstrumentId(1_001), 1_000), 1);
         assert_eq!(asset_category(InstrumentId(0), 1_000), 0);
+    }
+
+    #[test]
+    fn categories_stripe_across_independent_raft_groups() {
+        assert_eq!(raft_group_for_category(0, 4), 0);
+        assert_eq!(raft_group_for_category(1, 4), 1);
+        assert_eq!(raft_group_for_category(4, 4), 0);
+        for category in 0..10_000 {
+            assert!(raft_group_for_category(category, 4) < 4);
+        }
     }
 }

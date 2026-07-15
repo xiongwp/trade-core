@@ -358,6 +358,28 @@ fn duplicate_commands_are_rejected_and_cursor_persists() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+#[test]
+fn exact_duplicate_is_safe_even_without_monotonic_cursor_dedup() {
+    let mut processor = Processor::new(|| Box::new(PriceTimePriority), None);
+    processor.process(
+        Command::New(Order::limit(OrderId(700), Side::Buy, 100, 1)),
+        &mut |_| {},
+    );
+    let mut reports = Vec::new();
+    processor.process(
+        Command::New(Order::limit(OrderId(700), Side::Buy, 100, 1)),
+        &mut |report| reports.push(report),
+    );
+    assert!(matches!(
+        reports.as_slice(),
+        [ExecReport::Rejected {
+            reason: "duplicate",
+            ..
+        }]
+    ));
+    assert_eq!(processor.engine(InstrumentId(0)).unwrap().book().len(), 1);
+}
+
 /// Fees are computed in the matching path and carried on every trade report.
 #[test]
 fn trade_reports_carry_authoritative_fees() {
