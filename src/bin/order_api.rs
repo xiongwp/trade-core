@@ -1,6 +1,6 @@
-//! Persistent order system: Kafka is the ordered source of truth; MySQL is a
-//! 10 databases x 100 asset-sharded query projection, and committed Kafka
-//! records are forwarded directly to the Raft-backed matcher.
+//! Persistent order system: Kafka is the ordered source of truth and fans out
+//! through independent consumer groups to the MySQL query projection and the
+//! Raft-backed matcher.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -104,7 +104,10 @@ struct KafkaIngress {
     producer: FutureProducer,
     brokers: String,
     router: QueueRouter,
-    consumers: usize,
+    db_consumers: usize,
+    matcher_consumers: usize,
+    db_group: String,
+    matcher_group: String,
     batch_size: usize,
     linger: Duration,
 }
@@ -147,7 +150,20 @@ impl KafkaIngress {
             producer,
             brokers,
             router: QueueRouter::new(topics, partitions, version),
-            consumers: env_number("TC_ORDER_KAFKA_CONSUMERS", 8usize).max(1),
+            db_consumers: env_number(
+                "TC_ORDER_KAFKA_DB_CONSUMERS",
+                env_number("TC_ORDER_KAFKA_CONSUMERS", 8usize),
+            )
+            .max(1),
+            matcher_consumers: env_number(
+                "TC_ORDER_KAFKA_MATCH_CONSUMERS",
+                env_number("TC_ORDER_KAFKA_CONSUMERS", 8usize),
+            )
+            .max(1),
+            db_group: std::env::var("TC_ORDER_KAFKA_DB_GROUP")
+                .unwrap_or_else(|_| "trade-order-persist-v1".into()),
+            matcher_group: std::env::var("TC_ORDER_KAFKA_MATCH_GROUP")
+                .unwrap_or_else(|_| "trade-order-match-v1".into()),
             batch_size: env_number("TC_ORDER_BATCH_SIZE", 500usize).max(1),
             linger: Duration::from_millis(env_number("TC_ORDER_BATCH_LINGER_MS", 2u64)),
         }))
@@ -496,15 +512,19 @@ fn forward_kafka_batch(
     })
 }
 
-fn run_kafka_consumer(
-    store: OrderStore,
+fn run_kafka_stage<F>(
     kafka: KafkaIngress,
-    matcher_groups: Vec<Vec<MatcherTarget>>,
+    category_size: u32,
+    group_id: String,
+    stage: &'static str,
     worker: usize,
-) {
+    mut process: F,
+) where
+    F: FnMut(&[KafkaRecord]) -> Result<(), String>,
+{
     let consumer: BaseConsumer = ClientConfig::new()
         .set("bootstrap.servers", &kafka.brokers)
-        .set("group.id", "trade-order-persist-v1")
+        .set("group.id", &group_id)
         .set("enable.auto.commit", "false")
         .set("enable.auto.offset.store", "false")
         .set("auto.offset.reset", "earliest")
@@ -519,13 +539,9 @@ fn run_kafka_consumer(
         .collect::<Vec<_>>();
     consumer.subscribe(&topics).expect("subscribe order topics");
     eprintln!(
-        "[order-kafka-{worker}] direct MySQL+Raft consumer for {} queue groups",
-        topics.len()
+        "[order-kafka-{stage}-{worker}] group={group_id} subscribed to {} queue groups",
+        topics.len(),
     );
-    let mut matchers = matcher_groups
-        .into_iter()
-        .map(MatcherConnection::new)
-        .collect::<Vec<_>>();
     let mut consecutive_failures = 0u32;
     let mut last_failure_log = std::time::Instant::now() - Duration::from_secs(30);
 
@@ -535,14 +551,14 @@ fn run_kafka_consumer(
             continue;
         };
         match first {
-            Ok(message) => {
-                match decode_kafka_record(&message, &kafka.router, store.category_size) {
-                    Ok(record) => batch.push(record),
-                    Err(error) => eprintln!("[order-kafka-{worker}] rejected message: {error}"),
+            Ok(message) => match decode_kafka_record(&message, &kafka.router, category_size) {
+                Ok(record) => batch.push(record),
+                Err(error) => {
+                    eprintln!("[order-kafka-{stage}-{worker}] rejected message: {error}")
                 }
-            }
+            },
             Err(error) => {
-                eprintln!("[order-kafka-{worker}] poll failed: {error}");
+                eprintln!("[order-kafka-{stage}-{worker}] poll failed: {error}");
                 continue;
             }
         }
@@ -551,21 +567,20 @@ fn run_kafka_consumer(
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             match consumer.poll(remaining) {
                 Some(Ok(message)) => {
-                    match decode_kafka_record(&message, &kafka.router, store.category_size) {
+                    match decode_kafka_record(&message, &kafka.router, category_size) {
                         Ok(record) => batch.push(record),
                         Err(error) => {
-                            eprintln!("[order-kafka-{worker}] rejected message: {error}")
+                            eprintln!("[order-kafka-{stage}-{worker}] rejected message: {error}")
                         }
                     }
                 }
-                Some(Err(error)) => eprintln!("[order-kafka-{worker}] poll failed: {error}"),
+                Some(Err(error)) => {
+                    eprintln!("[order-kafka-{stage}-{worker}] poll failed: {error}")
+                }
                 None => break,
             }
         }
-        match persist_kafka_batch(&store, &batch)
-            .and_then(|()| forward_kafka_batch(&mut matchers, &batch))
-            .and_then(|()| commit_kafka_batch(&consumer, &batch))
-        {
+        match process(&batch).and_then(|()| commit_kafka_batch(&consumer, &batch)) {
             Ok(()) => consecutive_failures = 0,
             Err(error) => {
                 consecutive_failures = consecutive_failures.saturating_add(1);
@@ -573,7 +588,7 @@ fn run_kafka_consumer(
                     || last_failure_log.elapsed() >= Duration::from_secs(30)
                 {
                     eprintln!(
-                        "[order-kafka-{worker}] batch retained for retry (failure {consecutive_failures}): {error}"
+                        "[order-kafka-{stage}-{worker}] batch retained for retry (failure {consecutive_failures}): {error}"
                     );
                     last_failure_log = std::time::Instant::now();
                 }
@@ -949,21 +964,55 @@ fn main() {
         .expect("configure Kafka order ingress")
         .expect("TC_ORDER_KAFKA_BROKERS is required");
     eprintln!(
-        "[order-api] category_size={} raft_groups={} direct_consumers={} kafka=true",
+        "[order-api] category_size={} raft_groups={} db_consumers={} matcher_consumers={} db_group={} matcher_group={} kafka=true",
         store.category_size,
         matcher_groups.len(),
-        kafka.consumers
+        kafka.db_consumers,
+        kafka.matcher_consumers,
+        kafka.db_group,
+        kafka.matcher_group,
     );
-    for worker in 0..kafka.consumers {
+    for worker in 0..kafka.db_consumers {
         let consumer_store = store.clone();
         let consumer_kafka = kafka.clone();
+        let group_id = kafka.db_group.clone();
+        let category_size = store.category_size;
+        std::thread::Builder::new()
+            .name(format!("order-kafka-mysql-{worker}"))
+            .spawn(move || {
+                run_kafka_stage(
+                    consumer_kafka,
+                    category_size,
+                    group_id,
+                    "mysql",
+                    worker,
+                    move |batch| persist_kafka_batch(&consumer_store, batch),
+                )
+            })
+            .expect("spawn Kafka MySQL projection consumer");
+    }
+    for worker in 0..kafka.matcher_consumers {
+        let consumer_kafka = kafka.clone();
+        let group_id = kafka.matcher_group.clone();
+        let category_size = store.category_size;
         let worker_matchers = matcher_groups.clone();
         std::thread::Builder::new()
-            .name(format!("order-kafka-direct-{worker}"))
+            .name(format!("order-kafka-match-{worker}"))
             .spawn(move || {
-                run_kafka_consumer(consumer_store, consumer_kafka, worker_matchers, worker)
+                let mut matchers = worker_matchers
+                    .into_iter()
+                    .map(MatcherConnection::new)
+                    .collect::<Vec<_>>();
+                run_kafka_stage(
+                    consumer_kafka,
+                    category_size,
+                    group_id,
+                    "match",
+                    worker,
+                    move |batch| forward_kafka_batch(&mut matchers, batch),
+                )
             })
-            .expect("spawn direct Kafka order consumer");
+            .expect("spawn Kafka matching consumer");
     }
     let listener = TcpListener::bind("0.0.0.0:9200").expect("bind order API");
     let shared_store = Arc::new(store);
