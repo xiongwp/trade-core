@@ -90,12 +90,14 @@ fn main() {
         .store(execution_kafka_brokers.is_none() as u64, Ordering::Release);
     let running = Arc::new(AtomicBool::new(true));
     let accepting = Arc::new(AtomicBool::new(false));
+    let leadership = Arc::new(AtomicBool::new(false));
     let (message_tx, message_rx) = mpsc::channel();
     let (proposal_tx, proposal_rx) = mpsc::sync_channel::<ProposalRequest>(1 << 16);
     spawn_listener(raft_addr, message_tx);
 
     let runtime_running = running.clone();
     let runtime_accepting = accepting.clone();
+    let runtime_leadership = leadership.clone();
     let runtime_peers = peers.clone();
     let runtime_metrics = metrics.clone();
     let max_apply_lag = std::env::var("TC_RAFT_READY_MAX_APPLY_LAG")
@@ -198,26 +200,26 @@ fn main() {
                     commit_started.clear();
                 }
                 was_leader = leader;
-                runtime_accepting.store(leader, Ordering::Release);
+                runtime_leadership.store(leader, Ordering::Release);
                 runtime_metrics.set_raft_state(
                     leader as u64 * 2,
                     node.term(),
                     node.leader_id(),
                     node.commit_index(),
                 );
-                runtime_metrics.set_ready(
-                    node.leader_id() != 0
-                        && runtime_metrics.raft_apply_lag() <= max_apply_lag
-                        && runtime_metrics.asset_wal_errors.load(Ordering::Relaxed) == 0
-                        && runtime_metrics
-                            .execution_outbox_pending
-                            .load(Ordering::Relaxed)
-                            <= max_outbox_pending
-                        && runtime_metrics
-                            .execution_outbox_publish_healthy
-                            .load(Ordering::Acquire)
-                            == 1,
-                );
+                let ready = node.leader_id() != 0
+                    && runtime_metrics.raft_apply_lag() <= max_apply_lag
+                    && runtime_metrics.asset_wal_errors.load(Ordering::Relaxed) == 0
+                    && runtime_metrics
+                        .execution_outbox_pending
+                        .load(Ordering::Relaxed)
+                        <= max_outbox_pending
+                    && runtime_metrics
+                        .execution_outbox_publish_healthy
+                        .load(Ordering::Acquire)
+                        == 1;
+                runtime_metrics.set_ready(ready);
+                runtime_accepting.store(leader && ready, Ordering::Release);
                 if leader && !pending.is_empty() {
                     let requests = std::mem::take(&mut pending);
                     let mut entries = Vec::new();
@@ -341,6 +343,7 @@ fn main() {
             category_size,
             running.clone(),
             metrics.clone(),
+            leadership,
         );
     }
     let ingress_running = running.clone();
@@ -380,6 +383,7 @@ fn spawn_execution_outbox_publisher(
     category_size: u32,
     running: Arc<AtomicBool>,
     metrics: Arc<trade_core::metrics::Metrics>,
+    leadership: Arc<AtomicBool>,
 ) {
     thread::Builder::new()
         .name("execution-outbox-publisher".into())
@@ -417,7 +421,17 @@ fn spawn_execution_outbox_publisher(
                         }
                     }
                 }
+                if !leadership.load(Ordering::Acquire) {
+                    // Followers retain the durable outbox for failover but do
+                    // not own the external side effect.
+                    metrics
+                        .execution_outbox_publish_healthy
+                        .store(1, Ordering::Release);
+                }
                 for reader in readers.values_mut() {
+                    if !leadership.load(Ordering::Acquire) {
+                        continue;
+                    }
                     match reader.read_batch(batch_size) {
                         Ok(records) if !records.is_empty() => {
                             let prepared = records
