@@ -84,6 +84,10 @@ fn main() {
     });
     let metrics = handle.metrics.clone();
     metrics.set_ready(false);
+    let execution_kafka_brokers = std::env::var("TC_EXECUTION_KAFKA_BROKERS").ok();
+    metrics
+        .execution_outbox_publish_healthy
+        .store(execution_kafka_brokers.is_none() as u64, Ordering::Release);
     let running = Arc::new(AtomicBool::new(true));
     let accepting = Arc::new(AtomicBool::new(false));
     let (message_tx, message_rx) = mpsc::channel();
@@ -98,6 +102,10 @@ fn main() {
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(32);
+    let max_outbox_pending = std::env::var("TC_RAFT_READY_MAX_OUTBOX_PENDING")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(10_000);
     let state_path = data_dir.join("raft.state");
     let asset_root = data_dir.join("journal").join("assets");
     thread::Builder::new()
@@ -200,7 +208,15 @@ fn main() {
                 runtime_metrics.set_ready(
                     node.leader_id() != 0
                         && runtime_metrics.raft_apply_lag() <= max_apply_lag
-                        && runtime_metrics.asset_wal_errors.load(Ordering::Relaxed) == 0,
+                        && runtime_metrics.asset_wal_errors.load(Ordering::Relaxed) == 0
+                        && runtime_metrics
+                            .execution_outbox_pending
+                            .load(Ordering::Relaxed)
+                            <= max_outbox_pending
+                        && runtime_metrics
+                            .execution_outbox_publish_healthy
+                            .load(Ordering::Acquire)
+                            == 1,
                 );
                 if leader && !pending.is_empty() {
                     let requests = std::mem::take(&mut pending);
@@ -297,7 +313,7 @@ fn main() {
         })
         .expect("spawn raft runtime");
 
-    trade_core::metrics::serve(metrics_addr, metrics);
+    trade_core::metrics::serve(metrics_addr, metrics.clone());
     let listener = TcpListener::bind(&order_addr).expect("bind order listener");
     let md_listener = TcpListener::bind(md_addr).expect("bind market-data fanout");
     let execution_topic =
@@ -307,18 +323,16 @@ fn main() {
         .and_then(|value| value.parse::<u32>().ok())
         .unwrap_or(DEFAULT_ASSET_CATEGORY_SIZE)
         .max(1);
-    let execution_producer = std::env::var("TC_EXECUTION_KAFKA_BROKERS")
-        .ok()
-        .map(|brokers| {
-            ClientConfig::new()
-                .set("bootstrap.servers", brokers)
-                .set("acks", "all")
-                .set("enable.idempotence", "true")
-                .set("linger.ms", "2")
-                .set("batch.num.messages", "10000")
-                .create::<FutureProducer>()
-                .expect("create execution Kafka producer")
-        });
+    let execution_producer = execution_kafka_brokers.map(|brokers| {
+        ClientConfig::new()
+            .set("bootstrap.servers", brokers)
+            .set("acks", "all")
+            .set("enable.idempotence", "true")
+            .set("linger.ms", "2")
+            .set("batch.num.messages", "10000")
+            .create::<FutureProducer>()
+            .expect("create execution Kafka producer")
+    });
     if let Some(producer) = execution_producer.clone() {
         spawn_execution_outbox_publisher(
             execution_outbox_dir,
@@ -326,6 +340,7 @@ fn main() {
             producer,
             category_size,
             running.clone(),
+            metrics.clone(),
         );
     }
     let ingress_running = running.clone();
@@ -364,12 +379,18 @@ fn spawn_execution_outbox_publisher(
     producer: FutureProducer,
     category_size: u32,
     running: Arc<AtomicBool>,
+    metrics: Arc<trade_core::metrics::Metrics>,
 ) {
     thread::Builder::new()
         .name("execution-outbox-publisher".into())
         .spawn(move || {
             let mut readers: HashMap<PathBuf, trade_core::execution_outbox::ExecutionOutboxReader> =
                 HashMap::new();
+            let batch_size = std::env::var("TC_EXECUTION_PUBLISH_BATCH")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(512)
+                .clamp(1, 10_000);
             while running.load(Ordering::Acquire) {
                 if let Ok(entries) = std::fs::read_dir(&root) {
                     for entry in entries.flatten() {
@@ -382,8 +403,10 @@ fn spawn_execution_outbox_publisher(
                         {
                             continue;
                         }
-                        match trade_core::execution_outbox::ExecutionOutboxReader::open(
+                        let cursor_path = path.with_extension("published.cursor");
+                        match trade_core::execution_outbox::ExecutionOutboxReader::open_with_cursor(
                             path.clone(),
+                            cursor_path,
                         ) {
                             Ok(reader) => {
                                 readers.insert(path, reader);
@@ -395,21 +418,77 @@ fn spawn_execution_outbox_publisher(
                     }
                 }
                 for reader in readers.values_mut() {
-                    if let Err(error) = reader.read_available(|record| {
-                        let key = record.kafka_key(category_size);
-                        let payload = record.kafka_payload();
-                        while running.load(Ordering::Acquire)
-                            && producer
-                                .send_result(FutureRecord::to(&topic).key(&key).payload(&payload))
-                                .is_err()
-                        {
-                            eprintln!("[execution-kafka] producer queue full; retrying outbox");
-                            thread::sleep(Duration::from_millis(10));
+                    match reader.read_batch(batch_size) {
+                        Ok(records) if !records.is_empty() => {
+                            let prepared = records
+                                .iter()
+                                .map(|record| {
+                                    (record.kafka_key(category_size), record.kafka_payload())
+                                })
+                                .collect::<Vec<_>>();
+                            let deliveries = futures::executor::block_on(
+                                futures::future::join_all(prepared.iter().map(|(key, payload)| {
+                                    producer.send(
+                                        FutureRecord::to(&topic).key(key).payload(payload),
+                                        Duration::from_secs(5),
+                                    )
+                                })),
+                            );
+                            if deliveries.iter().all(Result::is_ok) {
+                                if let Err(error) = reader.acknowledge(records.len()) {
+                                    metrics
+                                        .execution_outbox_publish_failures
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    metrics
+                                        .execution_outbox_publish_healthy
+                                        .store(0, Ordering::Release);
+                                    eprintln!(
+                                        "[execution-outbox] event=cursor_failed error={error}"
+                                    );
+                                } else {
+                                    metrics
+                                        .execution_outbox_published
+                                        .fetch_add(records.len() as u64, Ordering::Relaxed);
+                                    metrics
+                                        .execution_outbox_publish_healthy
+                                        .store(1, Ordering::Release);
+                                }
+                            } else {
+                                metrics
+                                    .execution_outbox_publish_failures
+                                    .fetch_add(1, Ordering::Relaxed);
+                                metrics
+                                    .execution_outbox_publish_healthy
+                                    .store(0, Ordering::Release);
+                                eprintln!(
+                                    "[execution-kafka] event=batch_not_acknowledged records={}",
+                                    records.len()
+                                );
+                            }
                         }
-                    }) {
-                        eprintln!("[execution-outbox] event=read_failed error={error}");
+                        Ok(_) => {
+                            metrics
+                                .execution_outbox_publish_healthy
+                                .store(1, Ordering::Release);
+                        }
+                        Err(error) => {
+                            metrics
+                                .execution_outbox_publish_failures
+                                .fetch_add(1, Ordering::Relaxed);
+                            metrics
+                                .execution_outbox_publish_healthy
+                                .store(0, Ordering::Release);
+                            eprintln!("[execution-outbox] event=read_failed error={error}");
+                        }
                     }
                 }
+                let pending = readers
+                    .values()
+                    .filter_map(|reader| reader.pending_records().ok())
+                    .sum();
+                metrics
+                    .execution_outbox_pending
+                    .store(pending, Ordering::Release);
                 thread::sleep(Duration::from_millis(25));
             }
         })

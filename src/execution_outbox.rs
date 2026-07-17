@@ -9,6 +9,8 @@ use crate::wire::{self, EXECUTION_EVENT_LEN, REPORT_LEN};
 
 pub const OUTBOX_HEADER: [u8; 8] = *b"TCEX\x01\0\0\0";
 pub const OUTBOX_RECORD_LEN: usize = 4 + 8 + 4 + REPORT_LEN + 8;
+const CURSOR_HEADER: [u8; 8] = *b"TCEC\x01\0\0\0";
+const CURSOR_LEN: usize = CURSOR_HEADER.len() + 8 + 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OutboxRecord {
@@ -139,6 +141,7 @@ fn write_record(mut writer: impl Write, record: &OutboxRecord) -> io::Result<()>
 
 pub struct ExecutionOutboxReader {
     path: PathBuf,
+    cursor_path: Option<PathBuf>,
     offset: u64,
 }
 
@@ -155,39 +158,144 @@ impl ExecutionOutboxReader {
         }
         Ok(ExecutionOutboxReader {
             path,
+            cursor_path: None,
             offset: OUTBOX_HEADER.len() as u64,
         })
     }
 
-    pub fn read_available(&mut self, mut emit: impl FnMut(OutboxRecord)) -> io::Result<usize> {
+    /// Open a publisher reader at its last broker-acknowledged offset. The
+    /// cursor is advanced atomically only after an entire publish batch has
+    /// succeeded, so a crash can duplicate a batch but can never skip one.
+    pub fn open_with_cursor(path: PathBuf, cursor_path: PathBuf) -> io::Result<Self> {
+        let mut reader = Self::open(path)?;
+        reader.cursor_path = Some(cursor_path.clone());
+        if cursor_path.exists() {
+            let bytes = std::fs::read(&cursor_path)?;
+            if bytes.len() != CURSOR_LEN || bytes[..CURSOR_HEADER.len()] != CURSOR_HEADER {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "execution outbox cursor header/version mismatch",
+                ));
+            }
+            let offset = u64::from_le_bytes(
+                bytes[CURSOR_HEADER.len()..CURSOR_HEADER.len() + 8]
+                    .try_into()
+                    .expect("cursor offset"),
+            );
+            let checksum = u64::from_le_bytes(
+                bytes[CURSOR_HEADER.len() + 8..]
+                    .try_into()
+                    .expect("cursor checksum"),
+            );
+            if fnv1a(&bytes[..CURSOR_HEADER.len() + 8]) != checksum
+                || offset < OUTBOX_HEADER.len() as u64
+                || (offset - OUTBOX_HEADER.len() as u64) % OUTBOX_RECORD_LEN as u64 != 0
+                || offset > std::fs::metadata(&reader.path)?.len()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "execution outbox cursor is corrupt or ahead of WAL",
+                ));
+            }
+            reader.offset = offset;
+        }
+        Ok(reader)
+    }
+
+    pub fn read_batch(&self, max_records: usize) -> io::Result<Vec<OutboxRecord>> {
         let file = File::open(&self.path)?;
         let mut reader = BufReader::new(file);
         reader.seek(SeekFrom::Start(self.offset))?;
-        let mut count = 0;
-        loop {
+        let mut records = Vec::with_capacity(max_records.min(1024));
+        while records.len() < max_records {
             let mut bytes = [0u8; OUTBOX_RECORD_LEN];
             match reader.read_exact(&mut bytes) {
                 Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(count),
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
                 Err(error) => return Err(error),
             }
             let expected =
                 u64::from_le_bytes(bytes[OUTBOX_RECORD_LEN - 8..].try_into().expect("checksum"));
             if fnv1a(&bytes[..OUTBOX_RECORD_LEN - 8]) != expected {
-                return Ok(count);
+                break;
             }
             let mut frame = [0u8; REPORT_LEN];
             frame.copy_from_slice(&bytes[16..16 + REPORT_LEN]);
-            emit(OutboxRecord {
+            records.push(OutboxRecord {
                 raft_group: u32::from_le_bytes(bytes[0..4].try_into().expect("group")),
                 raft_index: u64::from_le_bytes(bytes[4..12].try_into().expect("index")),
                 ordinal: u32::from_le_bytes(bytes[12..16].try_into().expect("ordinal")),
                 report_frame: frame,
             });
-            self.offset += OUTBOX_RECORD_LEN as u64;
-            count += 1;
         }
+        Ok(records)
     }
+
+    pub fn acknowledge(&mut self, records: usize) -> io::Result<()> {
+        if records == 0 {
+            return Ok(());
+        }
+        let advance = (records as u64)
+            .checked_mul(OUTBOX_RECORD_LEN as u64)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "cursor overflow"))?;
+        let next = self
+            .offset
+            .checked_add(advance)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "cursor overflow"))?;
+        if next > std::fs::metadata(&self.path)?.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot acknowledge records beyond outbox end",
+            ));
+        }
+        if let Some(path) = &self.cursor_path {
+            persist_cursor(path, next)?;
+        }
+        self.offset = next;
+        Ok(())
+    }
+
+    pub fn pending_records(&self) -> io::Result<u64> {
+        let len = std::fs::metadata(&self.path)?.len();
+        Ok(len.saturating_sub(self.offset) / OUTBOX_RECORD_LEN as u64)
+    }
+
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    pub fn read_available(&mut self, mut emit: impl FnMut(OutboxRecord)) -> io::Result<usize> {
+        let records = self.read_batch(usize::MAX)?;
+        for record in records.iter().copied() {
+            emit(record);
+        }
+        self.acknowledge(records.len())?;
+        Ok(records.len())
+    }
+}
+
+fn persist_cursor(path: &Path, offset: u64) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut bytes = [0u8; CURSOR_LEN];
+    bytes[..CURSOR_HEADER.len()].copy_from_slice(&CURSOR_HEADER);
+    bytes[CURSOR_HEADER.len()..CURSOR_HEADER.len() + 8].copy_from_slice(&offset.to_le_bytes());
+    let checksum = fnv1a(&bytes[..CURSOR_HEADER.len() + 8]);
+    bytes[CURSOR_HEADER.len() + 8..].copy_from_slice(&checksum.to_le_bytes());
+    let temp = path.with_extension("cursor.tmp");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&temp)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    std::fs::rename(&temp, path)?;
+    if let Some(parent) = path.parent() {
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -233,6 +341,52 @@ mod tests {
         assert_eq!(event.ordinal, 2);
         assert_eq!(event.report.instrument, InstrumentId(42));
         assert_eq!(event.report.order_id, OrderId(7));
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn publisher_cursor_only_advances_acknowledged_batches() {
+        let root = std::env::temp_dir().join(format!(
+            "tc-execution-cursor-{}",
+            crate::journal::now_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("outbox-shard-0.bin");
+        let cursor = root.join("outbox-shard-0.published.cursor");
+        {
+            let mut writer =
+                ExecutionOutboxWriter::open(&path, Duration::from_secs(60), 1).unwrap();
+            for index in 1..=3 {
+                writer
+                    .append(
+                        2,
+                        index,
+                        0,
+                        &ExecReport::Accepted {
+                            instrument: InstrumentId(5),
+                            order_id: OrderId(index),
+                        },
+                    )
+                    .unwrap();
+            }
+        }
+
+        let mut reader =
+            ExecutionOutboxReader::open_with_cursor(path.clone(), cursor.clone()).unwrap();
+        assert_eq!(reader.pending_records().unwrap(), 3);
+        assert_eq!(reader.read_batch(2).unwrap().len(), 2);
+        assert_eq!(reader.pending_records().unwrap(), 3);
+        reader.acknowledge(2).unwrap();
+        assert_eq!(reader.pending_records().unwrap(), 1);
+        drop(reader);
+
+        let mut restored = ExecutionOutboxReader::open_with_cursor(path, cursor).unwrap();
+        let tail = restored.read_batch(10).unwrap();
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].raft_index, 3);
+        restored.acknowledge(1).unwrap();
+        assert_eq!(restored.pending_records().unwrap(), 0);
 
         std::fs::remove_dir_all(root).ok();
     }

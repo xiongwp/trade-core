@@ -41,6 +41,10 @@ pub struct Metrics {
     pub match_ns_total: AtomicU64,
     pub match_ns_max: AtomicU64,
     pub match_samples: AtomicU64,
+    pub execution_outbox_pending: AtomicU64,
+    pub execution_outbox_published: AtomicU64,
+    pub execution_outbox_publish_failures: AtomicU64,
+    pub execution_outbox_publish_healthy: AtomicU64,
 }
 
 impl Metrics {
@@ -113,6 +117,10 @@ impl Metrics {
             c("match_ns_total", "Total in-memory matching time in nanoseconds", self.match_ns_total.load(Ordering::Relaxed)),
             c("match_samples", "Commands matched", self.match_samples.load(Ordering::Relaxed)),
             format!("# HELP tc_match_ns_max Maximum in-memory matching time in nanoseconds\n# TYPE tc_match_ns_max gauge\ntc_match_ns_max {}\n", self.match_ns_max.load(Ordering::Relaxed)),
+            format!("# HELP tc_execution_outbox_pending Execution events durably recorded but not broker-acknowledged\n# TYPE tc_execution_outbox_pending gauge\ntc_execution_outbox_pending {}\n", self.execution_outbox_pending.load(Ordering::Relaxed)),
+            c("execution_outbox_published", "Execution events acknowledged by Kafka", self.execution_outbox_published.load(Ordering::Relaxed)),
+            c("execution_outbox_publish_failures", "Execution outbox batches rejected or not acknowledged by Kafka", self.execution_outbox_publish_failures.load(Ordering::Relaxed)),
+            format!("# HELP tc_execution_outbox_publish_healthy Execution publisher health (1 = initialized and last batch acknowledged)\n# TYPE tc_execution_outbox_publish_healthy gauge\ntc_execution_outbox_publish_healthy {}\n", self.execution_outbox_publish_healthy.load(Ordering::Relaxed)),
         ]
         .concat()
     }
