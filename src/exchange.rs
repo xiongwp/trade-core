@@ -239,6 +239,13 @@ pub enum ExecReport {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionReportEvent {
+    pub raft_index: Option<u64>,
+    pub ordinal: u32,
+    pub report: ExecReport,
+}
+
 /// A function that produces a fresh matching strategy for each new instrument.
 pub type StrategyFactory = fn() -> Box<dyn MatchingStrategy>;
 
@@ -450,17 +457,22 @@ impl OrderGateway {
 
 /// The order system's handle for receiving asynchronous execution reports.
 pub struct ResultSink {
-    results: Vec<Consumer<ExecReport>>,
+    results: Vec<Consumer<ExecutionReportEvent>>,
 }
 
 impl ResultSink {
     /// Drain every currently-available report across all shards, invoking `f`
     /// for each. Non-blocking; returns the number of reports delivered.
     pub fn poll(&self, mut f: impl FnMut(ExecReport)) -> usize {
+        self.poll_events(|event| f(event.report))
+    }
+
+    /// Drain report events with their deterministic Raft metadata.
+    pub fn poll_events(&self, mut f: impl FnMut(ExecutionReportEvent)) -> usize {
         let mut count = 0;
         for rx in &self.results {
-            while let Some(r) = rx.pop() {
-                f(r);
+            while let Some(event) = rx.pop() {
+                f(event);
                 count += 1;
             }
         }
@@ -556,7 +568,7 @@ fn build_inner(
     for shard_id in 0..config.shards {
         let (high_tx, high_rx) = lockfree::channel::<QueuedCommand>(config.queue_capacity);
         let (normal_tx, normal_rx) = lockfree::channel::<QueuedCommand>(config.queue_capacity);
-        let (res_tx, res_rx) = lockfree::channel::<ExecReport>(config.queue_capacity);
+        let (res_tx, res_rx) = lockfree::channel::<ExecutionReportEvent>(config.queue_capacity);
 
         shard_tx.push(ShardTx {
             high: high_tx,
@@ -1202,7 +1214,7 @@ struct Shard {
     normal_rx: Consumer<QueuedCommand>,
     instrument_rx: Vec<InstrumentRx>,
     next_instrument: usize,
-    result_tx: Producer<ExecReport>,
+    result_tx: Producer<ExecutionReportEvent>,
     journal: Option<JournalWriter>,
     /// Portable WALs written per asset alongside the legacy shard journal.
     /// They provide the migration/replay unit while shard snapshots retain the
@@ -1357,7 +1369,11 @@ impl Shard {
     }
 
     fn emit_report(&self, report: ExecReport) {
-        let mut pending = report;
+        let mut pending = ExecutionReportEvent {
+            raft_index: None,
+            ordinal: 0,
+            report,
+        };
         loop {
             match self.result_tx.push(pending) {
                 Ok(()) => return,
@@ -1521,7 +1537,8 @@ impl Shard {
                 .journal_seq
                 .fetch_max(self.rep_seq, Ordering::Relaxed);
         }
-        self.process_and_emit(cmd);
+        let mut ordinal = 0;
+        self.process_and_emit(cmd, raft_index, &mut ordinal);
         if let Some(index) = raft_index {
             self.metrics.set_raft_applied_index(index);
         }
@@ -1529,14 +1546,20 @@ impl Shard {
             .record_command_latency(started.elapsed().as_nanos() as u64);
     }
 
-    fn process_and_emit(&mut self, command: Command) {
+    fn process_and_emit(&mut self, command: Command, raft_index: Option<u64>, ordinal: &mut u32) {
         let started = Instant::now();
         let result_tx = &self.result_tx;
         let metrics = &self.metrics;
         self.processor.process(command, &mut |report| {
             metrics.record(&report);
+            let event = ExecutionReportEvent {
+                raft_index,
+                ordinal: *ordinal,
+                report,
+            };
+            *ordinal = ordinal.saturating_add(1);
             // Backpressure: spin+yield until the order system drains.
-            let mut pending = report;
+            let mut pending = event;
             loop {
                 match result_tx.push(pending) {
                     Ok(()) => return,
@@ -1618,8 +1641,9 @@ impl Shard {
         self.metrics
             .journal_seq
             .fetch_max(self.rep_seq, Ordering::Relaxed);
+        let mut ordinal = 0;
         for command in commands {
-            self.process_and_emit(command);
+            self.process_and_emit(command, Some(raft_index), &mut ordinal);
         }
         self.metrics.set_raft_applied_index(raft_index);
         self.metrics

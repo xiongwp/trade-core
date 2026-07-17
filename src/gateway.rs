@@ -197,7 +197,7 @@ pub fn serve_committed_forever<F, R>(
 ) -> io::Result<()>
 where
     F: Fn(Vec<Command>) -> Option<u64> + Send + Sync + 'static,
-    R: Fn(&crate::exchange::ExecReport) + Send + Sync + 'static,
+    R: Fn(&crate::exchange::ExecutionReportEvent) + Send + Sync + 'static,
 {
     let fanout = md_listener.map(|l| {
         eprintln!(
@@ -492,15 +492,15 @@ fn report_fanout_drain(
     sink: ResultSink,
     fanout: Option<MdFanout>,
     running: Arc<AtomicBool>,
-    report_callback: Arc<dyn Fn(&crate::exchange::ExecReport) + Send + Sync>,
+    report_callback: Arc<dyn Fn(&crate::exchange::ExecutionReportEvent) + Send + Sync>,
 ) -> ResultSink {
     let mut out: Vec<u8> = Vec::with_capacity(REPORT_LEN * 256);
     loop {
         out.clear();
-        sink.poll(|report| {
-            report_callback(&report);
+        sink.poll_events(|event| {
+            report_callback(&event);
             let mut frame = [0u8; REPORT_LEN];
-            wire::encode_report(&report, &mut frame);
+            wire::encode_report(&event.report, &mut frame);
             out.extend_from_slice(&frame);
         });
 

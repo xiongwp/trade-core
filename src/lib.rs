@@ -64,7 +64,7 @@ pub use book::{OrderBook, OrderPool};
 pub use engine::{MatchingEngine, SelfTradePolicy};
 pub use exchange::{
     build as build_exchange, recover_into, replay_journal, Command, ExchangeConfig, ExchangeHandle,
-    ExecReport, OrderGateway, ResultSink,
+    ExecReport, ExecutionReportEvent, OrderGateway, ResultSink,
 };
 pub use order::Order;
 pub use risk::{PriceGuard, RiskLimits};

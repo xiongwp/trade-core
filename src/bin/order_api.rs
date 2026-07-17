@@ -249,6 +249,7 @@ fn bootstrap(store: &OrderStore) -> mysql::Result<()> {
         conn.query_drop(format!("CREATE DATABASE IF NOT EXISTS {db_name}"))?;
         conn.query_drop(format!("CREATE TABLE IF NOT EXISTS {db_name}.processed_commands (category_id INT UNSIGNED NOT NULL, kafka_partition INT NOT NULL, kafka_offset BIGINT UNSIGNED NOT NULL, command_id BIGINT UNSIGNED NOT NULL UNIQUE, user_id BIGINT UNSIGNED NOT NULL, shard_table INT UNSIGNED NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(category_id,kafka_offset), KEY idx_partition_offset (kafka_partition,kafka_offset)) ENGINE=InnoDB"))?;
         conn.query_drop(format!("CREATE TABLE IF NOT EXISTS {db_name}.processed_executions (kafka_partition INT NOT NULL, kafka_offset BIGINT UNSIGNED NOT NULL, instrument INT UNSIGNED NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(kafka_partition,kafka_offset), KEY idx_instrument_offset (instrument,kafka_offset)) ENGINE=InnoDB"))?;
+        conn.query_drop(format!("CREATE TABLE IF NOT EXISTS {db_name}.processed_execution_events (raft_group INT UNSIGNED NOT NULL, raft_index BIGINT UNSIGNED NOT NULL, report_ordinal INT UNSIGNED NOT NULL, instrument INT UNSIGNED NOT NULL, order_id BIGINT UNSIGNED NOT NULL, report_type TINYINT UNSIGNED NOT NULL, kafka_partition INT NOT NULL, kafka_offset BIGINT UNSIGNED NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(raft_group,raft_index,report_ordinal), KEY idx_instrument_index (instrument,raft_index), KEY idx_order_event (order_id,raft_index)) ENGINE=InnoDB"))?;
         for table in 0..TABLES_PER_DB {
             conn.query_drop(format!("CREATE TABLE IF NOT EXISTS {db_name}.asset_orders_{table:03} (row_seq BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, order_id BIGINT UNSIGNED NOT NULL UNIQUE, category_id INT UNSIGNED NOT NULL, user_id BIGINT UNSIGNED NOT NULL, instrument INT UNSIGNED NOT NULL, side TINYINT NOT NULL, price BIGINT UNSIGNED NOT NULL, qty BIGINT UNSIGNED NOT NULL, filled_qty BIGINT UNSIGNED NOT NULL DEFAULT 0, status VARCHAR(16) NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, KEY idx_category_row (category_id,row_seq), KEY idx_user_created (user_id,created_at)) ENGINE=InnoDB"))?;
         }
@@ -921,11 +922,11 @@ fn run_execution_mysql_consumer(store: OrderStore, kafka: KafkaIngress, worker: 
                 continue;
             }
         };
-        let Some(report) = message.payload().and_then(wire::decode_report) else {
+        let Some(event) = message.payload().and_then(wire::decode_execution_event) else {
             eprintln!("[execution-mysql-{worker}] rejected invalid execution report");
             continue;
         };
-        match persist_execution_report(&store, message.partition(), message.offset(), report) {
+        match persist_execution_report(&store, message.partition(), message.offset(), event) {
             Ok(()) => {
                 if let Err(error) = consumer.commit_message(&message, CommitMode::Sync) {
                     eprintln!("[execution-mysql-{worker}] offset commit failed: {error}");
@@ -949,8 +950,9 @@ fn persist_execution_report(
     store: &OrderStore,
     partition: i32,
     offset: i64,
-    report: wire::DecodedReport,
+    event: wire::ExecutionEvent,
 ) -> Result<(), String> {
+    let report = event.report;
     let category = sharding::asset_category(report.instrument, store.category_size);
     let route = sharding::route_category(category);
     let db = route.db_name();
@@ -962,15 +964,32 @@ fn persist_execution_report(
     let mut tx = conn
         .start_transaction(TxOpts::default())
         .map_err(|error| error.to_string())?;
-    tx.exec_drop(
-        format!("INSERT IGNORE INTO {db}.processed_executions (kafka_partition,kafka_offset,instrument) VALUES (:partition,:offset,:instrument)"),
-        params! {
-            "partition" => partition,
-            "offset" => offset as u64,
-            "instrument" => report.instrument.0,
-        },
-    )
-    .map_err(|error| error.to_string())?;
+    if event.raft_index == 0 {
+        tx.exec_drop(
+            format!("INSERT IGNORE INTO {db}.processed_executions (kafka_partition,kafka_offset,instrument) VALUES (:partition,:offset,:instrument)"),
+            params! {
+                "partition" => partition,
+                "offset" => offset as u64,
+                "instrument" => report.instrument.0,
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    } else {
+        tx.exec_drop(
+            format!("INSERT IGNORE INTO {db}.processed_execution_events (raft_group,raft_index,report_ordinal,instrument,order_id,report_type,kafka_partition,kafka_offset) VALUES (:raft_group,:raft_index,:ordinal,:instrument,:order_id,:report_type,:partition,:offset)"),
+            params! {
+                "raft_group" => event.raft_group,
+                "raft_index" => event.raft_index,
+                "ordinal" => event.ordinal,
+                "instrument" => report.instrument.0,
+                "order_id" => report.order_id.0,
+                "report_type" => report.type_code,
+                "partition" => partition,
+                "offset" => offset as u64,
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    }
     if tx.affected_rows() == 0 {
         tx.commit().map_err(|error| error.to_string())?;
         return Ok(());

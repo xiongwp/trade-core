@@ -58,6 +58,7 @@ fn main() -> ExitCode {
             data_dir.display()
         );
         let child = Command::new(&binary)
+            .env("TC_RAFT_GROUP_ID", group.to_string())
             .arg(node.to_string())
             .arg(format!("raft-{node}:{raft_port}"))
             .arg(peers)

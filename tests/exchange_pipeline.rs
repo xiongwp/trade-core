@@ -1,7 +1,7 @@
 //! Integration tests for the sharded, lock-free exchange runtime.
 
 use std::time::{Duration, Instant};
-use trade_core::exchange::{build, ExchangeConfig, ExecReport};
+use trade_core::exchange::{build, Command, ExchangeConfig, ExecReport, ExecutionReportEvent};
 use trade_core::prelude::*;
 use trade_core::InstrumentId;
 
@@ -24,6 +24,48 @@ fn collect(sink: &trade_core::ResultSink, want: usize) -> Vec<ExecReport> {
         }
     }
     got
+}
+
+fn collect_events(sink: &trade_core::ResultSink, want: usize) -> Vec<ExecutionReportEvent> {
+    let mut got = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while got.len() < want && Instant::now() < deadline {
+        let n = sink.poll_events(|event| {
+            if !matches!(
+                event.report,
+                ExecReport::DepthLevel { .. } | ExecReport::DepthEnd { .. }
+            ) {
+                got.push(event);
+            }
+        });
+        if n == 0 {
+            std::thread::yield_now();
+        }
+    }
+    got
+}
+
+#[test]
+fn committed_batch_reports_carry_stable_event_order() {
+    let (gw, sink, handle) = build(ExchangeConfig::default());
+    let commands = vec![
+        Command::New(Order::limit(OrderId(1), Side::Sell, 100, 5).on(InstrumentId(0))),
+        Command::New(Order::limit(OrderId(2), Side::Buy, 100, 5).on(InstrumentId(0))),
+    ];
+
+    gw.submit_committed(88, Command::Batch(commands)).unwrap();
+    let events = collect_events(&sink, 5);
+    handle.shutdown();
+
+    assert_eq!(events.len(), 5);
+    for (ordinal, event) in events.iter().enumerate() {
+        assert_eq!(event.raft_index, Some(88));
+        assert_eq!(event.ordinal, ordinal as u32);
+    }
+    assert!(matches!(events[0].report, ExecReport::Accepted { .. }));
+    assert!(events
+        .iter()
+        .any(|event| matches!(event.report, ExecReport::Trade { .. })));
 }
 
 #[test]

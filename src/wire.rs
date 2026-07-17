@@ -87,6 +87,8 @@ pub fn decode_raft_entry(payload: &[u8]) -> Option<Vec<Command>> {
 
 /// Fixed execution-report frame length in bytes (v2: 56 — adds fee fields).
 pub const REPORT_LEN: usize = 56;
+pub const EXECUTION_EVENT_LEN: usize = 88;
+const EXECUTION_EVENT_MAGIC: [u8; 4] = *b"EX01";
 
 const MT_NEW: u8 = 1;
 const MT_CANCEL: u8 = 2;
@@ -528,6 +530,61 @@ pub struct DecodedReport {
     pub side: Side,
 }
 
+/// A durable execution event envelope. The report remains the old fixed frame;
+/// the envelope gives consumers a deterministic id that survives Kafka
+/// republish, leader failover and consumer offset rewind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExecutionEvent {
+    pub raft_group: u32,
+    pub raft_index: u64,
+    pub ordinal: u32,
+    pub report: DecodedReport,
+}
+
+pub fn encode_execution_event(
+    raft_group: u32,
+    raft_index: u64,
+    ordinal: u32,
+    report: &ExecReport,
+    out: &mut [u8; EXECUTION_EVENT_LEN],
+) {
+    out.fill(0);
+    out[..4].copy_from_slice(&EXECUTION_EVENT_MAGIC);
+    out[4..8].copy_from_slice(&1u32.to_le_bytes());
+    out[8..12].copy_from_slice(&raft_group.to_le_bytes());
+    out[16..24].copy_from_slice(&raft_index.to_le_bytes());
+    out[24..28].copy_from_slice(&ordinal.to_le_bytes());
+    let mut frame = [0u8; REPORT_LEN];
+    encode_report(report, &mut frame);
+    out[24 + 8..].copy_from_slice(&frame);
+}
+
+pub fn decode_execution_event(buf: &[u8]) -> Option<ExecutionEvent> {
+    if buf.len() >= EXECUTION_EVENT_LEN && buf[..4] == EXECUTION_EVENT_MAGIC {
+        let version = u32::from_le_bytes(buf[4..8].try_into().ok()?);
+        if version != 1 {
+            return None;
+        }
+        let raft_group = u32::from_le_bytes(buf[8..12].try_into().ok()?);
+        let raft_index = u64::from_le_bytes(buf[16..24].try_into().ok()?);
+        let ordinal = u32::from_le_bytes(buf[24..28].try_into().ok()?);
+        let report = decode_report(&buf[32..32 + REPORT_LEN])?;
+        return Some(ExecutionEvent {
+            raft_group,
+            raft_index,
+            ordinal,
+            report,
+        });
+    }
+    let report = decode_report(buf)?;
+    Some(ExecutionEvent {
+        raft_group: 0,
+        raft_index: 0,
+        ordinal: 0,
+        report,
+    })
+}
+
 /// Decode a 40-byte report frame, or `None` if the buffer is too short.
 pub fn decode_report(buf: &[u8]) -> Option<DecodedReport> {
     let b: &[u8; REPORT_LEN] = buf.get(..REPORT_LEN)?.try_into().ok()?;
@@ -600,6 +657,31 @@ mod tests {
         assert_eq!(d.side, Side::Sell);
         assert_eq!(d.maker_fee, 49, "fees must survive the wire");
         assert_eq!(d.taker_fee, 99);
+    }
+
+    #[test]
+    fn execution_event_round_trips_and_legacy_report_decodes() {
+        let r = ExecReport::Resting {
+            instrument: InstrumentId(42),
+            order_id: OrderId(99),
+        };
+        let mut payload = [0u8; EXECUTION_EVENT_LEN];
+        encode_execution_event(7, 1234, 5, &r, &mut payload);
+        let event = decode_execution_event(&payload).unwrap();
+        assert_eq!(event.raft_group, 7);
+        assert_eq!(event.raft_index, 1234);
+        assert_eq!(event.ordinal, 5);
+        assert_eq!(event.report.type_code, RT_RESTING);
+        assert_eq!(event.report.instrument, InstrumentId(42));
+        assert_eq!(event.report.order_id, OrderId(99));
+
+        let mut legacy = [0u8; REPORT_LEN];
+        encode_report(&r, &mut legacy);
+        let legacy_event = decode_execution_event(&legacy).unwrap();
+        assert_eq!(legacy_event.raft_group, 0);
+        assert_eq!(legacy_event.raft_index, 0);
+        assert_eq!(legacy_event.ordinal, 0);
+        assert_eq!(legacy_event.report, event.report);
     }
 
     #[test]

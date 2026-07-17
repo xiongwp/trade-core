@@ -290,6 +290,10 @@ fn main() {
     let md_listener = TcpListener::bind(md_addr).expect("bind market-data fanout");
     let execution_topic =
         std::env::var("TC_EXECUTION_KAFKA_TOPIC").unwrap_or_else(|_| "trade-executions-v1".into());
+    let raft_group_id = std::env::var("TC_RAFT_GROUP_ID")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(0);
     let category_size = std::env::var("TC_ORDER_CATEGORY_SIZE")
         .ok()
         .and_then(|value| value.parse::<u32>().ok())
@@ -332,10 +336,10 @@ fn main() {
                 None
             }
         },
-        move |report| {
+        move |event| {
             if !report_accepting.load(Ordering::Acquire)
                 || matches!(
-                    report,
+                    &event.report,
                     trade_core::ExecReport::DepthLevel { .. }
                         | trade_core::ExecReport::DepthEnd { .. }
                 )
@@ -346,10 +350,22 @@ fn main() {
                 return;
             };
             let mut frame = [0u8; wire::REPORT_LEN];
-            wire::encode_report(report, &mut frame);
+            wire::encode_report(&event.report, &mut frame);
             let key = execution_category_key(&frame, category_size);
+            let mut payload = [0u8; wire::EXECUTION_EVENT_LEN];
+            wire::encode_execution_event(
+                raft_group_id,
+                event.raft_index.unwrap_or(0),
+                event.ordinal,
+                &event.report,
+                &mut payload,
+            );
             if producer
-                .send_result(FutureRecord::to(&execution_topic).key(&key).payload(&frame))
+                .send_result(
+                    FutureRecord::to(&execution_topic)
+                        .key(&key)
+                        .payload(&payload),
+                )
                 .is_err()
             {
                 eprintln!("[execution-kafka] producer queue full; report will be replayed");
