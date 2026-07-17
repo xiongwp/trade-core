@@ -1243,7 +1243,7 @@ impl Shard {
                 if !self.running.load(Ordering::Acquire) {
                     break;
                 }
-                thread::yield_now();
+                thread::park_timeout(Duration::from_micros(100));
                 continue;
             }
             if is_parked {
@@ -1291,7 +1291,7 @@ impl Shard {
                     self.take_snapshot();
                 }
                 self.maybe_publish_depth();
-                thread::yield_now();
+                thread::park_timeout(Duration::from_micros(50));
             }
         }
         // Final snapshot on clean shutdown makes the next start instant — but
@@ -1573,9 +1573,6 @@ impl Shard {
             },
             None => Vec::new(),
         };
-        self.metrics
-            .record_wal_fsync_latency(wal_started.elapsed().as_nanos() as u64);
-
         let mut replicated = Vec::with_capacity(commands.len());
         for command in &commands {
             let mut frame = [0u8; wire::MSG_LEN];
@@ -1591,9 +1588,20 @@ impl Shard {
         }
         if let Some(journal) = &mut self.journal {
             journal
+                .flush_to_os()
+                .expect("flush committed Raft command batch journal");
+        }
+        if let Some(asset_journal) = &self.asset_journal {
+            asset_journal
+                .sync_committed_batch(&touched)
+                .expect("group commit asset and shard WAL files");
+        } else if let Some(journal) = &mut self.journal {
+            journal
                 .sync_data()
                 .expect("sync committed Raft command batch journal");
         }
+        self.metrics
+            .record_wal_fsync_latency(wal_started.elapsed().as_nanos() as u64);
         if let Some(asset_journal) = &self.asset_journal {
             asset_journal
                 .mark_raft_batch_applied(&touched, raft_index)

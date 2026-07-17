@@ -105,9 +105,9 @@ impl AssetJournalSet {
         Ok(seq)
     }
 
-    /// Append one quorum-committed Raft entry containing many commands, then
-    /// synchronize each touched asset WAL once. The applied watermarks are
-    /// advanced separately, after the shard journal also contains the batch.
+    /// Append one quorum-committed Raft entry containing many commands and
+    /// flush every touched asset WAL into the kernel. The caller issues one
+    /// filesystem group commit after its shard journal has also been flushed.
     pub fn append_committed_batch(
         &mut self,
         commands: &[Command],
@@ -124,9 +124,22 @@ impl AssetJournalSet {
             self.writers
                 .get_mut(instrument)
                 .expect("writer opened by batch append")
-                .sync_data()?;
+                .flush_to_os()?;
         }
         Ok(touched)
+    }
+
+    /// One durability barrier for all asset WALs and the shard journal on the
+    /// same filesystem. Must be called only after every userspace buffer has
+    /// been flushed.
+    pub fn sync_committed_batch(&self, touched: &[InstrumentId]) -> io::Result<()> {
+        let Some(instrument) = touched.first() else {
+            return Ok(());
+        };
+        self.writers
+            .get(instrument)
+            .expect("writer opened by batch append")
+            .sync_filesystem()
     }
 
     pub fn mark_raft_applied(&self, instrument: InstrumentId, raft_index: u64) -> io::Result<()> {

@@ -45,6 +45,10 @@ struct OrderPipelineMetrics {
     raft_forward_ns_total: AtomicU64,
     raft_forward_ns_max: AtomicU64,
     raft_forward_samples: AtomicU64,
+    published_commands: AtomicU64,
+    mysql_completed_commands: AtomicU64,
+    match_completed_commands: AtomicU64,
+    backpressure_rejections: AtomicU64,
 }
 
 impl OrderPipelineMetrics {
@@ -73,6 +77,58 @@ impl OrderPipelineMetrics {
         );
     }
 
+    fn try_reserve(&self, commands: u64, max_backlog: u64) -> Result<(), u64> {
+        loop {
+            let published = self.published_commands.load(AtomicOrdering::Acquire);
+            let completed = self
+                .mysql_completed_commands
+                .load(AtomicOrdering::Acquire)
+                .min(self.match_completed_commands.load(AtomicOrdering::Acquire));
+            let backlog = published.saturating_sub(completed);
+            if backlog.saturating_add(commands) > max_backlog {
+                self.backpressure_rejections
+                    .fetch_add(commands, AtomicOrdering::Relaxed);
+                return Err(backlog);
+            }
+            if self
+                .published_commands
+                .compare_exchange_weak(
+                    published,
+                    published.saturating_add(commands),
+                    AtomicOrdering::AcqRel,
+                    AtomicOrdering::Acquire,
+                )
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
+    }
+
+    fn rollback_reservation(&self, commands: u64) {
+        self.published_commands
+            .fetch_sub(commands, AtomicOrdering::AcqRel);
+    }
+
+    fn complete(&self, stage: &str, commands: u64) {
+        let counter = match stage {
+            "mysql" => &self.mysql_completed_commands,
+            "match" => &self.match_completed_commands,
+            _ => return,
+        };
+        counter.fetch_add(commands, AtomicOrdering::Release);
+    }
+
+    fn backlog(&self) -> u64 {
+        let completed = self
+            .mysql_completed_commands
+            .load(AtomicOrdering::Acquire)
+            .min(self.match_completed_commands.load(AtomicOrdering::Acquire));
+        self.published_commands
+            .load(AtomicOrdering::Acquire)
+            .saturating_sub(completed)
+    }
+
     fn render(&self) -> String {
         format!(
             "# TYPE tc_order_mysql_commit_ns_total counter\ntc_order_mysql_commit_ns_total {}\n\
@@ -87,6 +143,17 @@ impl OrderPipelineMetrics {
             self.raft_forward_ns_total.load(AtomicOrdering::Relaxed),
             self.raft_forward_ns_max.load(AtomicOrdering::Relaxed),
             self.raft_forward_samples.load(AtomicOrdering::Relaxed),
+        ) + &format!(
+            "# TYPE tc_order_ingress_backlog gauge\ntc_order_ingress_backlog {}\n\
+# TYPE tc_order_published_commands counter\ntc_order_published_commands {}\n\
+# TYPE tc_order_mysql_completed_commands counter\ntc_order_mysql_completed_commands {}\n\
+# TYPE tc_order_match_completed_commands counter\ntc_order_match_completed_commands {}\n\
+# TYPE tc_order_backpressure_rejections counter\ntc_order_backpressure_rejections {}\n",
+            self.backlog(),
+            self.published_commands.load(AtomicOrdering::Relaxed),
+            self.mysql_completed_commands.load(AtomicOrdering::Relaxed),
+            self.match_completed_commands.load(AtomicOrdering::Relaxed),
+            self.backpressure_rejections.load(AtomicOrdering::Relaxed),
         )
     }
 }
@@ -109,6 +176,14 @@ fn required<T: std::str::FromStr>(query: &str, key: &str) -> Result<T, String> {
         .ok_or_else(|| format!("missing {key}"))?
         .parse()
         .map_err(|_| format!("invalid {key}"))
+}
+
+fn ingress_error_status(error: &str) -> &'static str {
+    if error.starts_with("backpressure:") {
+        "429 Too Many Requests"
+    } else {
+        "503 Service Unavailable"
+    }
 }
 
 fn order_from_query(query: &str) -> Result<Order, String> {
@@ -171,10 +246,12 @@ struct KafkaIngress {
     raft_group_pins: Arc<HashMap<u32, usize>>,
     batch_size: usize,
     linger: Duration,
+    max_pipeline_backlog: u64,
+    metrics: Arc<OrderPipelineMetrics>,
 }
 
 impl KafkaIngress {
-    fn from_env() -> Result<Option<Self>, String> {
+    fn from_env(metrics: Arc<OrderPipelineMetrics>) -> Result<Option<Self>, String> {
         let Ok(brokers) = std::env::var("TC_ORDER_KAFKA_BROKERS") else {
             return Ok(None);
         };
@@ -246,7 +323,24 @@ impl KafkaIngress {
             raft_group_pins: Arc::new(raft_group_pins),
             batch_size: env_number("TC_ORDER_BATCH_SIZE", 500usize).max(1),
             linger: Duration::from_millis(env_number("TC_ORDER_BATCH_LINGER_MS", 2u64)),
+            max_pipeline_backlog: env_number(
+                "TC_ORDER_MAX_PIPELINE_BACKLOG",
+                250_000u64,
+            )
+            .max(1),
+            metrics,
         }))
+    }
+
+    fn reserve(&self, commands: usize) -> Result<(), String> {
+        self.metrics
+            .try_reserve(commands as u64, self.max_pipeline_backlog)
+            .map_err(|backlog| {
+                format!(
+                    "backpressure: pipeline backlog {backlog} reached limit {}",
+                    self.max_pipeline_backlog
+                )
+            })
     }
 
     fn publish(
@@ -255,6 +349,7 @@ impl KafkaIngress {
         user: u64,
         frame: &[u8; wire::MSG_LEN],
     ) -> Result<CategorySequence, String> {
+        self.reserve(1)?;
         let route = self.router.route(category_id);
         let envelope = encode_envelope(user, route.version, frame);
         let key = category_id.to_be_bytes();
@@ -267,7 +362,13 @@ impl KafkaIngress {
                 Duration::from_secs(5),
             ),
         );
-        let offset = delivery.map_err(|(error, _)| error.to_string())?.offset;
+        let offset = match delivery {
+            Ok(delivery) => delivery.offset,
+            Err((error, _)) => {
+                self.metrics.rollback_reservation(1);
+                return Err(error.to_string());
+            }
+        };
         Ok(CategorySequence {
             category_id,
             category_seq: (offset as u64).saturating_add(1),
@@ -275,6 +376,7 @@ impl KafkaIngress {
     }
 
     fn publish_batch(&self, records: &[BatchRecord]) -> Result<(), String> {
+        self.reserve(records.len())?;
         let prepared = records
             .iter()
             .map(|record| {
@@ -297,8 +399,17 @@ impl KafkaIngress {
                 )
             }),
         ));
+        let mut failed = 0u64;
+        let mut first_error = None;
         for delivery in deliveries {
-            delivery.map_err(|(error, _)| error.to_string())?;
+            if let Err((error, _)) = delivery {
+                failed += 1;
+                first_error.get_or_insert_with(|| error.to_string());
+            }
+        }
+        if failed > 0 {
+            self.metrics.rollback_reservation(failed);
+            return Err(first_error.unwrap_or_else(|| "Kafka batch publish failed".into()));
         }
         Ok(())
     }
@@ -686,7 +797,10 @@ fn run_kafka_stage<F>(
             }
         }
         match process(&batch).and_then(|()| commit_kafka_batch(&consumer, &batch)) {
-            Ok(()) => consecutive_failures = 0,
+            Ok(()) => {
+                kafka.metrics.complete(stage, batch.len() as u64);
+                consecutive_failures = 0;
+            }
             Err(error) => {
                 consecutive_failures = consecutive_failures.saturating_add(1);
                 if consecutive_failures == 1
@@ -1129,12 +1243,15 @@ fn handle(stream: TcpStream, store: Arc<OrderStore>, kafka: Arc<KafkaIngress>, t
                         ),
                         keep_alive,
                     ),
-                    Err(error) => respond(
-                        reader.get_mut(),
-                        "503 Service Unavailable",
-                        &format!("{{\"error\":\"{error}\"}}"),
-                        keep_alive,
-                    ),
+                    Err(error) => {
+                        let status = ingress_error_status(&error);
+                        respond(
+                            reader.get_mut(),
+                            status,
+                            &format!("{{\"error\":\"{error}\"}}"),
+                            keep_alive,
+                        )
+                    }
                 },
                 Err(error) => respond(
                     reader.get_mut(),
@@ -1186,7 +1303,7 @@ fn handle(stream: TcpStream, store: Arc<OrderStore>, kafka: Arc<KafkaIngress>, t
             ),
             Err(error) => respond(
                 reader.get_mut(),
-                "400 Bad Request",
+                ingress_error_status(&error),
                 &format!("{{\"error\":\"{error}\"}}"),
                 keep_alive,
             ),
@@ -1202,16 +1319,17 @@ fn main() {
     let matcher_groups = parse_matcher_groups();
     let token = std::env::var("TC_ORDER_API_TOKEN").expect("TC_ORDER_API_TOKEN");
     let store = open_when_ready(&shard_urls);
-    let kafka = KafkaIngress::from_env()
+    let kafka = KafkaIngress::from_env(store.metrics.clone())
         .expect("configure Kafka order ingress")
         .expect("TC_ORDER_KAFKA_BROKERS is required");
     eprintln!(
-        "[order-api] category_size={} raft_groups={} db_consumers={} matcher_consumers={} execution_consumers={} db_group={} matcher_group={} execution_group={} kafka=true",
+        "[order-api] category_size={} raft_groups={} db_consumers={} matcher_consumers={} execution_consumers={} max_pipeline_backlog={} db_group={} matcher_group={} execution_group={} kafka=true",
         store.category_size,
         matcher_groups.len(),
         kafka.db_consumers,
         kafka.matcher_consumers,
         kafka.execution_consumers,
+        kafka.max_pipeline_backlog,
         kafka.db_group,
         kafka.matcher_group,
         kafka.execution_group,

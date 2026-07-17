@@ -246,6 +246,10 @@ services:
       TC_ORDER_KAFKA_ROUTE_VERSION: ${TC_ORDER_KAFKA_ROUTE_VERSION:-1}
       TC_ORDER_BATCH_SIZE: ${TC_ORDER_BATCH_SIZE:-500}
       TC_ORDER_BATCH_LINGER_MS: ${TC_ORDER_BATCH_LINGER_MS:-2}
+      # Hard bound for commands accepted by Kafka but not completed by both
+      # MySQL and matching. Production sets this to roughly two seconds of
+      # designed traffic and clients retry HTTP 429 with jitter.
+      TC_ORDER_MAX_PIPELINE_BACKLOG: ${TC_ORDER_MAX_PIPELINE_BACKLOG:-250000}
     ports:
       - "9200:9200"
     restart: unless-stopped
