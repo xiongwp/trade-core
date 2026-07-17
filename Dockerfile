@@ -2,7 +2,7 @@
 # build is just this repo's compilation.
 FROM rust:1-slim AS build
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends pkg-config libssl-dev cmake make g++ \
+    && apt-get install -y --no-install-recommends pkg-config cmake make g++ \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY Cargo.toml ./
@@ -19,7 +19,7 @@ RUN cargo build --release \
 
 FROM debian:stable-slim
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates libssl3 \
+    && apt-get install -y --no-install-recommends zlib1g libzstd1 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/target/release/trade-core /usr/local/bin/trade-core
 COPY --from=build /src/target/release/order /usr/local/bin/order

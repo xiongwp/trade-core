@@ -204,7 +204,7 @@ batch=1000 -> 约 72 个事务/s/实例
 
 - Kafka、Raft、MySQL 使用独立 VLAN 或独立物理网络队列。
 - Raft 节点双 25 GbE；复制流量与客户端/监控流量分离。
-- 所有服务使用 mTLS，证书身份绑定服务角色和节点 ID。
+- 服务间使用隔离内网和 ACL，数据面保持明文长连接，避免 TLS 握手与加解密开销。
 - Raft 五副本跨 5 个 rack，至少跨 3 个可用区。
 - NTP/PTP 时钟偏差告警阈值 50 ms；撮合顺序不依赖墙钟。
 - 禁止同一 group 的两个 replica 落在同一物理宿主、机架或电源域。
@@ -233,7 +233,7 @@ batch=1000 -> 约 72 个事务/s/实例
 
 ## 11. 上线步骤
 
-1. 部署监控、日志、PKI、配置中心和路由控制面。
+1. 部署监控、日志、网络 ACL、配置中心和路由控制面。
 2. 部署 40 broker Kafka，完成 RF=3、故障和吞吐验收。
 3. 创建订单与成交 topics，预分配 partitions，不在高峰动态扩 partition。
 4. 部署 100 MySQL primary 及副本，创建 100 库/10000 表目标结构。
@@ -268,6 +268,6 @@ batch=1000 -> 约 72 个事务/s/实例
 5. 完成持久化 execution outbox 与确定性 event ID。
 6. 完成 100 group leader 故障、回放、迁移和 fingerprint E2E。
 7. 在已修复空载 busy-spin 的基础上，完成生产 CPU affinity 和低负载延迟验收。
-8. 将管理面 mTLS、RBAC、nonce、审计和告警接入生产基础设施。
+8. 将管理面 RBAC、nonce、审计、网络 ACL 和告警接入生产基础设施。
 
 上述项目未全部通过前，不能对外承诺 500 万持续 TPS。

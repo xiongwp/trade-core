@@ -390,7 +390,7 @@ impl RaftNode {
     }
 
     /// Raft messages to be sent to their `to` peer. The caller must preserve
-    /// each message exactly; TCP framing and mTLS live in the runtime adapter.
+    /// each message exactly; TCP framing lives in the runtime adapter.
     pub fn take_outbound(&mut self) -> Vec<Message> {
         std::mem::take(&mut self.outbound)
     }

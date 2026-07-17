@@ -1,5 +1,5 @@
 //! Five-node Raft TCP simulation. This is intentionally an in-memory
-//! demonstration runtime; production replaces it with durable storage + mTLS.
+//! demonstration runtime; production replaces it with durable storage.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};

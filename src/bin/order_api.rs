@@ -1144,7 +1144,6 @@ struct MatcherConnection {
     targets: Vec<MatcherTarget>,
     stream: Option<TcpStream>,
     active_target: Option<usize>,
-    last_health_check: std::time::Instant,
 }
 
 impl MatcherConnection {
@@ -1153,7 +1152,6 @@ impl MatcherConnection {
             targets,
             stream: None,
             active_target: None,
-            last_health_check: std::time::Instant::now() - Duration::from_secs(1),
         }
     }
 
@@ -1174,7 +1172,6 @@ impl MatcherConnection {
             stream.set_write_timeout(Some(Duration::from_millis(750)))?;
             self.stream = Some(stream);
             self.active_target = Some(index);
-            self.last_health_check = std::time::Instant::now();
             return Ok(());
         }
         Err(std::io::Error::new(
@@ -1197,18 +1194,6 @@ impl MatcherConnection {
             payload.extend_from_slice(&record.frame);
         }
         for _ in 0..2 {
-            if self.last_health_check.elapsed() >= Duration::from_millis(500) {
-                self.last_health_check = std::time::Instant::now();
-                if self.active_target.is_some_and(|index| {
-                    self.targets[index]
-                        .metrics_addr
-                        .as_deref()
-                        .is_some_and(|metrics| !is_leader(metrics))
-                }) {
-                    self.stream = None;
-                    self.active_target = None;
-                }
-            }
             if self.stream.is_none() {
                 self.connect()?;
             }
