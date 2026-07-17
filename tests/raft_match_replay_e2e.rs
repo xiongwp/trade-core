@@ -63,33 +63,40 @@ fn quorum_committed_orders_replay_to_the_identical_match_result_after_restart() 
     assert!(leader.is_leader());
 
     let instrument = InstrumentId(7001);
-    for order in [
+    let frames = [
         Order::limit(OrderId(101), Side::Sell, 100, 5).on(instrument),
         Order::limit(OrderId(102), Side::Buy, 100, 5).on(instrument),
-    ] {
+    ]
+    .map(|order| {
         let mut frame = [0u8; MSG_LEN];
         wire::encode_command(&Command::New(order), &mut frame);
-        leader.propose(frame.to_vec()).unwrap();
-        pump(&mut leader, &mut followers);
-    }
+        frame
+    });
+    leader
+        .propose(wire::encode_raft_batch(&frames).unwrap())
+        .unwrap();
+    pump(&mut leader, &mut followers);
     drop(leader);
 
     // Simulates a process dying after quorum commit. Restart exposes the
     // committed entries so the matching state machine can complete recovery.
     let mut restarted = RaftNode::open(config, &state).unwrap();
     let committed = restarted.take_committed();
-    assert_eq!(committed.len(), 2);
+    assert_eq!(
+        committed.len(),
+        1,
+        "the whole category batch is one Raft entry"
+    );
 
     let mut asset_logs =
         AssetJournalSet::open(root.join("assets"), Duration::from_millis(1)).unwrap();
     let mut live = Processor::new(|| Box::new(PriceTimePriority), None);
     let mut live_reports = Vec::new();
     for (_, payload) in committed {
-        let command = wire::WireView::parse(&payload)
-            .and_then(|view| view.to_command())
-            .expect("valid committed order frame");
-        asset_logs.append(&command).unwrap();
-        live.process(command, &mut |report| live_reports.push(report));
+        for command in wire::decode_raft_entry(&payload).expect("valid committed order batch") {
+            asset_logs.append(&command).unwrap();
+            live.process(command, &mut |report| live_reports.push(report));
+        }
     }
     asset_logs.flush_all().unwrap();
 

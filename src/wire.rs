@@ -40,6 +40,50 @@ use std::fmt;
 
 /// Fixed wire frame length in bytes.
 pub const MSG_LEN: usize = 40;
+pub const RAFT_BATCH_HEADER_LEN: usize = 12;
+pub const RAFT_BATCH_MAX_COMMANDS: usize = 1_000;
+const RAFT_BATCH_MAGIC: [u8; 4] = *b"RB01";
+
+/// Encode multiple command frames into one Raft application entry. Consensus
+/// persists and replicates this byte string atomically, so a batch consumes one
+/// log index and one Ready fsync rather than one of each per command.
+pub fn encode_raft_batch(frames: &[[u8; MSG_LEN]]) -> Option<Vec<u8>> {
+    if frames.is_empty() || frames.len() > RAFT_BATCH_MAX_COMMANDS {
+        return None;
+    }
+    let mut out = Vec::with_capacity(RAFT_BATCH_HEADER_LEN + frames.len() * MSG_LEN);
+    out.extend_from_slice(&RAFT_BATCH_MAGIC);
+    out.extend_from_slice(&1u32.to_le_bytes());
+    out.extend_from_slice(&(frames.len() as u32).to_le_bytes());
+    for frame in frames {
+        WireView::parse(frame)?;
+        out.extend_from_slice(frame);
+    }
+    Some(out)
+}
+
+/// Decode either a new batch entry or a legacy one-command Raft entry.
+pub fn decode_raft_entry(payload: &[u8]) -> Option<Vec<Command>> {
+    if payload.len() == MSG_LEN {
+        return Some(vec![WireView::parse(payload)?.to_command()?]);
+    }
+    if payload.len() < RAFT_BATCH_HEADER_LEN || payload[..4] != RAFT_BATCH_MAGIC {
+        return None;
+    }
+    let version = u32::from_le_bytes(payload[4..8].try_into().ok()?);
+    let count = u32::from_le_bytes(payload[8..12].try_into().ok()?) as usize;
+    if version != 1
+        || count == 0
+        || count > RAFT_BATCH_MAX_COMMANDS
+        || payload.len() != RAFT_BATCH_HEADER_LEN + count * MSG_LEN
+    {
+        return None;
+    }
+    payload[RAFT_BATCH_HEADER_LEN..]
+        .chunks_exact(MSG_LEN)
+        .map(|frame| WireView::parse(frame)?.to_command())
+        .collect()
+}
 
 /// Fixed execution-report frame length in bytes (v2: 56 — adds fee fields).
 pub const REPORT_LEN: usize = 56;
@@ -54,15 +98,15 @@ const MT_HALT_USER: u8 = 7;
 const MT_RESUME_USER: u8 = 8;
 
 // Report type codes.
-const RT_ACCEPTED: u8 = 1;
-const RT_TRADE: u8 = 2;
-const RT_FILLED: u8 = 3;
-const RT_PARTIAL: u8 = 4;
-const RT_RESTING: u8 = 5;
-const RT_CANCELLED: u8 = 6;
-const RT_REJECTED: u8 = 7;
-const RT_MODIFIED: u8 = 8;
-const RT_NOTFOUND: u8 = 9;
+pub const RT_ACCEPTED: u8 = 1;
+pub const RT_TRADE: u8 = 2;
+pub const RT_FILLED: u8 = 3;
+pub const RT_PARTIAL: u8 = 4;
+pub const RT_RESTING: u8 = 5;
+pub const RT_CANCELLED: u8 = 6;
+pub const RT_REJECTED: u8 = 7;
+pub const RT_MODIFIED: u8 = 8;
+pub const RT_NOTFOUND: u8 = 9;
 /// One depth ladder level (market-data): aux = level index, price/qty set.
 pub const RT_DEPTH_LEVEL: u8 = 10;
 /// Depth snapshot terminator: aux = bid_levels | ask_levels << 8.
@@ -638,5 +682,26 @@ mod tests {
     fn short_buffer_is_rejected() {
         let short = [0u8; MSG_LEN - 1];
         assert!(WireView::parse(&short).is_none());
+    }
+
+    #[test]
+    fn raft_batch_is_one_entry_and_legacy_entries_still_decode() {
+        let orders = [
+            Order::limit(OrderId(101), Side::Sell, 100, 5).on(InstrumentId(7)),
+            Order::limit(OrderId(102), Side::Buy, 100, 5).on(InstrumentId(7)),
+        ];
+        let frames = orders.map(|order| {
+            let mut frame = [0; MSG_LEN];
+            encode_new(&order, &mut frame);
+            frame
+        });
+
+        let payload = encode_raft_batch(&frames).unwrap();
+        let commands = decode_raft_entry(&payload).unwrap();
+
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0].id(), 101);
+        assert_eq!(commands[1].id(), 102);
+        assert_eq!(decode_raft_entry(&frames[0]).unwrap().len(), 1);
     }
 }

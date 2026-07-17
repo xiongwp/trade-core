@@ -1464,10 +1464,14 @@ impl Shard {
         // its own record (the total order stays flat and replayable); atomicity
         // holds because this thread pops nothing until the loop finishes.
         if let Command::Batch(cmds) = cmd {
+            if let Some(index) = raft_index {
+                self.handle_committed_batch(index, cmds, started);
+                return;
+            }
             for c in cmds {
                 self.handle(QueuedCommand {
                     command: c,
-                    raft_index,
+                    raft_index: None,
                 });
             }
             return;
@@ -1498,13 +1502,13 @@ impl Shard {
                 None => self.rep_seq + 1,
             };
             self.rep_seq = seq;
-            if raft_index.is_some() {
+            if let Some(raft_index) = raft_index {
                 if let Some(journal) = &mut self.journal {
                     journal.sync_data().expect("sync raft command journal");
                 }
                 if let Some(asset_journal) = &self.asset_journal {
                     asset_journal
-                        .mark_raft_applied(cmd.instrument(), raft_index.unwrap())
+                        .mark_raft_applied(cmd.instrument(), raft_index)
                         .expect("persist raft application watermark");
                 }
             }
@@ -1517,9 +1521,16 @@ impl Shard {
                 .journal_seq
                 .fetch_max(self.rep_seq, Ordering::Relaxed);
         }
+        self.process_and_emit(cmd);
+        self.metrics
+            .record_command_latency(started.elapsed().as_nanos() as u64);
+    }
+
+    fn process_and_emit(&mut self, command: Command) {
+        let started = Instant::now();
         let result_tx = &self.result_tx;
         let metrics = &self.metrics;
-        self.processor.process(cmd, &mut |report| {
+        self.processor.process(command, &mut |report| {
             metrics.record(&report);
             // Backpressure: spin+yield until the order system drains.
             let mut pending = report;
@@ -1533,6 +1544,72 @@ impl Shard {
                 }
             }
         });
+        self.metrics
+            .record_match_latency(started.elapsed().as_nanos() as u64);
+    }
+
+    fn handle_committed_batch(
+        &mut self,
+        raft_index: u64,
+        commands: Vec<Command>,
+        started: Instant,
+    ) {
+        if commands.is_empty() {
+            return;
+        }
+        let wal_started = Instant::now();
+        let touched = match &mut self.asset_journal {
+            Some(asset_journal) => match asset_journal.append_committed_batch(&commands) {
+                Ok(touched) => touched,
+                Err(error) => {
+                    self.metrics
+                        .asset_wal_errors
+                        .fetch_add(1, Ordering::Relaxed);
+                    eprintln!(
+                        "[asset-journal] event=batch_append_failed action=reject error={error}"
+                    );
+                    return;
+                }
+            },
+            None => Vec::new(),
+        };
+        self.metrics
+            .record_wal_fsync_latency(wal_started.elapsed().as_nanos() as u64);
+
+        let mut replicated = Vec::with_capacity(commands.len());
+        for command in &commands {
+            let mut frame = [0u8; wire::MSG_LEN];
+            wire::encode_command(command, &mut frame);
+            let seq = match &mut self.journal {
+                Some(journal) => journal
+                    .append(journal::now_nanos(), &frame)
+                    .unwrap_or_else(|_| self.rep_seq + 1),
+                None => self.rep_seq + 1,
+            };
+            self.rep_seq = seq;
+            replicated.push((seq, frame));
+        }
+        if let Some(journal) = &mut self.journal {
+            journal
+                .sync_data()
+                .expect("sync committed Raft command batch journal");
+        }
+        if let Some(asset_journal) = &self.asset_journal {
+            asset_journal
+                .mark_raft_batch_applied(&touched, raft_index)
+                .expect("persist Raft batch application watermarks");
+        }
+        if let Some(rep) = &self.rep {
+            for (seq, frame) in replicated {
+                rep.publish(self.shard_id, seq, &frame);
+            }
+        }
+        self.metrics
+            .journal_seq
+            .fetch_max(self.rep_seq, Ordering::Relaxed);
+        for command in commands {
+            self.process_and_emit(command);
+        }
         self.metrics
             .record_command_latency(started.elapsed().as_nanos() as u64);
     }

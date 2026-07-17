@@ -6,35 +6,35 @@ services:
     build: .
     image: trade-core-node
     command: ["exec raft-multi-node 1 ${TC_RAFT_GROUPS:-4} /data"]
-    environment: { TC_MATCH_POOL_PER_ASSET: "${TC_MATCH_POOL_PER_ASSET:-2}" }
+    environment: { TC_MATCH_POOL_PER_ASSET: "${TC_MATCH_POOL_PER_ASSET:-2}", TC_WAL_PREALLOCATE_BYTES: "${TC_WAL_PREALLOCATE_BYTES:-0}", TC_ORDER_CATEGORY_SIZE: "${TC_ORDER_CATEGORY_SIZE:-1000}", TC_EXECUTION_KAFKA_BROKERS: "redpanda:9092,redpanda-2:9092,redpanda-3:9092", TC_EXECUTION_KAFKA_TOPIC: "${TC_EXECUTION_KAFKA_TOPIC:-trade-executions-v1}" }
     ports: ["9301:9001", "9201:9102", "9401:9011", "9211:9112", "9501:9021", "9221:9122", "9601:9031", "9231:9132"]
     volumes: ["raft-1-data:/data"]
     restart: unless-stopped
   raft-2:
     image: trade-core-node
     command: ["exec raft-multi-node 2 ${TC_RAFT_GROUPS:-4} /data"]
-    environment: { TC_MATCH_POOL_PER_ASSET: "${TC_MATCH_POOL_PER_ASSET:-2}" }
+    environment: { TC_MATCH_POOL_PER_ASSET: "${TC_MATCH_POOL_PER_ASSET:-2}", TC_WAL_PREALLOCATE_BYTES: "${TC_WAL_PREALLOCATE_BYTES:-0}", TC_ORDER_CATEGORY_SIZE: "${TC_ORDER_CATEGORY_SIZE:-1000}", TC_EXECUTION_KAFKA_BROKERS: "redpanda:9092,redpanda-2:9092,redpanda-3:9092", TC_EXECUTION_KAFKA_TOPIC: "${TC_EXECUTION_KAFKA_TOPIC:-trade-executions-v1}" }
     ports: ["9302:9001", "9202:9102", "9402:9011", "9212:9112", "9502:9021", "9222:9122", "9602:9031", "9232:9132"]
     volumes: ["raft-2-data:/data"]
     restart: unless-stopped
   raft-3:
     image: trade-core-node
     command: ["exec raft-multi-node 3 ${TC_RAFT_GROUPS:-4} /data"]
-    environment: { TC_MATCH_POOL_PER_ASSET: "${TC_MATCH_POOL_PER_ASSET:-2}" }
+    environment: { TC_MATCH_POOL_PER_ASSET: "${TC_MATCH_POOL_PER_ASSET:-2}", TC_WAL_PREALLOCATE_BYTES: "${TC_WAL_PREALLOCATE_BYTES:-0}", TC_ORDER_CATEGORY_SIZE: "${TC_ORDER_CATEGORY_SIZE:-1000}", TC_EXECUTION_KAFKA_BROKERS: "redpanda:9092,redpanda-2:9092,redpanda-3:9092", TC_EXECUTION_KAFKA_TOPIC: "${TC_EXECUTION_KAFKA_TOPIC:-trade-executions-v1}" }
     ports: ["9303:9001", "9203:9102", "9403:9011", "9213:9112", "9503:9021", "9223:9122", "9603:9031", "9233:9132"]
     volumes: ["raft-3-data:/data"]
     restart: unless-stopped
   raft-4:
     image: trade-core-node
     command: ["exec raft-multi-node 4 ${TC_RAFT_GROUPS:-4} /data"]
-    environment: { TC_MATCH_POOL_PER_ASSET: "${TC_MATCH_POOL_PER_ASSET:-2}" }
+    environment: { TC_MATCH_POOL_PER_ASSET: "${TC_MATCH_POOL_PER_ASSET:-2}", TC_WAL_PREALLOCATE_BYTES: "${TC_WAL_PREALLOCATE_BYTES:-0}", TC_ORDER_CATEGORY_SIZE: "${TC_ORDER_CATEGORY_SIZE:-1000}", TC_EXECUTION_KAFKA_BROKERS: "redpanda:9092,redpanda-2:9092,redpanda-3:9092", TC_EXECUTION_KAFKA_TOPIC: "${TC_EXECUTION_KAFKA_TOPIC:-trade-executions-v1}" }
     ports: ["9304:9001", "9204:9102", "9404:9011", "9214:9112", "9504:9021", "9224:9122", "9604:9031", "9234:9132"]
     volumes: ["raft-4-data:/data"]
     restart: unless-stopped
   raft-5:
     image: trade-core-node
     command: ["exec raft-multi-node 5 ${TC_RAFT_GROUPS:-4} /data"]
-    environment: { TC_MATCH_POOL_PER_ASSET: "${TC_MATCH_POOL_PER_ASSET:-2}" }
+    environment: { TC_MATCH_POOL_PER_ASSET: "${TC_MATCH_POOL_PER_ASSET:-2}", TC_WAL_PREALLOCATE_BYTES: "${TC_WAL_PREALLOCATE_BYTES:-0}", TC_ORDER_CATEGORY_SIZE: "${TC_ORDER_CATEGORY_SIZE:-1000}", TC_EXECUTION_KAFKA_BROKERS: "redpanda:9092,redpanda-2:9092,redpanda-3:9092", TC_EXECUTION_KAFKA_TOPIC: "${TC_EXECUTION_KAFKA_TOPIC:-trade-executions-v1}" }
     ports: ["9305:9001", "9205:9102", "9405:9011", "9215:9112", "9505:9021", "9225:9122", "9605:9031", "9235:9132"]
     volumes: ["raft-5-data:/data"]
     restart: unless-stopped

@@ -451,11 +451,12 @@ mod tests {
     }
 
     fn log_entry(index: u64, term: u64, data: &[u8]) -> Entry {
-        let mut entry = Entry::default();
-        entry.index = index;
-        entry.term = term;
-        entry.data = data.to_vec().into();
-        entry
+        Entry {
+            index,
+            term,
+            data: data.to_vec().into(),
+            ..Default::default()
+        }
     }
 
     fn pump(nodes: &mut [RaftNode]) {

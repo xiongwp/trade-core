@@ -14,23 +14,20 @@ use std::time::{Duration, Instant};
 
 use protobuf::Message as PbMessage;
 use raft::prelude::Message;
+use rdkafka::producer::{FutureProducer, FutureRecord};
+use rdkafka::ClientConfig;
 use trade_core::asset_log;
 use trade_core::exchange::{build, ExchangeConfig};
 use trade_core::gateway;
 use trade_core::raft_log::{ClusterConfig, RaftNode, CLUSTER_SIZE};
+use trade_core::sharding::{self, DEFAULT_ASSET_CATEGORY_SIZE};
 use trade_core::wire::{self, MSG_LEN};
 
 const PROPOSAL_BATCH: usize = 512;
 
 struct ProposalRequest {
-    command: trade_core::Command,
+    commands: Vec<trade_core::Command>,
     committed: mpsc::SyncSender<u64>,
-}
-
-struct ProposalGroup {
-    command_id: u64,
-    command: trade_core::Command,
-    waiters: Vec<mpsc::SyncSender<u64>>,
 }
 
 fn main() {
@@ -77,7 +74,7 @@ fn main() {
     let running = Arc::new(AtomicBool::new(true));
     let accepting = Arc::new(AtomicBool::new(false));
     let (message_tx, message_rx) = mpsc::channel();
-    let (proposal_tx, proposal_rx) = mpsc::sync_channel(1 << 16);
+    let (proposal_tx, proposal_rx) = mpsc::sync_channel::<ProposalRequest>(1 << 16);
     spawn_listener(raft_addr, message_tx);
 
     let runtime_running = running.clone();
@@ -92,30 +89,48 @@ fn main() {
             let mut node = RaftNode::open(config, state_path).expect("open durable raft state");
             let mut pending = Vec::new();
             let mut commit_waiters: BTreeMap<u64, Vec<mpsc::SyncSender<u64>>> = BTreeMap::new();
+            let mut commit_started: BTreeMap<u64, Instant> = BTreeMap::new();
             let mut committed_ids: HashMap<u64, u64> = HashMap::new();
-            let mut inflight_ids: HashMap<u64, u64> = HashMap::new();
             let mut was_leader = false;
             let mut last_tick = Instant::now();
+            let applied_batches = asset_log::load_applied_batches(&asset_root)
+                .expect("load applied Raft batch watermarks");
 
             // Rebuild exact idempotency and matching state before this member
             // can campaign or accept a retry. Otherwise a fast election can
             // race the recovered committed prefix and append an old command a
             // second time.
             for (index, payload) in node.take_committed() {
-                let command = wire::WireView::parse(&payload)
-                    .and_then(|view| view.to_command())
-                    .expect("durable committed Raft entry is not a valid order frame");
-                let command_id = command.id();
-                if command_id != 0 {
-                    committed_ids.entry(command_id).or_insert(index);
-                }
-                if asset_log::applied_raft_index(&asset_root, command.instrument())
-                    .expect("read asset application watermark")
-                    >= index
-                {
+                let commands = wire::decode_raft_entry(&payload)
+                    .expect("durable committed Raft entry is not a valid command batch");
+                let is_batch = payload.len() != MSG_LEN;
+                if is_batch && applied_batches.contains(&index) {
+                    for command in commands {
+                        let command_id = command.id();
+                        if command_id != 0 {
+                            committed_ids.entry(command_id).or_insert(index);
+                        }
+                    }
                     continue;
                 }
-                let mut pending_command = command;
+                let mut apply = Vec::new();
+                for command in commands {
+                    let command_id = command.id();
+                    if command_id != 0 {
+                        committed_ids.entry(command_id).or_insert(index);
+                    }
+                    if is_batch
+                        || asset_log::applied_raft_index(&asset_root, command.instrument())
+                            .expect("read asset application watermark")
+                            < index
+                    {
+                        apply.push(command);
+                    }
+                }
+                if apply.is_empty() {
+                    continue;
+                }
+                let mut pending_command = trade_core::Command::Batch(apply);
                 loop {
                     match gateway.submit_committed(index, pending_command) {
                         Ok(()) => break,
@@ -145,7 +160,7 @@ fn main() {
                 if was_leader && !leader {
                     pending.clear();
                     commit_waiters.clear();
-                    inflight_ids.clear();
+                    commit_started.clear();
                 }
                 was_leader = leader;
                 runtime_accepting.store(leader, Ordering::Release);
@@ -157,54 +172,44 @@ fn main() {
                 );
                 runtime_metrics.set_ready(node.leader_id() != 0);
                 if leader && !pending.is_empty() {
-                    let requests = pending.drain(..).collect::<Vec<ProposalRequest>>();
-                    let mut groups = Vec::<ProposalGroup>::new();
-                    let mut group_by_id = HashMap::<u64, usize>::new();
+                    let requests = std::mem::take(&mut pending);
+                    let mut entries = Vec::new();
+                    let mut waiters = Vec::new();
                     for request in requests {
-                        let id = request.command.id();
-                        if id != 0 {
-                            if let Some(index) = committed_ids.get(&id).copied() {
-                                let _ = request.committed.send(index);
-                                continue;
-                            }
-                            if let Some(index) = inflight_ids.get(&id).copied() {
-                                commit_waiters
-                                    .entry(index)
-                                    .or_default()
-                                    .push(request.committed);
-                                continue;
-                            }
-                            if let Some(group) = group_by_id.get(&id).copied() {
-                                groups[group].waiters.push(request.committed);
-                                continue;
-                            }
+                        let committed_index = request
+                            .commands
+                            .iter()
+                            .filter_map(|command| committed_ids.get(&command.id()).copied())
+                            .max();
+                        if request.commands.iter().all(|command| {
+                            command.id() != 0 && committed_ids.contains_key(&command.id())
+                        }) {
+                            let _ = request.committed.send(committed_index.unwrap_or(0));
+                            continue;
                         }
-                        if id != 0 {
-                            group_by_id.insert(id, groups.len());
-                        }
-                        groups.push(ProposalGroup {
-                            command_id: id,
-                            command: request.command,
-                            waiters: vec![request.committed],
-                        });
+                        let frames = request
+                            .commands
+                            .iter()
+                            .map(|command| {
+                                let mut frame = [0u8; MSG_LEN];
+                                wire::encode_command(command, &mut frame);
+                                frame
+                            })
+                            .collect::<Vec<_>>();
+                        let Some(entry) = wire::encode_raft_batch(&frames) else {
+                            continue;
+                        };
+                        entries.push(entry);
+                        waiters.push(request.committed);
                     }
-                    let frames = groups
-                        .iter()
-                        .map(|group| {
-                            let mut frame = [0u8; MSG_LEN];
-                            wire::encode_command(&group.command, &mut frame);
-                            frame.to_vec()
-                        })
-                        .collect::<Vec<_>>();
-                    if !frames.is_empty() {
-                        node.propose_batch(frames).expect("leader proposal batch");
-                        let first_index = node.last_index() + 1 - groups.len() as u64;
-                        for (offset, group) in groups.into_iter().enumerate() {
+                    if !entries.is_empty() {
+                        node.propose_batch(entries)
+                            .expect("leader category-batch proposal");
+                        let first_index = node.last_index() + 1 - waiters.len() as u64;
+                        for (offset, waiter) in waiters.into_iter().enumerate() {
                             let index = first_index + offset as u64;
-                            if group.command_id != 0 {
-                                inflight_ids.insert(group.command_id, index);
-                            }
-                            commit_waiters.insert(index, group.waiters);
+                            commit_waiters.entry(index).or_default().push(waiter);
+                            commit_started.insert(index, Instant::now());
                         }
                     }
                 }
@@ -214,34 +219,36 @@ fn main() {
                     }
                 }
                 for (index, payload) in node.take_committed() {
-                    let Some(command) =
-                        wire::WireView::parse(&payload).and_then(|view| view.to_command())
-                    else {
-                        panic!("committed Raft entry is not a valid order frame");
-                    };
-                    let id = command.id();
-                    let duplicate = id != 0 && committed_ids.contains_key(&id);
-                    if id != 0 {
-                        committed_ids.entry(id).or_insert(index);
-                        inflight_ids.remove(&id);
+                    if let Some(started) = commit_started.remove(&index) {
+                        runtime_metrics
+                            .record_raft_commit_latency(started.elapsed().as_nanos() as u64);
                     }
                     if let Some(waiters) = commit_waiters.remove(&index) {
                         for waiter in waiters {
                             let _ = waiter.send(index);
                         }
                     }
-                    if duplicate {
+                    let commands = wire::decode_raft_entry(&payload)
+                        .expect("committed Raft entry is not a valid command batch");
+                    let mut apply = Vec::new();
+                    for command in commands {
+                        let id = command.id();
+                        let duplicate = id != 0 && committed_ids.contains_key(&id);
+                        if id != 0 {
+                            committed_ids.entry(id).or_insert(index);
+                        }
+                        if !duplicate
+                            && asset_log::applied_raft_index(&asset_root, command.instrument())
+                                .expect("read asset application watermark")
+                                < index
+                        {
+                            apply.push(command);
+                        }
+                    }
+                    if apply.is_empty() {
                         continue;
                     }
-                    // The matching runtime already reconstructed commands at or
-                    // below this durable watermark from its shard journal.
-                    if asset_log::applied_raft_index(&asset_root, command.instrument())
-                        .expect("read asset application watermark")
-                        >= index
-                    {
-                        continue;
-                    }
-                    let mut pending_command = command;
+                    let mut pending_command = trade_core::Command::Batch(apply);
                     loop {
                         match gateway.submit_committed(index, pending_command) {
                             Ok(()) => break,
@@ -260,14 +267,34 @@ fn main() {
     trade_core::metrics::serve(metrics_addr, metrics);
     let listener = TcpListener::bind(&order_addr).expect("bind order listener");
     let md_listener = TcpListener::bind(md_addr).expect("bind market-data fanout");
+    let execution_topic =
+        std::env::var("TC_EXECUTION_KAFKA_TOPIC").unwrap_or_else(|_| "trade-executions-v1".into());
+    let category_size = std::env::var("TC_ORDER_CATEGORY_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(DEFAULT_ASSET_CATEGORY_SIZE)
+        .max(1);
+    let execution_producer = std::env::var("TC_EXECUTION_KAFKA_BROKERS")
+        .ok()
+        .map(|brokers| {
+            ClientConfig::new()
+                .set("bootstrap.servers", brokers)
+                .set("acks", "all")
+                .set("enable.idempotence", "true")
+                .set("linger.ms", "2")
+                .set("batch.num.messages", "10000")
+                .create::<FutureProducer>()
+                .expect("create execution Kafka producer")
+        });
     let ingress_running = running.clone();
+    let report_accepting = accepting.clone();
     gateway::serve_committed_forever(
         listener,
         Some(md_listener),
         sink,
         running.clone(),
         0,
-        move |command| {
+        move |commands| {
             while !accepting.load(Ordering::Acquire) && ingress_running.load(Ordering::Acquire) {
                 thread::sleep(Duration::from_millis(2));
             }
@@ -275,7 +302,7 @@ fn main() {
                 let (committed_tx, committed_rx) = mpsc::sync_channel(1);
                 proposal_tx
                     .send(ProposalRequest {
-                        command,
+                        commands,
                         committed: committed_tx,
                     })
                     .expect("raft runtime stopped");
@@ -284,9 +311,39 @@ fn main() {
                 None
             }
         },
+        move |report| {
+            if !report_accepting.load(Ordering::Acquire)
+                || matches!(
+                    report,
+                    trade_core::ExecReport::DepthLevel { .. }
+                        | trade_core::ExecReport::DepthEnd { .. }
+                )
+            {
+                return;
+            }
+            let Some(producer) = &execution_producer else {
+                return;
+            };
+            let mut frame = [0u8; wire::REPORT_LEN];
+            wire::encode_report(report, &mut frame);
+            let key = execution_category_key(&frame, category_size);
+            if producer
+                .send_result(FutureRecord::to(&execution_topic).key(&key).payload(&frame))
+                .is_err()
+            {
+                eprintln!("[execution-kafka] producer queue full; report will be replayed");
+            }
+        },
     )
     .expect("serve committed gateway");
     handle.shutdown();
+}
+
+fn execution_category_key(frame: &[u8; wire::REPORT_LEN], category_size: u32) -> [u8; 4] {
+    let instrument = trade_core::InstrumentId(u32::from_le_bytes(
+        frame[4..8].try_into().expect("execution instrument"),
+    ));
+    sharding::asset_category(instrument, category_size).to_be_bytes()
 }
 
 fn parse_peers(input: &str) -> HashMap<u64, String> {
@@ -330,4 +387,28 @@ fn send(addr: &str, message: &Message) {
     };
     let _ = stream.write_all(&(bytes.len() as u32).to_be_bytes());
     let _ = stream.write_all(&bytes);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use trade_core::{ExecReport, InstrumentId, OrderId};
+
+    fn category_key(instrument: u32) -> [u8; 4] {
+        let mut frame = [0; wire::REPORT_LEN];
+        wire::encode_report(
+            &ExecReport::Accepted {
+                instrument: InstrumentId(instrument),
+                order_id: OrderId(instrument as u64),
+            },
+            &mut frame,
+        );
+        execution_category_key(&frame, 1_000)
+    }
+
+    #[test]
+    fn execution_reports_partition_by_category_not_instrument() {
+        assert_eq!(category_key(1), category_key(1_000));
+        assert_ne!(category_key(1_000), category_key(1_001));
+    }
 }

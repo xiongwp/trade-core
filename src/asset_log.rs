@@ -5,7 +5,8 @@
 //! unrelated markets. Raft's committed index is the authority for which
 //! commands may enter these logs; this module is the durable per-asset view.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -104,9 +105,74 @@ impl AssetJournalSet {
         Ok(seq)
     }
 
+    /// Append one quorum-committed Raft entry containing many commands, then
+    /// synchronize each touched asset WAL once. The applied watermarks are
+    /// advanced separately, after the shard journal also contains the batch.
+    pub fn append_committed_batch(
+        &mut self,
+        commands: &[Command],
+    ) -> io::Result<Vec<InstrumentId>> {
+        let mut touched = Vec::new();
+        for command in commands {
+            let instrument = command.instrument();
+            self.append(command)?;
+            if !touched.contains(&instrument) {
+                touched.push(instrument);
+            }
+        }
+        for instrument in &touched {
+            self.writers
+                .get_mut(instrument)
+                .expect("writer opened by batch append")
+                .sync_data()?;
+        }
+        Ok(touched)
+    }
+
     pub fn mark_raft_applied(&self, instrument: InstrumentId, raft_index: u64) -> io::Result<()> {
         write_applied_index(&self.root, instrument, raft_index)
     }
+
+    pub fn mark_raft_batch_applied(
+        &self,
+        _instruments: &[InstrumentId],
+        raft_index: u64,
+    ) -> io::Result<()> {
+        append_applied_batch(&self.root, raft_index)
+    }
+}
+
+/// Load the durable set of fully applied multi-command Raft entries. Each
+/// record represents a whole batch whose asset WALs and shard journal were
+/// synchronized before the marker was appended.
+pub fn load_applied_batches(root: &Path) -> io::Result<HashSet<u64>> {
+    let path = root.join("raft-batches.applied");
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(HashSet::new()),
+        Err(error) => return Err(error),
+    };
+    let mut applied = HashSet::new();
+    let mut record = [0u8; 16];
+    loop {
+        match file.read_exact(&mut record) {
+            Ok(()) => {
+                let index = u64::from_le_bytes(record[..8].try_into().unwrap());
+                if journal::fnv1a(&record[..8])
+                    != u64::from_le_bytes(record[8..].try_into().unwrap())
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "applied Raft batch watermark checksum mismatch",
+                    ));
+                }
+                applied.insert(index);
+            }
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(applied)
 }
 
 /// Highest Raft entry durably represented in the local asset and shard logs.
@@ -279,6 +345,19 @@ fn write_applied_index(root: &Path, instrument: InstrumentId, raft_index: u64) -
     std::fs::rename(temp, path)
 }
 
+fn append_applied_batch(root: &Path, raft_index: u64) -> io::Result<()> {
+    let mut record = [0u8; 16];
+    record[..8].copy_from_slice(&raft_index.to_le_bytes());
+    let checksum = journal::fnv1a(&record[..8]);
+    record[8..].copy_from_slice(&checksum.to_le_bytes());
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(root.join("raft-batches.applied"))?;
+    file.write_all(&record)?;
+    file.sync_data()
+}
+
 fn last_seq(path: &Path) -> io::Result<u64> {
     Ok(JournalReader::open(path)?
         .last()
@@ -392,6 +471,25 @@ mod tests {
         let error = logs.append(&command).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(!logs.path_for(btc).exists());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn batch_watermarks_group_commit_and_reload() {
+        let root = std::env::temp_dir().join(format!(
+            "tc-asset-log-watermark-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let logs = AssetJournalSet::open(&root, Duration::from_millis(1)).unwrap();
+
+        logs.mark_raft_batch_applied(&[InstrumentId(1), InstrumentId(2)], 77)
+            .unwrap();
+
+        let applied = load_applied_batches(&root).unwrap();
+        assert_eq!(applied.len(), 1);
+        assert!(applied.contains(&77));
         std::fs::remove_dir_all(&root).ok();
     }
 }

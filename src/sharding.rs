@@ -86,6 +86,22 @@ pub fn raft_group_for_category(category_id: u32, group_count: usize) -> usize {
     category_id as usize % group_count
 }
 
+/// Route with an explicit hot-category override. Control-plane configuration
+/// can pin a busy category to a dedicated group while every other category
+/// keeps deterministic modulo routing.
+#[inline]
+pub fn raft_group_for_category_pinned(
+    category_id: u32,
+    group_count: usize,
+    pinned: &std::collections::HashMap<u32, usize>,
+) -> usize {
+    pinned
+        .get(&category_id)
+        .copied()
+        .filter(|group| *group < group_count)
+        .unwrap_or_else(|| raft_group_for_category(category_id, group_count))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,5 +155,12 @@ mod tests {
         for category in 0..10_000 {
             assert!(raft_group_for_category(category, 4) < 4);
         }
+    }
+
+    #[test]
+    fn hot_category_can_own_a_dedicated_group() {
+        let pinned = std::collections::HashMap::from([(42, 7)]);
+        assert_eq!(raft_group_for_category_pinned(42, 8, &pinned), 7);
+        assert_eq!(raft_group_for_category_pinned(43, 8, &pinned), 3);
     }
 }

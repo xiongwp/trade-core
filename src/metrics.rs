@@ -28,6 +28,15 @@ pub struct Metrics {
     pub command_latency_ns_max: AtomicU64,
     pub command_latency_samples: AtomicU64,
     pub asset_wal_errors: AtomicU64,
+    pub raft_commit_ns_total: AtomicU64,
+    pub raft_commit_ns_max: AtomicU64,
+    pub raft_commit_samples: AtomicU64,
+    pub wal_fsync_ns_total: AtomicU64,
+    pub wal_fsync_ns_max: AtomicU64,
+    pub wal_fsync_samples: AtomicU64,
+    pub match_ns_total: AtomicU64,
+    pub match_ns_max: AtomicU64,
+    pub match_samples: AtomicU64,
 }
 
 impl Metrics {
@@ -83,6 +92,15 @@ impl Metrics {
             c("command_latency_samples", "Matching command latency samples", self.command_latency_samples.load(Ordering::Relaxed)),
             format!("# HELP tc_command_latency_ns_max Maximum matching command processing time in nanoseconds\n# TYPE tc_command_latency_ns_max gauge\ntc_command_latency_ns_max {}\n", self.command_latency_ns_max.load(Ordering::Relaxed)),
             c("asset_wal_errors", "Per-asset WAL append failures", self.asset_wal_errors.load(Ordering::Relaxed)),
+            c("raft_commit_ns_total", "Total Raft quorum commit time in nanoseconds", self.raft_commit_ns_total.load(Ordering::Relaxed)),
+            c("raft_commit_samples", "Raft quorum commit batches", self.raft_commit_samples.load(Ordering::Relaxed)),
+            format!("# HELP tc_raft_commit_ns_max Maximum Raft quorum commit time in nanoseconds\n# TYPE tc_raft_commit_ns_max gauge\ntc_raft_commit_ns_max {}\n", self.raft_commit_ns_max.load(Ordering::Relaxed)),
+            c("wal_fsync_ns_total", "Total asset WAL group fsync time in nanoseconds", self.wal_fsync_ns_total.load(Ordering::Relaxed)),
+            c("wal_fsync_samples", "Asset WAL group fsync batches", self.wal_fsync_samples.load(Ordering::Relaxed)),
+            format!("# HELP tc_wal_fsync_ns_max Maximum asset WAL group fsync time in nanoseconds\n# TYPE tc_wal_fsync_ns_max gauge\ntc_wal_fsync_ns_max {}\n", self.wal_fsync_ns_max.load(Ordering::Relaxed)),
+            c("match_ns_total", "Total in-memory matching time in nanoseconds", self.match_ns_total.load(Ordering::Relaxed)),
+            c("match_samples", "Commands matched", self.match_samples.load(Ordering::Relaxed)),
+            format!("# HELP tc_match_ns_max Maximum in-memory matching time in nanoseconds\n# TYPE tc_match_ns_max gauge\ntc_match_ns_max {}\n", self.match_ns_max.load(Ordering::Relaxed)),
         ]
         .concat()
     }
@@ -110,6 +128,39 @@ impl Metrics {
         self.command_latency_ns_max
             .fetch_max(elapsed_ns, Ordering::Relaxed);
         self.command_latency_samples.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_stage(total: &AtomicU64, max: &AtomicU64, samples: &AtomicU64, elapsed_ns: u64) {
+        total.fetch_add(elapsed_ns, Ordering::Relaxed);
+        max.fetch_max(elapsed_ns, Ordering::Relaxed);
+        samples.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_raft_commit_latency(&self, elapsed_ns: u64) {
+        Self::record_stage(
+            &self.raft_commit_ns_total,
+            &self.raft_commit_ns_max,
+            &self.raft_commit_samples,
+            elapsed_ns,
+        );
+    }
+
+    pub fn record_wal_fsync_latency(&self, elapsed_ns: u64) {
+        Self::record_stage(
+            &self.wal_fsync_ns_total,
+            &self.wal_fsync_ns_max,
+            &self.wal_fsync_samples,
+            elapsed_ns,
+        );
+    }
+
+    pub fn record_match_latency(&self, elapsed_ns: u64) {
+        Self::record_stage(
+            &self.match_ns_total,
+            &self.match_ns_max,
+            &self.match_samples,
+            elapsed_ns,
+        );
     }
 }
 
@@ -187,11 +238,17 @@ mod tests {
         let m = Metrics::default();
         m.record_command_latency(100);
         m.record_command_latency(250);
+        m.record_raft_commit_latency(300);
+        m.record_wal_fsync_latency(400);
+        m.record_match_latency(50);
         m.asset_wal_errors.fetch_add(1, Ordering::Relaxed);
         let text = m.render();
         assert!(text.contains("tc_command_latency_ns_total 350"));
         assert!(text.contains("tc_command_latency_samples 2"));
         assert!(text.contains("tc_command_latency_ns_max 250"));
         assert!(text.contains("tc_asset_wal_errors 1"));
+        assert!(text.contains("tc_raft_commit_ns_total 300"));
+        assert!(text.contains("tc_wal_fsync_ns_max 400"));
+        assert!(text.contains("tc_match_ns_total 50"));
     }
 }

@@ -96,6 +96,9 @@ services:
             "orders-v2-g$$i"
           i=$$((i + 1))
         done
+        rpk topic create --if-not-exists --brokers=redpanda:9092 \
+          --partitions=${TC_EXECUTION_KAFKA_PARTITIONS:-16} --replicas=3 \
+          "${TC_EXECUTION_KAFKA_TOPIC:-trade-executions-v1}"
     restart: "no"
 
   market-data:
@@ -229,11 +232,17 @@ services:
       TC_ORDER_KAFKA_TOPIC_COUNT: ${TC_ORDER_KAFKA_TOPIC_COUNT:-4}
       # Laptop-safe default. Production capacity tests override this to 64+.
       TC_ORDER_KAFKA_PARTITIONS_PER_TOPIC: ${TC_ORDER_KAFKA_PARTITIONS_PER_TOPIC:-8}
-      TC_ORDER_KAFKA_CONSUMERS: ${TC_ORDER_KAFKA_CONSUMERS:-8}
-      TC_ORDER_KAFKA_DB_CONSUMERS: ${TC_ORDER_KAFKA_DB_CONSUMERS:-8}
-      TC_ORDER_KAFKA_MATCH_CONSUMERS: ${TC_ORDER_KAFKA_MATCH_CONSUMERS:-8}
+      # One consumer per physical partition keeps independent offset/retry pipelines.
+      TC_ORDER_KAFKA_CONSUMERS: ${TC_ORDER_KAFKA_CONSUMERS:-32}
+      TC_ORDER_KAFKA_DB_CONSUMERS: ${TC_ORDER_KAFKA_DB_CONSUMERS:-32}
+      TC_ORDER_KAFKA_MATCH_CONSUMERS: ${TC_ORDER_KAFKA_MATCH_CONSUMERS:-32}
       TC_ORDER_KAFKA_DB_GROUP: ${TC_ORDER_KAFKA_DB_GROUP:-trade-order-persist-v1}
       TC_ORDER_KAFKA_MATCH_GROUP: ${TC_ORDER_KAFKA_MATCH_GROUP:-trade-order-match-v1}
+      TC_EXECUTION_KAFKA_TOPIC: ${TC_EXECUTION_KAFKA_TOPIC:-trade-executions-v1}
+      TC_EXECUTION_KAFKA_MYSQL_GROUP: ${TC_EXECUTION_KAFKA_MYSQL_GROUP:-trade-order-execution-mysql-v1}
+      TC_EXECUTION_KAFKA_MYSQL_CONSUMERS: ${TC_EXECUTION_KAFKA_MYSQL_CONSUMERS:-4}
+      # Example: "12:4,99:5" pins hot categories to dedicated Raft groups.
+      TC_RAFT_CATEGORY_PINS: ${TC_RAFT_CATEGORY_PINS:-}
       TC_ORDER_KAFKA_ROUTE_VERSION: ${TC_ORDER_KAFKA_ROUTE_VERSION:-1}
       TC_ORDER_BATCH_SIZE: ${TC_ORDER_BATCH_SIZE:-500}
       TC_ORDER_BATCH_LINGER_MS: ${TC_ORDER_BATCH_LINGER_MS:-2}

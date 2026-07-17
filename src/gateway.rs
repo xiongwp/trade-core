@@ -30,6 +30,8 @@ use std::time::Duration;
 use crate::exchange::{Command, OrderGateway, ResultSink};
 use crate::wire::{self, WireView, MSG_LEN, REPORT_LEN};
 
+const COMMITTED_BATCH_MAGIC: [u8; 4] = *b"TCB1";
+
 /// Market-data fanout: subscribers connected on a side port each receive a copy
 /// of every execution-report frame (write-only feed — e.g. a candle/K-line
 /// service). Dead subscribers are dropped on first failed write.
@@ -145,10 +147,14 @@ pub fn serve_forever(
         sink,
         running,
         max_cmds_per_sec,
-        move |cmd| {
-            dispatch(&gateway.lock().expect("gateway lock"), cmd);
+        move |commands| {
+            let gateway = gateway.lock().expect("gateway lock");
+            for command in commands {
+                dispatch(&gateway, command);
+            }
             Some(0)
         },
+        |_| {},
     )
 }
 
@@ -180,16 +186,18 @@ where
 /// Persistent committed ingress for a long-running matching member. A client
 /// disconnect ends only that TCP session; Raft, journals and the next session
 /// continue with the already committed state.
-pub fn serve_committed_forever<F>(
+pub fn serve_committed_forever<F, R>(
     listener: TcpListener,
     md_listener: Option<TcpListener>,
     sink: ResultSink,
     running: Arc<AtomicBool>,
     max_cmds_per_sec: u64,
     submit: F,
+    report_callback: R,
 ) -> io::Result<()>
 where
-    F: Fn(Command) -> Option<u64> + Send + Sync + 'static,
+    F: Fn(Vec<Command>) -> Option<u64> + Send + Sync + 'static,
+    R: Fn(&crate::exchange::ExecReport) + Send + Sync + 'static,
 {
     let fanout = md_listener.map(|l| {
         eprintln!(
@@ -199,9 +207,10 @@ where
         MdFanout::accept_on(l, running.clone())
     });
     let report_running = running.clone();
+    let report_callback = Arc::new(report_callback);
     thread::Builder::new()
         .name("md-report-drain".into())
-        .spawn(move || report_fanout_drain(sink, fanout, report_running))
+        .spawn(move || report_fanout_drain(sink, fanout, report_running, report_callback))
         .expect("spawn market-data report drain");
     let submit = Arc::new(submit);
     let local = listener.local_addr()?;
@@ -368,62 +377,63 @@ fn read_loop<S: Read, F: Fn(Command)>(
 /// has been handed to the committed ingress. Execution reports are drained by a
 /// process-wide background fanout in the Raft runtime, so short-lived clients
 /// cannot starve market-data consumers.
-fn read_loop_ack<S: Read + Write, F: Fn(Command) -> Option<u64>>(
+fn read_loop_ack<S: Read + Write, F: Fn(Vec<Command>) -> Option<u64>>(
     mut stream: S,
     submit: &F,
     running: &AtomicBool,
     max_cmds_per_sec: u64,
 ) -> io::Result<()> {
-    let mut window = std::time::Instant::now();
-    let mut budget = max_cmds_per_sec;
-    let mut buf = vec![0u8; MSG_LEN * 512];
-    let mut filled = 0usize;
-
     while running.load(Ordering::Acquire) {
-        let n = stream.read(&mut buf[filled..])?;
-        if n == 0 {
-            eprintln!("[gateway] peer closed connection");
-            break;
+        let mut prefix = [0u8; 4];
+        match stream.read_exact(&mut prefix) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(error) => return Err(error),
         }
-        filled += n;
-
-        let mut off = 0;
-        while filled - off >= MSG_LEN {
-            if max_cmds_per_sec > 0 {
-                if budget == 0 {
-                    let elapsed = window.elapsed();
-                    if elapsed < Duration::from_secs(1) {
-                        thread::sleep(Duration::from_secs(1) - elapsed);
-                    }
-                    window = std::time::Instant::now();
-                    budget = max_cmds_per_sec;
-                }
-                budget -= 1;
+        let frames = if prefix == COMMITTED_BATCH_MAGIC {
+            let mut count = [0u8; 4];
+            stream.read_exact(&mut count)?;
+            let count = u32::from_be_bytes(count) as usize;
+            if count == 0 || count > wire::RAFT_BATCH_MAX_COMMANDS {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid committed command batch size",
+                ));
             }
-            if let Some(view) = WireView::parse(&buf[off..off + MSG_LEN]) {
-                if let Some(cmd) = view.to_command() {
-                    let Some(index) = submit(cmd) else {
-                        return Err(io::Error::new(
-                            io::ErrorKind::NotConnected,
-                            "command was not committed by this leader",
-                        ));
-                    };
-                    let mut ack = [0u8; 9];
-                    ack[0] = 1;
-                    ack[1..].copy_from_slice(&index.to_be_bytes());
-                    stream.write_all(&ack)?;
-                }
-            }
-            off += MSG_LEN;
+            let mut frames = vec![0u8; count * MSG_LEN];
+            stream.read_exact(&mut frames)?;
+            frames
+        } else {
+            let mut frame = vec![0u8; MSG_LEN];
+            frame[..4].copy_from_slice(&prefix);
+            stream.read_exact(&mut frame[4..])?;
+            frame
+        };
+        let command_count = frames.len() / MSG_LEN;
+        if max_cmds_per_sec > 0 && command_count as u64 > max_cmds_per_sec {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "committed batch exceeds rate limit",
+            ));
         }
-
-        if off > 0 {
-            buf.copy_within(off..filled, 0);
-            filled -= off;
-        }
-        if filled == buf.len() {
-            buf.resize(buf.len() * 2, 0);
-        }
+        let commands = frames
+            .chunks_exact(MSG_LEN)
+            .map(|frame| {
+                WireView::parse(frame)
+                    .and_then(|view| view.to_command())
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid command"))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        let Some(index) = submit(commands) else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "command batch was not committed by this leader",
+            ));
+        };
+        let mut ack = [0u8; 9];
+        ack[0] = 1;
+        ack[1..].copy_from_slice(&index.to_be_bytes());
+        stream.write_all(&ack)?;
     }
     Ok(())
 }
@@ -482,11 +492,13 @@ fn report_fanout_drain(
     sink: ResultSink,
     fanout: Option<MdFanout>,
     running: Arc<AtomicBool>,
+    report_callback: Arc<dyn Fn(&crate::exchange::ExecReport) + Send + Sync>,
 ) -> ResultSink {
     let mut out: Vec<u8> = Vec::with_capacity(REPORT_LEN * 256);
     loop {
         out.clear();
         sink.poll(|report| {
+            report_callback(&report);
             let mut frame = [0u8; REPORT_LEN];
             wire::encode_report(&report, &mut frame);
             out.extend_from_slice(&frame);
@@ -504,4 +516,53 @@ fn report_fanout_drain(
         }
     }
     sink
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::order::Order;
+    use crate::types::{InstrumentId, OrderId, Side};
+    use std::io::Cursor;
+
+    #[test]
+    fn committed_batch_protocol_acks_one_index_for_many_commands() {
+        let orders = [
+            Order::limit(OrderId(1), Side::Sell, 100, 2).on(InstrumentId(9)),
+            Order::limit(OrderId(2), Side::Buy, 100, 2).on(InstrumentId(9)),
+        ];
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&COMMITTED_BATCH_MAGIC);
+        bytes.extend_from_slice(&(orders.len() as u32).to_be_bytes());
+        for order in orders {
+            let mut frame = [0u8; MSG_LEN];
+            wire::encode_new(&order, &mut frame);
+            bytes.extend_from_slice(&frame);
+        }
+        let input_len = bytes.len();
+        let mut stream = Cursor::new(bytes);
+        let observed = Mutex::new(Vec::new());
+
+        read_loop_ack(
+            &mut stream,
+            &|commands| {
+                observed
+                    .lock()
+                    .unwrap()
+                    .extend(commands.into_iter().map(|command| command.id()));
+                Some(77)
+            },
+            &AtomicBool::new(true),
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(*observed.lock().unwrap(), vec![1, 2]);
+        let bytes = stream.into_inner();
+        assert_eq!(bytes[input_len], 1);
+        assert_eq!(
+            u64::from_be_bytes(bytes[input_len + 1..].try_into().unwrap()),
+            77
+        );
+    }
 }
