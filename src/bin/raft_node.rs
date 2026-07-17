@@ -20,7 +20,7 @@ use trade_core::asset_log;
 use trade_core::exchange::{build, ExchangeConfig};
 use trade_core::gateway;
 use trade_core::raft_log::{ClusterConfig, RaftNode, CLUSTER_SIZE};
-use trade_core::sharding::{self, DEFAULT_ASSET_CATEGORY_SIZE};
+use trade_core::sharding::DEFAULT_ASSET_CATEGORY_SIZE;
 use trade_core::wire::{self, MSG_LEN};
 
 const PROPOSAL_BATCH: usize = 512;
@@ -51,6 +51,11 @@ fn main() {
     }
     voters.sort_unstable();
     std::fs::create_dir_all(&data_dir).expect("create data directory");
+    let raft_group_id = std::env::var("TC_RAFT_GROUP_ID")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(0);
+    let execution_outbox_dir = data_dir.join("execution-outbox");
     let pool_orders_per_book = std::env::var("TC_MATCH_POOL_PER_ASSET")
         .ok()
         .and_then(|value| value.parse().ok())
@@ -68,6 +73,13 @@ fn main() {
         // single-market default. Hot dedicated assets can raise this through
         // TC_MATCH_POOL_PER_ASSET; pools still grow dynamically when needed.
         pool_orders_per_book,
+        execution_outbox_dir: Some(execution_outbox_dir.clone()),
+        raft_group_id,
+        execution_outbox_sync_every: std::env::var("TC_EXECUTION_OUTBOX_SYNC_EVERY")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1)
+            .max(1),
         ..ExchangeConfig::default()
     });
     let metrics = handle.metrics.clone();
@@ -290,10 +302,6 @@ fn main() {
     let md_listener = TcpListener::bind(md_addr).expect("bind market-data fanout");
     let execution_topic =
         std::env::var("TC_EXECUTION_KAFKA_TOPIC").unwrap_or_else(|_| "trade-executions-v1".into());
-    let raft_group_id = std::env::var("TC_RAFT_GROUP_ID")
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok())
-        .unwrap_or(0);
     let category_size = std::env::var("TC_ORDER_CATEGORY_SIZE")
         .ok()
         .and_then(|value| value.parse::<u32>().ok())
@@ -311,8 +319,16 @@ fn main() {
                 .create::<FutureProducer>()
                 .expect("create execution Kafka producer")
         });
+    if let Some(producer) = execution_producer.clone() {
+        spawn_execution_outbox_publisher(
+            execution_outbox_dir,
+            execution_topic.clone(),
+            producer,
+            category_size,
+            running.clone(),
+        );
+    }
     let ingress_running = running.clone();
-    let report_accepting = accepting.clone();
     gateway::serve_committed_forever(
         listener,
         Some(md_listener),
@@ -336,51 +352,76 @@ fn main() {
                 None
             }
         },
-        move |event| {
-            if !report_accepting.load(Ordering::Acquire)
-                || matches!(
-                    &event.report,
-                    trade_core::ExecReport::DepthLevel { .. }
-                        | trade_core::ExecReport::DepthEnd { .. }
-                )
-            {
-                return;
-            }
-            let Some(producer) = &execution_producer else {
-                return;
-            };
-            let mut frame = [0u8; wire::REPORT_LEN];
-            wire::encode_report(&event.report, &mut frame);
-            let key = execution_category_key(&frame, category_size);
-            let mut payload = [0u8; wire::EXECUTION_EVENT_LEN];
-            wire::encode_execution_event(
-                raft_group_id,
-                event.raft_index.unwrap_or(0),
-                event.ordinal,
-                &event.report,
-                &mut payload,
-            );
-            if producer
-                .send_result(
-                    FutureRecord::to(&execution_topic)
-                        .key(&key)
-                        .payload(&payload),
-                )
-                .is_err()
-            {
-                eprintln!("[execution-kafka] producer queue full; report will be replayed");
-            }
-        },
+        move |_event| {},
     )
     .expect("serve committed gateway");
     handle.shutdown();
 }
 
+fn spawn_execution_outbox_publisher(
+    root: PathBuf,
+    topic: String,
+    producer: FutureProducer,
+    category_size: u32,
+    running: Arc<AtomicBool>,
+) {
+    thread::Builder::new()
+        .name("execution-outbox-publisher".into())
+        .spawn(move || {
+            let mut readers: HashMap<PathBuf, trade_core::execution_outbox::ExecutionOutboxReader> =
+                HashMap::new();
+            while running.load(Ordering::Acquire) {
+                if let Ok(entries) = std::fs::read_dir(&root) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if !path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| name.starts_with("outbox-shard-"))
+                            || readers.contains_key(&path)
+                        {
+                            continue;
+                        }
+                        match trade_core::execution_outbox::ExecutionOutboxReader::open(
+                            path.clone(),
+                        ) {
+                            Ok(reader) => {
+                                readers.insert(path, reader);
+                            }
+                            Err(error) => {
+                                eprintln!("[execution-outbox] event=open_failed error={error}");
+                            }
+                        }
+                    }
+                }
+                for reader in readers.values_mut() {
+                    if let Err(error) = reader.read_available(|record| {
+                        let key = record.kafka_key(category_size);
+                        let payload = record.kafka_payload();
+                        while running.load(Ordering::Acquire)
+                            && producer
+                                .send_result(FutureRecord::to(&topic).key(&key).payload(&payload))
+                                .is_err()
+                        {
+                            eprintln!("[execution-kafka] producer queue full; retrying outbox");
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                    }) {
+                        eprintln!("[execution-outbox] event=read_failed error={error}");
+                    }
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+        })
+        .expect("spawn execution outbox publisher");
+}
+
+#[cfg(test)]
 fn execution_category_key(frame: &[u8; wire::REPORT_LEN], category_size: u32) -> [u8; 4] {
     let instrument = trade_core::InstrumentId(u32::from_le_bytes(
         frame[4..8].try_into().expect("execution instrument"),
     ));
-    sharding::asset_category(instrument, category_size).to_be_bytes()
+    trade_core::sharding::asset_category(instrument, category_size).to_be_bytes()
 }
 
 fn parse_peers(input: &str) -> HashMap<u64, String> {

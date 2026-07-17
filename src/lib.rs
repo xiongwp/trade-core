@@ -41,6 +41,7 @@ pub mod book;
 pub mod cluster;
 pub mod engine;
 pub mod exchange;
+pub mod execution_outbox;
 pub mod fees;
 pub mod gateway;
 pub mod idgen;

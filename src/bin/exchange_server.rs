@@ -142,6 +142,9 @@ fn main() {
             max_notional: 10_000_000_000,
             max_user_orders: 10_000,
         }),
+        execution_outbox_dir: None,
+        raft_group_id: 0,
+        execution_outbox_sync_every: 1,
     });
 
     // Standalone mode becomes ready once recovery/build has completed. The

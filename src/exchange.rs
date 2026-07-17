@@ -292,6 +292,14 @@ pub struct ExchangeConfig {
     /// high-water mark (exactly-once under order-system re-send; cursor is
     /// snapshot-persisted). Requires globally increasing ids (Leaf).
     pub dedup_commands: bool,
+    /// Durable execution outbox directory. When enabled, every non-depth report
+    /// produced from a Raft-committed command is appended before it leaves the
+    /// matching shard.
+    pub execution_outbox_dir: Option<PathBuf>,
+    /// Raft group id used in deterministic execution event ids.
+    pub raft_group_id: u32,
+    /// How many outbox records may be grouped per durability sync.
+    pub execution_outbox_sync_every: usize,
 }
 
 impl Default for ExchangeConfig {
@@ -313,6 +321,9 @@ impl Default for ExchangeConfig {
             risk_limits: None,
             fees: crate::fees::FeeSchedule::default(),
             dedup_commands: false,
+            execution_outbox_dir: None,
+            raft_group_id: 0,
+            execution_outbox_sync_every: 1,
         }
     }
 }
@@ -618,6 +629,7 @@ fn build_inner(
         // existing snapshot + journal is recovered into the processor first.
         let mut journal_w = None;
         let mut asset_journal = None;
+        let mut execution_outbox = None;
         let mut snapshot_path = None;
         if let Some(dir) = &config.journal_dir {
             std::fs::create_dir_all(dir).expect("create journal dir");
@@ -638,6 +650,16 @@ fn build_inner(
             );
             snapshot_path = Some(spath);
         }
+        if let Some(dir) = &config.execution_outbox_dir {
+            execution_outbox = Some(
+                crate::execution_outbox::ExecutionOutboxWriter::open(
+                    &dir.join(format!("outbox-shard-{shard_id}.bin")),
+                    config.journal_flush,
+                    config.execution_outbox_sync_every,
+                )
+                .expect("open execution outbox"),
+            );
+        }
 
         let snap_request = Arc::new(AtomicBool::new(false));
         snap_requests.push(snap_request.clone());
@@ -655,6 +677,8 @@ fn build_inner(
             result_tx: res_tx,
             journal: journal_w,
             asset_journal,
+            execution_outbox,
+            raft_group_id: config.raft_group_id,
             snapshot_path,
             snapshot_every: config.snapshot_every,
             last_snapshot: Instant::now(),
@@ -1220,6 +1244,8 @@ struct Shard {
     /// They provide the migration/replay unit while shard snapshots retain the
     /// existing fast restart path during the transition.
     asset_journal: Option<AssetJournalSet>,
+    execution_outbox: Option<crate::execution_outbox::ExecutionOutboxWriter>,
+    raft_group_id: u32,
     snapshot_path: Option<PathBuf>,
     snapshot_every: Option<Duration>,
     last_snapshot: Instant,
@@ -1550,7 +1576,16 @@ impl Shard {
         let started = Instant::now();
         let result_tx = &self.result_tx;
         let metrics = &self.metrics;
+        let outbox = &mut self.execution_outbox;
+        let raft_group_id = self.raft_group_id;
         self.processor.process(command, &mut |report| {
+            if let (Some(index), Some(outbox)) = (raft_index, outbox.as_mut()) {
+                if let Err(error) = outbox.append(raft_group_id, index, *ordinal, &report) {
+                    metrics.asset_wal_errors.fetch_add(1, Ordering::Relaxed);
+                    eprintln!("[execution-outbox] event=append_failed action=reject error={error}");
+                    return;
+                }
+            }
             metrics.record(&report);
             let event = ExecutionReportEvent {
                 raft_index,
