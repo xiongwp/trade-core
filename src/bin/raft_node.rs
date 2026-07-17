@@ -24,6 +24,7 @@ use trade_core::sharding::{self, DEFAULT_ASSET_CATEGORY_SIZE};
 use trade_core::wire::{self, MSG_LEN};
 
 const PROPOSAL_BATCH: usize = 512;
+const MAX_RAFT_MESSAGE_BYTES: usize = 16 << 20;
 
 struct ProposalRequest {
     commands: Vec<trade_core::Command>,
@@ -81,12 +82,17 @@ fn main() {
     let runtime_accepting = accepting.clone();
     let runtime_peers = peers.clone();
     let runtime_metrics = metrics.clone();
+    let max_apply_lag = std::env::var("TC_RAFT_READY_MAX_APPLY_LAG")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(32);
     let state_path = data_dir.join("raft.state");
     let asset_root = data_dir.join("journal").join("assets");
     thread::Builder::new()
         .name("raft-runtime".into())
         .spawn(move || {
             let mut node = RaftNode::open(config, state_path).expect("open durable raft state");
+            let transport = PeerTransport::spawn(runtime_peers, runtime_metrics.clone());
             let mut pending = Vec::new();
             let mut commit_waiters: BTreeMap<u64, Vec<mpsc::SyncSender<u64>>> = BTreeMap::new();
             let mut commit_started: BTreeMap<u64, Instant> = BTreeMap::new();
@@ -95,6 +101,10 @@ fn main() {
             let mut last_tick = Instant::now();
             let applied_batches = asset_log::load_applied_batches(&asset_root)
                 .expect("load applied Raft batch watermarks");
+            if let Some(index) = applied_batches.iter().max().copied() {
+                runtime_metrics.set_raft_enqueued_index(index);
+                runtime_metrics.set_raft_applied_index(index);
+            }
 
             // Rebuild exact idempotency and matching state before this member
             // can campaign or accept a retry. Otherwise a fast election can
@@ -111,6 +121,8 @@ fn main() {
                             committed_ids.entry(command_id).or_insert(index);
                         }
                     }
+                    runtime_metrics.set_raft_enqueued_index(index);
+                    runtime_metrics.set_raft_applied_index(index);
                     continue;
                 }
                 let mut apply = Vec::new();
@@ -128,6 +140,8 @@ fn main() {
                     }
                 }
                 if apply.is_empty() {
+                    runtime_metrics.set_raft_enqueued_index(index);
+                    runtime_metrics.set_raft_applied_index(index);
                     continue;
                 }
                 let mut pending_command = trade_core::Command::Batch(apply);
@@ -140,6 +154,7 @@ fn main() {
                         }
                     }
                 }
+                runtime_metrics.set_raft_enqueued_index(index);
             }
 
             while runtime_running.load(Ordering::Acquire) {
@@ -170,7 +185,11 @@ fn main() {
                     node.leader_id(),
                     node.commit_index(),
                 );
-                runtime_metrics.set_ready(node.leader_id() != 0);
+                runtime_metrics.set_ready(
+                    node.leader_id() != 0
+                        && runtime_metrics.raft_apply_lag() <= max_apply_lag
+                        && runtime_metrics.asset_wal_errors.load(Ordering::Relaxed) == 0,
+                );
                 if leader && !pending.is_empty() {
                     let requests = std::mem::take(&mut pending);
                     let mut entries = Vec::new();
@@ -214,20 +233,14 @@ fn main() {
                     }
                 }
                 for message in node.take_outbound() {
-                    if let Some(addr) = runtime_peers.get(&message.to) {
-                        send(addr, &message);
-                    }
+                    transport.send(message);
                 }
                 for (index, payload) in node.take_committed() {
                     if let Some(started) = commit_started.remove(&index) {
                         runtime_metrics
                             .record_raft_commit_latency(started.elapsed().as_nanos() as u64);
                     }
-                    if let Some(waiters) = commit_waiters.remove(&index) {
-                        for waiter in waiters {
-                            let _ = waiter.send(index);
-                        }
-                    }
+                    let waiters = commit_waiters.remove(&index);
                     let commands = wire::decode_raft_entry(&payload)
                         .expect("committed Raft entry is not a valid command batch");
                     let mut apply = Vec::new();
@@ -246,16 +259,24 @@ fn main() {
                         }
                     }
                     if apply.is_empty() {
-                        continue;
-                    }
-                    let mut pending_command = trade_core::Command::Batch(apply);
-                    loop {
-                        match gateway.submit_committed(index, pending_command) {
-                            Ok(()) => break,
-                            Err(command) => {
-                                pending_command = command;
-                                thread::yield_now();
+                        runtime_metrics.set_raft_enqueued_index(index);
+                        runtime_metrics.set_raft_applied_index(index);
+                    } else {
+                        let mut pending_command = trade_core::Command::Batch(apply);
+                        loop {
+                            match gateway.submit_committed(index, pending_command) {
+                                Ok(()) => break,
+                                Err(command) => {
+                                    pending_command = command;
+                                    thread::yield_now();
+                                }
                             }
+                        }
+                        runtime_metrics.set_raft_enqueued_index(index);
+                    }
+                    if let Some(waiters) = waiters {
+                        for waiter in waiters {
+                            let _ = waiter.send(index);
                         }
                     }
                 }
@@ -361,37 +382,129 @@ fn spawn_listener(addr: String, tx: mpsc::Sender<Message>) {
         let listener = TcpListener::bind(&addr).expect("bind raft listener");
         for stream in listener.incoming().flatten() {
             let tx = tx.clone();
-            thread::spawn(move || {
-                let mut stream = stream;
-                let mut size = [0u8; 4];
-                if stream.read_exact(&mut size).is_err() {
-                    return;
-                }
-                let mut bytes = vec![0; u32::from_be_bytes(size) as usize];
-                if stream.read_exact(&mut bytes).is_ok() {
-                    if let Ok(message) = Message::parse_from_bytes(&bytes) {
-                        let _ = tx.send(message);
-                    }
-                }
-            });
+            thread::spawn(move || read_peer_frames(stream, &tx));
         }
     });
 }
 
-fn send(addr: &str, message: &Message) {
-    let Ok(bytes) = message.write_to_bytes() else {
-        return;
-    };
-    let Ok(mut stream) = TcpStream::connect(addr) else {
-        return;
-    };
-    let _ = stream.write_all(&(bytes.len() as u32).to_be_bytes());
-    let _ = stream.write_all(&bytes);
+fn read_peer_frames(mut stream: impl Read, tx: &mpsc::Sender<Message>) {
+    loop {
+        let mut size = [0u8; 4];
+        if stream.read_exact(&mut size).is_err() {
+            return;
+        }
+        let size = u32::from_be_bytes(size) as usize;
+        if size == 0 || size > MAX_RAFT_MESSAGE_BYTES {
+            return;
+        }
+        let mut bytes = vec![0; size];
+        if stream.read_exact(&mut bytes).is_err() {
+            return;
+        }
+        if let Ok(message) = Message::parse_from_bytes(&bytes) {
+            if tx.send(message).is_err() {
+                return;
+            }
+        }
+    }
+}
+
+struct PeerTransport {
+    peers: HashMap<u64, mpsc::SyncSender<Message>>,
+    metrics: Arc<trade_core::metrics::Metrics>,
+}
+
+impl PeerTransport {
+    fn spawn(peers: HashMap<u64, String>, metrics: Arc<trade_core::metrics::Metrics>) -> Self {
+        let queue_capacity = std::env::var("TC_RAFT_TRANSPORT_QUEUE")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(8192)
+            .max(64);
+        let mut senders = HashMap::with_capacity(peers.len());
+        for (id, addr) in peers {
+            let (tx, rx) = mpsc::sync_channel(queue_capacity);
+            let worker_metrics = metrics.clone();
+            thread::Builder::new()
+                .name(format!("raft-peer-{id}"))
+                .spawn(move || run_peer_writer(addr, rx, worker_metrics))
+                .expect("spawn Raft peer writer");
+            senders.insert(id, tx);
+        }
+        Self {
+            peers: senders,
+            metrics,
+        }
+    }
+
+    fn send(&self, message: Message) {
+        let Some(peer) = self.peers.get(&message.to) else {
+            return;
+        };
+        if peer.try_send(message).is_err() {
+            self.metrics
+                .raft_transport_dropped
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+fn run_peer_writer(
+    addr: String,
+    rx: mpsc::Receiver<Message>,
+    metrics: Arc<trade_core::metrics::Metrics>,
+) {
+    let mut stream: Option<TcpStream> = None;
+    while let Ok(message) = rx.recv() {
+        let Ok(bytes) = message.write_to_bytes() else {
+            continue;
+        };
+        let mut frame = Vec::with_capacity(4 + bytes.len());
+        frame.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&bytes);
+        let mut delivered = false;
+        for attempt in 0..2 {
+            if stream.is_none() {
+                match TcpStream::connect(&addr) {
+                    Ok(connected) => {
+                        connected.set_nodelay(true).ok();
+                        connected
+                            .set_write_timeout(Some(Duration::from_millis(500)))
+                            .ok();
+                        stream = Some(connected);
+                        metrics
+                            .raft_transport_reconnects
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(_) => {
+                        if attempt == 0 {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        continue;
+                    }
+                }
+            }
+            if stream
+                .as_mut()
+                .is_some_and(|stream| stream.write_all(&frame).is_ok())
+            {
+                delivered = true;
+                break;
+            }
+            stream = None;
+        }
+        if !delivered {
+            metrics
+                .raft_transport_dropped
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
     use trade_core::{ExecReport, InstrumentId, OrderId};
 
     fn category_key(instrument: u32) -> [u8; 4] {
@@ -410,5 +523,35 @@ mod tests {
     fn execution_reports_partition_by_category_not_instrument() {
         assert_eq!(category_key(1), category_key(1_000));
         assert_ne!(category_key(1_000), category_key(1_001));
+    }
+
+    #[test]
+    fn peer_connection_carries_multiple_framed_messages() {
+        let messages = [(1, 2), (2, 1)].map(|(from, to)| Message {
+            from,
+            to,
+            ..Default::default()
+        });
+        let mut wire = Vec::new();
+        for message in &messages {
+            let bytes = message.write_to_bytes().unwrap();
+            wire.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            wire.extend_from_slice(&bytes);
+        }
+        let (tx, rx) = mpsc::channel();
+        read_peer_frames(Cursor::new(wire), &tx);
+        assert_eq!(rx.try_recv().unwrap().from, 1);
+        assert_eq!(rx.try_recv().unwrap().from, 2);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn peer_connection_rejects_oversized_frame() {
+        let (tx, rx) = mpsc::channel();
+        read_peer_frames(
+            Cursor::new(((MAX_RAFT_MESSAGE_BYTES + 1) as u32).to_be_bytes()),
+            &tx,
+        );
+        assert!(rx.try_recv().is_err());
     }
 }

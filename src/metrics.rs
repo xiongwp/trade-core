@@ -24,6 +24,10 @@ pub struct Metrics {
     pub raft_term: AtomicU64,
     pub raft_leader_id: AtomicU64,
     pub raft_commit_index: AtomicU64,
+    pub raft_enqueued_index: AtomicU64,
+    pub raft_applied_index: AtomicU64,
+    pub raft_transport_reconnects: AtomicU64,
+    pub raft_transport_dropped: AtomicU64,
     pub command_latency_ns_total: AtomicU64,
     pub command_latency_ns_max: AtomicU64,
     pub command_latency_samples: AtomicU64,
@@ -88,6 +92,14 @@ impl Metrics {
                 self.raft_leader_id.load(Ordering::Relaxed)),
             format!("# HELP tc_raft_commit_index Highest Raft entry committed by quorum\n# TYPE tc_raft_commit_index gauge\ntc_raft_commit_index {}\n",
                 self.raft_commit_index.load(Ordering::Relaxed)),
+            format!("# HELP tc_raft_enqueued_index Highest committed command entry admitted to matching\n# TYPE tc_raft_enqueued_index gauge\ntc_raft_enqueued_index {}\n",
+                self.raft_enqueued_index.load(Ordering::Relaxed)),
+            format!("# HELP tc_raft_applied_index Highest committed command entry fully applied by matching\n# TYPE tc_raft_applied_index gauge\ntc_raft_applied_index {}\n",
+                self.raft_applied_index.load(Ordering::Relaxed)),
+            format!("# HELP tc_raft_apply_lag Committed command entries queued but not fully applied\n# TYPE tc_raft_apply_lag gauge\ntc_raft_apply_lag {}\n",
+                self.raft_apply_lag()),
+            c("raft_transport_reconnects", "Raft peer transport TCP reconnects", self.raft_transport_reconnects.load(Ordering::Relaxed)),
+            c("raft_transport_dropped", "Raft peer messages dropped after bounded transport retries or queue saturation", self.raft_transport_dropped.load(Ordering::Relaxed)),
             c("command_latency_ns_total", "Total matching command processing time in nanoseconds", self.command_latency_ns_total.load(Ordering::Relaxed)),
             c("command_latency_samples", "Matching command latency samples", self.command_latency_samples.load(Ordering::Relaxed)),
             format!("# HELP tc_command_latency_ns_max Maximum matching command processing time in nanoseconds\n# TYPE tc_command_latency_ns_max gauge\ntc_command_latency_ns_max {}\n", self.command_latency_ns_max.load(Ordering::Relaxed)),
@@ -120,6 +132,20 @@ impl Metrics {
         self.raft_leader_id.store(leader_id, Ordering::Relaxed);
         self.raft_commit_index
             .store(commit_index, Ordering::Relaxed);
+    }
+
+    pub fn set_raft_enqueued_index(&self, index: u64) {
+        self.raft_enqueued_index.fetch_max(index, Ordering::Release);
+    }
+
+    pub fn set_raft_applied_index(&self, index: u64) {
+        self.raft_applied_index.fetch_max(index, Ordering::Release);
+    }
+
+    pub fn raft_apply_lag(&self) -> u64 {
+        self.raft_enqueued_index
+            .load(Ordering::Acquire)
+            .saturating_sub(self.raft_applied_index.load(Ordering::Acquire))
     }
 
     pub fn record_command_latency(&self, elapsed_ns: u64) {
@@ -231,6 +257,7 @@ mod tests {
         assert!(text.contains("tc_cancels 1"));
         assert!(text.contains("# TYPE tc_trades counter"));
         assert!(text.contains("tc_raft_commit_index 0"));
+        assert!(text.contains("tc_raft_apply_lag 0"));
     }
 
     #[test]
@@ -242,6 +269,8 @@ mod tests {
         m.record_wal_fsync_latency(400);
         m.record_match_latency(50);
         m.asset_wal_errors.fetch_add(1, Ordering::Relaxed);
+        m.set_raft_enqueued_index(12);
+        m.set_raft_applied_index(9);
         let text = m.render();
         assert!(text.contains("tc_command_latency_ns_total 350"));
         assert!(text.contains("tc_command_latency_samples 2"));
@@ -250,5 +279,6 @@ mod tests {
         assert!(text.contains("tc_raft_commit_ns_total 300"));
         assert!(text.contains("tc_wal_fsync_ns_max 400"));
         assert!(text.contains("tc_match_ns_total 50"));
+        assert!(text.contains("tc_raft_apply_lag 3"));
     }
 }

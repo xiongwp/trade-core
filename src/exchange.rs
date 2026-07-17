@@ -1522,6 +1522,9 @@ impl Shard {
                 .fetch_max(self.rep_seq, Ordering::Relaxed);
         }
         self.process_and_emit(cmd);
+        if let Some(index) = raft_index {
+            self.metrics.set_raft_applied_index(index);
+        }
         self.metrics
             .record_command_latency(started.elapsed().as_nanos() as u64);
     }
@@ -1618,6 +1621,7 @@ impl Shard {
         for command in commands {
             self.process_and_emit(command);
         }
+        self.metrics.set_raft_applied_index(raft_index);
         self.metrics
             .record_command_latency(started.elapsed().as_nanos() as u64);
     }

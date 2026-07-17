@@ -1099,13 +1099,23 @@ fn is_leader(metrics_addr: &str) -> bool {
     let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
     let _ = stream.write_all(b"GET /metrics HTTP/1.1\r\nHost: raft\r\nConnection: close\r\n\r\n");
     let mut response = String::new();
-    std::io::Read::read_to_string(&mut stream, &mut response).is_ok()
-        && response.lines().any(|line| line.trim() == "tc_raft_role 2")
+    if std::io::Read::read_to_string(&mut stream, &mut response).is_err() {
+        return false;
+    }
+    let has = |metric: &str, expected: &str| {
+        response.lines().any(|line| {
+            line.split_once(' ')
+                .is_some_and(|(name, value)| name == metric && value.trim() == expected)
+        })
+    };
+    has("tc_raft_role", "2") && has("tc_ready", "1")
 }
 
 struct MatcherConnection {
     targets: Vec<MatcherTarget>,
     stream: Option<TcpStream>,
+    active_target: Option<usize>,
+    last_health_check: std::time::Instant,
 }
 
 impl MatcherConnection {
@@ -1113,11 +1123,13 @@ impl MatcherConnection {
         Self {
             targets,
             stream: None,
+            active_target: None,
+            last_health_check: std::time::Instant::now() - Duration::from_secs(1),
         }
     }
 
     fn connect(&mut self) -> std::io::Result<()> {
-        for target in &self.targets {
+        for (index, target) in self.targets.iter().enumerate() {
             if target
                 .metrics_addr
                 .as_deref()
@@ -1132,6 +1144,8 @@ impl MatcherConnection {
             stream.set_read_timeout(Some(Duration::from_millis(750)))?;
             stream.set_write_timeout(Some(Duration::from_millis(750)))?;
             self.stream = Some(stream);
+            self.active_target = Some(index);
+            self.last_health_check = std::time::Instant::now();
             return Ok(());
         }
         Err(std::io::Error::new(
@@ -1154,6 +1168,18 @@ impl MatcherConnection {
             payload.extend_from_slice(&record.frame);
         }
         for _ in 0..2 {
+            if self.last_health_check.elapsed() >= Duration::from_millis(500) {
+                self.last_health_check = std::time::Instant::now();
+                if self.active_target.is_some_and(|index| {
+                    self.targets[index]
+                        .metrics_addr
+                        .as_deref()
+                        .is_some_and(|metrics| !is_leader(metrics))
+                }) {
+                    self.stream = None;
+                    self.active_target = None;
+                }
+            }
             if self.stream.is_none() {
                 self.connect()?;
             }
@@ -1167,6 +1193,7 @@ impl MatcherConnection {
                 return Ok(());
             }
             self.stream = None;
+            self.active_target = None;
         }
         Err(std::io::Error::new(
             std::io::ErrorKind::ConnectionAborted,
