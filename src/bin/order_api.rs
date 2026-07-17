@@ -323,11 +323,7 @@ impl KafkaIngress {
             raft_group_pins: Arc::new(raft_group_pins),
             batch_size: env_number("TC_ORDER_BATCH_SIZE", 500usize).max(1),
             linger: Duration::from_millis(env_number("TC_ORDER_BATCH_LINGER_MS", 2u64)),
-            max_pipeline_backlog: env_number(
-                "TC_ORDER_MAX_PIPELINE_BACKLOG",
-                250_000u64,
-            )
-            .max(1),
+            max_pipeline_backlog: env_number("TC_ORDER_MAX_PIPELINE_BACKLOG", 250_000u64).max(1),
             metrics,
         }))
     }
@@ -1443,5 +1439,22 @@ mod tests {
         assert!(decode_batch(&body, 1_000)
             .unwrap_err()
             .contains("does not match"));
+    }
+
+    #[test]
+    fn ingress_backpressure_waits_for_both_fanout_stages() {
+        let metrics = OrderPipelineMetrics::default();
+        metrics.try_reserve(3, 5).unwrap();
+        metrics.complete("mysql", 3);
+        assert_eq!(metrics.backlog(), 3);
+
+        metrics.complete("match", 2);
+        assert_eq!(metrics.backlog(), 1);
+        metrics.try_reserve(4, 5).unwrap();
+        assert!(metrics.try_reserve(1, 5).is_err());
+        assert_eq!(
+            ingress_error_status("backpressure: full"),
+            "429 Too Many Requests"
+        );
     }
 }

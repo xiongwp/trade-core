@@ -133,23 +133,30 @@ fn main() {
                     body.len()
                 );
                 let started = Instant::now();
-                let result = stream
-                    .write_all(header.as_bytes())
-                    .and_then(|()| stream.write_all(&body))
-                    .and_then(|()| read_status(&mut reader));
-                local_latencies.push(started.elapsed().as_nanos() as u64);
-                match result {
-                    Ok(202) => {
-                        accepted.fetch_add(count, Ordering::Relaxed);
-                    }
-                    result => {
-                        failed.fetch_add(count, Ordering::Relaxed);
-                        let mut samples = errors.lock().unwrap();
-                        if samples.len() < 10 {
-                            samples.push(format!("batch at order {first}: {result:?}"));
+                loop {
+                    let result = stream
+                        .write_all(header.as_bytes())
+                        .and_then(|()| stream.write_all(&body))
+                        .and_then(|()| read_status(&mut reader));
+                    match result {
+                        Ok(202) => {
+                            accepted.fetch_add(count, Ordering::Relaxed);
+                            break;
+                        }
+                        Ok(429) => {
+                            std::thread::sleep(std::time::Duration::from_millis(2));
+                        }
+                        result => {
+                            failed.fetch_add(count, Ordering::Relaxed);
+                            let mut samples = errors.lock().unwrap();
+                            if samples.len() < 10 {
+                                samples.push(format!("batch at order {first}: {result:?}"));
+                            }
+                            break;
                         }
                     }
                 }
+                local_latencies.push(started.elapsed().as_nanos() as u64);
             }
             latencies.lock().unwrap().extend(local_latencies);
         }));
