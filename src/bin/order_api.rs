@@ -49,6 +49,8 @@ struct OrderPipelineMetrics {
     mysql_completed_commands: AtomicU64,
     match_completed_commands: AtomicU64,
     backpressure_rejections: AtomicU64,
+    observed_mysql_lag: AtomicU64,
+    observed_match_lag: AtomicU64,
 }
 
 impl OrderPipelineMetrics {
@@ -84,7 +86,11 @@ impl OrderPipelineMetrics {
                 .mysql_completed_commands
                 .load(AtomicOrdering::Acquire)
                 .min(self.match_completed_commands.load(AtomicOrdering::Acquire));
-            let backlog = published.saturating_sub(completed);
+            let backlog = published.saturating_sub(completed).max(
+                self.observed_mysql_lag
+                    .load(AtomicOrdering::Acquire)
+                    .max(self.observed_match_lag.load(AtomicOrdering::Acquire)),
+            );
             if backlog.saturating_add(commands) > max_backlog {
                 self.backpressure_rejections
                     .fetch_add(commands, AtomicOrdering::Relaxed);
@@ -116,7 +122,21 @@ impl OrderPipelineMetrics {
             "match" => &self.match_completed_commands,
             _ => return,
         };
-        counter.fetch_add(commands, AtomicOrdering::Release);
+        let published = self.published_commands.load(AtomicOrdering::Acquire);
+        let _ = counter.fetch_update(
+            AtomicOrdering::AcqRel,
+            AtomicOrdering::Acquire,
+            |completed| Some(completed.saturating_add(commands).min(published)),
+        );
+    }
+
+    fn set_observed_lag(&self, stage: &str, lag: u64) {
+        let counter = match stage {
+            "mysql" => &self.observed_mysql_lag,
+            "match" => &self.observed_match_lag,
+            _ => return,
+        };
+        counter.store(lag, AtomicOrdering::Release);
     }
 
     fn backlog(&self) -> u64 {
@@ -124,9 +144,15 @@ impl OrderPipelineMetrics {
             .mysql_completed_commands
             .load(AtomicOrdering::Acquire)
             .min(self.match_completed_commands.load(AtomicOrdering::Acquire));
-        self.published_commands
+        let local = self
+            .published_commands
             .load(AtomicOrdering::Acquire)
-            .saturating_sub(completed)
+            .saturating_sub(completed);
+        local.max(
+            self.observed_mysql_lag
+                .load(AtomicOrdering::Acquire)
+                .max(self.observed_match_lag.load(AtomicOrdering::Acquire)),
+        )
     }
 
     fn render(&self) -> String {
@@ -154,6 +180,11 @@ impl OrderPipelineMetrics {
             self.mysql_completed_commands.load(AtomicOrdering::Relaxed),
             self.match_completed_commands.load(AtomicOrdering::Relaxed),
             self.backpressure_rejections.load(AtomicOrdering::Relaxed),
+        ) + &format!(
+            "# TYPE tc_order_mysql_consumer_lag gauge\ntc_order_mysql_consumer_lag {}\n\
+# TYPE tc_order_match_consumer_lag gauge\ntc_order_match_consumer_lag {}\n",
+            self.observed_mysql_lag.load(AtomicOrdering::Relaxed),
+            self.observed_match_lag.load(AtomicOrdering::Relaxed),
         )
     }
 }
@@ -236,6 +267,7 @@ struct KafkaIngress {
     producer: FutureProducer,
     brokers: String,
     router: QueueRouter,
+    partitions_per_topic: u32,
     db_consumers: usize,
     matcher_consumers: usize,
     db_group: String,
@@ -301,6 +333,7 @@ impl KafkaIngress {
             producer,
             brokers,
             router: QueueRouter::new(topics, partitions, version),
+            partitions_per_topic: partitions,
             db_consumers: env_number(
                 "TC_ORDER_KAFKA_DB_CONSUMERS",
                 env_number("TC_ORDER_KAFKA_CONSUMERS", partition_workers),
