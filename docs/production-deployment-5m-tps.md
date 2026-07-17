@@ -63,6 +63,26 @@ flowchart LR
 
 8 GiB 的开发机规格不适用于该目标。生产 Raft 与 MySQL 必须使用本地企业级 NVMe，不使用网络盘承载 WAL。
 
+### 3.1 按机器规格注入参数
+
+以下是起始基线，不是固定生产值。每台机器通过独立 `.env`、ConfigMap 或机器清单注入，压测后按内存水位和 fsync p99 校准：
+
+| 节点档位 | `TC_ORDER_MAX_PIPELINE_BACKLOG` | `TC_ASSET_WAL_MAX_OPEN_WRITERS` | `TC_ASSET_WAL_BUFFER_BYTES` | `TC_WAL_PREALLOCATE_BYTES` |
+|---|---:|---:|---:|---:|
+| 本地 8 GiB 全栈 | 50,000 | 1,024 | 8 KiB | 0 |
+| 128 GiB 通用 Raft 节点 | 按 Order API 独立配置 | 8,192 | 32 KiB | 64-256 MiB/asset |
+| 256 GiB 热点资产独占节点 | 按热点 category 单独限流 | 1,024-4,096 | 64-256 KiB | 1-4 GiB/asset |
+
+`TC_ORDER_MAX_PIPELINE_BACKLOG` 应按以下方式计算，而不是直接照抄表格：
+
+```text
+max_backlog = 可用于流水线的内存字节
+              / 压测得到的每命令驻留字节
+              / Raft 副本与重试放大系数
+```
+
+取计算值与“2 秒设计流量”的较小值，并保留至少 30% 内存余量。WAL writer 上限不得低于单条 Raft entry 的最大命令数，否则当前批次可能在 durability barrier 前淘汰 writer。
+
 ## 4. Category 与路由
 
 所有链路使用同一个版本化路由记录：
@@ -243,12 +263,11 @@ batch=1000 -> 约 72 个事务/s/实例
 
 1. 将 `DB_COUNT=10` 改为版本化、可配置的 100 物理数据库路由。
 2. 将本地 4 group Compose 扩展为生产 100 group 的自动生成部署清单。
-3. 完成 WAL group commit 的故障注入和真实 NVMe 基准。
+3. 在已接入 WAL group commit 的基础上，完成断电故障注入和真实 NVMe 基准。
 4. 完成按 category 的入口背压、内存水位和最大订单簿容量保护。
 5. 完成持久化 execution outbox 与确定性 event ID。
 6. 完成 100 group leader 故障、回放、迁移和 fingerprint E2E。
-7. 修复空载撮合线程 busy-spin，并验证低负载延迟没有明显回退。
+7. 在已修复空载 busy-spin 的基础上，完成生产 CPU affinity 和低负载延迟验收。
 8. 将管理面 mTLS、RBAC、nonce、审计和告警接入生产基础设施。
 
 上述项目未全部通过前，不能对外承诺 500 万持续 TPS。
-

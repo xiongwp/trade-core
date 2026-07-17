@@ -138,8 +138,10 @@ const L1_WORDS: usize = (W_WORDS + 63) / 64; // 1
 struct LevelIndex {
     /// Window start price; `Price::MAX` until the first insert centres it.
     base: Price,
-    /// Dense per-tick levels; `levels[price - base]` — allocated lazily.
-    levels: Vec<Level>,
+    /// Dense per-tick pointer slots. The 1024-slot index is allocated lazily,
+    /// and a full `Level` exists only for prices that actually trade. This is
+    /// important when one node hosts thousands of sparse asset books.
+    levels: Vec<Option<Box<Level>>>,
     /// Logical occupancy bitmap: bit i set <=> levels[i].live > 0.
     l0: [u64; W_WORDS],
     /// Summary bitmap: bit w set <=> l0[w] != 0.
@@ -196,18 +198,21 @@ impl LevelIndex {
             // Centre the window on the first price seen. Near Price::MAX the
             // nominal upper half of the window is simply unreachable.
             self.base = price.saturating_sub((WINDOW / 2) as u64);
-            self.levels.resize(WINDOW, Level::default());
+            self.levels.resize_with(WINDOW, || None);
         }
         match self.idx(price) {
             Some(i) => {
-                if self.levels[i].live == 0 {
+                if self.levels[i]
+                    .as_ref()
+                    .map_or(true, |level| level.live == 0)
+                {
                     self.set_bit(i);
                     self.in_window = self
                         .in_window
                         .checked_add(1)
                         .expect("in-window level count overflow");
                 }
-                let lv = &mut self.levels[i];
+                let lv = self.levels[i].get_or_insert_with(|| Box::new(Level::default()));
                 lv.orders.push_back(slot);
                 lv.qty = lv
                     .qty
@@ -232,7 +237,7 @@ impl LevelIndex {
     fn get(&self, price: Price) -> Option<&Level> {
         match self.idx(price) {
             Some(i) => {
-                let lv = self.levels.get(i)?;
+                let lv = self.levels.get(i)?.as_deref()?;
                 (lv.live > 0).then_some(lv)
             }
             None => self.overflow.get(&price).filter(|lv| lv.live > 0),
@@ -244,7 +249,7 @@ impl LevelIndex {
     fn get_mut(&mut self, price: Price) -> Option<&mut Level> {
         match self.idx(price) {
             Some(i) => {
-                let lv = self.levels.get_mut(i)?;
+                let lv = self.levels.get_mut(i)?.as_deref_mut()?;
                 (lv.live > 0).then_some(lv)
             }
             None => self.overflow.get_mut(&price).filter(|lv| lv.live > 0),
@@ -292,13 +297,16 @@ impl LevelIndex {
 
         match self.idx(price) {
             Some(i) => {
-                reclaim(&mut self.levels[i], pool);
-                if self.levels[i].live == 0 && self.bit(i) {
+                if let Some(level) = self.levels[i].as_deref_mut() {
+                    reclaim(level, pool);
+                }
+                if self.levels[i].as_ref().is_some_and(|level| level.live == 0) && self.bit(i) {
                     self.clear_bit(i);
                     self.in_window = self
                         .in_window
                         .checked_sub(1)
                         .expect("in-window level count underflow");
+                    self.levels[i] = None;
                 }
             }
             None => {
@@ -379,7 +387,10 @@ impl LevelIndex {
                     .base
                     .checked_add(i as u64)
                     .expect("occupied price overflow");
-                if !f(px, &self.levels[i]) {
+                let level = self.levels[i]
+                    .as_deref()
+                    .expect("occupied level missing from dense window");
+                if !f(px, level) {
                     return;
                 }
                 bits &= bits - 1;
@@ -411,7 +422,10 @@ impl LevelIndex {
                     .base
                     .checked_add(i as u64)
                     .expect("occupied price overflow");
-                if !f(px, &self.levels[i]) {
+                let level = self.levels[i]
+                    .as_deref()
+                    .expect("occupied level missing from dense window");
+                if !f(px, level) {
                     return;
                 }
                 bits &= !(1u64 << (i % 64));

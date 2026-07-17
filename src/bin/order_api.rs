@@ -356,7 +356,7 @@ impl KafkaIngress {
             raft_group_pins: Arc::new(raft_group_pins),
             batch_size: env_number("TC_ORDER_BATCH_SIZE", 500usize).max(1),
             linger: Duration::from_millis(env_number("TC_ORDER_BATCH_LINGER_MS", 2u64)),
-            max_pipeline_backlog: env_number("TC_ORDER_MAX_PIPELINE_BACKLOG", 250_000u64).max(1),
+            max_pipeline_backlog: env_number("TC_ORDER_MAX_PIPELINE_BACKLOG", 50_000u64).max(1),
             metrics,
         }))
     }
@@ -846,6 +846,50 @@ fn run_kafka_stage<F>(
                 std::thread::sleep(Duration::from_millis(backoff_ms));
             }
         }
+    }
+}
+
+fn read_consumer_group_lag(consumer: &BaseConsumer, kafka: &KafkaIngress) -> Result<u64, String> {
+    let mut requested = TopicPartitionList::new();
+    for topic in kafka.router.topics() {
+        for partition in 0..kafka.partitions_per_topic as i32 {
+            requested.add_partition(topic, partition);
+        }
+    }
+    let committed = consumer
+        .committed_offsets(requested, Duration::from_secs(2))
+        .map_err(|error| error.to_string())?;
+    let mut lag = 0u64;
+    for element in committed.elements() {
+        let offset = match element.offset() {
+            Offset::Offset(offset) => offset,
+            _ => 0,
+        };
+        let (_, high) = consumer
+            .fetch_watermarks(element.topic(), element.partition(), Duration::from_secs(2))
+            .map_err(|error| error.to_string())?;
+        lag = lag.saturating_add(high.saturating_sub(offset) as u64);
+    }
+    Ok(lag)
+}
+
+fn run_consumer_lag_monitor(kafka: KafkaIngress, group_id: String, stage: &'static str) {
+    let consumer: BaseConsumer = ClientConfig::new()
+        .set("bootstrap.servers", &kafka.brokers)
+        .set("group.id", &group_id)
+        .create()
+        .expect("create Kafka lag monitor");
+    let mut last_error_log = std::time::Instant::now() - Duration::from_secs(30);
+    loop {
+        match read_consumer_group_lag(&consumer, &kafka) {
+            Ok(lag) => kafka.metrics.set_observed_lag(stage, lag),
+            Err(error) if last_error_log.elapsed() >= Duration::from_secs(30) => {
+                eprintln!("[order-kafka-{stage}-lag] failed to read {group_id}: {error}");
+                last_error_log = std::time::Instant::now();
+            }
+            Err(_) => {}
+        }
+        std::thread::sleep(Duration::from_millis(500));
     }
 }
 
@@ -1363,6 +1407,16 @@ fn main() {
         kafka.matcher_group,
         kafka.execution_group,
     );
+    for (stage, group_id) in [
+        ("mysql", kafka.db_group.clone()),
+        ("match", kafka.matcher_group.clone()),
+    ] {
+        let monitor_kafka = kafka.clone();
+        std::thread::Builder::new()
+            .name(format!("order-kafka-{stage}-lag"))
+            .spawn(move || run_consumer_lag_monitor(monitor_kafka, group_id, stage))
+            .expect("spawn Kafka lag monitor");
+    }
     for worker in 0..kafka.db_consumers {
         let consumer_store = store.clone();
         let consumer_kafka = kafka.clone();

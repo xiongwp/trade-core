@@ -40,7 +40,15 @@ pub struct AssetReplaySummary {
 pub struct AssetJournalSet {
     root: PathBuf,
     flush_interval: Duration,
-    writers: HashMap<InstrumentId, JournalWriter>,
+    writers: HashMap<InstrumentId, CachedWriter>,
+    max_open_writers: usize,
+    writer_buffer_bytes: usize,
+    access_clock: u64,
+}
+
+struct CachedWriter {
+    writer: JournalWriter,
+    last_access: u64,
 }
 
 impl AssetJournalSet {
@@ -51,7 +59,61 @@ impl AssetJournalSet {
             root,
             flush_interval,
             writers: HashMap::new(),
+            // One Raft entry can touch at most this many assets. Keeping at
+            // least that many writers guarantees no writer from the current
+            // batch is evicted before the group durability barrier.
+            max_open_writers: std::env::var("TC_ASSET_WAL_MAX_OPEN_WRITERS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(1024usize)
+                .max(wire::RAFT_BATCH_MAX_COMMANDS),
+            writer_buffer_bytes: std::env::var("TC_ASSET_WAL_BUFFER_BYTES")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(8 << 10),
+            access_clock: 0,
         })
+    }
+
+    fn writer_for(&mut self, instrument: InstrumentId) -> io::Result<&mut JournalWriter> {
+        self.access_clock = self.access_clock.wrapping_add(1);
+        let access = self.access_clock;
+        if self.writers.contains_key(&instrument) {
+            let cached = self.writers.get_mut(&instrument).expect("writer exists");
+            cached.last_access = access;
+            return Ok(&mut cached.writer);
+        }
+
+        if self.writers.len() >= self.max_open_writers {
+            let victim = self
+                .writers
+                .iter()
+                .min_by_key(|(_, cached)| cached.last_access)
+                .map(|(instrument, _)| *instrument)
+                .expect("non-empty writer cache");
+            let mut evicted = self.writers.remove(&victim).expect("victim exists");
+            evicted.writer.flush_to_os()?;
+        }
+
+        let path = asset_path(&self.root, instrument);
+        let mut writer = JournalWriter::open_with_capacity(
+            &path,
+            self.flush_interval,
+            self.writer_buffer_bytes,
+        )?;
+        writer.resume_from(last_seq(&path)?);
+        self.writers.insert(
+            instrument,
+            CachedWriter {
+                writer,
+                last_access: access,
+            },
+        );
+        Ok(&mut self
+            .writers
+            .get_mut(&instrument)
+            .expect("writer inserted")
+            .writer)
     }
 
     pub fn path_for(&self, instrument: InstrumentId) -> PathBuf {
@@ -71,21 +133,13 @@ impl AssetJournalSet {
         }
         let mut frame = [0u8; MSG_LEN];
         wire::encode_command(command, &mut frame);
-        let path = asset_path(&self.root, instrument);
-        let writer = match self.writers.entry(instrument) {
-            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                let mut writer = JournalWriter::open(&path, self.flush_interval)?;
-                writer.resume_from(last_seq(&path)?);
-                entry.insert(writer)
-            }
-        };
+        let writer = self.writer_for(instrument)?;
         writer.append(journal::now_nanos(), &frame)
     }
 
     pub fn flush_all(&mut self) -> io::Result<()> {
-        for writer in self.writers.values_mut() {
-            writer.flush()?;
+        for cached in self.writers.values_mut() {
+            cached.writer.flush()?;
         }
         Ok(())
     }
@@ -100,7 +154,7 @@ impl AssetJournalSet {
             .writers
             .get_mut(&instrument)
             .expect("writer opened by append");
-        writer.sync_data()?;
+        writer.writer.sync_data()?;
         let _ = raft_index;
         Ok(seq)
     }
@@ -124,6 +178,7 @@ impl AssetJournalSet {
             self.writers
                 .get_mut(instrument)
                 .expect("writer opened by batch append")
+                .writer
                 .flush_to_os()?;
         }
         Ok(touched)
@@ -139,6 +194,7 @@ impl AssetJournalSet {
         self.writers
             .get(instrument)
             .expect("writer opened by batch append")
+            .writer
             .sync_filesystem()
     }
 
