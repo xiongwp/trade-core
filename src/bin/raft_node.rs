@@ -332,6 +332,11 @@ fn main() {
             .set("enable.idempotence", "true")
             .set("linger.ms", "2")
             .set("batch.num.messages", "10000")
+            .set(
+                "message.timeout.ms",
+                std::env::var("TC_EXECUTION_KAFKA_DELIVERY_TIMEOUT_MS")
+                    .unwrap_or_else(|_| "5000".into()),
+            )
             .create::<FutureProducer>()
             .expect("create execution Kafka producer")
     });
@@ -428,6 +433,13 @@ fn spawn_execution_outbox_publisher(
                         .execution_outbox_publish_healthy
                         .store(1, Ordering::Release);
                 }
+                let pending_before_publish = readers
+                    .values()
+                    .filter_map(|reader| reader.pending_records().ok())
+                    .sum();
+                metrics
+                    .execution_outbox_pending
+                    .store(pending_before_publish, Ordering::Release);
                 for reader in readers.values_mut() {
                     if !leadership.load(Ordering::Acquire) {
                         continue;

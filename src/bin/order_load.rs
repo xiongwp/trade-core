@@ -12,7 +12,7 @@
 //! While this runs, the market-data service keeps aggregating candles from the
 //! fanout port, so the K-line chart shows the stress flow live.
 //!
-//! Usage: order_load [ADDR] [ORDERS]
+//! Usage: order_load [ADDR] [ORDERS] [ID_BASE]
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -47,6 +47,7 @@ fn main() {
         .next()
         .and_then(|s| s.parse().ok())
         .unwrap_or(20_000_000);
+    let id_base: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(0);
 
     // ---- Phase 1: generate and shard into 10 DBs x 100 tables --------------
     println!("[load] phase 1: generating {total} orders into 10 DBs x 100 tables…");
@@ -61,6 +62,7 @@ fn main() {
     let mut rng = Rng(0xE2E_2024);
     let mut frame = [0u8; MSG_LEN];
     for i in 1..=total {
+        let command_id = id_base.saturating_add(i);
         let user = rng.range(1, 100_000);
         let sym = InstrumentId(1 + (rng.next() % 4) as u32);
         let category = sharding::asset_category(sym, 1);
@@ -68,16 +70,26 @@ fn main() {
         let slot = route.db as usize * TABLES_PER_DB as usize + route.table as usize;
         if i > 1000 && rng.next() % 7 == 0 {
             // Cancel an earlier order (may be already gone -> NotFound, fine).
-            wire::encode_cancel(sym, OrderId(rng.range(1, i - 1)), i, &mut frame);
+            wire::encode_cancel(
+                sym,
+                OrderId(id_base.saturating_add(rng.range(1, i - 1))),
+                command_id,
+                &mut frame,
+            );
         } else {
             let side = if rng.next() & 1 == 0 {
                 Side::Buy
             } else {
                 Side::Sell
             };
-            let order = Order::limit(OrderId(i), side, rng.range(990, 1010), rng.range(1, 50))
-                .on(sym)
-                .by(user);
+            let order = Order::limit(
+                OrderId(command_id),
+                side,
+                rng.range(990, 1010),
+                rng.range(1, 50),
+            )
+            .on(sym)
+            .by(user);
             wire::encode_new(&order, &mut frame);
         }
         tables[slot] += 1;

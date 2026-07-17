@@ -804,7 +804,10 @@ fn run_kafka_stage<F>(
                 }
             },
             Err(error) => {
-                eprintln!("[order-kafka-{stage}-{worker}] poll failed: {error}");
+                if last_failure_log.elapsed() >= Duration::from_secs(30) {
+                    eprintln!("[order-kafka-{stage}-{worker}] poll failed: {error}");
+                    last_failure_log = std::time::Instant::now();
+                }
                 continue;
             }
         }
@@ -821,7 +824,10 @@ fn run_kafka_stage<F>(
                     }
                 }
                 Some(Err(error)) => {
-                    eprintln!("[order-kafka-{stage}-{worker}] poll failed: {error}")
+                    if last_failure_log.elapsed() >= Duration::from_secs(30) {
+                        eprintln!("[order-kafka-{stage}-{worker}] poll failed: {error}");
+                        last_failure_log = std::time::Instant::now();
+                    }
                 }
                 None => break,
             }
@@ -911,6 +917,7 @@ fn run_execution_mysql_consumer(store: OrderStore, kafka: KafkaIngress, worker: 
         "[execution-mysql-{worker}] group={} topic={}",
         kafka.execution_group, kafka.execution_topic
     );
+    let mut last_failure_log = std::time::Instant::now() - Duration::from_secs(30);
     loop {
         let Some(message) = consumer.poll(Duration::from_millis(100)) else {
             continue;
@@ -918,7 +925,10 @@ fn run_execution_mysql_consumer(store: OrderStore, kafka: KafkaIngress, worker: 
         let message = match message {
             Ok(message) => message,
             Err(error) => {
-                eprintln!("[execution-mysql-{worker}] poll failed: {error}");
+                if last_failure_log.elapsed() >= Duration::from_secs(30) {
+                    eprintln!("[execution-mysql-{worker}] poll failed: {error}");
+                    last_failure_log = std::time::Instant::now();
+                }
                 continue;
             }
         };
