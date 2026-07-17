@@ -18,9 +18,6 @@ RUN cargo build --release \
     --bin trade-core --bin order --bin order-api --bin market-data --bin order_client --bin order_load
 
 FROM debian:stable-slim
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends zlib1g libzstd1 \
-    && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/target/release/trade-core /usr/local/bin/trade-core
 COPY --from=build /src/target/release/order /usr/local/bin/order
 COPY --from=build /src/target/release/order-api /usr/local/bin/order-api

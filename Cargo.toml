@@ -74,8 +74,8 @@ panic = "abort"
 [dependencies]
 raft = "0.7.0"
 protobuf = "2.28"
-# Internal MySQL transport is deliberately plaintext. Disabling the crate's
-# default native-tls feature also removes OpenSSL from the deployed binaries.
+# Internal MySQL transport is deliberately plaintext; only the minimal
+# protocol feature set is compiled into deployed binaries.
 mysql = { version = "25", default-features = false, features = ["minimal"] }
 futures = "0.3"
 rdkafka = "0.39"

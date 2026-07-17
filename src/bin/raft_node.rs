@@ -404,12 +404,7 @@ fn spawn_execution_outbox_publisher(
                 if let Ok(entries) = std::fs::read_dir(&root) {
                     for entry in entries.flatten() {
                         let path = entry.path();
-                        if !path
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                            .is_some_and(|name| name.starts_with("outbox-shard-"))
-                            || readers.contains_key(&path)
-                        {
+                        if !is_execution_outbox_file(&path) || readers.contains_key(&path) {
                             continue;
                         }
                         let cursor_path = path.with_extension("published.cursor");
@@ -519,6 +514,14 @@ fn spawn_execution_outbox_publisher(
             }
         })
         .expect("spawn execution outbox publisher");
+}
+
+fn is_execution_outbox_file(path: &std::path::Path) -> bool {
+    path.extension().and_then(|extension| extension.to_str()) == Some("bin")
+        && path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("outbox-shard-"))
 }
 
 #[cfg(test)]
@@ -685,6 +688,19 @@ mod tests {
     fn execution_reports_partition_by_category_not_instrument() {
         assert_eq!(category_key(1), category_key(1_000));
         assert_ne!(category_key(1_000), category_key(1_001));
+    }
+
+    #[test]
+    fn execution_outbox_discovery_ignores_publisher_cursor() {
+        assert!(is_execution_outbox_file(std::path::Path::new(
+            "outbox-shard-0.bin"
+        )));
+        assert!(!is_execution_outbox_file(std::path::Path::new(
+            "outbox-shard-0.published.cursor"
+        )));
+        assert!(!is_execution_outbox_file(std::path::Path::new(
+            "unrelated.bin"
+        )));
     }
 
     #[test]
