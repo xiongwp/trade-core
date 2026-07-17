@@ -111,6 +111,7 @@ services:
       TC_TRADING_TOKEN: ${TC_TRADING_TOKEN:-local-trading-token}
       TC_ORDER_API_ADDR: order:9200
       TC_ORDER_API_TOKEN: ${TC_ORDER_API_TOKEN:-local-order-api-token}
+      TC_ORDER_API_MAX_IDLE_CONNECTIONS: ${TC_ORDER_API_MAX_IDLE_CONNECTIONS:-32}
     depends_on:
       - raft-1
       - raft-2

@@ -479,8 +479,7 @@ fn handle_http(
     state: &Arc<Mutex<State>>,
     admin_token: Option<&str>,
     trading_token: Option<&str>,
-    order_api: &str,
-    order_api_token: &str,
+    order_api: &OrderApiPool,
 ) {
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
     let mut reader = BufReader::new(stream.try_clone().expect("clone"));
@@ -566,7 +565,7 @@ fn handle_http(
                 Ok(()) => match new_order_from_query(query) {
                     Ok(order) => {
                         let _ = order;
-                        match forward_order_api(order_api, "/orders", query, order_api_token) {
+                        match order_api.forward("/orders", query) {
                             Ok(()) => respond(
                                 &mut stream,
                                 "202 Accepted",
@@ -598,7 +597,7 @@ fn handle_http(
                 Ok(()) => match cancel_from_query(query) {
                     Ok((instrument, order_id, cmd_id)) => {
                         let _ = (instrument, order_id, cmd_id);
-                        match forward_order_api(order_api, "/cancels", query, order_api_token) {
+                        match order_api.forward("/cancels", query) {
                             Ok(()) => respond(
                                 &mut stream,
                                 "202 Accepted",
@@ -702,20 +701,98 @@ fn cancel_from_query(query: &str) -> Result<(InstrumentId, OrderId, u64), String
     ))
 }
 
-fn forward_order_api(order_api: &str, path: &str, query: &str, token: &str) -> std::io::Result<()> {
-    let mut stream = TcpStream::connect(order_api)?;
-    stream.set_nodelay(true)?;
-    stream.write_all(format!("POST {path}?{query} HTTP/1.1\r\nHost: order-api\r\nAuthorization: Bearer {token}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes())?;
-    let mut response = String::new();
-    stream.read_to_string(&mut response)?;
-    if response.starts_with("HTTP/1.1 202") {
-        Ok(())
-    } else {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "order API rejected request",
-        ))
+struct OrderApiPool {
+    address: String,
+    token: String,
+    idle: Mutex<Vec<TcpStream>>,
+    max_idle: usize,
+}
+
+impl OrderApiPool {
+    fn new(address: String, token: String, max_idle: usize) -> Self {
+        Self {
+            address,
+            token,
+            idle: Mutex::new(Vec::with_capacity(max_idle)),
+            max_idle,
+        }
     }
+
+    fn connect(&self) -> std::io::Result<TcpStream> {
+        let stream = TcpStream::connect(&self.address)?;
+        stream.set_nodelay(true)?;
+        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+        Ok(stream)
+    }
+
+    fn forward(&self, path: &str, query: &str) -> std::io::Result<()> {
+        let request = format!(
+            "POST {path}?{query} HTTP/1.1\r\nHost: order-api\r\nAuthorization: Bearer {}\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n",
+            self.token
+        );
+        let mut last_error = None;
+        for _ in 0..2 {
+            let mut stream = match self.idle.lock().unwrap().pop() {
+                Some(stream) => stream,
+                None => self.connect()?,
+            };
+            match send_order_api_request(&mut stream, request.as_bytes()) {
+                Ok(accepted) => {
+                    let mut idle = self.idle.lock().unwrap();
+                    if idle.len() < self.max_idle {
+                        idle.push(stream);
+                    }
+                    return if accepted {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "order API rejected request",
+                        ))
+                    };
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::Other, "order API unavailable")
+        }))
+    }
+}
+
+fn send_order_api_request(stream: &mut TcpStream, request: &[u8]) -> std::io::Result<bool> {
+    stream.write_all(request)?;
+    let mut reader = BufReader::new(stream);
+    let mut status = String::new();
+    reader.read_line(&mut status)?;
+    if status.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "order API closed persistent connection",
+        ));
+    }
+    let mut content_length = 0usize;
+    loop {
+        let mut header = String::new();
+        reader.read_line(&mut header)?;
+        if header == "\r\n" || header.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = header.split_once(':') {
+            if name.eq_ignore_ascii_case("content-length") {
+                content_length = value.trim().parse().map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "invalid order API content length",
+                    )
+                })?;
+            }
+        }
+    }
+    let mut body = vec![0; content_length];
+    reader.read_exact(&mut body)?;
+    Ok(status.starts_with("HTTP/1.1 202"))
 }
 
 fn admin_access<'a>(
@@ -749,6 +826,15 @@ fn main() {
     let order_api =
         std::env::var("TC_ORDER_API_ADDR").unwrap_or_else(|_| "127.0.0.1:9200".to_string());
     let order_api_token = std::env::var("TC_ORDER_API_TOKEN").expect("TC_ORDER_API_TOKEN");
+    let order_api_pool = Arc::new(OrderApiPool::new(
+        order_api,
+        order_api_token,
+        std::env::var("TC_ORDER_API_MAX_IDLE_CONNECTIONS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(32)
+            .clamp(1, 4_096),
+    ));
 
     // Load persisted candle history, if any.
     let persist: Option<PathBuf> = (data_dir != "none").then(|| {
@@ -800,8 +886,7 @@ fn main() {
         let state = state.clone();
         let admin_token = admin_token.clone();
         let trading_token = trading_token.clone();
-        let order_api = order_api.clone();
-        let order_api_token = order_api_token.clone();
+        let order_api = order_api_pool.clone();
         std::thread::spawn(move || {
             handle_http(
                 stream,
@@ -809,8 +894,44 @@ fn main() {
                 admin_token.as_deref(),
                 trading_token.as_deref(),
                 &order_api,
-                &order_api_token,
             )
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn order_api_pool_reuses_keep_alive_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            for _ in 0..2 {
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    assert!(!line.is_empty());
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                reader
+                    .get_mut()
+                    .write_all(
+                        b"HTTP/1.1 202 Accepted\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\n{}",
+                    )
+                    .unwrap();
+            }
+        });
+
+        let pool = OrderApiPool::new(address.to_string(), "token".into(), 1);
+        pool.forward("/orders", "order_id=1").unwrap();
+        pool.forward("/orders", "order_id=2").unwrap();
+        server.join().unwrap();
+        assert_eq!(pool.idle.lock().unwrap().len(), 1);
     }
 }
