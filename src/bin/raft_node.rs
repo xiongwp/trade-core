@@ -19,7 +19,7 @@ use rdkafka::ClientConfig;
 use trade_core::asset_log;
 use trade_core::exchange::{build, ExchangeConfig};
 use trade_core::gateway;
-use trade_core::raft_log::{ClusterConfig, RaftNode, CLUSTER_SIZE};
+use trade_core::raft_log::{ClusterConfig, RaftNode, MAX_CLUSTER_SIZE};
 use trade_core::sharding::DEFAULT_ASSET_CATEGORY_SIZE;
 use trade_core::wire::{self, MSG_LEN};
 
@@ -44,11 +44,11 @@ fn main() {
     let data_dir = PathBuf::from(args.next().expect("data directory"));
     let md_addr = args.next().unwrap_or_else(|| "0.0.0.0:9101".into());
     let metrics_addr = args.next().unwrap_or_else(|| "0.0.0.0:9102".into());
-    assert_eq!(peers.len(), CLUSTER_SIZE, "requires exactly five peers");
-    let mut voters = [0u64; CLUSTER_SIZE];
-    for (slot, voter) in voters.iter_mut().zip(peers.keys()) {
-        *slot = *voter;
-    }
+    assert!(
+        (1..=MAX_CLUSTER_SIZE).contains(&peers.len()),
+        "cluster must have between 1 and {MAX_CLUSTER_SIZE} peers"
+    );
+    let mut voters = peers.keys().copied().collect::<Vec<u64>>();
     voters.sort_unstable();
     std::fs::create_dir_all(&data_dir).expect("create data directory");
     let raft_group_id = std::env::var("TC_RAFT_GROUP_ID")
@@ -62,9 +62,20 @@ fn main() {
         .unwrap_or(16usize)
         .max(1);
 
-    let config = ClusterConfig::new(id, voters).expect("valid five-node cluster");
+    let config = ClusterConfig::new(id, voters).expect("valid cluster membership");
+    // Bound recovery time and per-asset WAL growth: without periodic engine
+    // snapshots the production node would replay from genesis and grow its
+    // journals forever. Each shard writes `snapshot-shard-N.bin` and truncates
+    // its journal on this cadence; that durable engine snapshot is the state the
+    // Raft log compaction below folds its prefix into. Set 0 to disable.
+    let snapshot_every_secs = std::env::var("TC_SNAPSHOT_EVERY_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(30);
+    let snapshot_every = (snapshot_every_secs > 0).then(|| Duration::from_secs(snapshot_every_secs));
     let (gateway, sink, handle) = build(ExchangeConfig {
         journal_dir: Some(data_dir.join("journal")),
+        snapshot_every,
         // Exact duplicate suppression lives at the Raft ingress. The old
         // processor high-water cursors reject valid lower ids from independent
         // Kafka partitions, so they must not be enabled here.
@@ -121,18 +132,50 @@ fn main() {
             let mut committed_ids: HashMap<u64, u64> = HashMap::new();
             let mut was_leader = false;
             let mut last_tick = Instant::now();
+            // Fencing: committed terms are monotonic within a member's stream.
+            // A regression would mean a stale leader's entry reached apply, so
+            // refuse to matching it. route_version is reserved for the future
+            // split-matching topology (single group => 0 today).
+            let mut fence_term = 0u64;
+            // Opt-in Raft log compaction. Once the durably-applied contiguous
+            // prefix has grown by this many entries past the last snapshot, the
+            // consensus log prefix (in memory and on the WAL) is folded into a
+            // snapshot point. Disabled (0) by default so it never races the
+            // engine's own snapshot/journal maintenance unless deliberately on.
+            let compact_threshold = std::env::var("TC_RAFT_COMPACT_APPLIED_THRESHOLD")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(0);
+            let mut committed_batch_indexes: std::collections::BTreeSet<u64> =
+                std::collections::BTreeSet::new();
+            let mut last_compaction_check = Instant::now();
             let applied_batches = asset_log::load_applied_batches(&asset_root)
                 .expect("load applied Raft batch watermarks");
             if let Some(index) = applied_batches.iter().max().copied() {
                 runtime_metrics.set_raft_enqueued_index(index);
                 runtime_metrics.set_raft_applied_index(index);
             }
+            if let Some(reference) = node.take_installed_snapshot() {
+                eprintln!(
+                    "[raft-node] event=recovered_snapshot index={} reference_bytes={}",
+                    node.snapshot_index(),
+                    reference.len()
+                );
+            }
 
             // Rebuild exact idempotency and matching state before this member
             // can campaign or accept a retry. Otherwise a fast election can
             // race the recovered committed prefix and append an old command a
             // second time.
-            for (index, payload) in node.take_committed() {
+            for committed in node.take_committed() {
+                let index = committed.index;
+                assert!(
+                    committed.term >= fence_term,
+                    "fencing violation: committed term regressed from {fence_term} to {} at index {index}",
+                    committed.term
+                );
+                fence_term = committed.term;
+                let payload = committed.data;
                 let commands = wire::decode_raft_entry(&payload)
                     .expect("durable committed Raft entry is not a valid command batch");
                 let is_batch = payload.len() != MSG_LEN;
@@ -265,7 +308,16 @@ fn main() {
                 for message in node.take_outbound() {
                     transport.send(message);
                 }
-                for (index, payload) in node.take_committed() {
+                for committed in node.take_committed() {
+                    let index = committed.index;
+                    assert!(
+                        committed.term >= fence_term,
+                        "fencing violation: committed term regressed from {fence_term} to {} at index {index}",
+                        committed.term
+                    );
+                    fence_term = committed.term;
+                    let payload = committed.data;
+                    committed_batch_indexes.insert(index);
                     if let Some(started) = commit_started.remove(&index) {
                         runtime_metrics
                             .record_raft_commit_latency(started.elapsed().as_nanos() as u64);
@@ -307,6 +359,49 @@ fn main() {
                     if let Some(waiters) = waiters {
                         for waiter in waiters {
                             let _ = waiter.send(index);
+                        }
+                    }
+                }
+                if compact_threshold != 0
+                    && last_compaction_check.elapsed() >= Duration::from_secs(1)
+                    && node
+                        .applied_index()
+                        .saturating_sub(node.snapshot_index())
+                        >= compact_threshold
+                {
+                    last_compaction_check = Instant::now();
+                    // The safe compaction point is the longest contiguous run of
+                    // committed batches this member has *durably applied* (per
+                    // the asset WAL watermarks). Compacting past an un-applied
+                    // entry would drop a command still needed for recovery.
+                    let applied = asset_log::load_applied_batches(&asset_root)
+                        .expect("load applied Raft batch watermarks");
+                    let mut safe = node.snapshot_index();
+                    for &idx in committed_batch_indexes.iter() {
+                        if applied.contains(&idx) {
+                            safe = idx;
+                        } else {
+                            break;
+                        }
+                    }
+                    if safe > node.snapshot_index() {
+                        // The snapshot blob is a durable reference to the engine
+                        // state at `safe`; the engine's own snapshots/WAL hold
+                        // the recoverable state, so the Raft layer only needs the
+                        // fencing index to bound the log.
+                        let reference = safe.to_le_bytes().to_vec();
+                        match node.compact(safe, reference) {
+                            Ok(true) => {
+                                committed_batch_indexes.retain(|&idx| idx > safe);
+                                eprintln!(
+                                    "[raft-node] event=compacted snapshot_index={safe} first_log_index={}",
+                                    node.first_log_index()
+                                );
+                            }
+                            Ok(false) => {}
+                            Err(error) => {
+                                eprintln!("[raft-node] event=compaction_failed error={error}");
+                            }
                         }
                     }
                 }

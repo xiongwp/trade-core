@@ -1,5 +1,19 @@
 //! Hot-standby replication: the journal's total order, streamed live.
 //!
+//! **DEPRECATED — single-machine development only.** This module predates the
+//! Raft consensus path ([`crate::raft_log`]) and provides *no* quorum, leader
+//! election or split-brain fencing: it manually streams one primary's journal
+//! to passive standbys and relies on an external actor to promote one. Running
+//! two "primaries" concurrently silently forks state. It is retained only
+//! because existing tests depend on it and because it is a convenient
+//! single-box mirror for development.
+//!
+//! **Production high availability MUST use the Raft path** (the
+//! [`crate::raft_log`] module and the `raft-node` binary), which is the only
+//! supported topology with durable quorum commit, automatic failover and
+//! fencing. Do not deploy this module. `accept_on` and `run_replica` emit a
+//! runtime warning to make the deprecation visible in logs.
+//!
 //! Every command a shard journals is simultaneously pushed (shard id + seq +
 //! frame) to a replication fanout. A **standby** node consumes the stream and
 //! applies each command through the same deterministic [`Processor`] — so its
@@ -39,6 +53,11 @@ pub struct RepFanout {
 impl RepFanout {
     /// Accept standby connections on `listener` in a background thread.
     pub fn accept_on(listener: TcpListener, running: Arc<AtomicBool>) -> RepFanout {
+        eprintln!(
+            "[replication] WARNING: hot-standby replication is DEPRECATED and \
+             for single-machine development only (no quorum / no fencing). Use \
+             the Raft path (raft-node) for production high availability."
+        );
         let fanout = RepFanout::default();
         let subs = fanout.subs.clone();
         let attached = fanout.attached.clone();
@@ -104,6 +123,10 @@ pub fn run_replica(
     skip_seq: &HashMap<u32, u64>,
     applied: &AtomicU64,
 ) -> std::io::Result<Replica> {
+    eprintln!(
+        "[replication] WARNING: run_replica is DEPRECATED (development-only hot \
+         standby, no quorum / no fencing). Production HA uses the Raft path."
+    );
     let mut sock = TcpStream::connect(primary_addr)?;
     sock.set_nodelay(true).ok();
     let mut replica = Replica {

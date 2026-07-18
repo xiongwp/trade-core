@@ -5,7 +5,8 @@ use std::process::{Child, Command, ExitCode};
 use std::thread;
 use std::time::Duration;
 
-const REPLICAS: u16 = 5;
+/// Default replication factor. Override with `TC_RAFT_REPLICAS` (3, 5, 7, 9).
+const DEFAULT_REPLICAS: u16 = 5;
 
 fn group_port(base: u16, group: u16, node: u16) -> u16 {
     base + group * 10 + node
@@ -31,7 +32,18 @@ fn main() -> ExitCode {
         .parse()
         .expect("numeric raft group count");
     let data_root = PathBuf::from(args.next().expect("data root"));
-    assert!((1..=REPLICAS).contains(&node), "node id must be 1..=5");
+    let replicas: u16 = std::env::var("TC_RAFT_REPLICAS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_REPLICAS);
+    assert!(
+        (1..=9).contains(&replicas),
+        "replication factor must be 1..=9"
+    );
+    assert!(
+        (1..=replicas).contains(&node),
+        "node id must be 1..={replicas}"
+    );
     assert!(groups > 0, "at least one Raft group is required");
 
     let binary = std::env::var("TC_RAFT_NODE_BIN").unwrap_or_else(|_| "raft-node".into());
@@ -41,7 +53,7 @@ fn main() -> ExitCode {
         let order_port = 9001 + group * 10;
         let md_port = 9101 + group * 10;
         let metrics_port = 9102 + group * 10;
-        let peers = (1..=REPLICAS)
+        let peers = (1..=replicas)
             .map(|peer| format!("{peer}@raft-{peer}:{}", group_port(7000, group, peer)))
             .collect::<Vec<_>>()
             .join(",");
