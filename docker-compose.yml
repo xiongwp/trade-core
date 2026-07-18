@@ -280,6 +280,10 @@ services:
       TC_EXECUTION_KAFKA_TOPIC: ${TC_EXECUTION_KAFKA_TOPIC:-trade-executions-v1}
       TC_EXECUTION_KAFKA_MYSQL_GROUP: ${TC_EXECUTION_KAFKA_MYSQL_GROUP:-trade-order-execution-mysql-v1}
       TC_EXECUTION_KAFKA_MYSQL_CONSUMERS: ${TC_EXECUTION_KAFKA_MYSQL_CONSUMERS:-4}
+      # Per physical DB transaction target/hard cap. The consumer collects
+      # roughly DB_COUNT × this value before order-id routing (10 × 500=5000).
+      TC_EXECUTION_MYSQL_BATCH_PER_DB: ${TC_EXECUTION_MYSQL_BATCH_PER_DB:-500}
+      TC_EXECUTION_MYSQL_BATCH_LINGER_MS: ${TC_EXECUTION_MYSQL_BATCH_LINGER_MS:-10}
       # Example: "12:4,99:5" pins hot categories to dedicated Raft groups.
       TC_RAFT_CATEGORY_PINS: ${TC_RAFT_CATEGORY_PINS:-}
       TC_RAFT_LEADER_PROBE_TIMEOUT_MS: ${TC_RAFT_LEADER_PROBE_TIMEOUT_MS:-1000}

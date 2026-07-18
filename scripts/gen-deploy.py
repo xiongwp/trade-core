@@ -452,6 +452,8 @@ def render_gateway_compose(topo):
         "      TC_ORDER_KAFKA_DB_CONSUMERS: 0",
         "      TC_ORDER_KAFKA_MATCH_CONSUMERS: 0",
         "      TC_EXECUTION_KAFKA_MYSQL_CONSUMERS: ${TC_EXECUTION_DB_CONSUMERS_PER_REPLICA:-8}",
+        "      TC_EXECUTION_MYSQL_BATCH_PER_DB: ${TC_EXECUTION_MYSQL_BATCH_PER_DB:-500}",
+        "      TC_EXECUTION_MYSQL_BATCH_LINGER_MS: ${TC_EXECUTION_MYSQL_BATCH_LINGER_MS:-10}",
         "      TC_ORDER_HTTP_INGRESS_ENABLED: false",
         "    restart: unless-stopped",
         "",

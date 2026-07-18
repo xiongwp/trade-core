@@ -688,6 +688,10 @@ struct KafkaIngress {
     execution_topic: String,
     execution_group: String,
     execution_consumers: usize,
+    /// Maximum execution events collected from Kafka before dispatching them
+    /// to order-id-routed DB workers.
+    execution_batch_size: usize,
+    execution_linger: Duration,
     raft_group_pins: Arc<HashMap<u32, usize>>,
     batch_size: usize,
     linger: Duration,
@@ -782,6 +786,17 @@ impl KafkaIngress {
             execution_group: std::env::var("TC_EXECUTION_KAFKA_MYSQL_GROUP")
                 .unwrap_or_else(|_| "trade-order-execution-mysql-v1".into()),
             execution_consumers: env_number("TC_EXECUTION_KAFKA_MYSQL_CONSUMERS", 4usize),
+            // The public knob is per physical DB. Collect one DB-wide target
+            // from every shard before dispatch, so 10 DBs × 500 rows becomes a
+            // roughly 5,000-event Kafka batch and each DB commits near 500.
+            execution_batch_size: execution_consumer_batch_size(
+                env_number("TC_EXECUTION_MYSQL_BATCH_PER_DB", 500usize),
+                env_number("TC_DB_COUNT", sharding::DB_COUNT as usize),
+            ),
+            execution_linger: Duration::from_millis(env_number(
+                "TC_EXECUTION_MYSQL_BATCH_LINGER_MS",
+                10u64,
+            )),
             raft_group_pins,
             batch_size: env_number("TC_ORDER_BATCH_SIZE", 1_000usize).max(1),
             linger: Duration::from_millis(env_number("TC_ORDER_BATCH_LINGER_MS", 2u64)),
@@ -957,6 +972,10 @@ fn env_enabled(name: &str, default: bool) -> bool {
         .ok()
         .map(|value| !matches!(value.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"))
         .unwrap_or(default)
+}
+
+fn execution_consumer_batch_size(per_db: usize, db_count: usize) -> usize {
+    per_db.max(1).saturating_mul(db_count.max(1))
 }
 
 #[derive(Clone)]
@@ -1569,8 +1588,8 @@ fn run_execution_mysql_consumer(
     let base_backoff = Duration::from_millis(env_number("TC_ORDER_PERSIST_RETRY_BASE_MS", 100u64));
     log_info!(
         "execution-mysql", worker;
-        "group={} topic={} max_retries={max_retries}",
-        kafka.execution_group, kafka.execution_topic
+        "group={} topic={} batch_size={} max_retries={max_retries}",
+        kafka.execution_group, kafka.execution_topic, kafka.execution_batch_size
     );
     let mut last_failure_log = std::time::Instant::now() - Duration::from_secs(30);
     loop {
@@ -1587,7 +1606,7 @@ fn run_execution_mysql_consumer(
                 continue;
             }
         };
-        let mut records = Vec::with_capacity(kafka.batch_size);
+        let mut records = Vec::with_capacity(kafka.execution_batch_size);
         push_execution_record(
             &metrics,
             &dlq,
@@ -1597,8 +1616,8 @@ fn run_execution_mysql_consumer(
             &first,
             &mut records,
         );
-        let deadline = std::time::Instant::now() + kafka.linger;
-        while records.len() < kafka.batch_size && std::time::Instant::now() < deadline {
+        let deadline = std::time::Instant::now() + kafka.execution_linger;
+        while records.len() < kafka.execution_batch_size && std::time::Instant::now() < deadline {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             match consumer.poll(remaining) {
                 Some(Ok(message)) => {
@@ -1768,6 +1787,8 @@ impl ExecutionDbForwarder {
     fn spawn(store: OrderStore) -> Self {
         let queue = env_number("TC_MYSQL_SHARD_QUEUE", 64usize).max(1);
         let coalesce_jobs = env_number("TC_MYSQL_SHARD_COALESCE_JOBS", 16usize).max(1);
+        let tx_max_records =
+            env_number("TC_EXECUTION_MYSQL_BATCH_PER_DB", 500usize).max(1);
         let mut shards = Vec::with_capacity(store.routing.db_count as usize);
         for shard_db in 0..store.routing.db_count as u32 {
             let (tx, rx) = std::sync::mpsc::sync_channel::<ExecutionShardJob>(queue);
@@ -1794,6 +1815,7 @@ impl ExecutionDbForwarder {
                             &shard_store,
                             shard_db,
                             tables,
+                            tx_max_records,
                         );
                         for job in jobs {
                             let _ = job.reply.send(result.clone());
@@ -1854,30 +1876,42 @@ fn persist_execution_shard(
     store: &OrderStore,
     shard_db: u32,
     tables: ExecutionShardTables,
+    tx_max_records: usize,
 ) -> Result<(), String> {
     let db = format!("order_db_{shard_db}");
     let mut conn = store
         .shard(shard_db)
         .get_conn()
         .map_err(|error| error.to_string())?;
-    let mut tx = conn
-        .start_transaction(TxOpts::default())
-        .map_err(|error| error.to_string())?;
+    let mut updates = Vec::new();
     for (shard_table, records) in tables {
         let table = format!("asset_orders_{shard_table:03}");
         for (record, target_order_id) in records {
+            updates.push((table.clone(), record, target_order_id));
+        }
+    }
+    // Coalescing several consumer jobs is useful for queue efficiency, but it
+    // must not silently create an unbounded transaction. Chunk the merged work
+    // at the configured hard limit; Kafka offsets advance only after every
+    // chunk succeeds, so a partial retry remains safe through event idempotency.
+    for chunk in updates.chunks(tx_max_records) {
+        let mut tx = conn
+            .start_transaction(TxOpts::default())
+            .map_err(|error| error.to_string())?;
+        for (table, record, target_order_id) in chunk {
             apply_execution_report(
                 &mut tx,
                 &db,
-                &table,
+                table,
                 record.partition,
                 record.offset,
                 record.event,
-                target_order_id,
+                *target_order_id,
             )?;
         }
+        tx.commit().map_err(|error| error.to_string())?;
     }
-    tx.commit().map_err(|error| error.to_string())
+    Ok(())
 }
 
 fn apply_execution_report(
@@ -2647,6 +2681,13 @@ mod tests {
         let mut body = user.to_le_bytes().to_vec();
         body.extend_from_slice(&frame);
         body
+    }
+
+    #[test]
+    fn execution_batch_target_scales_with_physical_db_count() {
+        assert_eq!(execution_consumer_batch_size(100, 10), 1_000);
+        assert_eq!(execution_consumer_batch_size(500, 10), 5_000);
+        assert_eq!(execution_consumer_batch_size(0, 0), 1);
     }
 
     #[test]
