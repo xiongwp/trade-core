@@ -63,7 +63,26 @@ flowchart LR
 
 8 GiB 的开发机规格不适用于该目标。生产 Raft 与 MySQL 必须使用本地企业级 NVMe，不使用网络盘承载 WAL。
 
-### 3.1 按机器规格注入参数
+### 3.1 Order API/worker 水平扩展角色
+
+`TC_ORDER_KAFKA_*_CONSUMERS` 是每个进程创建的消费者数量，不是集群总数。生产部署应使用
+同一镜像拆成四种角色，避免每增加一个 HTTP 副本就成倍增加撮合提交者：
+
+| 角色 | DB consumers | Match consumers | Execution DB consumers | 扩展依据 |
+|---|---:|---:|---:|---|
+| API ingress | 0 | 0 | 0 | HTTP CPU、连接数、Kafka produce 延迟 |
+| Command DB worker | `P/N` | 0 | 0 | 命令 partition 数和 MySQL 写能力 |
+| Match worker | 0 | `G/N` | 0 | 活跃 Raft group 数；全集群总数接近 G |
+| Execution DB worker | 0 | 0 | `E/N` | 结果 partition 数和数据库写能力 |
+
+其中 `P` 为命令 Kafka 总 partition 数，`G` 为活跃 Raft group 数，`E` 为结果 Kafka
+partition 数，`N` 为对应角色的进程数。消费者全集群总数超过 partition 数不会增加并行度；
+撮合消费者总数明显超过 Raft group 数还会增加同一有序 group 的竞争和 leader 重试。
+
+API 本地只统计正在等待 Kafka delivery 的命令；持久流水线背压读取共享 consumer-group lag，
+因此某个 API 发布的命令可由其他 worker 完成，不会在发布实例上形成永不释放的本地积压。
+
+### 3.2 按机器规格注入参数
 
 以下是起始基线，不是固定生产值。每台机器通过独立 `.env`、ConfigMap 或机器清单注入，压测后按内存水位和 fsync p99 校准：
 

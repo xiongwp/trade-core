@@ -227,11 +227,13 @@ impl OrderPipelineMetrics {
             self.execution_mysql_completed_events.load(AtomicOrdering::Relaxed),
         ) + &format!(
             "# TYPE tc_order_ingress_backlog gauge\ntc_order_ingress_backlog {}\n\
+# TYPE tc_order_publish_inflight gauge\ntc_order_publish_inflight {}\n\
 # TYPE tc_order_published_commands counter\ntc_order_published_commands {}\n\
 # TYPE tc_order_mysql_completed_commands counter\ntc_order_mysql_completed_commands {}\n\
 # TYPE tc_order_match_completed_commands counter\ntc_order_match_completed_commands {}\n\
 # TYPE tc_order_backpressure_rejections counter\ntc_order_backpressure_rejections {}\n",
             self.backlog(),
+            self.inflight_publish_commands.load(AtomicOrdering::Relaxed),
             self.published_commands.load(AtomicOrdering::Relaxed),
             self.mysql_completed_commands.load(AtomicOrdering::Relaxed),
             self.match_completed_commands.load(AtomicOrdering::Relaxed),
