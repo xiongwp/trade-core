@@ -1835,8 +1835,12 @@ fn is_leader(metrics_addr: &str) -> bool {
     let Ok(mut stream) = TcpStream::connect(metrics_addr) else {
         return false;
     };
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
-    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+    let timeout = Duration::from_millis(env_number(
+        "TC_RAFT_LEADER_PROBE_TIMEOUT_MS",
+        1_000u64,
+    ));
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
     let _ = stream.write_all(b"GET /metrics HTTP/1.1\r\nHost: raft\r\nConnection: close\r\n\r\n");
     let mut response = String::new();
     if std::io::Read::read_to_string(&mut stream, &mut response).is_err() {
@@ -1879,8 +1883,12 @@ impl MatcherConnection {
                 continue;
             };
             stream.set_nodelay(true)?;
-            stream.set_read_timeout(Some(Duration::from_millis(750)))?;
-            stream.set_write_timeout(Some(Duration::from_millis(750)))?;
+            let timeout = Duration::from_millis(env_number(
+                "TC_RAFT_MATCHER_IO_TIMEOUT_MS",
+                5_000u64,
+            ));
+            stream.set_read_timeout(Some(timeout))?;
+            stream.set_write_timeout(Some(timeout))?;
             self.stream = Some(stream);
             self.active_target = Some(index);
             return Ok(());
@@ -1891,18 +1899,18 @@ impl MatcherConnection {
         ))
     }
 
-    fn send_batch(&mut self, records: &[&KafkaRecord]) -> std::io::Result<()> {
-        if records.is_empty() || records.len() > wire::RAFT_BATCH_MAX_COMMANDS {
+    fn send_frames(&mut self, frames: &[[u8; wire::MSG_LEN]]) -> std::io::Result<()> {
+        if frames.is_empty() || frames.len() > wire::RAFT_BATCH_MAX_COMMANDS {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "invalid matcher batch size",
             ));
         }
-        let mut payload = Vec::with_capacity(8 + records.len() * wire::MSG_LEN);
+        let mut payload = Vec::with_capacity(8 + frames.len() * wire::MSG_LEN);
         payload.extend_from_slice(b"TCB1");
-        payload.extend_from_slice(&(records.len() as u32).to_be_bytes());
-        for record in records {
-            payload.extend_from_slice(&record.frame);
+        payload.extend_from_slice(&(frames.len() as u32).to_be_bytes());
+        for frame in frames {
+            payload.extend_from_slice(frame);
         }
         for _ in 0..2 {
             if self.stream.is_none() {

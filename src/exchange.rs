@@ -1728,23 +1728,39 @@ impl Shard {
         let emitted = self
             .match_and_record_batch(commands, raft_index)
             .expect("append committed batch execution reports to durable outbox");
+        // The Linux asset-WAL barrier below is filesystem-wide. Flush the
+        // outbox's userspace buffer first so WAL, shard journal and outbox are
+        // all covered by that single syncfs instead of paying a second fsync.
+        if let Some(outbox) = &mut self.execution_outbox {
+            outbox
+                .flush_to_os()
+                .expect("flush committed execution outbox to OS");
+        }
         // Group-commit barrier: command WAL(s) + execution outbox in one shot.
         // Timed on its own so a slow durability barrier can be alerted without
         // conflating it with the batch's matching/append work.
         let fsync_started = Instant::now();
-        if let Some(asset_journal) = &self.asset_journal {
+        let used_filesystem_barrier = if let Some(asset_journal) = &self.asset_journal {
             asset_journal
                 .sync_committed_batch(&touched)
                 .expect("group commit asset and shard WAL files");
+            cfg!(target_os = "linux")
         } else if let Some(journal) = &mut self.journal {
             journal
                 .sync_data()
                 .expect("sync committed Raft command batch journal");
-        }
+            false
+        } else {
+            false
+        };
         if let Some(outbox) = &mut self.execution_outbox {
-            outbox
-                .sync_data()
-                .expect("group commit execution outbox with WAL barrier");
+            if used_filesystem_barrier {
+                outbox.mark_synced();
+            } else {
+                outbox
+                    .sync_data()
+                    .expect("group commit execution outbox with WAL barrier");
+            }
         }
         let fsync_elapsed = fsync_started.elapsed();
         let wal_ns = wal_started.elapsed().as_nanos() as u64;

@@ -327,11 +327,25 @@ impl ExecutionOutboxWriter {
     }
 
     pub fn sync_data(&mut self) -> io::Result<()> {
-        self.writer.flush()?;
+        self.flush_to_os()?;
         self.writer.get_ref().sync_data()?;
+        self.mark_synced();
+        Ok(())
+    }
+
+    /// Move buffered outbox records into the kernel before a filesystem-wide
+    /// group-commit barrier. On Linux the asset WAL coordinator then uses one
+    /// `syncfs` for the WAL, shard journal and this outbox together.
+    pub fn flush_to_os(&mut self) -> io::Result<()> {
+        self.writer.flush()
+    }
+
+    /// Record that an external filesystem-wide barrier made the flushed
+    /// records durable. This only updates batching bookkeeping; callers must
+    /// invoke it strictly after a successful `syncfs`/equivalent barrier.
+    pub fn mark_synced(&mut self) {
         self.written_since_flush = 0;
         self.last_flush = Instant::now();
-        Ok(())
     }
 }
 
