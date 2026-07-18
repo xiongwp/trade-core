@@ -175,6 +175,19 @@ pub fn write(path: &Path, data: SnapshotData<'_>) -> io::Result<()> {
         f.sync_all()?; // durable before it can become "the" snapshot
     }
     fs::rename(&tmp, path)?; // atomic on POSIX filesystems
+    // fsync the parent directory so the rename itself survives a crash;
+    // otherwise the directory entry may still point at the old (or no)
+    // snapshot after power loss even though the file data is durable.
+    if let Some(parent) = path.parent() {
+        File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("fsync snapshot parent dir {}: {e}", parent.display()),
+                )
+            })?;
+    }
     Ok(())
 }
 

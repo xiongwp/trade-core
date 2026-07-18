@@ -113,15 +113,31 @@ services:
       TC_ORDER_API_TOKEN: ${TC_ORDER_API_TOKEN:-local-order-api-token}
       TC_ORDER_API_MAX_IDLE_CONNECTIONS: ${TC_ORDER_API_MAX_IDLE_CONNECTIONS:-32}
     depends_on:
-      - raft-1
-      - raft-2
-      - raft-3
-      - raft-4
-      - raft-5
+      # raft-* live in docker-compose.raft.yml and define no healthcheck, so
+      # they stay service_started; order exposes one and gates the UI proxy.
+      order:
+        condition: service_healthy
+      raft-1:
+        condition: service_started
+      raft-2:
+        condition: service_started
+      raft-3:
+        condition: service_started
+      raft-4:
+        condition: service_started
+      raft-5:
+        condition: service_started
     ports:
       - "8081:8080"   # chart UI + JSON API + WebSocket (8080 is in use locally)
     volumes:
       - market-data-history:/data/md
+    healthcheck:
+      # debian:stable-slim ships no curl/wget; bash /dev/tcp probes the HTTP port.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080 && exec 3>&- 3<&-"]
+      interval: 5s
+      timeout: 3s
+      retries: 40
+      start_period: 20s
     restart: unless-stopped
 
   mysql-order-0:
@@ -255,6 +271,14 @@ services:
       TC_ORDER_MAX_PIPELINE_BACKLOG: ${TC_ORDER_MAX_PIPELINE_BACKLOG:-50000}
     ports:
       - "9200:9200"
+    healthcheck:
+      # :9200 serves /metrics; a TCP connect via bash /dev/tcp is enough to
+      # gate dependents (debian:stable-slim has no curl/wget).
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9200 && exec 3>&- 3<&-"]
+      interval: 5s
+      timeout: 3s
+      retries: 40
+      start_period: 30s
     restart: unless-stopped
 
 volumes:

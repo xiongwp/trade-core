@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # rdkafka builds librdkafka from source; keep the C build quiet but parallel.
+  NUM_JOBS: 4
+
+jobs:
+  build:
+    name: fmt + clippy + build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup component add rustfmt clippy
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-build-${{ hashFiles('Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-build-
+
+      # Cargo.lock is gitignored but the Dockerfile COPYs it; regenerate a
+      # lockfile so CI and container builds resolve the same way locally.
+      # (Recommendation: commit Cargo.lock for binary crates instead.)
+      - name: Ensure lockfile
+        run: test -f Cargo.lock || cargo generate-lockfile
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      # Advisory for now: surface warnings without failing the pipeline.
+      - name: cargo clippy (advisory)
+        continue-on-error: true
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo build
+        run: cargo build --locked --bins
+
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        run: |
+          rustup update stable
+          rustup default stable
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-test-
+
+      - name: Ensure lockfile
+        run: test -f Cargo.lock || cargo generate-lockfile
+
+      - name: cargo test
+        run: cargo test --locked
+
+  bench-smoke:
+    name: throughput bench smoke (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        run: |
+          rustup update stable
+          rustup default stable
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-bench-${{ hashFiles('Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-bench-
+
+      - name: Ensure lockfile
+        run: test -f Cargo.lock || cargo generate-lockfile
+
+      # Smoke run only: CI runners are not a performance baseline.
+      - name: cargo bench throughput (smoke)
+        run: cargo bench --locked --bench throughput
