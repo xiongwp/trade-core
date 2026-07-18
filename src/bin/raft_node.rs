@@ -241,11 +241,43 @@ fn main() {
                 );
             }
 
+            let recovered_committed = node.take_committed();
+            let mut legacy_candidates = std::collections::HashSet::new();
+            for committed in &recovered_committed {
+                if applied_batches.contains(&committed.index) {
+                    continue;
+                }
+                for command in wire::decode_raft_entry(&committed.data)
+                    .expect("durable committed Raft entry is not a valid command batch")
+                {
+                    if command.id() != 0 {
+                        legacy_candidates.insert(command.id());
+                    }
+                }
+            }
+            let recovered_fingerprints = if legacy_candidates.is_empty() {
+                None
+            } else {
+                asset_log::recovered_command_fingerprints(
+                    &asset_root,
+                    &data_dir.join("journal"),
+                    &legacy_candidates,
+                )
+                .expect("validate legacy asset WAL recovery coverage")
+            };
+            if let Some(fingerprints) = &recovered_fingerprints {
+                log_info!(
+                    "raft-node",
+                    "event=legacy_recovery_coverage commands={}",
+                    fingerprints.len()
+                );
+            }
+
             // Rebuild exact idempotency and matching state before this member
             // can campaign or accept a retry. Otherwise a fast election can
             // race the recovered committed prefix and append an old command a
             // second time.
-            for committed in node.take_committed() {
+            for committed in recovered_committed {
                 let index = committed.index;
                 assert!(
                     committed.term >= fence_term,
@@ -270,10 +302,25 @@ fn main() {
                 for command in commands {
                     let command_id = command.id();
                     committed_ids.remember(command_id, index);
-                    if is_batch
-                        || asset_log::applied_raft_index(&asset_root, command.instrument())
-                            .expect("read asset application watermark")
-                            < index
+                    let recovered_from_legacy_wal = recovered_fingerprints
+                        .as_ref()
+                        .and_then(|fingerprints| fingerprints.get(&command_id))
+                        .is_some_and(|fingerprint| {
+                            let mut frame = [0u8; MSG_LEN];
+                            wire::encode_command(&command, &mut frame);
+                            *fingerprint == trade_core::journal::fnv1a(&frame)
+                        });
+                    // Batch group-commit watermarks were introduced after the
+                    // original per-asset application watermarks.  A durable
+                    // node upgraded from that format therefore has no batch
+                    // marker even though every command is already reflected in
+                    // its recovered book.  Fall back to the per-asset marker
+                    // instead of blindly replaying the whole batch; doing so
+                    // would insert resting orders twice during an upgrade.
+                    if !recovered_from_legacy_wal
+                        && asset_log::applied_raft_index(&asset_root, command.instrument())
+                        .expect("read asset application watermark")
+                        < index
                     {
                         apply.push(command);
                     }

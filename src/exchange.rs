@@ -897,6 +897,13 @@ impl Processor {
             *self.positions.entry((u, InstrumentId(i))).or_insert(0) += q;
         }
         for e in &snap.engines {
+            // Exact command-id dedup is independent of the optional monotonic
+            // high-water gate.  Rebuild it for every order represented by the
+            // snapshot before replaying the journal tail; otherwise a durable
+            // retry appended immediately after the snapshot can attempt to
+            // insert the same resting order twice during recovery.
+            self.seen_command_ids
+                .extend(e.orders.iter().map(|order| order.id.0));
             let engine = self.engine_for(e.instrument);
             engine.restore(e.engine_seq, &e.orders);
         }

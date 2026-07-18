@@ -264,6 +264,91 @@ pub fn load_applied_batches(root: &Path) -> io::Result<HashSet<u64>> {
     Ok(applied)
 }
 
+/// Load exact command fingerprints from the per-asset WALs, but only when the
+/// WAL record count proves that every record is also represented by the shard
+/// snapshot+journal state recovered by the matching engine.
+///
+/// This is an upgrade bridge for nodes written before batch application
+/// watermarks existed.  Asset WAL append precedes the shard journal append, so
+/// membership in an asset WAL alone is not enough to claim that a command was
+/// applied.  Equality with the sum of the shard journal sequence heads closes
+/// that crash window: there can be no WAL-only tail record.
+pub fn recovered_command_fingerprints(
+    root: &Path,
+    journal_root: &Path,
+    wanted: &HashSet<u64>,
+) -> io::Result<Option<HashMap<u64, u64>>> {
+    let mut shard_ids = HashSet::new();
+    for entry in std::fs::read_dir(journal_root)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        for (prefix, suffix) in [("journal-shard-", ".bin"), ("snapshot-shard-", ".bin")] {
+            if let Some(id) = name
+                .strip_prefix(prefix)
+                .and_then(|value| value.strip_suffix(suffix))
+                .and_then(|value| value.parse::<usize>().ok())
+            {
+                shard_ids.insert(id);
+            }
+        }
+    }
+    let mut recovered_records = 0u64;
+    for shard_id in shard_ids {
+        let snapshot_path = journal_root.join(format!("snapshot-shard-{shard_id}.bin"));
+        let journal_path = journal_root.join(format!("journal-shard-{shard_id}.bin"));
+        let snapshot_seq = if snapshot_path.exists() {
+            crate::snapshot::load(&snapshot_path)?.journal_seq
+        } else {
+            0
+        };
+        let journal_seq = if journal_path.exists() {
+            last_seq(&journal_path)?
+        } else {
+            0
+        };
+        recovered_records = recovered_records.saturating_add(snapshot_seq.max(journal_seq));
+    }
+
+    let mut wal_records = 0u64;
+    let mut fingerprints = HashMap::new();
+    for entry in std::fs::read_dir(root)? {
+        let path = entry?.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("wal") {
+            continue;
+        }
+        for record in JournalReader::open(&path)? {
+            wal_records = wal_records.saturating_add(1);
+            let Some(command) =
+                wire::WireView::parse(&record.frame).and_then(|view| view.to_command())
+            else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("asset WAL {} contains an invalid command", path.display()),
+                ));
+            };
+            let id = command.id();
+            if id == 0 || !wanted.contains(&id) {
+                continue;
+            }
+            let fingerprint = journal::fnv1a(&record.frame);
+            match fingerprints.insert(id, fingerprint) {
+                Some(previous) if previous != fingerprint => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("command id {id} has conflicting asset WAL payloads"),
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+    if wal_records != recovered_records {
+        return Ok(None);
+    }
+    Ok(Some(fingerprints))
+}
+
 /// Highest Raft entry durably represented in the local asset and shard logs.
 /// A missing watermark means that recovery must re-submit every committed
 /// entry for this asset.
@@ -580,5 +665,50 @@ mod tests {
         assert_eq!(applied.len(), 1);
         assert!(applied.contains(&77));
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn legacy_recovery_fingerprints_require_complete_shard_journal_coverage() {
+        let base = std::env::temp_dir().join(format!(
+            "tc-asset-log-legacy-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let assets = base.join("assets");
+        std::fs::create_dir_all(&assets).unwrap();
+        let instrument = InstrumentId(77);
+        let command = Command::New(
+            Order::limit(OrderId(7_700), Side::Buy, 100, 1).on(instrument),
+        );
+        let mut asset_logs = AssetJournalSet::open(&assets, Duration::from_millis(1)).unwrap();
+        asset_logs.append(&command).unwrap();
+        asset_logs.flush_all().unwrap();
+
+        let mut frame = [0u8; MSG_LEN];
+        wire::encode_command(&command, &mut frame);
+        let mut shard_log = JournalWriter::open(
+            &base.join("journal-shard-0.bin"),
+            Duration::from_millis(1),
+        )
+        .unwrap();
+        shard_log.append(1, &frame).unwrap();
+        shard_log.sync_data().unwrap();
+
+        let wanted = HashSet::from([command.id()]);
+        let recovered = recovered_command_fingerprints(&assets, &base, &wanted)
+            .unwrap()
+            .expect("equal WAL and shard sequence counts prove full coverage");
+        assert_eq!(recovered[&command.id()], journal::fnv1a(&frame));
+
+        asset_logs.append(&Command::New(
+            Order::limit(OrderId(7_701), Side::Sell, 101, 1).on(instrument),
+        ))
+        .unwrap();
+        asset_logs.flush_all().unwrap();
+        assert!(recovered_command_fingerprints(&assets, &base, &wanted)
+            .unwrap()
+            .is_none());
+        std::fs::remove_dir_all(&base).ok();
     }
 }

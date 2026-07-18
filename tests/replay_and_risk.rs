@@ -6,10 +6,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use trade_core::exchange::{
-    build, fingerprint_reports, replay_journal, ExchangeConfig, ExecReport,
+    build, fingerprint_reports, replay_journal, Command, ExchangeConfig, ExecReport,
 };
 use trade_core::prelude::*;
 use trade_core::risk::PriceGuard;
+use trade_core::snapshot::{EngineState, Snapshot};
 use trade_core::InstrumentId;
 
 fn temp_dir(tag: &str) -> PathBuf {
@@ -17,6 +18,38 @@ fn temp_dir(tag: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
+}
+
+#[test]
+fn snapshot_restores_exact_ids_before_replaying_a_duplicate_tail() {
+    let instrument = InstrumentId(9);
+    let order = Order::limit(OrderId(900), Side::Buy, 100, 2).on(instrument);
+    let snapshot = Snapshot {
+        journal_seq: 1,
+        max_cmd_id: 0,
+        max_admin_id: 0,
+        halted: Vec::new(),
+        suspended: Vec::new(),
+        positions: Vec::new(),
+        engines: vec![EngineState {
+            instrument,
+            engine_seq: 1,
+            orders: vec![order],
+        }],
+    };
+    let mut processor = trade_core::exchange::Processor::new(
+        || Box::new(PriceTimePriority),
+        None,
+    );
+    processor.restore_state(&snapshot);
+    let mut reports = Vec::new();
+    processor.process(Command::New(order), &mut |report| reports.push(report));
+
+    assert_eq!(processor.engine(instrument).unwrap().book().len(), 1);
+    assert!(matches!(
+        reports.as_slice(),
+        [ExecReport::Rejected { reason: "duplicate", .. }]
+    ));
 }
 
 /// Drain the sink until no report arrives for a while.
