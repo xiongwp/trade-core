@@ -188,6 +188,11 @@ emergency: lag >= 15 秒或 quorum 丢失 -> 停止该 category 写入
 
 50 台 Raft 机器承载 100 group 时，每台平均运行 10 个 replica。需要将线程固定到 CPU，并让空载线程休眠；禁止空载 busy-spin 消耗所有核心。
 
+生产launcher通过每台机器独立的 `TC_RAFT_GROUP_PLACEMENTS` 注入本机副本清单，格式为
+`group|local_node|id@host:port,...;...`。未设置时才使用开发环境的“每台机器承载全部group”
+模式。placement必须保证同一group的副本分散到不同故障域，并同步生成Order worker使用的
+`TC_RAFT_GROUP_MATCHERS`。
+
 ## 7. 撮合部署
 
 - 100 台 active matching node 对应 100 个 category owner。
