@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use protobuf::Message as PbMessage;
 use raft::prelude::Message;
-use trade_core::raft_log::{ClusterConfig, RaftNode, CLUSTER_SIZE};
+use trade_core::raft_log::{ClusterConfig, RaftNode, MAX_CLUSTER_SIZE};
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -22,17 +22,13 @@ fn main() {
     let listen = args.next().expect("listen address");
     let peers = args.next().expect("peers: id@host:port,...");
     let peers = parse_peers(&peers);
-    assert_eq!(
-        peers.len(),
-        CLUSTER_SIZE,
-        "simulation requires exactly five peers"
+    assert!(
+        (1..=MAX_CLUSTER_SIZE).contains(&peers.len()),
+        "simulation cluster must have between 1 and {MAX_CLUSTER_SIZE} peers"
     );
-    let mut voters = [0u64; CLUSTER_SIZE];
-    for (slot, voter) in voters.iter_mut().zip(peers.keys()) {
-        *slot = *voter;
-    }
+    let mut voters = peers.keys().copied().collect::<Vec<u64>>();
     voters.sort_unstable();
-    let mut node = RaftNode::new(ClusterConfig::new(id, voters).expect("valid five-node config"))
+    let mut node = RaftNode::new(ClusterConfig::new(id, voters).expect("valid cluster config"))
         .expect("create raft node");
     let (tx, rx) = mpsc::channel();
     spawn_listener(listen, tx);
@@ -58,10 +54,10 @@ fn main() {
                 send(addr, &message);
             }
         }
-        for (index, payload) in node.take_committed() {
+        for committed in node.take_committed() {
             eprintln!(
-                "[raft-sim node={id}] committed index={index} payload={:?}",
-                payload
+                "[raft-sim node={id}] committed index={} term={} payload={:?}",
+                committed.index, committed.term, committed.data
             );
         }
         if last_status.elapsed() >= Duration::from_secs(2) {

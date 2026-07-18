@@ -3,12 +3,12 @@ use std::time::Duration;
 use trade_core::asset_log::{replay_with_reports, AssetJournalSet};
 use trade_core::exchange::{Command, Processor};
 use trade_core::order::Order;
-use trade_core::raft_log::{ClusterConfig, RaftNode, CLUSTER_SIZE};
+use trade_core::raft_log::{ClusterConfig, RaftNode};
 use trade_core::strategy::PriceTimePriority;
 use trade_core::types::{InstrumentId, OrderId, Side};
 use trade_core::wire::{self, MSG_LEN, REPORT_LEN};
 
-const VOTERS: [u64; CLUSTER_SIZE] = [1, 2, 3, 4, 5];
+const VOTERS: [u64; 5] = [1, 2, 3, 4, 5];
 
 fn pump(leader: &mut RaftNode, followers: &mut [RaftNode]) {
     for _ in 0..100 {
@@ -92,8 +92,8 @@ fn quorum_committed_orders_replay_to_the_identical_match_result_after_restart() 
         AssetJournalSet::open(root.join("assets"), Duration::from_millis(1)).unwrap();
     let mut live = Processor::new(|| Box::new(PriceTimePriority), None);
     let mut live_reports = Vec::new();
-    for (_, payload) in committed {
-        for command in wire::decode_raft_entry(&payload).expect("valid committed order batch") {
+    for entry in committed {
+        for command in wire::decode_raft_entry(&entry.data).expect("valid committed order batch") {
             asset_logs.append(&command).unwrap();
             live.process(command, &mut |report| live_reports.push(report));
         }
