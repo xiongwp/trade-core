@@ -3,10 +3,12 @@
 //! Raft-backed matcher.
 
 use std::collections::{BTreeMap, HashMap};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::sync::Arc;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use mysql::prelude::Queryable;
@@ -16,9 +18,10 @@ use rdkafka::message::Message;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::topic_partition_list::{Offset, TopicPartitionList};
 use rdkafka::ClientConfig;
+use trade_core::journal;
 use trade_core::order::Order;
 use trade_core::order_queue::{encode_envelope, QueueEnvelope, QueueRouter};
-use trade_core::sharding::{self, DB_COUNT, DEFAULT_ASSET_CATEGORY_SIZE, TABLES_PER_DB};
+use trade_core::sharding::{self, DEFAULT_ASSET_CATEGORY_SIZE};
 use trade_core::types::{InstrumentId, OrderId, Side};
 use trade_core::wire;
 
@@ -34,6 +37,9 @@ struct MatcherTarget {
 struct OrderStore {
     shards: Arc<Vec<Pool>>,
     category_size: u32,
+    /// Versioned shard routing record. All row placement goes through this so a
+    /// parameter change is a fenced migration (see [`sharding::RouteConfig`]).
+    routing: sharding::RouteConfig,
     metrics: Arc<OrderPipelineMetrics>,
 }
 
@@ -51,6 +57,7 @@ struct OrderPipelineMetrics {
     backpressure_rejections: AtomicU64,
     observed_mysql_lag: AtomicU64,
     observed_match_lag: AtomicU64,
+    dlq_total: AtomicU64,
 }
 
 impl OrderPipelineMetrics {
@@ -182,9 +189,11 @@ impl OrderPipelineMetrics {
             self.backpressure_rejections.load(AtomicOrdering::Relaxed),
         ) + &format!(
             "# TYPE tc_order_mysql_consumer_lag gauge\ntc_order_mysql_consumer_lag {}\n\
-# TYPE tc_order_match_consumer_lag gauge\ntc_order_match_consumer_lag {}\n",
+# TYPE tc_order_match_consumer_lag gauge\ntc_order_match_consumer_lag {}\n\
+# TYPE tc_order_dlq_total counter\ntc_order_dlq_total {}\n",
             self.observed_mysql_lag.load(AtomicOrdering::Relaxed),
             self.observed_match_lag.load(AtomicOrdering::Relaxed),
+            self.dlq_total.load(AtomicOrdering::Relaxed),
         )
     }
 }
@@ -192,6 +201,347 @@ impl OrderPipelineMetrics {
 impl OrderStore {
     fn shard(&self, db: u32) -> &Pool {
         &self.shards[db as usize]
+    }
+}
+
+/// Ingress admission tier for one category, from the document's §5.3 ladder.
+/// Ordered by severity so a batch spanning categories can take the worst.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, PartialOrd, Ord)]
+enum BackpressureTier {
+    /// Below the soft limit — accept normally.
+    Normal,
+    /// >= soft limit (default 2 s of design traffic): slow the caller down.
+    Soft,
+    /// >= hard limit (default 5 s): reject with HTTP 429.
+    Hard,
+    /// >= emergency limit (default 15 s) or the category's Raft quorum is lost:
+    /// stop writes for this category with HTTP 503. Independently recoverable.
+    Emergency,
+}
+
+/// Per-category, three-tier ingress backpressure (production doc §5.3).
+///
+/// Lag is observed **per Kafka partition** (a category maps to exactly one
+/// partition) as the max of the persist and match consumer groups, so a hot
+/// partition throttles only the categories that share it — the global
+/// [`OrderPipelineMetrics`] backlog stays as the market-wide master switch.
+/// Quorum health is tracked per Raft group and clears on the next successful
+/// forward, making the emergency tier independently recoverable.
+struct Backpressure {
+    soft: u64,
+    hard: u64,
+    emergency: u64,
+    soft_delay: Duration,
+    topic_count: u32,
+    partitions_per_topic: u32,
+    raft_group_count: usize,
+    raft_group_pins: Arc<HashMap<u32, usize>>,
+    mysql_lag: Vec<AtomicU64>,
+    match_lag: Vec<AtomicU64>,
+    group_unhealthy: Vec<AtomicBool>,
+    soft_events: AtomicU64,
+    hard_events: AtomicU64,
+    emergency_events: AtomicU64,
+}
+
+impl Backpressure {
+    fn from_env(
+        topic_count: usize,
+        partitions_per_topic: u32,
+        raft_group_count: usize,
+        raft_group_pins: Arc<HashMap<u32, usize>>,
+    ) -> Self {
+        // Defaults express ~2 s / 5 s / 15 s of a 50k commands/s/partition
+        // design load; each is overridable directly for the machine's tuning.
+        let soft = env_number("TC_ORDER_BP_SOFT", 100_000u64).max(1);
+        let hard = env_number("TC_ORDER_BP_HARD", 250_000u64).max(soft);
+        let emergency = env_number("TC_ORDER_BP_EMERGENCY", 750_000u64).max(hard);
+        let partitions = topic_count * partitions_per_topic as usize;
+        Self {
+            soft,
+            hard,
+            emergency,
+            soft_delay: Duration::from_millis(env_number("TC_ORDER_BP_SOFT_DELAY_MS", 2u64)),
+            topic_count: topic_count.max(1) as u32,
+            partitions_per_topic: partitions_per_topic.max(1),
+            raft_group_count: raft_group_count.max(1),
+            raft_group_pins,
+            mysql_lag: (0..partitions).map(|_| AtomicU64::new(0)).collect(),
+            match_lag: (0..partitions).map(|_| AtomicU64::new(0)).collect(),
+            group_unhealthy: (0..raft_group_count.max(1))
+                .map(|_| AtomicBool::new(false))
+                .collect(),
+            soft_events: AtomicU64::new(0),
+            hard_events: AtomicU64::new(0),
+            emergency_events: AtomicU64::new(0),
+        }
+    }
+
+    /// Pure tier decision — the state machine unit-tested in isolation.
+    fn classify(&self, lag: u64, quorum_lost: bool) -> BackpressureTier {
+        if quorum_lost || lag >= self.emergency {
+            BackpressureTier::Emergency
+        } else if lag >= self.hard {
+            BackpressureTier::Hard
+        } else if lag >= self.soft {
+            BackpressureTier::Soft
+        } else {
+            BackpressureTier::Normal
+        }
+    }
+
+    fn partition_index(&self, category_id: u32) -> usize {
+        let topic = (category_id % self.topic_count) as usize;
+        let partition = ((category_id / self.topic_count) % self.partitions_per_topic) as usize;
+        topic * self.partitions_per_topic as usize + partition
+    }
+
+    fn raft_group(&self, category_id: u32) -> usize {
+        sharding::raft_group_for_category_pinned(
+            category_id,
+            self.raft_group_count,
+            &self.raft_group_pins,
+        )
+    }
+
+    fn partition_lag(&self, index: usize) -> u64 {
+        let mysql = self.mysql_lag.get(index).map_or(0, |v| v.load(AtomicOrdering::Acquire));
+        let matcher = self.match_lag.get(index).map_or(0, |v| v.load(AtomicOrdering::Acquire));
+        mysql.max(matcher)
+    }
+
+    fn set_partition_lags(&self, stage: &str, lags: &[u64]) {
+        let target = match stage {
+            "mysql" => &self.mysql_lag,
+            "match" => &self.match_lag,
+            _ => return,
+        };
+        for (slot, lag) in target.iter().zip(lags.iter()) {
+            slot.store(*lag, AtomicOrdering::Release);
+        }
+    }
+
+    fn set_group_health(&self, group: usize, healthy: bool) {
+        if let Some(flag) = self.group_unhealthy.get(group) {
+            flag.store(!healthy, AtomicOrdering::Release);
+        }
+    }
+
+    fn group_unhealthy(&self, group: usize) -> bool {
+        self.group_unhealthy
+            .get(group)
+            .is_some_and(|flag| flag.load(AtomicOrdering::Acquire))
+    }
+
+    /// Current tier for a category from its partition lag and quorum health.
+    fn tier_for_category(&self, category_id: u32) -> BackpressureTier {
+        let lag = self.partition_lag(self.partition_index(category_id));
+        self.classify(lag, self.group_unhealthy(self.raft_group(category_id)))
+    }
+
+    fn note(&self, tier: BackpressureTier) {
+        match tier {
+            BackpressureTier::Soft => &self.soft_events,
+            BackpressureTier::Hard => &self.hard_events,
+            BackpressureTier::Emergency => &self.emergency_events,
+            BackpressureTier::Normal => return,
+        }
+        .fetch_add(1, AtomicOrdering::Relaxed);
+    }
+
+    /// Admit one category's write: apply the soft-tier slowdown inline, or map
+    /// hard/emergency to an ingress error. Emergency is 503, hard is 429.
+    fn admit(&self, category_id: u32) -> Result<(), String> {
+        let tier = self.tier_for_category(category_id);
+        self.note(tier);
+        match tier {
+            BackpressureTier::Normal => Ok(()),
+            BackpressureTier::Soft => {
+                if !self.soft_delay.is_zero() {
+                    std::thread::sleep(self.soft_delay);
+                }
+                Ok(())
+            }
+            BackpressureTier::Hard => Err(format!(
+                "backpressure: category {category_id} throttled at hard limit {}",
+                self.hard
+            )),
+            BackpressureTier::Emergency => Err(format!(
+                "backpressure-emergency: category {category_id} writes stopped (lag/quorum)"
+            )),
+        }
+    }
+
+    fn max_partition_lag(&self) -> u64 {
+        (0..self.mysql_lag.len())
+            .map(|i| self.partition_lag(i))
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn unhealthy_groups(&self) -> u64 {
+        self.group_unhealthy
+            .iter()
+            .filter(|flag| flag.load(AtomicOrdering::Acquire))
+            .count() as u64
+    }
+
+    fn render(&self) -> String {
+        format!(
+            "# TYPE tc_order_bp_soft_limit gauge\ntc_order_bp_soft_limit {}\n\
+# TYPE tc_order_bp_hard_limit gauge\ntc_order_bp_hard_limit {}\n\
+# TYPE tc_order_bp_emergency_limit gauge\ntc_order_bp_emergency_limit {}\n\
+# TYPE tc_order_bp_soft_total counter\ntc_order_bp_soft_total {}\n\
+# TYPE tc_order_bp_hard_total counter\ntc_order_bp_hard_total {}\n\
+# TYPE tc_order_bp_emergency_total counter\ntc_order_bp_emergency_total {}\n\
+# TYPE tc_order_bp_max_partition_lag gauge\ntc_order_bp_max_partition_lag {}\n\
+# TYPE tc_order_bp_quorum_unhealthy_groups gauge\ntc_order_bp_quorum_unhealthy_groups {}\n",
+            self.soft,
+            self.hard,
+            self.emergency,
+            self.soft_events.load(AtomicOrdering::Relaxed),
+            self.hard_events.load(AtomicOrdering::Relaxed),
+            self.emergency_events.load(AtomicOrdering::Relaxed),
+            self.max_partition_lag(),
+            self.unhealthy_groups(),
+        )
+    }
+}
+
+/// Header stamped on a fresh dead-letter file; a version bump changes it so old
+/// files are rejected rather than silently misparsed.
+const DLQ_HEADER: [u8; 8] = *b"TCDLQ01\0";
+
+/// Append-only dead-letter log for order-execution messages that exhausted
+/// their retry budget. Mirrors the journal WAL style: a magic header, one
+/// length-framed record per poison message carrying `(partition, offset,
+/// reason, original payload)`, each closed by an FNV-1a checksum so a torn
+/// tail is detected and dropped on read.
+struct DlqWriter {
+    file: File,
+}
+
+impl DlqWriter {
+    fn open(path: &Path) -> io::Result<Self> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let mut probe = OpenOptions::new()
+            .read(true)
+            .create(true)
+            .append(true)
+            .open(path)?;
+        if probe.metadata()?.len() == 0 {
+            probe.write_all(&DLQ_HEADER)?;
+            probe.sync_data()?;
+        } else {
+            let mut header = [0u8; 8];
+            probe.read_exact(&mut header)?;
+            if header != DLQ_HEADER {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "DLQ header/version mismatch (migration required)",
+                ));
+            }
+        }
+        Ok(Self {
+            file: OpenOptions::new().append(true).open(path)?,
+        })
+    }
+
+    fn append(
+        &mut self,
+        partition: i32,
+        offset: i64,
+        reason: &str,
+        payload: &[u8],
+    ) -> io::Result<()> {
+        let reason = reason.as_bytes();
+        let mut body = Vec::with_capacity(28 + reason.len() + payload.len());
+        body.extend_from_slice(&journal::now_nanos().to_le_bytes());
+        body.extend_from_slice(&partition.to_le_bytes());
+        body.extend_from_slice(&offset.to_le_bytes());
+        body.extend_from_slice(&(reason.len() as u32).to_le_bytes());
+        body.extend_from_slice(reason);
+        body.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        body.extend_from_slice(payload);
+        let checksum = journal::fnv1a(&body);
+        let mut frame = Vec::with_capacity(4 + body.len() + 8);
+        frame.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        frame.extend_from_slice(&body);
+        frame.extend_from_slice(&checksum.to_le_bytes());
+        self.file.write_all(&frame)?;
+        self.file.sync_data()
+    }
+}
+
+/// Outcome of driving one message through the persist-retry-or-dead-letter
+/// loop. Both variants advance the Kafka offset — a poison message must not
+/// wedge the partition forever.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PersistOutcome {
+    Committed,
+    DeadLettered,
+}
+
+/// Persist one message with bounded exponential-backoff retries; on exhausting
+/// the budget, dead-letter it and report `DeadLettered` so the caller advances
+/// the offset. A DLQ write failure is *not* treated as success — we keep
+/// retrying rather than silently drop the record.
+fn persist_with_retry<F>(
+    mut persist: F,
+    dlq: &Mutex<DlqWriter>,
+    metrics: &OrderPipelineMetrics,
+    max_retries: u32,
+    base_backoff: Duration,
+    partition: i32,
+    offset: i64,
+    payload: &[u8],
+) -> PersistOutcome
+where
+    F: FnMut() -> Result<(), String>,
+{
+    let mut attempt = 1u32;
+    loop {
+        match persist() {
+            Ok(()) => return PersistOutcome::Committed,
+            Err(error) if attempt >= max_retries => {
+                let written = dlq
+                    .lock()
+                    .map_err(|_| "DLQ mutex poisoned".to_string())
+                    .and_then(|mut writer| {
+                        writer
+                            .append(partition, offset, &error, payload)
+                            .map_err(|e| e.to_string())
+                    });
+                match written {
+                    Ok(()) => {
+                        metrics.dlq_total.fetch_add(1, AtomicOrdering::Relaxed);
+                        return PersistOutcome::DeadLettered;
+                    }
+                    Err(dlq_error) => {
+                        eprintln!(
+                            "[execution-mysql] DLQ write failed for p{partition}@{offset}, retrying: {dlq_error}"
+                        );
+                        if !base_backoff.is_zero() {
+                            std::thread::sleep(base_backoff);
+                        }
+                        // Keep the same attempt count: stay in the dead-letter
+                        // branch until the record is durably captured.
+                    }
+                }
+            }
+            Err(_) => {
+                let shift = (attempt - 1).min(9);
+                let backoff = base_backoff.saturating_mul(1u32 << shift);
+                if !backoff.is_zero() {
+                    std::thread::sleep(backoff);
+                }
+                attempt += 1;
+            }
+        }
     }
 }
 
@@ -210,7 +560,11 @@ fn required<T: std::str::FromStr>(query: &str, key: &str) -> Result<T, String> {
 }
 
 fn ingress_error_status(error: &str) -> &'static str {
-    if error.starts_with("backpressure:") {
+    if error.starts_with("backpressure-emergency:") {
+        // Emergency tier / lost quorum: stop writes for this category.
+        "503 Service Unavailable"
+    } else if error.starts_with("backpressure:") {
+        // Hard tier or global backlog master switch: throttle.
         "429 Too Many Requests"
     } else {
         "503 Service Unavailable"
@@ -243,14 +597,14 @@ fn cancel_from_query(query: &str) -> Result<(InstrumentId, OrderId, u64, u64), S
 }
 
 fn bootstrap(store: &OrderStore) -> mysql::Result<()> {
-    for db in 0..DB_COUNT {
+    for db in 0..store.routing.db_count {
         let mut conn = store.shard(db as u32).get_conn()?;
         let db_name = format!("order_db_{db}");
         conn.query_drop(format!("CREATE DATABASE IF NOT EXISTS {db_name}"))?;
         conn.query_drop(format!("CREATE TABLE IF NOT EXISTS {db_name}.processed_commands (category_id INT UNSIGNED NOT NULL, kafka_partition INT NOT NULL, kafka_offset BIGINT UNSIGNED NOT NULL, command_id BIGINT UNSIGNED NOT NULL UNIQUE, user_id BIGINT UNSIGNED NOT NULL, shard_table INT UNSIGNED NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(category_id,kafka_offset), KEY idx_partition_offset (kafka_partition,kafka_offset)) ENGINE=InnoDB"))?;
         conn.query_drop(format!("CREATE TABLE IF NOT EXISTS {db_name}.processed_executions (kafka_partition INT NOT NULL, kafka_offset BIGINT UNSIGNED NOT NULL, instrument INT UNSIGNED NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(kafka_partition,kafka_offset), KEY idx_instrument_offset (instrument,kafka_offset)) ENGINE=InnoDB"))?;
         conn.query_drop(format!("CREATE TABLE IF NOT EXISTS {db_name}.processed_execution_events (raft_group INT UNSIGNED NOT NULL, raft_index BIGINT UNSIGNED NOT NULL, report_ordinal INT UNSIGNED NOT NULL, instrument INT UNSIGNED NOT NULL, order_id BIGINT UNSIGNED NOT NULL, report_type TINYINT UNSIGNED NOT NULL, kafka_partition INT NOT NULL, kafka_offset BIGINT UNSIGNED NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(raft_group,raft_index,report_ordinal), KEY idx_instrument_index (instrument,raft_index), KEY idx_order_event (order_id,raft_index)) ENGINE=InnoDB"))?;
-        for table in 0..TABLES_PER_DB {
+        for table in 0..store.routing.tables_per_db {
             conn.query_drop(format!("CREATE TABLE IF NOT EXISTS {db_name}.asset_orders_{table:03} (row_seq BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, order_id BIGINT UNSIGNED NOT NULL UNIQUE, category_id INT UNSIGNED NOT NULL, user_id BIGINT UNSIGNED NOT NULL, instrument INT UNSIGNED NOT NULL, side TINYINT NOT NULL, price BIGINT UNSIGNED NOT NULL, qty BIGINT UNSIGNED NOT NULL, filled_qty BIGINT UNSIGNED NOT NULL DEFAULT 0, status VARCHAR(16) NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, KEY idx_category_row (category_id,row_seq), KEY idx_user_created (user_id,created_at)) ENGINE=InnoDB"))?;
         }
     }
@@ -281,10 +635,15 @@ struct KafkaIngress {
     linger: Duration,
     max_pipeline_backlog: u64,
     metrics: Arc<OrderPipelineMetrics>,
+    /// Per-category three-tier ingress backpressure (production doc §5.3).
+    backpressure: Arc<Backpressure>,
 }
 
 impl KafkaIngress {
-    fn from_env(metrics: Arc<OrderPipelineMetrics>) -> Result<Option<Self>, String> {
+    fn from_env(
+        metrics: Arc<OrderPipelineMetrics>,
+        raft_group_count: usize,
+    ) -> Result<Option<Self>, String> {
         let Ok(brokers) = std::env::var("TC_ORDER_KAFKA_BROKERS") else {
             return Ok(None);
         };
@@ -308,18 +667,20 @@ impl KafkaIngress {
         let partitions = env_number("TC_ORDER_KAFKA_PARTITIONS_PER_TOPIC", 8u32);
         let version = env_number("TC_ORDER_KAFKA_ROUTE_VERSION", 1u32);
         let partition_workers = topics.len().saturating_mul(partitions as usize).max(1);
-        let raft_group_pins = std::env::var("TC_RAFT_CATEGORY_PINS")
-            .ok()
-            .map(|value| {
-                value
-                    .split(',')
-                    .filter_map(|entry| {
-                        let (category, group) = entry.trim().split_once(':')?;
-                        Some((category.parse().ok()?, group.parse().ok()?))
-                    })
-                    .collect::<HashMap<_, _>>()
-            })
-            .unwrap_or_default();
+        let raft_group_pins = Arc::new(
+            std::env::var("TC_RAFT_CATEGORY_PINS")
+                .ok()
+                .map(|value| {
+                    value
+                        .split(',')
+                        .filter_map(|entry| {
+                            let (category, group) = entry.trim().split_once(':')?;
+                            Some((category.parse().ok()?, group.parse().ok()?))
+                        })
+                        .collect::<HashMap<_, _>>()
+                })
+                .unwrap_or_default(),
+        );
         let producer = ClientConfig::new()
             .set("bootstrap.servers", &brokers)
             .set("acks", "all")
@@ -330,6 +691,13 @@ impl KafkaIngress {
             .set("batch.num.messages", "10000")
             .create::<FutureProducer>()
             .map_err(|error| error.to_string())?;
+        let topic_count = topics.len();
+        let backpressure = Arc::new(Backpressure::from_env(
+            topic_count,
+            partitions,
+            raft_group_count,
+            Arc::clone(&raft_group_pins),
+        ));
         Ok(Some(Self {
             producer,
             brokers,
@@ -354,11 +722,12 @@ impl KafkaIngress {
             execution_group: std::env::var("TC_EXECUTION_KAFKA_MYSQL_GROUP")
                 .unwrap_or_else(|_| "trade-order-execution-mysql-v1".into()),
             execution_consumers: env_number("TC_EXECUTION_KAFKA_MYSQL_CONSUMERS", 4usize).max(1),
-            raft_group_pins: Arc::new(raft_group_pins),
+            raft_group_pins,
             batch_size: env_number("TC_ORDER_BATCH_SIZE", 500usize).max(1),
             linger: Duration::from_millis(env_number("TC_ORDER_BATCH_LINGER_MS", 2u64)),
             max_pipeline_backlog: env_number("TC_ORDER_MAX_PIPELINE_BACKLOG", 50_000u64).max(1),
             metrics,
+            backpressure,
         }))
     }
 
@@ -373,12 +742,35 @@ impl KafkaIngress {
             })
     }
 
+    /// Admit a batch by its worst-tier category. A batch is one HTTP request,
+    /// so the client owns which categories it groups; per-request granularity
+    /// still isolates other categories' *separate* requests, which is the
+    /// isolation the design requires.
+    fn admit_batch(&self, records: &[BatchRecord]) -> Result<(), String> {
+        let Some(worst) = records
+            .iter()
+            .map(|record| {
+                (
+                    self.backpressure.tier_for_category(record.category_id),
+                    record.category_id,
+                )
+            })
+            .max()
+        else {
+            return Ok(());
+        };
+        self.backpressure.admit(worst.1)
+    }
+
     fn publish(
         &self,
         category_id: u32,
         user: u64,
         frame: &[u8; wire::MSG_LEN],
     ) -> Result<CategorySequence, String> {
+        // Per-category tier first (soft slowdown / hard 429 / emergency 503),
+        // then the market-wide backlog master switch.
+        self.backpressure.admit(category_id)?;
         self.reserve(1)?;
         let route = self.router.route(category_id);
         let envelope = encode_envelope(user, route.version, frame);
@@ -406,6 +798,7 @@ impl KafkaIngress {
     }
 
     fn publish_batch(&self, records: &[BatchRecord]) -> Result<(), String> {
+        self.admit_batch(records)?;
         self.reserve(records.len())?;
         let prepared = records
             .iter()
@@ -542,7 +935,7 @@ fn exec_multi_insert(
 fn persist_kafka_batch(store: &OrderStore, records: &[KafkaRecord]) -> Result<(), String> {
     let mut by_db: HashMap<u32, Vec<&KafkaRecord>> = HashMap::new();
     for record in records {
-        let route = sharding::route_category(record.category_id);
+        let route = store.routing.route_category(record.category_id);
         by_db.entry(route.db).or_default().push(record);
     }
 
@@ -579,7 +972,7 @@ fn persist_mysql_shard(
     let mut cancels = Vec::new();
 
     for record in records {
-        let route = sharding::route_category(record.category_id);
+        let route = store.routing.route_category(record.category_id);
         let command = wire::WireView::parse(&record.frame)
             .and_then(|view| view.to_command())
             .ok_or_else(|| "invalid Kafka command frame".to_string())?;
@@ -714,6 +1107,7 @@ fn forward_kafka_batch(
     matchers: &mut [MatcherConnection],
     records: &[KafkaRecord],
     pins: &HashMap<u32, usize>,
+    backpressure: &Backpressure,
 ) -> Result<(), String> {
     if matchers.is_empty() {
         return Err("no Raft groups configured".into());
@@ -742,11 +1136,17 @@ fn forward_kafka_batch(
             jobs.push(scope.spawn(move || -> Result<(), String> {
                 for records in categories.into_values() {
                     for batch in records.chunks(wire::RAFT_BATCH_MAX_COMMANDS) {
-                        matcher.send_batch(batch).map_err(|error| {
-                            format!("Raft group {group} batch commit failed: {error}")
-                        })?;
+                        if let Err(error) = matcher.send_batch(batch) {
+                            // Lost quorum/leader for this group -> categories on
+                            // it flip to the emergency tier until it recovers.
+                            backpressure.set_group_health(group, false);
+                            return Err(format!(
+                                "Raft group {group} batch commit failed: {error}"
+                            ));
+                        }
                     }
                 }
+                backpressure.set_group_health(group, true);
                 Ok(())
             }));
         }
@@ -856,28 +1256,46 @@ fn run_kafka_stage<F>(
     }
 }
 
-fn read_consumer_group_lag(consumer: &BaseConsumer, kafka: &KafkaIngress) -> Result<u64, String> {
+/// Per-partition consumer lag, indexed by the router's global partition index
+/// (`topic_pos * partitions_per_topic + partition`). Per-category backpressure
+/// keys off this; the caller also sums it for the market-wide backlog switch.
+fn read_consumer_group_lag(
+    consumer: &BaseConsumer,
+    kafka: &KafkaIngress,
+) -> Result<Vec<u64>, String> {
+    let topics = kafka.router.topics();
+    let per_topic = kafka.partitions_per_topic as i32;
     let mut requested = TopicPartitionList::new();
-    for topic in kafka.router.topics() {
-        for partition in 0..kafka.partitions_per_topic as i32 {
+    for topic in topics {
+        for partition in 0..per_topic {
             requested.add_partition(topic, partition);
         }
     }
     let committed = consumer
         .committed_offsets(requested, Duration::from_secs(2))
         .map_err(|error| error.to_string())?;
-    let mut lag = 0u64;
+    let mut committed_by_tp: HashMap<(String, i32), i64> = HashMap::new();
     for element in committed.elements() {
         let offset = match element.offset() {
             Offset::Offset(offset) => offset,
             _ => 0,
         };
-        let (_, high) = consumer
-            .fetch_watermarks(element.topic(), element.partition(), Duration::from_secs(2))
-            .map_err(|error| error.to_string())?;
-        lag = lag.saturating_add(high.saturating_sub(offset) as u64);
+        committed_by_tp.insert((element.topic().to_string(), element.partition()), offset);
     }
-    Ok(lag)
+    let mut lags = Vec::with_capacity(topics.len() * per_topic as usize);
+    for topic in topics {
+        for partition in 0..per_topic {
+            let offset = committed_by_tp
+                .get(&(topic.clone(), partition))
+                .copied()
+                .unwrap_or(0);
+            let (_, high) = consumer
+                .fetch_watermarks(topic, partition, Duration::from_secs(2))
+                .map_err(|error| error.to_string())?;
+            lags.push(high.saturating_sub(offset).max(0) as u64);
+        }
+    }
+    Ok(lags)
 }
 
 fn run_consumer_lag_monitor(kafka: KafkaIngress, group_id: String, stage: &'static str) {
@@ -889,7 +1307,13 @@ fn run_consumer_lag_monitor(kafka: KafkaIngress, group_id: String, stage: &'stat
     let mut last_error_log = std::time::Instant::now() - Duration::from_secs(30);
     loop {
         match read_consumer_group_lag(&consumer, &kafka) {
-            Ok(lag) => kafka.metrics.set_observed_lag(stage, lag),
+            Ok(lags) => {
+                let total: u64 = lags.iter().sum();
+                // Global backlog master switch keeps the summed view; the
+                // per-category tier machine keeps the per-partition breakdown.
+                kafka.metrics.set_observed_lag(stage, total);
+                kafka.backpressure.set_partition_lags(stage, &lags);
+            }
             Err(error) if last_error_log.elapsed() >= Duration::from_secs(30) => {
                 eprintln!("[order-kafka-{stage}-lag] failed to read {group_id}: {error}");
                 last_error_log = std::time::Instant::now();
@@ -900,7 +1324,12 @@ fn run_consumer_lag_monitor(kafka: KafkaIngress, group_id: String, stage: &'stat
     }
 }
 
-fn run_execution_mysql_consumer(store: OrderStore, kafka: KafkaIngress, worker: usize) {
+fn run_execution_mysql_consumer(
+    store: OrderStore,
+    kafka: KafkaIngress,
+    worker: usize,
+    dlq: Arc<Mutex<DlqWriter>>,
+) {
     let consumer: BaseConsumer = ClientConfig::new()
         .set("bootstrap.servers", &kafka.brokers)
         .set("group.id", &kafka.execution_group)
@@ -913,8 +1342,12 @@ fn run_execution_mysql_consumer(store: OrderStore, kafka: KafkaIngress, worker: 
     consumer
         .subscribe(&[&kafka.execution_topic])
         .expect("subscribe execution topic");
+    // Bounded retry then dead-letter: a poison message must never wedge the
+    // partition (was an unbounded seek-and-retry loop).
+    let max_retries = env_number("TC_ORDER_PERSIST_MAX_RETRIES", 10u32).max(1);
+    let base_backoff = Duration::from_millis(env_number("TC_ORDER_PERSIST_RETRY_BASE_MS", 100u64));
     eprintln!(
-        "[execution-mysql-{worker}] group={} topic={}",
+        "[execution-mysql-{worker}] group={} topic={} max_retries={max_retries}",
         kafka.execution_group, kafka.execution_topic
     );
     let mut last_failure_log = std::time::Instant::now() - Duration::from_secs(30);
@@ -932,26 +1365,42 @@ fn run_execution_mysql_consumer(store: OrderStore, kafka: KafkaIngress, worker: 
                 continue;
             }
         };
+        let partition = message.partition();
+        let offset = message.offset();
         let Some(event) = message.payload().and_then(wire::decode_execution_event) else {
-            eprintln!("[execution-mysql-{worker}] rejected invalid execution report");
-            continue;
-        };
-        match persist_execution_report(&store, message.partition(), message.offset(), event) {
-            Ok(()) => {
-                if let Err(error) = consumer.commit_message(&message, CommitMode::Sync) {
-                    eprintln!("[execution-mysql-{worker}] offset commit failed: {error}");
+            // Undecodable payload is poison by definition -> dead-letter and
+            // advance rather than reject-and-loop.
+            let payload = message.payload().unwrap_or(&[]).to_vec();
+            if let Ok(mut writer) = dlq.lock() {
+                if let Err(error) =
+                    writer.append(partition, offset, "invalid execution report", &payload)
+                {
+                    eprintln!("[execution-mysql-{worker}] DLQ write failed: {error}");
+                    continue; // keep offset; retry capturing it on next poll
                 }
             }
-            Err(error) => {
-                eprintln!("[execution-mysql-{worker}] projection retry: {error}");
-                let _ = consumer.seek(
-                    message.topic(),
-                    message.partition(),
-                    Offset::Offset(message.offset()),
-                    Duration::from_secs(1),
-                );
-                std::thread::sleep(Duration::from_millis(100));
-            }
+            store.metrics.dlq_total.fetch_add(1, AtomicOrdering::Relaxed);
+            eprintln!("[execution-mysql-{worker}] dead-lettered undecodable p{partition}@{offset}");
+            let _ = consumer.commit_message(&message, CommitMode::Sync);
+            continue;
+        };
+        let payload = message.payload().unwrap_or(&[]).to_vec();
+        let outcome = persist_with_retry(
+            || persist_execution_report(&store, partition, offset, event),
+            &dlq,
+            &store.metrics,
+            max_retries,
+            base_backoff,
+            partition,
+            offset,
+            &payload,
+        );
+        if outcome == PersistOutcome::DeadLettered {
+            eprintln!("[execution-mysql-{worker}] dead-lettered p{partition}@{offset} after {max_retries} attempts");
+        }
+        // Both Committed and DeadLettered advance the offset.
+        if let Err(error) = consumer.commit_message(&message, CommitMode::Sync) {
+            eprintln!("[execution-mysql-{worker}] offset commit failed: {error}");
         }
     }
 }
@@ -964,7 +1413,7 @@ fn persist_execution_report(
 ) -> Result<(), String> {
     let report = event.report;
     let category = sharding::asset_category(report.instrument, store.category_size);
-    let route = sharding::route_category(category);
+    let route = store.routing.route_category(category);
     let db = route.db_name();
     let table = route.table_name();
     let mut conn = store
@@ -1067,7 +1516,11 @@ fn update_execution_status(
     .map_err(|error| error.to_string())
 }
 
-fn parse_shard_urls() -> Vec<String> {
+/// One MySQL URL per physical database. An explicit `TC_ORDER_MYSQL_SHARD_URLS`
+/// list must match the configured `db_count` (part of the versioned route
+/// record); otherwise a single `TC_ORDER_MYSQL_URL` is fanned out to every
+/// database.
+fn parse_shard_urls(db_count: usize) -> Vec<String> {
     if let Ok(value) = std::env::var("TC_ORDER_MYSQL_SHARD_URLS") {
         let urls = value
             .split(',')
@@ -1075,19 +1528,29 @@ fn parse_shard_urls() -> Vec<String> {
             .filter(|url| !url.is_empty())
             .map(str::to_string)
             .collect::<Vec<_>>();
-        if urls.len() == DB_COUNT as usize {
-            return urls;
+        match validate_shard_urls(&urls, db_count) {
+            Ok(()) => return urls,
+            Err(error) => eprintln!("[order-api] {error}"),
         }
-        eprintln!(
-            "[order-api] TC_ORDER_MYSQL_SHARD_URLS must contain {DB_COUNT} urls; got {}",
-            urls.len()
-        );
     }
     let url = std::env::var("TC_ORDER_MYSQL_URL").expect("TC_ORDER_MYSQL_URL");
-    vec![url; DB_COUNT as usize]
+    vec![url; db_count]
 }
 
-fn open_when_ready(shard_urls: &[String]) -> OrderStore {
+/// Startup guard: the shard URL count must equal `db_count` from the route
+/// record, or rows would route to a database that has no connection pool.
+fn validate_shard_urls(urls: &[String], db_count: usize) -> Result<(), String> {
+    if urls.len() == db_count {
+        Ok(())
+    } else {
+        Err(format!(
+            "TC_ORDER_MYSQL_SHARD_URLS must contain {db_count} urls to match TC_DB_COUNT; got {}",
+            urls.len()
+        ))
+    }
+}
+
+fn open_when_ready(shard_urls: &[String], routing: sharding::RouteConfig) -> OrderStore {
     loop {
         let opened = (|| -> mysql::Result<OrderStore> {
             let mut shards = Vec::with_capacity(shard_urls.len());
@@ -1097,6 +1560,7 @@ fn open_when_ready(shard_urls: &[String]) -> OrderStore {
             let store = OrderStore {
                 shards: Arc::new(shards),
                 category_size: category_size(),
+                routing,
                 metrics: Arc::new(OrderPipelineMetrics::default()),
             };
             bootstrap(&store)?;
@@ -1324,7 +1788,7 @@ fn handle(stream: TcpStream, store: Arc<OrderStore>, kafka: Arc<KafkaIngress>, t
                 reader.get_mut(),
                 "200 OK",
                 "text/plain; version=0.0.4",
-                &store.metrics.render(),
+                &(store.metrics.render() + &kafka.backpressure.render()),
                 keep_alive,
             );
             if !keep_alive {
@@ -1429,21 +1893,37 @@ fn handle(stream: TcpStream, store: Arc<OrderStore>, kafka: Arc<KafkaIngress>, t
 }
 
 fn main() {
-    let shard_urls = parse_shard_urls();
+    let routing = sharding::RouteConfig::from_env();
+    let shard_urls = parse_shard_urls(routing.db_count as usize);
+    if let Err(error) = validate_shard_urls(&shard_urls, routing.db_count as usize) {
+        panic!("[order-api] shard routing mismatch: {error}");
+    }
     let matcher_groups = parse_matcher_groups();
     let token = std::env::var("TC_ORDER_API_TOKEN").expect("TC_ORDER_API_TOKEN");
-    let store = open_when_ready(&shard_urls);
-    let kafka = KafkaIngress::from_env(store.metrics.clone())
+    let store = open_when_ready(&shard_urls, routing);
+    let kafka = KafkaIngress::from_env(store.metrics.clone(), matcher_groups.len())
         .expect("configure Kafka order ingress")
         .expect("TC_ORDER_KAFKA_BROKERS is required");
+    let dlq_path = std::env::var("TC_ORDER_DLQ_PATH")
+        .unwrap_or_else(|_| "order-execution-dlq.wal".into());
+    let dlq = Arc::new(Mutex::new(
+        DlqWriter::open(Path::new(&dlq_path)).expect("open execution DLQ file"),
+    ));
     eprintln!(
-        "[order-api] category_size={} raft_groups={} db_consumers={} matcher_consumers={} execution_consumers={} max_pipeline_backlog={} db_group={} matcher_group={} execution_group={} kafka=true",
+        "[order-api] category_size={} db_count={} tables_per_db={} route_version={} raft_groups={} db_consumers={} matcher_consumers={} execution_consumers={} max_pipeline_backlog={} bp_soft={} bp_hard={} bp_emergency={} dlq={} db_group={} matcher_group={} execution_group={} kafka=true",
         store.category_size,
+        routing.db_count,
+        routing.tables_per_db,
+        routing.route_version,
         matcher_groups.len(),
         kafka.db_consumers,
         kafka.matcher_consumers,
         kafka.execution_consumers,
         kafka.max_pipeline_backlog,
+        kafka.backpressure.soft,
+        kafka.backpressure.hard,
+        kafka.backpressure.emergency,
+        dlq_path,
         kafka.db_group,
         kafka.matcher_group,
         kafka.execution_group,
@@ -1484,6 +1964,7 @@ fn main() {
         let worker_matchers = matcher_groups.clone();
         let consumer_store_metrics = store.metrics.clone();
         let raft_group_pins = kafka.raft_group_pins.clone();
+        let backpressure = kafka.backpressure.clone();
         std::thread::Builder::new()
             .name(format!("order-kafka-match-{worker}"))
             .spawn(move || {
@@ -1499,7 +1980,12 @@ fn main() {
                     worker,
                     move |batch| {
                         let started = std::time::Instant::now();
-                        let result = forward_kafka_batch(&mut matchers, batch, &raft_group_pins);
+                        let result = forward_kafka_batch(
+                            &mut matchers,
+                            batch,
+                            &raft_group_pins,
+                            &backpressure,
+                        );
                         consumer_store_metrics.record_raft(started.elapsed());
                         result
                     },
@@ -1510,9 +1996,17 @@ fn main() {
     for worker in 0..kafka.execution_consumers {
         let execution_store = store.clone();
         let execution_kafka = kafka.clone();
+        let execution_dlq = dlq.clone();
         std::thread::Builder::new()
             .name(format!("execution-kafka-mysql-{worker}"))
-            .spawn(move || run_execution_mysql_consumer(execution_store, execution_kafka, worker))
+            .spawn(move || {
+                run_execution_mysql_consumer(
+                    execution_store,
+                    execution_kafka,
+                    worker,
+                    execution_dlq,
+                )
+            })
             .expect("spawn execution MySQL projection consumer");
     }
     let listener = TcpListener::bind("0.0.0.0:9200").expect("bind order API");
@@ -1584,5 +2078,207 @@ mod tests {
             ingress_error_status("backpressure: full"),
             "429 Too Many Requests"
         );
+    }
+
+    fn test_backpressure(soft: u64, hard: u64, emergency: u64, partitions: usize, groups: usize) -> Backpressure {
+        Backpressure {
+            soft,
+            hard,
+            emergency,
+            soft_delay: Duration::ZERO,
+            topic_count: 1,
+            partitions_per_topic: partitions as u32,
+            raft_group_count: groups,
+            raft_group_pins: Arc::new(HashMap::new()),
+            mysql_lag: (0..partitions).map(|_| AtomicU64::new(0)).collect(),
+            match_lag: (0..partitions).map(|_| AtomicU64::new(0)).collect(),
+            group_unhealthy: (0..groups).map(|_| AtomicBool::new(false)).collect(),
+            soft_events: AtomicU64::new(0),
+            hard_events: AtomicU64::new(0),
+            emergency_events: AtomicU64::new(0),
+        }
+    }
+
+    #[test]
+    fn backpressure_tiers_climb_by_threshold_and_recover() {
+        let bp = test_backpressure(100, 250, 750, 1, 1);
+        // Climb through every tier as lag crosses each threshold.
+        assert_eq!(bp.classify(0, false), BackpressureTier::Normal);
+        assert_eq!(bp.classify(99, false), BackpressureTier::Normal);
+        assert_eq!(bp.classify(100, false), BackpressureTier::Soft);
+        assert_eq!(bp.classify(249, false), BackpressureTier::Soft);
+        assert_eq!(bp.classify(250, false), BackpressureTier::Hard);
+        assert_eq!(bp.classify(749, false), BackpressureTier::Hard);
+        assert_eq!(bp.classify(750, false), BackpressureTier::Emergency);
+        // Lost quorum forces emergency regardless of lag.
+        assert_eq!(bp.classify(0, true), BackpressureTier::Emergency);
+        // Recovery falls back down as lag drains.
+        assert_eq!(bp.classify(300, false), BackpressureTier::Hard);
+        assert_eq!(bp.classify(120, false), BackpressureTier::Soft);
+        assert_eq!(bp.classify(10, false), BackpressureTier::Normal);
+    }
+
+    #[test]
+    fn backpressure_is_isolated_per_category_and_takes_group_max() {
+        // 4 partitions; category N maps to partition N (topic_count 1).
+        let bp = test_backpressure(100, 250, 750, 4, 2);
+        // A hot partition 0 only throttles categories on it.
+        bp.set_partition_lags("mysql", &[300, 0, 0, 0]);
+        assert_eq!(bp.tier_for_category(0), BackpressureTier::Hard);
+        assert_eq!(bp.tier_for_category(1), BackpressureTier::Normal);
+        assert_eq!(bp.tier_for_category(4), BackpressureTier::Hard); // 4 -> partition 0
+        // Match-group lag on partition 1 dominates via max().
+        bp.set_partition_lags("match", &[0, 800, 0, 0]);
+        assert_eq!(bp.tier_for_category(1), BackpressureTier::Emergency);
+        // Drain both groups -> everything recovers to normal.
+        bp.set_partition_lags("mysql", &[0, 0, 0, 0]);
+        bp.set_partition_lags("match", &[0, 0, 0, 0]);
+        assert_eq!(bp.tier_for_category(0), BackpressureTier::Normal);
+        assert_eq!(bp.tier_for_category(1), BackpressureTier::Normal);
+    }
+
+    #[test]
+    fn backpressure_quorum_loss_is_per_group_and_recoverable() {
+        let bp = test_backpressure(100, 250, 750, 2, 2);
+        // Category 0 -> group 0, category 1 -> group 1.
+        bp.set_group_health(0, false);
+        assert_eq!(bp.tier_for_category(0), BackpressureTier::Emergency);
+        assert_eq!(bp.tier_for_category(1), BackpressureTier::Normal);
+        // Group recovers on the next healthy forward.
+        bp.set_group_health(0, true);
+        assert_eq!(bp.tier_for_category(0), BackpressureTier::Normal);
+    }
+
+    #[test]
+    fn backpressure_admit_maps_tiers_to_ingress_status() {
+        let bp = test_backpressure(100, 250, 750, 1, 1);
+        // Soft accepts (slowdown only).
+        bp.set_partition_lags("mysql", &[150]);
+        assert!(bp.admit(0).is_ok());
+        // Hard -> 429.
+        bp.set_partition_lags("mysql", &[300]);
+        let hard = bp.admit(0).unwrap_err();
+        assert_eq!(ingress_error_status(&hard), "429 Too Many Requests");
+        // Emergency -> 503.
+        bp.set_partition_lags("mysql", &[900]);
+        let emergency = bp.admit(0).unwrap_err();
+        assert_eq!(ingress_error_status(&emergency), "503 Service Unavailable");
+    }
+
+    #[test]
+    fn shard_url_count_must_match_db_count() {
+        assert!(validate_shard_urls(&["db0".to_string()], 1).is_ok());
+        let three = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        assert!(validate_shard_urls(&three, 3).is_ok());
+        let err = validate_shard_urls(&three, 10).unwrap_err();
+        assert!(err.contains("10"));
+        assert!(validate_shard_urls(&[], 1).is_err());
+    }
+
+    fn dlq_temp_path(tag: &str) -> std::path::PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "tc-dlq-{}-{tag}-{n}.wal",
+            std::process::id()
+        ))
+    }
+
+    fn read_dlq(path: &Path) -> Vec<(i32, i64, String, Vec<u8>)> {
+        let mut file = File::open(path).unwrap();
+        let mut header = [0u8; 8];
+        file.read_exact(&mut header).unwrap();
+        assert_eq!(header, DLQ_HEADER);
+        let mut out = Vec::new();
+        loop {
+            let mut len_bytes = [0u8; 4];
+            if file.read_exact(&mut len_bytes).is_err() {
+                break;
+            }
+            let len = u32::from_le_bytes(len_bytes) as usize;
+            let mut body = vec![0u8; len];
+            file.read_exact(&mut body).unwrap();
+            let mut checksum = [0u8; 8];
+            file.read_exact(&mut checksum).unwrap();
+            assert_eq!(journal::fnv1a(&body), u64::from_le_bytes(checksum));
+            let partition = i32::from_le_bytes(body[8..12].try_into().unwrap());
+            let offset = i64::from_le_bytes(body[12..20].try_into().unwrap());
+            let reason_len = u32::from_le_bytes(body[20..24].try_into().unwrap()) as usize;
+            let reason = String::from_utf8(body[24..24 + reason_len].to_vec()).unwrap();
+            let mut cursor = 24 + reason_len;
+            let payload_len =
+                u32::from_le_bytes(body[cursor..cursor + 4].try_into().unwrap()) as usize;
+            cursor += 4;
+            let payload = body[cursor..cursor + payload_len].to_vec();
+            out.push((partition, offset, reason, payload));
+        }
+        out
+    }
+
+    #[test]
+    fn persist_retry_dead_letters_after_exhausting_retries() {
+        let path = dlq_temp_path("poison");
+        let _ = std::fs::remove_file(&path);
+        let dlq = Mutex::new(DlqWriter::open(&path).unwrap());
+        let metrics = OrderPipelineMetrics::default();
+
+        let attempts = AtomicU64::new(0);
+        let outcome = persist_with_retry(
+            || {
+                attempts.fetch_add(1, AtomicOrdering::Relaxed);
+                Err("poison message".to_string())
+            },
+            &dlq,
+            &metrics,
+            3,
+            Duration::ZERO,
+            7,
+            42,
+            b"raw-envelope",
+        );
+
+        assert_eq!(outcome, PersistOutcome::DeadLettered);
+        assert_eq!(attempts.load(AtomicOrdering::Relaxed), 3, "tries up to the retry cap");
+        assert_eq!(metrics.dlq_total.load(AtomicOrdering::Relaxed), 1);
+
+        let records = read_dlq(&path);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].0, 7);
+        assert_eq!(records[0].1, 42);
+        assert!(records[0].2.contains("poison"));
+        assert_eq!(records[0].3, b"raw-envelope");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn persist_retry_commits_and_skips_dlq_on_eventual_success() {
+        let path = dlq_temp_path("recover");
+        let _ = std::fs::remove_file(&path);
+        let dlq = Mutex::new(DlqWriter::open(&path).unwrap());
+        let metrics = OrderPipelineMetrics::default();
+
+        let attempts = AtomicU64::new(0);
+        let outcome = persist_with_retry(
+            || {
+                // Fail twice, then succeed on the third attempt.
+                if attempts.fetch_add(1, AtomicOrdering::Relaxed) < 2 {
+                    Err("transient".to_string())
+                } else {
+                    Ok(())
+                }
+            },
+            &dlq,
+            &metrics,
+            5,
+            Duration::ZERO,
+            1,
+            2,
+            b"x",
+        );
+
+        assert_eq!(outcome, PersistOutcome::Committed);
+        assert_eq!(metrics.dlq_total.load(AtomicOrdering::Relaxed), 0);
+        assert!(read_dlq(&path).is_empty(), "no dead-letter on success");
+        std::fs::remove_file(&path).ok();
     }
 }

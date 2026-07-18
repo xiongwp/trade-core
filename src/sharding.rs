@@ -15,15 +15,121 @@
 
 use crate::types::InstrumentId;
 
-/// Number of physical databases.
+/// Number of physical databases (compile-time default / cold-start value).
 pub const DB_COUNT: u64 = 10;
-/// Tables per database.
+/// Tables per database (compile-time default / cold-start value).
 pub const TABLES_PER_DB: u64 = 100;
-/// Total shard slots.
+/// Total shard slots for the default configuration.
 pub const SLOTS: u64 = DB_COUNT * TABLES_PER_DB;
 /// Default number of instruments in one ordering category. With the default,
 /// instruments 1..=1000 share one ordered stream, 1001..=2000 the next, etc.
 pub const DEFAULT_ASSET_CATEGORY_SIZE: u32 = 1_000;
+/// Default route version stamped on a [`RouteConfig`] that was not given one.
+pub const DEFAULT_ROUTE_VERSION: u32 = 1;
+
+/// Versioned routing record: the shard fan-out parameters *plus* the route
+/// version they belong to. Every service that persists or routes order rows
+/// carries the same record, so changing a parameter is an explicit, versioned
+/// migration rather than a silent code edit.
+///
+/// # Changing `db_count` / `tables_per_db` REQUIRES a data migration
+///
+/// These two numbers drive [`RouteConfig::route_category`]'s modulo striping.
+/// Changing either remaps existing categories onto different `(db, table)`
+/// slots, so rows written under an old record become unreadable under a new
+/// one **unless the data is physically migrated**. The safe procedure is:
+/// bump `route_version`, freeze writes for the affected categories, copy rows
+/// to their new slots, verify the fingerprint, then atomically switch the
+/// version. Never mutate `db_count`/`tables_per_db` in place on a live dataset.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RouteConfig {
+    /// Number of physical databases. See the type docs: changing this needs a
+    /// data migration, not just a config edit.
+    pub db_count: u64,
+    /// Tables per database. Same migration caveat as `db_count`.
+    pub tables_per_db: u64,
+    /// Version this parameter set belongs to; part of the routing record so a
+    /// parameter change is a fenced, versioned migration.
+    pub route_version: u32,
+}
+
+impl Default for RouteConfig {
+    fn default() -> Self {
+        Self {
+            db_count: DB_COUNT,
+            tables_per_db: TABLES_PER_DB,
+            route_version: DEFAULT_ROUTE_VERSION,
+        }
+    }
+}
+
+impl RouteConfig {
+    /// Build an explicit routing record. Panics on zero parameters — a shard
+    /// map with no databases or no tables cannot route anything.
+    pub fn new(db_count: u64, tables_per_db: u64, route_version: u32) -> Self {
+        assert!(db_count > 0, "at least one physical database is required");
+        assert!(tables_per_db > 0, "at least one table per database is required");
+        Self {
+            db_count,
+            tables_per_db,
+            route_version,
+        }
+    }
+
+    /// Read the routing record from the environment: `TC_DB_COUNT` and
+    /// `TC_TABLES_PER_DB` (defaults 10 / 100, preserving the historical shard
+    /// map) and `TC_SHARD_ROUTE_VERSION` (default 1). Invalid or zero values
+    /// fall back to the defaults.
+    pub fn from_env() -> Self {
+        let db_count = env_u64("TC_DB_COUNT").unwrap_or(DB_COUNT);
+        let tables_per_db = env_u64("TC_TABLES_PER_DB").unwrap_or(TABLES_PER_DB);
+        let route_version = std::env::var("TC_SHARD_ROUTE_VERSION")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(DEFAULT_ROUTE_VERSION);
+        Self::new(db_count, tables_per_db, route_version)
+    }
+
+    /// Total shard slots (`db_count * tables_per_db`).
+    #[inline]
+    pub fn slots(&self) -> u64 {
+        self.db_count.saturating_mul(self.tables_per_db)
+    }
+
+    /// Route a category to one stable slot. Same striped-modulo algorithm as
+    /// the free [`route_category`] function, with the parameters injected:
+    /// consecutive categories stripe across databases first, then tables.
+    #[inline]
+    pub fn route_category(&self, category_id: u32) -> ShardRoute {
+        let slot = category_id as u64 % self.slots();
+        ShardRoute {
+            db: (slot % self.db_count) as u32,
+            table: (slot / self.db_count) as u32,
+        }
+    }
+
+    /// Enumerate every `(db_name, table_name)` pair for this configuration.
+    pub fn all_tables(&self) -> impl Iterator<Item = (String, String)> {
+        let db_count = self.db_count;
+        let tables_per_db = self.tables_per_db;
+        (0..db_count).flat_map(move |db| {
+            (0..tables_per_db).map(move |table| {
+                let r = ShardRoute {
+                    db: db as u32,
+                    table: table as u32,
+                };
+                (r.db_name(), r.table_name())
+            })
+        })
+    }
+}
+
+fn env_u64(name: &str) -> Option<u64> {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+}
 
 /// Where an asset category's rows live.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -162,5 +268,44 @@ mod tests {
         let pinned = std::collections::HashMap::from([(42, 7)]);
         assert_eq!(raft_group_for_category_pinned(42, 8, &pinned), 7);
         assert_eq!(raft_group_for_category_pinned(43, 8, &pinned), 3);
+    }
+
+    #[test]
+    fn default_route_config_matches_the_const_routing() {
+        let cfg = RouteConfig::default();
+        assert_eq!(cfg.db_count, DB_COUNT);
+        assert_eq!(cfg.tables_per_db, TABLES_PER_DB);
+        assert_eq!(cfg.slots(), SLOTS);
+        for category in [0u32, 1, 42, 999, 12_345, u32::MAX] {
+            assert_eq!(cfg.route_category(category), route_category(category));
+        }
+    }
+
+    #[test]
+    fn route_config_is_deterministic_and_in_range_for_any_parameters() {
+        for (db_count, tables_per_db) in [(1u64, 1u64), (10, 100), (100, 100), (7, 13)] {
+            let cfg = RouteConfig::new(db_count, tables_per_db, 5);
+            for category in [0u32, 1, 3, 999, 1_000, 100_000, u32::MAX] {
+                let a = cfg.route_category(category);
+                // Stable: the same category always lands on the same slot.
+                assert_eq!(a, cfg.route_category(category));
+                assert!((a.db as u64) < db_count, "db in range for {db_count}");
+                assert!((a.table as u64) < tables_per_db, "table in range");
+            }
+            assert_eq!(cfg.all_tables().count() as u64, cfg.slots());
+        }
+    }
+
+    #[test]
+    fn different_db_count_reshards_slots_as_expected() {
+        // 100-database record spreads the first 100 categories one-per-db.
+        let cfg = RouteConfig::new(100, 100, 2);
+        let mut seen = std::collections::HashSet::new();
+        for category in 0..100u32 {
+            assert!(seen.insert(cfg.route_category(category).db));
+        }
+        assert_eq!(seen.len(), 100);
+        assert_eq!(cfg.route_category(0), ShardRoute { db: 0, table: 0 });
+        assert_eq!(cfg.route_category(100), ShardRoute { db: 0, table: 1 });
     }
 }

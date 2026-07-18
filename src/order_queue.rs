@@ -38,6 +38,18 @@ impl QueueRouter {
         &self.topics
     }
 
+    /// Number of partitions each topic carries. The topic/partition modulo
+    /// route is fully parameterised by `topics` and this value, both injected
+    /// at construction from the existing `TC_ORDER_KAFKA_*` environment.
+    pub fn partitions_per_topic(&self) -> u32 {
+        self.partitions_per_topic
+    }
+
+    /// Total addressable partitions across every queue group.
+    pub fn partition_count(&self) -> usize {
+        self.topics.len() * self.partitions_per_topic as usize
+    }
+
     /// Stable category routing across multiple queue groups. A category stays
     /// on exactly one partition; changing this mapping requires a fenced route
     /// version transition.
@@ -50,6 +62,17 @@ impl QueueRouter {
             partition: partition as i32,
             version: self.version,
         }
+    }
+
+    /// Flatten a category's route to a single global partition index in
+    /// `0..partition_count()`, ordered as `topic_pos * partitions_per_topic +
+    /// partition`. Per-category backpressure keys lag readings off this index
+    /// so one hot partition throttles only the categories that share it.
+    pub fn partition_index(&self, category_id: u32) -> usize {
+        let topic_count = self.topics.len() as u32;
+        let topic = (category_id % topic_count) as usize;
+        let partition = ((category_id / topic_count) % self.partitions_per_topic) as usize;
+        topic * self.partitions_per_topic as usize + partition
     }
 }
 
@@ -109,6 +132,29 @@ mod tests {
         assert_eq!(router.route(3).partition, 1);
         assert_eq!(router.route(3), router.route(3));
         assert_eq!(router.route(3).version, 7);
+    }
+
+    #[test]
+    fn partition_index_is_stable_and_matches_route() {
+        let router = QueueRouter::new(
+            vec!["orders-g0".into(), "orders-g1".into(), "orders-g2".into()],
+            64,
+            1,
+        );
+        assert_eq!(router.partition_count(), 3 * 64);
+        for category in [0u32, 1, 2, 3, 5, 191, 200, 100_000] {
+            let idx = router.partition_index(category);
+            assert!(idx < router.partition_count());
+            assert_eq!(idx, router.partition_index(category));
+            // Index agrees with the human-readable route it flattens.
+            let route = router.route(category);
+            let topic_pos = router
+                .topics()
+                .iter()
+                .position(|t| *t == route.topic)
+                .unwrap();
+            assert_eq!(idx, topic_pos * 64 + route.partition as usize);
+        }
     }
 
     #[test]
