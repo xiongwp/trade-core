@@ -328,6 +328,7 @@ fn duplicate_commands_are_rejected_and_cursor_persists() {
         &path,
         trade_core::snapshot::SnapshotData {
             journal_seq: 0,
+            raft_applied_index: 0,
             max_cmd_id: 6,
             max_admin_id: 6,
             halted: &[],

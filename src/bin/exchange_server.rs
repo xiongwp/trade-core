@@ -143,6 +143,7 @@ fn main() {
         pool_orders_per_book,
         prefault: true,
         journal_dir: journal,
+        raft_wal_authoritative: false,
         journal_flush: Duration::from_secs(1),
         journal_fsync: Duration::from_secs(1),
         price_guard: Some(guard),

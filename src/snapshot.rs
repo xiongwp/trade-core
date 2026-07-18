@@ -39,7 +39,8 @@ use crate::order::Order;
 use crate::types::*;
 
 const MAGIC: &[u8; 4] = b"TCS1";
-const VERSION: u32 = 3; // v3: + halted instruments + position ledger
+const VERSION: u32 = 4; // v4: + last durably applied Raft index
+const LEGACY_VERSION: u32 = 3;
 const ORDER_ENC: usize = 56;
 
 fn encode_order(o: &Order, out: &mut [u8; ORDER_ENC]) {
@@ -103,8 +104,15 @@ pub struct EngineState {
 
 /// A decoded shard snapshot.
 pub struct Snapshot {
+    /// On-disk format version. Version 3 snapshots can be upgraded from their
+    /// legacy shard journal; version 4 snapshots are self-describing for Raft
+    /// WAL replay.
+    pub format_version: u32,
     /// Journal sequence at capture time; replay records with seq > this.
     pub journal_seq: u64,
+    /// Highest Raft entry represented by this exact in-memory state image.
+    /// Recovery replays committed entries strictly above this index.
+    pub raft_applied_index: u64,
     /// Idempotency high-water marks (dual dedup cursors: New / admin streams).
     pub max_cmd_id: u64,
     pub max_admin_id: u64,
@@ -120,6 +128,7 @@ pub struct Snapshot {
 /// Borrowed state supplied when atomically writing a snapshot.
 pub struct SnapshotData<'a> {
     pub journal_seq: u64,
+    pub raft_applied_index: u64,
     pub max_cmd_id: u64,
     pub max_admin_id: u64,
     pub halted: &'a [u32],
@@ -134,6 +143,7 @@ pub fn write(path: &Path, data: SnapshotData<'_>) -> io::Result<()> {
     buf.extend_from_slice(MAGIC);
     buf.extend_from_slice(&VERSION.to_le_bytes());
     buf.extend_from_slice(&data.journal_seq.to_le_bytes());
+    buf.extend_from_slice(&data.raft_applied_index.to_le_bytes());
     buf.extend_from_slice(&data.max_cmd_id.to_le_bytes());
     buf.extend_from_slice(&data.max_admin_id.to_le_bytes());
     buf.extend_from_slice(&(data.halted.len() as u32).to_le_bytes());
@@ -175,9 +185,9 @@ pub fn write(path: &Path, data: SnapshotData<'_>) -> io::Result<()> {
         f.sync_all()?; // durable before it can become "the" snapshot
     }
     fs::rename(&tmp, path)?; // atomic on POSIX filesystems
-    // fsync the parent directory so the rename itself survives a crash;
-    // otherwise the directory entry may still point at the old (or no)
-    // snapshot after power loss even though the file data is durable.
+                             // fsync the parent directory so the rename itself survives a crash;
+                             // otherwise the directory entry may still point at the old (or no)
+                             // snapshot after power loss even though the file data is durable.
     if let Some(parent) = path.parent() {
         File::open(parent)
             .and_then(|dir| dir.sync_all())
@@ -206,13 +216,19 @@ pub fn load(path: &Path) -> io::Result<Snapshot> {
         return Err(corrupt("checksum mismatch"));
     }
     let version = u32::from_le_bytes(buf[4..8].try_into().unwrap());
-    if version != VERSION {
+    if version != VERSION && version != LEGACY_VERSION {
         return Err(corrupt("unsupported version"));
     }
     let journal_seq = u64::from_le_bytes(buf[8..16].try_into().unwrap());
-    let max_cmd_id = u64::from_le_bytes(buf[16..24].try_into().unwrap());
-    let max_admin_id = u64::from_le_bytes(buf[24..32].try_into().unwrap());
-    let mut pos = 32;
+    let (raft_applied_index, mut pos) = if version >= 4 {
+        (u64::from_le_bytes(buf[16..24].try_into().unwrap()), 24)
+    } else {
+        (0, 16)
+    };
+    let max_cmd_id = u64::from_le_bytes(buf[pos..pos + 8].try_into().unwrap());
+    pos += 8;
+    let max_admin_id = u64::from_le_bytes(buf[pos..pos + 8].try_into().unwrap());
+    pos += 8;
     let n_halt = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
     pos += 4;
     let mut halted = Vec::with_capacity(n_halt);
@@ -265,7 +281,9 @@ pub fn load(path: &Path) -> io::Result<Snapshot> {
         });
     }
     Ok(Snapshot {
+        format_version: version,
         journal_seq,
+        raft_applied_index,
         max_cmd_id,
         max_admin_id,
         halted,
@@ -301,6 +319,7 @@ mod tests {
             &path,
             SnapshotData {
                 journal_seq: 1000,
+                raft_applied_index: 777,
                 max_cmd_id: 555,
                 max_admin_id: 556,
                 halted: &[7],
@@ -313,6 +332,7 @@ mod tests {
 
         let snap = load(&path).unwrap();
         assert_eq!(snap.journal_seq, 1000);
+        assert_eq!(snap.raft_applied_index, 777);
         assert_eq!(snap.max_cmd_id, 555);
         assert_eq!(snap.max_admin_id, 556);
         assert_eq!(snap.halted, vec![7]);
@@ -326,6 +346,24 @@ mod tests {
         assert_eq!(e.orders[0].id, OrderId(1));
         assert_eq!(e.orders[0].user, 11);
         assert_eq!(e.orders[1].price, 101);
+
+        // Version 3 had no explicit Raft index. It remains readable so an
+        // existing snapshot+journal node can perform the one-time safe upgrade
+        // to the Raft-authoritative format.
+        let current = std::fs::read(&path).unwrap();
+        let current_body = current.len() - 8;
+        let mut legacy = Vec::with_capacity(current.len() - 8);
+        legacy.extend_from_slice(MAGIC);
+        legacy.extend_from_slice(&LEGACY_VERSION.to_le_bytes());
+        legacy.extend_from_slice(&current[8..16]);
+        legacy.extend_from_slice(&current[24..current_body]);
+        legacy.extend_from_slice(&fnv1a(&legacy).to_le_bytes());
+        std::fs::write(&path, &legacy).unwrap();
+        let legacy_snap = load(&path).unwrap();
+        assert_eq!(legacy_snap.format_version, 3);
+        assert_eq!(legacy_snap.raft_applied_index, 0);
+        assert_eq!(legacy_snap.journal_seq, 1000);
+        assert_eq!(legacy_snap.engines[0].orders.len(), 2);
 
         // Flip one byte: load must fail, not deliver silent garbage.
         let mut bytes = std::fs::read(&path).unwrap();

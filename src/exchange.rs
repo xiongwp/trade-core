@@ -9,7 +9,7 @@
 //!                                 lock-free SPSC
 //!   OrderGateway.submit(New) ───▶ [normal queue] ─┐
 //!   OrderGateway.submit(Cancel)─▶ [ high queue  ] ─┼─▶ Shard thread N (CPU-pinned)
-//!   OrderGateway.submit(Modify)─▶ [ high queue  ] ─┤     1. journal command (WAL)
+//!   OrderGateway.submit(Modify)─▶ [ high queue  ] ─┤     1. establish durable order
 //!   OrderGateway.submit(FClose)─▶ [ high queue  ] ─┘     2. price-guard vet
 //!                                                        3. match in memory
 //!   ResultSink.poll(...)     ◀─── [result queue] ◀────── 4. emit ExecReports (async)
@@ -18,10 +18,11 @@
 //! * **Multi-asset**: instruments are hashed to shards; each shard owns the books
 //!   for its instruments outright — the reason no locks are needed. Across
 //!   machines, the same routing extends via [`crate::cluster::ClusterMap`].
-//! * **Ordering & recovery**: every command is journaled in exact processing
-//!   order before it touches a book; the engine is deterministic, so replaying
-//!   the journal (see [`replay_journal`]) reproduces identical results. Loss
-//!   window is bounded by the journal flush cadence (seconds, by design).
+//! * **Ordering & recovery**: standalone mode journals every command in exact
+//!   processing order before it touches a book. Raft mode instead treats the
+//!   quorum-replicated Raft WAL as the sole command log and restores an atomic
+//!   memory snapshot plus the committed tail. Both paths use the same
+//!   deterministic processor, so replay reproduces identical results.
 //! * **Cancel/modify/force-close priority**: the high-priority queue is fully
 //!   drained before, and between, new orders.
 
@@ -34,7 +35,7 @@ use std::time::Duration;
 
 use std::time::Instant;
 
-use crate::asset_log::AssetJournalSet;
+use crate::asset_log::{AppliedBatchProof, AssetJournalSet};
 use crate::engine::{MatchingEngine, SelfTradePolicy};
 use crate::journal::{self, JournalReader, JournalWriter};
 use crate::lockfree::{self, Consumer, Producer};
@@ -117,6 +118,10 @@ pub enum Command {
 struct QueuedCommand {
     command: Command,
     raft_index: Option<u64>,
+    /// Present only during Raft recovery for a batch whose Outbox/result proof
+    /// is already durable. The shard rebuilds memory, verifies the exact result
+    /// stream, and suppresses duplicate side effects.
+    replay_proof: Option<AppliedBatchProof>,
 }
 
 impl Command {
@@ -268,6 +273,10 @@ pub struct ExchangeConfig {
     pub prefault: bool,
     /// Directory for per-shard command journals (`None` = no journaling).
     pub journal_dir: Option<PathBuf>,
+    /// Treat the replicated Raft WAL as the only command log. `journal_dir`
+    /// then stores state snapshots and application proofs only; per-asset and
+    /// per-shard command journals are not written on the matching hot path.
+    pub raft_wal_authoritative: bool,
     /// User-space flush cadence for the journal (loss window, roughly).
     pub journal_flush: Duration,
     /// fsync cadence (OS buffers → disk). The full loss window is about
@@ -278,9 +287,9 @@ pub struct ExchangeConfig {
     /// Pin shard `i` to CPU core `i` (best effort; see [`crate::affinity`]).
     pub pin_cpus: bool,
     /// Periodic state snapshots (requires `journal_dir`): each shard writes
-    /// `snapshot-shard-N.bin` and truncates its journal, bounding recovery time
-    /// to the commands since the last snapshot. `None` = manual only
-    /// (via [`ExchangeHandle::snapshot_now`]).
+    /// `snapshot-shard-N.bin`. Standalone mode truncates its covered command
+    /// journal; authoritative-Raft mode stores the covered Raft applied index.
+    /// `None` = manual only (via [`ExchangeHandle::snapshot_now`]).
     pub snapshot_every: Option<Duration>,
     /// Self-trade prevention policy applied to every book.
     pub stp: SelfTradePolicy,
@@ -312,6 +321,7 @@ impl Default for ExchangeConfig {
             pool_orders_per_book: 4096,
             prefault: false,
             journal_dir: None,
+            raft_wal_authoritative: false,
             journal_flush: Duration::from_secs(1),
             journal_fsync: Duration::from_secs(1),
             price_guard: None,
@@ -369,19 +379,32 @@ impl OrderGateway {
     /// the high-priority queue; new orders to the normal queue. Returns
     /// `Err(cmd)` if the target queue is full (backpressure).
     pub fn submit(&self, cmd: Command) -> Result<(), Command> {
-        self.submit_with_raft_index(cmd, None)
+        self.submit_with_raft_index(cmd, None, None)
     }
 
     /// Submit a command that has already crossed the Raft quorum. Its index is
     /// persisted with the local application watermark before matching.
     pub fn submit_committed(&self, raft_index: u64, cmd: Command) -> Result<(), Command> {
-        self.submit_with_raft_index(cmd, Some(raft_index))
+        self.submit_with_raft_index(cmd, Some(raft_index), None)
     }
 
-    fn submit_with_raft_index(&self, cmd: Command, raft_index: Option<u64>) -> Result<(), Command> {
+    /// Rebuild in-memory state for an entry whose exact result stream is
+    /// already durable. No report is appended or emitted; the supplied proof
+    /// must match deterministic replay exactly or the shard fails closed.
+    pub fn submit_recovered(&self, proof: AppliedBatchProof, cmd: Command) -> Result<(), Command> {
+        self.submit_with_raft_index(cmd, Some(proof.raft_index), Some(proof))
+    }
+
+    fn submit_with_raft_index(
+        &self,
+        cmd: Command,
+        raft_index: Option<u64>,
+        replay_proof: Option<AppliedBatchProof>,
+    ) -> Result<(), Command> {
         let queued = QueuedCommand {
             command: cmd,
             raft_index,
+            replay_proof,
         };
         let instrument = queued.command.instrument();
         if let Some(tx) = self.instruments.get(&instrument) {
@@ -514,8 +537,9 @@ impl ExchangeHandle {
         self.resume();
     }
 
-    /// Ask every shard to take a snapshot (and truncate its journal) at its
-    /// next opportunity. No-op for shards without journal/snapshot config.
+    /// Ask every shard to take a snapshot at its next opportunity. Standalone
+    /// shards also truncate their covered journal. No-op without snapshot
+    /// configuration.
     pub fn snapshot_now(&self) {
         for r in &self.snap_requests {
             r.store(true, Ordering::Release);
@@ -566,6 +590,10 @@ fn build_inner(
     rep: Option<crate::replication::RepFanout>,
 ) -> (OrderGateway, ResultSink, ExchangeHandle) {
     assert!(config.shards >= 1, "need at least one shard");
+    assert!(
+        !config.raft_wal_authoritative || config.shards == 1,
+        "Raft authoritative matching currently requires exactly one state-machine shard per group"
+    );
     let metrics = Arc::new(crate::metrics::Metrics::default());
     let running = Arc::new(AtomicBool::new(true));
     let started = Arc::new(AtomicBool::new(start_now));
@@ -625,30 +653,49 @@ fn build_inner(
             }
         }
 
-        // Journal + snapshot + fsync thread for this shard. On startup, any
-        // existing snapshot + journal is recovered into the processor first.
+        // Persistence for this shard. Standalone mode opens its command/asset
+        // journals; authoritative-Raft mode opens only snapshot, application
+        // proof and result-outbox state.
         let mut journal_w = None;
         let mut asset_journal = None;
         let mut execution_outbox = None;
         let mut snapshot_path = None;
+        let mut applied_root = None;
+        let mut initial_raft_index = 0u64;
         if let Some(dir) = &config.journal_dir {
             std::fs::create_dir_all(dir).expect("create journal dir");
             let jpath = dir.join(format!("journal-shard-{shard_id}.bin"));
             let spath = dir.join(format!("snapshot-shard-{shard_id}.bin"));
-            let (_, last_seq) =
-                recover_stats(&mut processor, &spath, &jpath).expect("recover shard state");
-            let mut w = JournalWriter::open(&jpath, config.journal_flush).expect("open journal");
-            // The journal seq IS the total order: continue it, never restart it.
-            w.resume_from(last_seq);
-            if let Ok(fh) = w.file_handle() {
-                journal::spawn_fsyncer(fh, config.journal_fsync, running.clone(), metrics.clone());
+            let proof_root = dir.join("assets");
+            std::fs::create_dir_all(&proof_root).expect("create Raft application proof dir");
+            if config.raft_wal_authoritative {
+                initial_raft_index =
+                    recover_raft_authoritative(&mut processor, &spath, &jpath, &proof_root)
+                        .expect("recover matching snapshot for Raft WAL replay");
+                applied_root = Some(proof_root);
+                snapshot_path = Some(spath);
+            } else {
+                let (_, last_seq) =
+                    recover_stats(&mut processor, &spath, &jpath).expect("recover shard state");
+                let mut w =
+                    JournalWriter::open(&jpath, config.journal_flush).expect("open journal");
+                // The journal seq IS the total order: continue it, never restart it.
+                w.resume_from(last_seq);
+                if let Ok(fh) = w.file_handle() {
+                    journal::spawn_fsyncer(
+                        fh,
+                        config.journal_fsync,
+                        running.clone(),
+                        metrics.clone(),
+                    );
+                }
+                journal_w = Some(w);
+                asset_journal = Some(
+                    AssetJournalSet::open(proof_root, config.journal_flush)
+                        .expect("open per-asset journals"),
+                );
+                snapshot_path = Some(spath);
             }
-            journal_w = Some(w);
-            asset_journal = Some(
-                AssetJournalSet::open(dir.join("assets"), config.journal_flush)
-                    .expect("open per-asset journals"),
-            );
-            snapshot_path = Some(spath);
         }
         if let Some(dir) = &config.execution_outbox_dir {
             let outbox_path = dir.join(format!("outbox-shard-{shard_id}.bin"));
@@ -665,9 +712,10 @@ fn build_inner(
                     .ok()
                     .and_then(|batches| batches.into_iter().max())
             });
-            let newest = crate::execution_outbox::latest_segment(&outbox_path).unwrap_or_else(
-                |error| panic!("scan execution outbox segments {}: {error}", dir.display()),
-            );
+            let newest =
+                crate::execution_outbox::latest_segment(&outbox_path).unwrap_or_else(|error| {
+                    panic!("scan execution outbox segments {}: {error}", dir.display())
+                });
             crate::execution_outbox::truncate_after_applied(&newest, max_applied).unwrap_or_else(
                 |error| {
                     panic!(
@@ -713,6 +761,9 @@ fn build_inner(
             journal: journal_w,
             asset_journal,
             execution_outbox,
+            applied_root,
+            last_raft_index: initial_raft_index,
+            raft_wal_authoritative: config.raft_wal_authoritative,
             raft_group_id: config.raft_group_id,
             snapshot_path,
             snapshot_every: config.snapshot_every,
@@ -731,6 +782,8 @@ fn build_inner(
                 .spawn(move || shard.run())
                 .expect("spawn shard"),
         );
+        metrics.set_raft_enqueued_index(initial_raft_index);
+        metrics.set_raft_applied_index(initial_raft_index);
     }
 
     (
@@ -1282,11 +1335,16 @@ struct Shard {
     next_instrument: usize,
     result_tx: Producer<ExecutionReportEvent>,
     journal: Option<JournalWriter>,
-    /// Portable WALs written per asset alongside the legacy shard journal.
-    /// They provide the migration/replay unit while shard snapshots retain the
-    /// existing fast restart path during the transition.
+    /// Portable WALs written per asset in standalone/legacy mode. Production
+    /// authoritative-Raft mode leaves this unset so the consensus WAL remains
+    /// the single command log.
     asset_journal: Option<AssetJournalSet>,
     execution_outbox: Option<crate::execution_outbox::ExecutionOutboxWriter>,
+    /// Directory containing durable Raft application proofs.
+    applied_root: Option<PathBuf>,
+    /// Highest Raft index represented by the live in-memory state.
+    last_raft_index: u64,
+    raft_wal_authoritative: bool,
     raft_group_id: u32,
     snapshot_path: Option<PathBuf>,
     snapshot_every: Option<Duration>,
@@ -1472,41 +1530,28 @@ impl Shard {
         }
     }
 
-    /// Capture state, persist it atomically, then truncate the journal. Safe
-    /// against a crash at any point in between (recovery skips journal records
-    /// already covered by the snapshot's sequence number).
+    /// Capture state and persist it atomically. Standalone mode then truncates
+    /// its covered journal; authoritative-Raft mode retains the consensus WAL
+    /// and stores its applied index in the snapshot.
     fn take_snapshot(&mut self) {
-        let (Some(path), Some(j)) = (self.snapshot_path.as_ref(), self.journal.as_mut()) else {
+        let Some(path) = self.snapshot_path.as_ref() else {
             return;
         };
-        if j.flush().is_err() {
-            return;
-        }
-        let states = self.processor.export_state();
-        let halted: Vec<u32> = self.processor.halted.iter().map(|i| i.0).collect();
-        let suspended: Vec<u64> = self.processor.suspended.iter().copied().collect();
-        let positions: Vec<(u64, u32, i64)> = self
-            .processor
-            .positions
-            .iter()
-            .filter(|(_, &q)| q != 0)
-            .map(|(&(u, i), &q)| (u, i.0, q))
-            .collect();
-        if snapshot::write(
-            path,
-            snapshot::SnapshotData {
-                journal_seq: j.seq(),
-                max_cmd_id: self.processor.max_new_id,
-                max_admin_id: self.processor.max_admin_id,
-                halted: &halted,
-                suspended: &suspended,
-                positions: &positions,
-                engines: &states,
-            },
-        )
-        .is_ok()
+        let journal_seq = match self.journal.as_mut() {
+            Some(journal) => {
+                if journal.flush().is_err() {
+                    return;
+                }
+                journal.seq()
+            }
+            None => 0,
+        };
+        if persist_processor_snapshot(&self.processor, path, journal_seq, self.last_raft_index)
+            .is_ok()
         {
-            let _ = j.truncate();
+            if let Some(journal) = self.journal.as_mut() {
+                let _ = journal.truncate();
+            }
         }
         self.last_snapshot = Instant::now();
     }
@@ -1549,19 +1594,21 @@ impl Shard {
         let QueuedCommand {
             command: cmd,
             raft_index,
+            replay_proof,
         } = queued;
         // Batches flatten HERE: each inner command is journaled/replicated as
         // its own record (the total order stays flat and replayable); atomicity
         // holds because this thread pops nothing until the loop finishes.
         if let Command::Batch(cmds) = cmd {
             if let Some(index) = raft_index {
-                self.handle_committed_batch(index, cmds, started);
+                self.handle_committed_batch(index, cmds, replay_proof, started);
                 return;
             }
             for c in cmds {
                 self.handle(QueuedCommand {
                     command: c,
                     raft_index: None,
+                    replay_proof: None,
                 });
             }
             return;
@@ -1674,9 +1721,27 @@ impl Shard {
         &mut self,
         raft_index: u64,
         commands: Vec<Command>,
+        replay_proof: Option<AppliedBatchProof>,
         started: Instant,
     ) {
         if commands.is_empty() {
+            return;
+        }
+        if let Some(proof) = replay_proof {
+            assert_eq!(
+                proof.raft_index, raft_index,
+                "Raft replay proof index does not match queued entry"
+            );
+            let mut reports = Vec::new();
+            for command in commands {
+                self.processor
+                    .process(command, &mut |report| reports.push(report));
+            }
+            let fingerprint = fingerprint_reports(&reports);
+            crate::asset_log::verify_applied_batch(proof, reports.len() as u32, fingerprint)
+                .unwrap_or_else(|error| panic!("{error}"));
+            self.last_raft_index = raft_index;
+            self.metrics.set_raft_applied_index(raft_index);
             return;
         }
         let wal_started = Instant::now();
@@ -1792,7 +1857,21 @@ impl Shard {
         // application watermark: a crash before this point re-applies the batch
         // and regenerates its (idempotent) outbox records; a crash after it
         // finds those records already present.
-        if let Some(asset_journal) = &self.asset_journal {
+        if self.raft_wal_authoritative {
+            let reports = emitted
+                .iter()
+                .map(|event| event.report.clone())
+                .collect::<Vec<_>>();
+            crate::asset_log::mark_applied_batch(
+                self.applied_root
+                    .as_deref()
+                    .expect("Raft authoritative matching requires an application proof dir"),
+                raft_index,
+                reports.len() as u32,
+                fingerprint_reports(&reports),
+            )
+            .expect("persist exact Raft application result proof");
+        } else if let Some(asset_journal) = &self.asset_journal {
             asset_journal
                 .mark_raft_batch_applied(&touched, raft_index)
                 .expect("persist Raft batch application watermarks");
@@ -1817,6 +1896,7 @@ impl Shard {
         for event in emitted {
             self.emit_report_event(event);
         }
+        self.last_raft_index = raft_index;
         self.metrics.set_raft_applied_index(raft_index);
         let command_ns = started.elapsed().as_nanos() as u64;
         self.metrics.record_command_latency(command_ns);
@@ -1899,6 +1979,76 @@ impl Shard {
 // ---------------------------------------------------------------------------
 // Journal replay
 // ---------------------------------------------------------------------------
+
+fn persist_processor_snapshot(
+    processor: &Processor,
+    path: &Path,
+    journal_seq: u64,
+    raft_applied_index: u64,
+) -> std::io::Result<()> {
+    let states = processor.export_state();
+    let halted: Vec<u32> = processor
+        .halted
+        .iter()
+        .map(|instrument| instrument.0)
+        .collect();
+    let suspended: Vec<u64> = processor.suspended.iter().copied().collect();
+    let positions: Vec<(u64, u32, i64)> = processor
+        .positions
+        .iter()
+        .filter(|(_, &quantity)| quantity != 0)
+        .map(|(&(user, instrument), &quantity)| (user, instrument.0, quantity))
+        .collect();
+    snapshot::write(
+        path,
+        snapshot::SnapshotData {
+            journal_seq,
+            raft_applied_index,
+            max_cmd_id: processor.max_new_id,
+            max_admin_id: processor.max_admin_id,
+            halted: &halted,
+            suspended: &suspended,
+            positions: &positions,
+            engines: &states,
+        },
+    )
+}
+
+/// Restore a version-4 matching snapshot whose Raft index is explicit. Legacy
+/// snapshot+journal deployments are upgraded once, using their already-durable
+/// application watermark as the exact Raft boundary. The old files are kept
+/// for rollback but are no longer appended after this succeeds.
+fn recover_raft_authoritative(
+    processor: &mut Processor,
+    snapshot_path: &Path,
+    legacy_journal_path: &Path,
+    applied_root: &Path,
+) -> std::io::Result<u64> {
+    if snapshot_path.exists() {
+        let snap = snapshot::load(snapshot_path)?;
+        if snap.format_version >= 4 {
+            let index = snap.raft_applied_index;
+            processor.restore_state(&snap);
+            return Ok(index);
+        }
+    }
+
+    let has_legacy_state = snapshot_path.exists() || legacy_journal_path.exists();
+    if !has_legacy_state {
+        return Ok(0);
+    }
+    let (_, last_seq) = recover_stats(processor, snapshot_path, legacy_journal_path)?;
+    let applied = crate::asset_log::load_applied_batches(applied_root)?;
+    let raft_applied_index = applied.iter().max().copied().unwrap_or(0);
+    if last_seq != 0 && raft_applied_index == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "legacy matching state has no durable Raft application watermark",
+        ));
+    }
+    persist_processor_snapshot(processor, snapshot_path, 0, raft_applied_index)?;
+    Ok(raft_applied_index)
+}
 
 /// The outcome of replaying one shard journal.
 pub struct ReplaySummary {

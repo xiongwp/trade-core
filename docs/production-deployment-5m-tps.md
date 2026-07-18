@@ -275,7 +275,7 @@ batch=1000 -> 约 72 个事务/s/实例
 - Kafka produce TPS、bytes、ISR、under-replicated partitions、consumer lag。
 - `mysql_commit_ms`、事务批大小、锁等待、redo fsync、buffer pool hit rate。
 - `raft_commit_ms`、term、leader、quorum、proposal queue、raft lag。
-- `wal_fsync_ms`、WAL bytes、磁盘延迟、磁盘剩余空间、applied watermark。
+- Raft WAL fsync、结果Outbox/应用证明持久化延迟、WAL bytes、快照耗时、磁盘延迟与剩余空间、applied watermark。
 - `match_ms`、queue depth、订单簿深度、拒绝数、撮合报告积压。
 - execution outbox depth、最老未发布事件年龄、重复消费数。
 

@@ -1,25 +1,23 @@
 # Five physical matching nodes. Every node hosts four independent Raft groups;
-# each group has one replica on every node and owns isolated consensus state,
-# matching journals and per-asset WALs.
+# each group has one replica on every node and owns an isolated consensus WAL,
+# in-memory matching snapshot, application proofs and execution Outbox.
 x-raft-environment: &raft-environment
   # Structured-log level and panic backtraces for every Raft member.
   TC_LOG: "${TC_LOG:-info}"
   RUST_BACKTRACE: "${RUST_BACKTRACE:-1}"
-  # Warn when a durability fsync (asset WAL / journal / execution outbox group
-  # commit) exceeds this many milliseconds.
+  # Warn when an execution Outbox/application-proof durability boundary exceeds
+  # this many milliseconds. The command itself is already durable in Raft WAL.
   TC_SLOW_FSYNC_WARN_MS: "${TC_SLOW_FSYNC_WARN_MS:-50}"
   TC_MATCH_POOL_PER_ASSET: "${TC_MATCH_POOL_PER_ASSET:-2}"
-  TC_WAL_PREALLOCATE_BYTES: "${TC_WAL_PREALLOCATE_BYTES:-0}"
-  TC_ASSET_WAL_MAX_OPEN_WRITERS: "${TC_ASSET_WAL_MAX_OPEN_WRITERS:-1024}"
-  TC_ASSET_WAL_BUFFER_BYTES: "${TC_ASSET_WAL_BUFFER_BYTES:-8192}"
   TC_RAFT_TRANSPORT_QUEUE: "${TC_RAFT_TRANSPORT_QUEUE:-8192}"
   TC_RAFT_READY_MAX_APPLY_LAG: "${TC_RAFT_READY_MAX_APPLY_LAG:-32}"
   TC_RAFT_READY_MAX_OUTBOX_PENDING: "${TC_RAFT_READY_MAX_OUTBOX_PENDING:-10000}"
   TC_RAFT_DEDUP_MAX_IDS: "${TC_RAFT_DEDUP_MAX_IDS:-1000000}"
-  # Engine snapshot cadence (bounds per-asset WAL growth + recovery time).
+  # Durable in-memory engine snapshot cadence. Recovery loads this image and
+  # deterministically replays the committed Raft tail above its embedded index.
   TC_SNAPSHOT_EVERY_SECS: "${TC_SNAPSHOT_EVERY_SECS:-30}"
-  # Raft log compaction: fold + truncate the consensus WAL prefix once this many
-  # durably-applied entries accumulate past the last snapshot (0 = off).
+  # Must remain 0 until matching snapshot transfer is atomically coupled to
+  # follower Raft snapshot installation. The node fails closed otherwise.
   TC_RAFT_COMPACT_APPLIED_THRESHOLD: "${TC_RAFT_COMPACT_APPLIED_THRESHOLD:-0}"
   TC_ORDER_CATEGORY_SIZE: "${TC_ORDER_CATEGORY_SIZE:-1000}"
   TC_EXECUTION_OUTBOX_SYNC_EVERY: "${TC_EXECUTION_OUTBOX_SYNC_EVERY:-1}"

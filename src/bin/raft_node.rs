@@ -141,9 +141,11 @@ fn main() {
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(30);
-    let snapshot_every = (snapshot_every_secs > 0).then(|| Duration::from_secs(snapshot_every_secs));
+    let snapshot_every =
+        (snapshot_every_secs > 0).then(|| Duration::from_secs(snapshot_every_secs));
     let (gateway, sink, handle) = build(ExchangeConfig {
         journal_dir: Some(data_dir.join("journal")),
+        raft_wal_authoritative: true,
         snapshot_every,
         // Exact duplicate suppression lives at the Raft ingress. The old
         // processor high-water cursors reject valid lower ids from independent
@@ -163,6 +165,10 @@ fn main() {
         ..ExchangeConfig::default()
     });
     let metrics = handle.metrics.clone();
+    let engine_snapshot_index =
+        trade_core::snapshot::load(&data_dir.join("journal").join("snapshot-shard-0.bin"))
+            .map(|snapshot| snapshot.raft_applied_index)
+            .unwrap_or(0);
     metrics.set_ready(false);
     // Single-group deployment: register one commit-latency series (group 0).
     // A future split-matching topology registers one per group here.
@@ -236,56 +242,25 @@ fn main() {
                 .ok()
                 .and_then(|value| value.parse::<u64>().ok())
                 .unwrap_or(0);
-            let mut committed_batch_indexes: std::collections::BTreeSet<u64> =
-                std::collections::BTreeSet::new();
-            let mut last_compaction_check = Instant::now();
+            assert_eq!(
+                compact_threshold, 0,
+                "Raft log compaction is disabled in authoritative-WAL mode until engine snapshot transfer is atomic"
+            );
             let applied_batches = asset_log::load_applied_batches(&asset_root)
                 .expect("load applied Raft batch watermarks");
-            if let Some(index) = applied_batches.iter().max().copied() {
-                runtime_metrics.set_raft_enqueued_index(index);
-                runtime_metrics.set_raft_applied_index(index);
-            }
+            let applied_proofs = asset_log::load_applied_batch_proofs(&asset_root)
+                .expect("load exact Raft replay proofs");
+            runtime_metrics.set_raft_enqueued_index(engine_snapshot_index);
+            runtime_metrics.set_raft_applied_index(engine_snapshot_index);
             if let Some(reference) = node.take_installed_snapshot() {
-                log_info!(
-                    "raft-node",
-                    "event=recovered_snapshot raft_index={} reference_bytes={}",
+                panic!(
+                    "Raft state contains an installed consensus snapshot at index {} ({} bytes), but no atomically installed matching snapshot; refusing unsafe startup",
                     node.snapshot_index(),
                     reference.len()
                 );
             }
 
             let recovered_committed = node.take_committed();
-            let mut legacy_candidates = std::collections::HashSet::new();
-            for committed in &recovered_committed {
-                if applied_batches.contains(&committed.index) {
-                    continue;
-                }
-                for command in wire::decode_raft_entry(&committed.data)
-                    .expect("durable committed Raft entry is not a valid command batch")
-                {
-                    if command.id() != 0 {
-                        legacy_candidates.insert(command.id());
-                    }
-                }
-            }
-            let recovered_fingerprints = if legacy_candidates.is_empty() {
-                None
-            } else {
-                asset_log::recovered_command_fingerprints(
-                    &asset_root,
-                    &data_dir.join("journal"),
-                    &legacy_candidates,
-                )
-                .expect("validate legacy asset WAL recovery coverage")
-            };
-            if let Some(fingerprints) = &recovered_fingerprints {
-                log_info!(
-                    "raft-node",
-                    "event=legacy_recovery_coverage commands={}",
-                    fingerprints.len()
-                );
-            }
-
             // Rebuild exact idempotency and matching state before this member
             // can campaign or accept a retry. Otherwise a fast election can
             // race the recovered committed prefix and append an old command a
@@ -301,11 +276,9 @@ fn main() {
                 let payload = committed.data;
                 let commands = wire::decode_raft_entry(&payload)
                     .expect("durable committed Raft entry is not a valid command batch");
-                let is_batch = payload.len() != MSG_LEN;
-                if is_batch && applied_batches.contains(&index) {
+                if index <= engine_snapshot_index {
                     for command in commands {
-                        let command_id = command.id();
-                        committed_ids.remember(command_id, index);
+                        committed_ids.remember(command.id(), index);
                     }
                     runtime_metrics.set_raft_enqueued_index(index);
                     runtime_metrics.set_raft_applied_index(index);
@@ -313,28 +286,10 @@ fn main() {
                 }
                 let mut apply = Vec::new();
                 for command in commands {
-                    let command_id = command.id();
-                    committed_ids.remember(command_id, index);
-                    let recovered_from_legacy_wal = recovered_fingerprints
-                        .as_ref()
-                        .and_then(|fingerprints| fingerprints.get(&command_id))
-                        .is_some_and(|fingerprint| {
-                            let mut frame = [0u8; MSG_LEN];
-                            wire::encode_command(&command, &mut frame);
-                            *fingerprint == trade_core::journal::fnv1a(&frame)
-                        });
-                    // Batch group-commit watermarks were introduced after the
-                    // original per-asset application watermarks.  A durable
-                    // node upgraded from that format therefore has no batch
-                    // marker even though every command is already reflected in
-                    // its recovered book.  Fall back to the per-asset marker
-                    // instead of blindly replaying the whole batch; doing so
-                    // would insert resting orders twice during an upgrade.
-                    if !recovered_from_legacy_wal
-                        && asset_log::applied_raft_index(&asset_root, command.instrument())
-                        .expect("read asset application watermark")
-                        < index
-                    {
+                    let id = command.id();
+                    let duplicate = id != 0 && committed_ids.contains(id);
+                    committed_ids.remember(id, index);
+                    if !duplicate {
                         apply.push(command);
                     }
                 }
@@ -345,7 +300,17 @@ fn main() {
                 }
                 let mut pending_command = trade_core::Command::Batch(apply);
                 loop {
-                    match gateway.submit_committed(index, pending_command) {
+                    let result = if applied_batches.contains(&index) {
+                        let proof = *applied_proofs.get(&index).unwrap_or_else(|| {
+                            panic!(
+                                "applied Raft index {index} is newer than snapshot {engine_snapshot_index} but has no exact replay proof"
+                            )
+                        });
+                        gateway.submit_recovered(proof, pending_command)
+                    } else {
+                        gateway.submit_committed(index, pending_command)
+                    };
+                    match result {
                         Ok(()) => break,
                         Err(command) => {
                             pending_command = command;
@@ -451,7 +416,6 @@ fn main() {
                     );
                     fence_term = committed.term;
                     let payload = committed.data;
-                    committed_batch_indexes.insert(index);
                     if let Some(started) = commit_started.remove(&index) {
                         let commit_ns = started.elapsed().as_nanos() as u64;
                         runtime_metrics.record_raft_commit_latency(commit_ns);
@@ -467,11 +431,7 @@ fn main() {
                         let id = command.id();
                         let duplicate = id != 0 && committed_ids.contains(id);
                         committed_ids.remember(id, index);
-                        if !duplicate
-                            && asset_log::applied_raft_index(&asset_root, command.instrument())
-                                .expect("read asset application watermark")
-                                < index
-                        {
+                        if !duplicate {
                             apply.push(command);
                         }
                     }
@@ -497,50 +457,6 @@ fn main() {
                         }
                     }
                 }
-                if compact_threshold != 0
-                    && last_compaction_check.elapsed() >= Duration::from_secs(1)
-                    && node
-                        .applied_index()
-                        .saturating_sub(node.snapshot_index())
-                        >= compact_threshold
-                {
-                    last_compaction_check = Instant::now();
-                    // The safe compaction point is the longest contiguous run of
-                    // committed batches this member has *durably applied* (per
-                    // the asset WAL watermarks). Compacting past an un-applied
-                    // entry would drop a command still needed for recovery.
-                    let applied = asset_log::load_applied_batches(&asset_root)
-                        .expect("load applied Raft batch watermarks");
-                    let mut safe = node.snapshot_index();
-                    for &idx in committed_batch_indexes.iter() {
-                        if applied.contains(&idx) {
-                            safe = idx;
-                        } else {
-                            break;
-                        }
-                    }
-                    if safe > node.snapshot_index() {
-                        // The snapshot blob is a durable reference to the engine
-                        // state at `safe`; the engine's own snapshots/WAL hold
-                        // the recoverable state, so the Raft layer only needs the
-                        // fencing index to bound the log.
-                        let reference = safe.to_le_bytes().to_vec();
-                        match node.compact(safe, reference) {
-                            Ok(true) => {
-                                committed_batch_indexes.retain(|&idx| idx > safe);
-                                log_info!(
-                                    "raft-node",
-                                    "event=compacted raft_index={safe} first_log_index={}",
-                                    node.first_log_index()
-                                );
-                            }
-                            Ok(false) => {}
-                            Err(error) => {
-                                log_error!("raft-node", "event=compaction_failed raft_index={safe} error={error}");
-                            }
-                        }
-                    }
-                }
                 thread::sleep(Duration::from_millis(2));
             }
         })
@@ -562,10 +478,24 @@ fn main() {
             .set("bootstrap.servers", &brokers)
             .set("acks", "all")
             .set("enable.idempotence", "true")
-            .set("linger.ms", std::env::var("TC_EXECUTION_KAFKA_LINGER_MS").unwrap_or_else(|_| "2".into()))
-            .set("batch.num.messages", std::env::var("TC_EXECUTION_KAFKA_BATCH_MESSAGES").unwrap_or_else(|_| "10000".into()))
-            .set("compression.type", std::env::var("TC_EXECUTION_KAFKA_COMPRESSION").unwrap_or_else(|_| "lz4".into()))
-            .set("queue.buffering.max.kbytes", std::env::var("TC_EXECUTION_KAFKA_QUEUE_KBYTES").unwrap_or_else(|_| "1048576".into()))
+            .set(
+                "linger.ms",
+                std::env::var("TC_EXECUTION_KAFKA_LINGER_MS").unwrap_or_else(|_| "2".into()),
+            )
+            .set(
+                "batch.num.messages",
+                std::env::var("TC_EXECUTION_KAFKA_BATCH_MESSAGES")
+                    .unwrap_or_else(|_| "10000".into()),
+            )
+            .set(
+                "compression.type",
+                std::env::var("TC_EXECUTION_KAFKA_COMPRESSION").unwrap_or_else(|_| "lz4".into()),
+            )
+            .set(
+                "queue.buffering.max.kbytes",
+                std::env::var("TC_EXECUTION_KAFKA_QUEUE_KBYTES")
+                    .unwrap_or_else(|_| "1048576".into()),
+            )
             .set(
                 "message.timeout.ms",
                 std::env::var("TC_EXECUTION_KAFKA_DELIVERY_TIMEOUT_MS")
@@ -720,13 +650,15 @@ fn spawn_execution_outbox_publisher(
                 for (name, offset) in pending_checkpoints.clone() {
                     let key = outbox_checkpoint_key(raft_group, &name);
                     let value = offset.to_le_bytes();
-                    let delivered = futures::executor::block_on(producer.send(
-                        FutureRecord::to(&checkpoint_topic)
-                            .partition(checkpoint_partition)
-                            .key(&key)
-                            .payload(&value),
-                        Duration::from_secs(5),
-                    ));
+                    let delivered = futures::executor::block_on(
+                        producer.send(
+                            FutureRecord::to(&checkpoint_topic)
+                                .partition(checkpoint_partition)
+                                .key(&key)
+                                .payload(&value),
+                            Duration::from_secs(5),
+                        ),
+                    );
                     if delivered.is_ok() {
                         pending_checkpoints.remove(&name);
                         shared_offsets.insert(name, offset);
@@ -751,7 +683,11 @@ fn spawn_execution_outbox_publisher(
                                 readers.insert(path, reader);
                             }
                             Err(error) => {
-                                log_error!("execution-outbox", "event=open_failed path={} error={error}", path.display());
+                                log_error!(
+                                    "execution-outbox",
+                                    "event=open_failed path={} error={error}",
+                                    path.display()
+                                );
                             }
                         }
                     }
@@ -785,7 +721,8 @@ fn spawn_execution_outbox_publisher(
                     .execution_outbox_pending
                     .store(pending_before_publish, Ordering::Release);
                 let mut publish_paths = readers.keys().cloned().collect::<Vec<_>>();
-                publish_paths.sort_by_key(|path| outbox_segment_order(path).unwrap_or((u32::MAX, u64::MAX)));
+                publish_paths
+                    .sort_by_key(|path| outbox_segment_order(path).unwrap_or((u32::MAX, u64::MAX)));
                 let mut visited_shards = HashSet::new();
                 for path in publish_paths {
                     let Some((shard, _)) = outbox_segment_order(&path) else {
@@ -863,9 +800,10 @@ fn spawn_execution_outbox_publisher(
                                     metrics
                                         .execution_outbox_published
                                         .fetch_add(records.len() as u64, Ordering::Relaxed);
-                                    metrics
-                                        .execution_outbox_publish_healthy
-                                        .store(pending_checkpoints.is_empty() as u64, Ordering::Release);
+                                    metrics.execution_outbox_publish_healthy.store(
+                                        pending_checkpoints.is_empty() as u64,
+                                        Ordering::Release,
+                                    );
                                 }
                             } else {
                                 metrics
@@ -1144,7 +1082,10 @@ mod tests {
             decode_outbox_checkpoint(7, Some(&key), Some(&payload)),
             Some(("outbox-shard-3.bin".into(), 12_345))
         );
-        assert_eq!(decode_outbox_checkpoint(8, Some(&key), Some(&payload)), None);
+        assert_eq!(
+            decode_outbox_checkpoint(8, Some(&key), Some(&payload)),
+            None
+        );
     }
 
     #[test]

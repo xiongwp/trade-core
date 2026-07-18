@@ -36,6 +36,19 @@ pub struct AssetReplaySummary {
     pub processor: Processor,
 }
 
+/// Durable proof that a Raft entry was applied and produced an exact result
+/// stream. Recovery uses it to rebuild memory without re-emitting already
+/// durable Outbox records, and fails closed if replay differs by one byte.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AppliedBatchProof {
+    pub raft_index: u64,
+    pub report_count: u32,
+    pub report_fingerprint: u64,
+}
+
+const APPLIED_PROOF_HEADER: [u8; 8] = *b"TCAP\x01\0\0\0";
+const APPLIED_PROOF_RECORD_LEN: usize = 32;
+
 /// Owns lazily-opened WAL writers for the instruments local to one machine.
 pub struct AssetJournalSet {
     root: PathBuf,
@@ -236,32 +249,135 @@ impl AssetJournalSet {
 /// synchronized before the marker was appended.
 pub fn load_applied_batches(root: &Path) -> io::Result<HashSet<u64>> {
     let path = root.join("raft-batches.applied");
+    let mut applied = HashSet::new();
+    match File::open(path) {
+        Ok(mut file) => {
+            let mut record = [0u8; 16];
+            loop {
+                match file.read_exact(&mut record) {
+                    Ok(()) => {
+                        let index = u64::from_le_bytes(record[..8].try_into().unwrap());
+                        if journal::fnv1a(&record[..8])
+                            != u64::from_le_bytes(record[8..].try_into().unwrap())
+                        {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "applied Raft batch watermark checksum mismatch",
+                            ));
+                        }
+                        applied.insert(index);
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    applied.extend(load_applied_batch_proofs(root)?.into_keys());
+    Ok(applied)
+}
+
+/// Append one fail-closed application proof after the result Outbox has been
+/// synchronized. A complete proof means both state application and its exact
+/// deterministic result stream crossed the durability boundary.
+pub fn mark_applied_batch(
+    root: &Path,
+    raft_index: u64,
+    report_count: u32,
+    report_fingerprint: u64,
+) -> io::Result<()> {
+    std::fs::create_dir_all(root)?;
+    let path = root.join("raft-batches.applied.v2");
+    let new_file = !path.exists();
+    let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+    if new_file {
+        file.write_all(&APPLIED_PROOF_HEADER)?;
+    }
+    let mut record = [0u8; APPLIED_PROOF_RECORD_LEN];
+    record[0..8].copy_from_slice(&raft_index.to_le_bytes());
+    record[8..12].copy_from_slice(&report_count.to_le_bytes());
+    record[16..24].copy_from_slice(&report_fingerprint.to_le_bytes());
+    let checksum = journal::fnv1a(&record[..24]);
+    record[24..32].copy_from_slice(&checksum.to_le_bytes());
+    file.write_all(&record)?;
+    file.sync_data()
+}
+
+/// Load and validate every exact replay proof. A torn final record is ignored
+/// because its batch has no durable application proof and will be replayed as
+/// a normal committed Raft entry. Corruption in a complete record is fatal.
+pub fn load_applied_batch_proofs(root: &Path) -> io::Result<HashMap<u64, AppliedBatchProof>> {
+    let path = root.join("raft-batches.applied.v2");
     let mut file = match File::open(path) {
         Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(HashSet::new()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(HashMap::new()),
         Err(error) => return Err(error),
     };
-    let mut applied = HashSet::new();
-    let mut record = [0u8; 16];
+    let mut header = [0u8; APPLIED_PROOF_HEADER.len()];
+    file.read_exact(&mut header)?;
+    if header != APPLIED_PROOF_HEADER {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "applied Raft proof header/version mismatch",
+        ));
+    }
+    let mut proofs = HashMap::new();
+    let mut record = [0u8; APPLIED_PROOF_RECORD_LEN];
     loop {
         match file.read_exact(&mut record) {
             Ok(()) => {
-                let index = u64::from_le_bytes(record[..8].try_into().unwrap());
-                if journal::fnv1a(&record[..8])
-                    != u64::from_le_bytes(record[8..].try_into().unwrap())
-                {
+                let expected = u64::from_le_bytes(record[24..32].try_into().unwrap());
+                if journal::fnv1a(&record[..24]) != expected {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        "applied Raft batch watermark checksum mismatch",
+                        "applied Raft proof checksum mismatch",
                     ));
                 }
-                applied.insert(index);
+                let proof = AppliedBatchProof {
+                    raft_index: u64::from_le_bytes(record[0..8].try_into().unwrap()),
+                    report_count: u32::from_le_bytes(record[8..12].try_into().unwrap()),
+                    report_fingerprint: u64::from_le_bytes(record[16..24].try_into().unwrap()),
+                };
+                if let Some(previous) = proofs.insert(proof.raft_index, proof) {
+                    if previous != proof {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "conflicting applied Raft proofs for one index",
+                        ));
+                    }
+                }
             }
             Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
             Err(error) => return Err(error),
         }
     }
-    Ok(applied)
+    Ok(proofs)
+}
+
+/// Validate deterministic replay against the durable proof. Callers must stop
+/// recovery on error; continuing would serve a book different from the one
+/// that produced the already-published executions.
+pub fn verify_applied_batch(
+    proof: AppliedBatchProof,
+    report_count: u32,
+    report_fingerprint: u64,
+) -> io::Result<()> {
+    if proof.report_count != report_count || proof.report_fingerprint != report_fingerprint {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Raft replay mismatch at index {}: expected count={} fingerprint={:#018x}, got count={} fingerprint={:#018x}",
+                proof.raft_index,
+                proof.report_count,
+                proof.report_fingerprint,
+                report_count,
+                report_fingerprint
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Load exact command fingerprints from the per-asset WALs, but only when the
@@ -553,6 +669,31 @@ mod tests {
     use super::*;
     use crate::order::Order;
     use crate::strategy::PriceTimePriority;
+
+    #[test]
+    fn exact_applied_proof_round_trips_and_is_visible_as_watermark() {
+        let root = std::env::temp_dir().join(format!(
+            "tc-applied-proof-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        mark_applied_batch(&root, 91, 5, 0xfeed_beef).unwrap();
+        let proofs = load_applied_batch_proofs(&root).unwrap();
+        assert_eq!(
+            proofs.get(&91),
+            Some(&AppliedBatchProof {
+                raft_index: 91,
+                report_count: 5,
+                report_fingerprint: 0xfeed_beef,
+            })
+        );
+        assert!(load_applied_batches(&root).unwrap().contains(&91));
+        assert!(verify_applied_batch(proofs[&91], 5, 0xfeed_beef).is_ok());
+        assert!(verify_applied_batch(proofs[&91], 4, 0xfeed_beef).is_err());
+        assert!(verify_applied_batch(proofs[&91], 5, 7).is_err());
+        std::fs::remove_dir_all(root).ok();
+    }
     use crate::types::{OrderId, Side};
 
     #[test]

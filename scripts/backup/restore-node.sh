@@ -4,11 +4,11 @@
 #
 # Flow:
 #   1. Validate the backup's sha256 manifest (detect bit-rot / partial backup).
-#   2. Verify journal integrity with journal-inspect (contiguous, no torn body).
+#   2. Verify supported journal/outbox segments with journal-inspect.
 #   3. Populate a FRESH docker volume from the backup (exact /data mirror).
 #   4. (default) Boot a single group-0 raft-node against the volume on an
-#      isolated port, let it recover, then compare /metrics tc_journal_seq /
-#      tc_raft_applied_index against the manifest anchors. Stop the container.
+#      isolated port, let it cross-validate Raft WAL + memory snapshot + exact
+#      application proofs, then compare recovery metrics with manifest anchors.
 #
 # The restore never touches the source backup (mounted read-only) and never
 # touches a running production node — it creates its own volume and container.
@@ -20,7 +20,7 @@
 #   --backup DIR   A node backup dir (…/raft-N) containing data/ + manifest.txt.
 #   --volume VOL   Target docker volume name to (re)build. Must be empty unless
 #                  --force is given (then it is wiped first).
-#   --dry-run      Validate manifest + journal-inspect only; make no volume,
+#   --dry-run      Validate manifest + supported segments only; make no volume,
 #                  boot nothing. Prints every action it would take.
 #   --no-boot      Populate the volume but skip the boot/metrics recovery check.
 #   --force        Allow using a non-empty target volume (wipes it first).
@@ -81,8 +81,8 @@ done < <(sed -n '/^\[files\]/,$p' "$MANIFEST")
 [[ "$sha_fail" -eq 0 ]] || die "manifest validation failed"
 log "manifest OK: $n files match recorded sha256"
 
-# ---- 2. journal integrity via journal-inspect (single throwaway container) --
-log "verifying journal/asset/outbox integrity with journal-inspect"
+# ---- 2. supported segment integrity (single throwaway container) ------------
+log "verifying supported journal/outbox integrity with journal-inspect"
 ji_fail=0
 # One container loops over every file (a node holds ~10k asset WALs; a container
 # per file would be unusable). ENTRYPOINT is `/bin/sh -c` => pass one script.
@@ -102,7 +102,7 @@ if ! docker run --rm -v "$DATA_DIR":/b:ro "$NODE_IMAGE" '
   ji_fail=1
 fi
 [[ "$ji_fail" -eq 0 ]] || die "journal-inspect verification failed"
-log "journal-inspect OK: all journals contiguous, all outbox records well-formed"
+log "segment check OK; boot recovery will validate Raft/snapshot/proof consistency"
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
   log "DRY RUN complete — validation passed; no volume created, nothing booted."

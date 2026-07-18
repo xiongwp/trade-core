@@ -53,9 +53,8 @@ MYSQL_IMAGE = "mysql:8.4"
 # so generated nodes keep the same knobs; each stays overridable per node .env.
 RAFT_ENV_KEYS = [
     ("TC_MATCH_POOL_PER_ASSET", "2"),
-    ("TC_WAL_PREALLOCATE_BYTES", "0"),
-    ("TC_ASSET_WAL_MAX_OPEN_WRITERS", "1024"),
-    ("TC_ASSET_WAL_BUFFER_BYTES", "8192"),
+    ("TC_SNAPSHOT_EVERY_SECS", "30"),
+    ("TC_RAFT_COMPACT_APPLIED_THRESHOLD", "0"),
     ("TC_RAFT_TRANSPORT_QUEUE", "8192"),
     ("TC_RAFT_READY_MAX_APPLY_LAG", "32"),
     ("TC_RAFT_READY_MAX_OUTBOX_PENDING", "10000"),
@@ -301,10 +300,7 @@ def render_node_env(topo, n):
         "TC_EXECUTION_KAFKA_BROKERS=redpanda:9092,redpanda-2:9092,redpanda-3:9092",
         "",
         "# --- per-machine tuning; see docs/production-deployment-5m-tps.md §3.1 ---",
-        "# 128 GiB Raft-node tier baseline (uncomment and calibrate after load test):",
-        "#TC_ASSET_WAL_MAX_OPEN_WRITERS=8192",
-        "#TC_ASSET_WAL_BUFFER_BYTES=32768",
-        "#TC_WAL_PREALLOCATE_BYTES=67108864",
+        "# 32 GiB / 8-core Raft-node baseline (uncomment and calibrate after load test):",
     ]
     for key, default in RAFT_ENV_KEYS:
         lines.append(f"#{key}={default}")

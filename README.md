@@ -41,7 +41,7 @@ scheduler noise — Linux with isolated, pinned cores trims them.)
 | Lock-free design | SPSC ring (Lamport + cached indices, cache-line padded); zero mutexes on the hot path | [lockfree.rs](src/lockfree.rs), 1M-item FIFO test |
 | Matching ⟂ order system, async results | `OrderGateway` / `ResultSink` handles; queues are the only coupling | pipeline tests |
 | Cancel & modify priority over new orders | dual intake queues; high queue (cancel/modify/force-close) fully drained first | `cancel_takes_priority_over_queued_new_orders` |
-| Strict ordering + crash replay, identical results | per-shard WAL journal written in processing order; deterministic engine ⇒ replay fingerprint equals live | `journal_replay_reproduces_identical_results` |
+| Strict ordering + crash replay, identical results | production: quorum Raft WAL + memory snapshot + exact application proof; standalone: per-shard journal | `raft_snapshot_wal_recovery`, `journal_replay_reproduces_identical_results` |
 | Replay by time | journal records carry ns timestamps; `replay_journal(..., until_ts)` | `replay_until_timestamp_stops_early` |
 | Few seconds of loss acceptable | buffered journal, 1 s flush + 1 s fsync cadence; checksummed records, truncated tail dropped on replay | journal truncation test |
 | In-memory matching, 3 GiB reserved at startup | slab `OrderPool`, pre-faulted pages; 3 GiB ≈ 50 M order slots (64 B each); zero allocation on the matching path | [book.rs](src/book.rs), server default `POOL_MB=3072` |
@@ -51,7 +51,7 @@ scheduler noise — Linux with isolated, pinned cores trims them.)
 | External price feed, anti-spike (防插针) | `PriceGuard`: lock-free reference prices; out-of-band aggressive limits rejected; market orders capped at band edge | `price_guard_rejects_spikes_and_protects_market_orders` |
 | CPU pinning | `affinity`: Linux `pthread_setaffinity_np`; macOS advisory tag (Apple Silicon: not supported — reported honestly, runs unpinned) | smoke test |
 | Meituan Leaf-style id generation | segment double-buffer, `fetch_add` hot path, monotonic cursor (a real duplicate-id race was caught by test and fixed) | 8-thread × 50k uniqueness test |
-| Snapshots + journal truncation | atomic per-shard snapshots; recovery = snapshot + journal tail, O(commands since last snapshot); `build()` auto-recovers on restart | `snapshot_plus_journal_tail_equals_continuous_state`, restart test |
+| Memory snapshots + WAL tail | atomic v4 snapshots embed `raft_applied_index`; Raft tail replay verifies result count/fingerprint and never republishes proved output | `raft_snapshot_wal_recovery` |
 | Self-trade prevention (STP) | `SelfTradePolicy`: CancelTaker / CancelMaker / CancelBoth, enforced inside the crossing loop | STP taker & maker tests |
 | Static pre-trade limits | `RiskLimits`: max qty, max notional, max open orders per user (O(1) via book counters) | `risk_limits_reject_oversize_and_order_count` |
 | Docker one-click deploy | multi-stage `Dockerfile` + `docker-compose.yml`: the three services **order / trade-core / market-data**, persistent journal volumes | full stack `compose up` verified, chart served from containers |
@@ -61,6 +61,14 @@ scheduler noise — Linux with isolated, pinned cores trims them.)
 | TCP long-connection intake | binary 40-byte frames, parse-in-place over a reusable buffer; reports streamed back async | [tcp_roundtrip.rs](tests/tcp_roundtrip.rs) |
 
 ## Architecture
+
+The diagram below shows the standalone engine API. In the production Raft
+pipeline, `raft.state` is the sole authoritative command WAL: a committed batch
+is matched in memory, its result Outbox is synced, then an exact
+`(raft_index, result_count, result_fingerprint)` proof is synced. Periodic v4
+snapshots capture the books and applied Raft index. Restart recovery loads the
+snapshot and deterministically replays the committed Raft tail; production does
+not duplicate commands into per-shard or per-asset WALs.
 
 ```text
  ORDER SYSTEM side                          MATCHING side (per node/machine)

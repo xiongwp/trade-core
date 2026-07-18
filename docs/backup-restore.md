@@ -16,21 +16,19 @@ four Raft groups** for that node. Group 0 is at `/data`; groups 1..3 at
 ```
 <group root>/
   journal/
-    journal-shard-0.bin      # command WAL, per-shard monotonic seq, FNV per record
-    snapshot-shard-0.bin      # engine snapshot; embeds journal_seq it covers; FNV footer
+    snapshot-shard-0.bin      # memory image; embeds raft_applied_index; FNV footer
     assets/
-      asset-<id>.wal          # per-instrument WAL (portable, idempotent replay)
-      asset-<id>.applied       # per-asset raft-index watermark
-      raft-batches.applied     # applied multi-command raft-batch watermarks
+      raft-batches.applied.v2 # exact index/result-count/result-fingerprint proofs
   execution-outbox/
     outbox-shard-0.bin         # durable execution events (+ rotation segments)
     outbox-shard-0.published.cursor   # publisher progress (optimization only)
-  raft.state                   # consensus log + hard state + last snapshot reference
+  raft.state                   # authoritative command WAL + consensus hard state
 ```
 
-All families are checksummed (FNV-1a) and their readers **stop at the first
-torn/short record**, treating it as a clean prefix — exactly the condition a
-live copy of an actively-appended file produces.
+Production Raft mode deliberately has **one command log**: `raft.state`.
+Per-shard and per-asset command WALs are legacy/standalone artifacts and are not
+written on this hot path. All durable families are checksummed; append-only
+readers accept only the complete prefix before a torn trailing record.
 
 ---
 
@@ -40,45 +38,31 @@ A running node is copied without pausing it. Correctness rests on two facts
 proven in the source:
 
 1. **Each file family self-reconciles at recovery.**
-   - *journal-shard* — replay applies only records with `seq >
-     snapshot.journal_seq` and stops at the first bad record
-     (`exchange.rs::recover_stats`, `journal.rs::JournalReader`).
-   - *asset WALs* — replay is idempotent: byte-identical duplicate command ids
-     are skipped, conflicting ones hard-fail, torn tail = safe prefix
-     (`asset_log.rs`).
-   - *watermarks* (`*.applied`, `raft-batches.applied`) — append-only; a short
-     read is EOF, so at worst one already-idempotent batch is re-applied.
+   - *memory snapshot* — atomic temp+fsync+rename image containing the exact
+     `raft_applied_index`; recovery never applies an entry at or below it.
+   - *Raft WAL* — the authoritative committed command sequence. Compaction is
+     currently disabled, so every snapshot can always be paired with its full
+     committed tail. A torn tail is removed when the log opens.
+   - *application proofs* — each complete v2 record binds one Raft index to the
+     exact result count and fingerprint. Replay suppresses duplicate output only
+     after recomputing and matching both values; mismatch is fail-stop.
    - *execution-outbox* — recovery **trims** every record past the last durable
-     applied watermark and drops a torn trailing record
+     application proof and drops a torn trailing record
      (`execution_outbox.rs::truncate_after_applied`); a corrupt
      `.published.cursor` is treated as "unpublished" and the segment is kept.
    - *raft.state* — a torn tail record is truncated at open
      (`raft_log.rs::read_or_truncate_torn_tail`).
 
-2. **Copy order: JOURNAL before SNAPSHOT (per shard).**
-   `take_snapshot()` (`exchange.rs`) writes `snapshot-shard-N.bin` atomically
-   (temp + fsync + rename) and **only then** truncates the journal. The
-   snapshot's `journal_seq` is the replay cut point. Copying the journal first
-   guarantees the snapshot we copy afterward is **≥** the journal head we
-   already have:
-   - If a snapshot+truncation cycle races the copy window, the snapshot read
-     afterward is the *new* one (journal_seq ≥ our journal head); recovery loads
-     it (state complete through journal_seq) and the older journal records are
-     skipped by the seq filter. **No gap.**
-   - If no cycle happens, the snapshot is the same/older pre-existing one and the
-     copied journal tail is a contiguous run above `snapshot.journal_seq`.
-     **No gap.**
-   - Copying snapshot-first would be **unsafe**: an old snapshot paired with a
-     post-truncation journal (which now starts *above* the old snapshot's seq)
-     leaves a hole. Journal-first structurally cannot produce that.
-
-   The remaining families are copied after the snapshot (order among them is
-   irrelevant — each reconciles itself), and `raft.state` last so the consensus
-   view is at least as new as the engine state it commits.
+2. **Copy `raft.state` last.** The full authoritative WAL is retained, so an
+   older snapshot only increases replay work and cannot create a command gap.
+   Copying `raft.state` after the atomic snapshot/proof/outbox files guarantees
+   the backup's command source is at least as new as its derived state. Any
+   unproved outbox tail is trimmed and deterministically regenerated from that
+   WAL during recovery.
 
 `backup-node.sh` implements exactly this order and then **proves** consistency
-after the fact: `--verify` runs `journal-inspect verify` on every journal/WAL
-(contiguous, checksum-clean) and re-checks the sha256 manifest.
+after the fact: `--verify` checks supported durable segments and re-checks the
+sha256 manifest.
 
 **Production hardening.** For an audit-grade byte-identical replica, copy from a
 filesystem/LVM/ZFS volume snapshot, or briefly `docker pause` the container
@@ -147,18 +131,18 @@ scripts/backup/restore-node.sh --backup /backups/…/raft-1 --volume VOL --no-bo
 
 What it does:
 1. **Manifest sha256 validation** — re-hashes every file, fails on mismatch/missing.
-2. **journal-inspect verification** — one throwaway container loops over all
-   journals/WALs (`verify`) and outbox segments (`dump --outbox`); fails on any
-   gap or malformed record.
+2. **segment verification** — one throwaway container checks every supported
+   journal/outbox segment and fails on a gap or malformed record; boot recovery
+   additionally validates Raft log, snapshot and application proofs together.
 3. **Volume populate** — `cp -a` the data mirror into the target volume (must be
    empty unless `--force`).
 4. **Boot verify** (default) — starts a single group-0 `raft-node` against the
    volume on an isolated port, waits for engine recovery, then reads `/metrics`
-   and checks `tc_journal_seq` did not regress below the backup anchor. Stops and
+   and checks the applied/commit watermarks did not regress. Stops and
    removes the container. *(A single-voter boot will not reach the original
-   5-voter quorum, so it stays a follower; engine recovery — snapshot + journal
-   tail + asset WAL replay — still runs and populates the metrics, which is what
-   we assert. In production the restored volume is attached to its real member,
+   5-voter quorum, so it stays a follower; engine recovery — memory snapshot +
+   authoritative Raft WAL tail + proof validation — still runs and populates
+   the metrics, which is what we assert. In production the restored volume is attached to its real member,
    which rejoins the live quorum.)*
 
 ### Restoring into the live cluster

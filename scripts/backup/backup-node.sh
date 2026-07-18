@@ -10,64 +10,31 @@
 # -----------------------------------------------------------------------------
 # CONSISTENCY MODEL (why a hot copy is safe — no pause/stop required)
 # -----------------------------------------------------------------------------
-# A node's /data tree holds several INDEPENDENTLY crash-recoverable file
-# families. Each already tolerates the exact conditions a live `docker cp`
-# reproduces — a reader observing bytes mid-append:
+# A production Raft node has one authoritative command log plus independently
+# crash-recoverable derived files. Readers tolerate a live `docker cp` seeing a
+# file mid-append:
 #
-#   * journal-shard-N.bin  — per-shard command WAL. JournalReader stops at the
-#     first torn/checksum-bad record (journal.rs), so a half-copied tail record
-#     is dropped, never applied. Recovery = load snapshot, then replay journal
-#     records with seq > snapshot.journal_seq (exchange.rs recover_stats).
-#   * snapshot-shard-N.bin — engine snapshot; embeds the journal_seq it covers,
-#     protected by an FNV footer validated by snapshot::load (corrupt => the
-#     node refuses to start, never loads garbage).
-#   * journal/assets/asset-*.wal — per-instrument WALs. Replay is idempotent:
-#     byte-identical duplicate command ids are skipped, and a torn tail is a
-#     safe prefix (asset_log.rs). Independent of the shard journal.
-#   * journal/assets/raft-batches.applied + asset-*.applied — append-only
-#     watermarks; a short/torn read is treated as EOF, so at worst recovery
-#     re-applies one already-idempotent batch.
+#   * raft.state — authoritative consensus command WAL. Its torn tail is
+#     truncated at open. Compaction is disabled until matching-state snapshot
+#     transfer/install is atomic, so the complete replay source is retained.
+#   * snapshot-shard-N.bin — atomic memory snapshot with raft_applied_index,
+#     protected by an FNV footer (corrupt => startup fails closed).
+#   * journal/assets/raft-batches.applied.v2 — exact result-count/fingerprint
+#     proof per applied Raft index; a torn trailing record is ignored.
 #   * execution-outbox/* — recovery trims every record past the last durable
-#     applied watermark and drops a torn trailing record
+#     application proof and drops a torn trailing record
 #     (execution_outbox.rs truncate_after_applied); the .published.cursor is an
 #     optimization (a corrupt cursor is treated as "unpublished").
-#   * raft.state — consensus log + last application-snapshot reference. A torn
-#     tail record is truncated at open (raft_log.rs read_or_truncate_torn_tail).
 #
-# The ONE ordering constraint that matters is between a shard's journal and its
-# snapshot, because the snapshot's journal_seq acts as the replay cut point:
-#
-#   take_snapshot() (exchange.rs) writes snapshot-shard-N.bin ATOMICALLY
-#   (temp + fsync + rename) and ONLY THEN truncates journal-shard-N.bin.
-#
-# Therefore we copy the JOURNAL FIRST, then the SNAPSHOT:
-#
-#   - If a snapshot+truncation cycle races our copy window, the snapshot we read
-#     afterward is the NEW one, whose journal_seq >= the head of the journal we
-#     already copied. Recovery loads that snapshot (state complete through its
-#     journal_seq) and the older journal records (all <= journal_seq) are simply
-#     skipped by the seq filter. No gap.
-#   - If no cycle happens, the snapshot is the same/older pre-existing one and
-#     the journal tail we copied is a contiguous run above snapshot.journal_seq.
-#     No gap.
-#
-#   Copying SNAPSHOT-first would be UNSAFE: an old snapshot paired with a
-#   post-truncation journal (which now starts ABOVE the old snapshot's seq)
-#   leaves a hole between them. journal-first structurally cannot produce that.
-#
-# The other families carry no cross-file ordering requirement (each reconciles
-# itself at recovery via watermark / dedup / torn-tail handling), so we copy
-# them after the snapshot, and raft.state last so the consensus view is at least
-# as new as the engine state it commits.
+# The script copies derived files first and raft.state last. An older snapshot
+# only causes more WAL replay; it cannot create a gap because the full Raft WAL
+# remains available. An unproved outbox tail is trimmed and regenerated.
 #
 # PRODUCTION NOTE (freezing): for an audit-grade, byte-identical replica you may
 # instead briefly `docker pause` the container around the copy (a few hundred ms
 # — matching is in-memory, so no client sees more than added latency), or take a
 # filesystem/LVM/ZFS snapshot of the volume and copy from that. This script does
-# NOT pause: on this shared bench another agent is running an acceptance load and
-# a pause would pollute its measurements. The hot copy above is provably
-# consistent for recovery, and --verify proves it after the fact with
-# journal-inspect.
+# not pause the node; `--verify` plus boot recovery checks the copied state.
 #
 # MySQL: --mysql uses `mysqldump --single-transaction` per shard, which takes a
 # consistent InnoDB snapshot without locking writers. PRODUCTION: prefer
@@ -98,8 +65,8 @@ Options:
   --mysql        Also mysqldump the order shards (--single-transaction).
   --mysql-only   Back up only the MySQL shards, no raft nodes.
   --out DIR      Destination directory (default: <repo>/backups/<UTC-timestamp>).
-  --verify       After copying, run journal-inspect verify on every journal /
-                 asset WAL / outbox in the backup and re-check the sha256 manifest.
+  --verify       After copying, verify supported durable segments and re-check
+                 the sha256 manifest.
   -h, --help     This help.
 
 Environment overrides:
@@ -207,13 +174,13 @@ backup_raft_node() {
       docker cp -q "$container:$f" "$dst/journal/$base" 2>/dev/null \
         || docker cp "$container:$f" "$dst/journal/$base"
     done
-    # ---- 2. snapshots AFTER the journal (snapshot.journal_seq >= journal head)
+    # ---- 2. atomic memory snapshots (authoritative Raft index cut point)
     for f in $(docker exec "$container" sh -c "ls $src/journal/snapshot-shard-*.bin 2>/dev/null || true"); do
       base="$(basename "$f")"
       docker cp "$container:$f" "$dst/journal/$base"
     done
     # ---- 3. per-asset WALs + watermarks (self-reconciling on replay) --------
-    #        (journal/assets also holds raft-batches.applied and *.applied)
+    #        (production holds raft-batches.applied.v2; legacy files are copied too)
     if docker exec "$container" sh -c "[ -d $src/journal/assets ]"; then
       docker cp "$container:$src/journal/assets/." "$dst/journal/assets/"
     fi
@@ -295,7 +262,7 @@ backup_mysql() {
 }
 
 # =============================================================================
-# Verification: journal-inspect over the backup + manifest re-check
+# Verification: supported segment readers + manifest re-check
 # =============================================================================
 verify_backup() {
   local node="$1"

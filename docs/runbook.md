@@ -16,12 +16,12 @@ symptom. Each entry: **symptom** (which alert or `event=` log line fires),
 - Per-group `/metrics` host port = `9200 + group*10 + node`
   (e.g. node 1 group 0 = `9201`, node 5 group 3 = `9235`).
 - Set `PREFIX=kaishi-29a4a3` for the commands below.
-- Persistence per group: `journal/journal-shard-N.bin` (command WAL, seq-ordered),
-  `journal/snapshot-shard-N.bin` (engine snapshot, embeds `journal_seq`),
-  `journal/assets/asset-*.wal` (+ `raft-batches.applied`, `asset-*.applied`
-  watermarks), `execution-outbox/outbox-shard-N.bin` (+ `.published.cursor`),
-  `raft.state` (consensus log + last snapshot ref). All are checksummed and
-  torn-tail tolerant; see `docs/backup-restore.md` for the consistency model.
+- Persistence per group: `raft.state` is the sole authoritative command WAL;
+  `journal/snapshot-shard-N.bin` is the atomic in-memory state image and embeds
+  `raft_applied_index`; `journal/assets/raft-batches.applied.v2` stores exact
+  result proofs; `execution-outbox/outbox-shard-N.bin` (+ `.published.cursor`)
+  stores durable results. Production Raft mode writes no duplicate per-shard or
+  per-asset command WAL. See `docs/backup-restore.md` for recovery ordering.
 
 ### Key metrics & their meaning
 | metric | meaning |
@@ -32,19 +32,19 @@ symptom. Each entry: **symptom** (which alert or `event=` log line fires),
 | `tc_raft_commit_index` | highest quorum-committed entry |
 | `tc_raft_applied_index` | highest entry fully applied to matching |
 | `tc_raft_apply_lag` | committed-but-not-applied backlog |
-| `tc_journal_seq` | per-shard command WAL head (total-order cursor) |
+| `tc_journal_seq` | processed command count/cursor (legacy metric name) |
 | `tc_execution_outbox_pending` | execution events durable but not yet acked by Kafka |
 | `tc_execution_outbox_publish_healthy` | 1 = publisher healthy, 0 = failing |
-| `tc_asset_wal_errors` | durability (fsync/append) failures — should stay 0 |
+| `tc_asset_wal_errors` | command/application durability failures — should stay 0 |
 | `tc_order_dlq_total` | order-api messages dead-lettered (poison) |
 
 ### Fail-stop philosophy
-The node is **fail-stop on durability loss**: a failed journal `sync_data`, an
-outbox append error (disk full / EIO), or a corrupt file at startup **panics**
+The node is **fail-stop on durability loss**: a failed Raft WAL, application
+proof or outbox barrier (disk full / EIO), or a corrupt file at startup **panics**
 (`panic=abort` → container exit → `restart: unless-stopped` relaunches it). On
-relaunch, recovery loads the last snapshot and replays the journal tail,
-stopping at the first torn/checksum-bad record — so a fail-stop never corrupts
-state, it only interrupts availability. Alerts below tell you which case you're in.
+relaunch, recovery loads the last memory snapshot and replays the committed
+Raft WAL tail. For already-proved batches it recomputes the result count and
+fingerprint before suppressing duplicate publication; mismatch aborts startup.
 
 ---
 
@@ -65,7 +65,8 @@ curl -s localhost:9201/metrics | grep -E 'tc_raft_(role|leader_id|commit_index|a
 docker ps -a --filter "name=${PREFIX}-raft" --format '{{.Names}}\t{{.Status}}'
 docker logs --tail 100 ${PREFIX}-raft-3-1
 # 3. If it's a transient crash, just restart it — it rejoins and catches up
-#    from the leader (log replication or a shipped snapshot).
+#    from the leader. Raft log compaction stays disabled until matching-state
+#    snapshot transfer/install is atomic with the consensus snapshot.
 docker start ${PREFIX}-raft-3-1
 ```
 
@@ -91,7 +92,7 @@ a new quorum — forcing can lose committed entries only present on down nodes.*
 # 1. Determine which nodes are recoverable (disk intact?).
 docker ps -a --filter "name=${PREFIX}-raft"
 # 2. Bring back enough original members to reach 3/5. If their volumes survived,
-#    just restart — durable raft.state + journals recover in place.
+#    just restart — durable raft.state + memory snapshot recover in place.
 docker start ${PREFIX}-raft-2-1 ${PREFIX}-raft-4-1
 # 3. If a node's DISK is lost, restore its volume from the latest backup FIRST
 #    (§ docs/backup-restore.md), then start it. A restored member rejoins as a
@@ -180,10 +181,9 @@ counts resume.
 
 ## 5. Disk full (write path fail-stop)
 
-**Symptom.** Journal-fsync logs `event=fsync_failed ... error=... — durability
-window is growing` (repeated at 1st and every 60th failure) and/or
+**Symptom.** Durability logs report `event=fsync_failed` and/or
 `tc_asset_wal_errors > 0`. If a synchronous write hits `ENOSPC`, the node
-**panics** (`sync raft command journal` / `append execution report to durable
+**panics** (`sync raft WAL` / `append execution report to durable
 outbox`) and the container restart-loops (crash → `restart: unless-stopped` →
 recover → same full disk → crash). `docker ps` shows a node `Restarting`.
 
@@ -203,8 +203,9 @@ docker logs --tail 50 ${PREFIX}-raft-3-1 | grep -E 'fsync_failed|ENOSPC|No space
 # 3. If the app itself can't free enough, grow the underlying disk/volume, then
 #    let the node restart-recover (or `docker start` it).
 ```
-Recovery is safe: on restart the node replays snapshot + journal tail and stops
-at the first torn record; the last (failed) write is simply not present.
+Recovery is safe: on restart the node replays the memory snapshot + committed
+Raft WAL tail. An outbox record without its exact durable application proof is
+trimmed and regenerated; a command not quorum-durable was never acknowledged.
 
 **Verify recovery.** `df -h /data` has headroom; node stays `Up` (no restart
 loop); `tc_asset_wal_errors` stops rising; `event=fsync_recovered` appears in
@@ -227,23 +228,23 @@ version skew) — *not* a torn tail, which is handled transparently.
 ```bash
 # 1. Read the exact panic to identify the file family.
 docker logs --tail 60 ${PREFIX}-raft-3-1
-# 2. Triage the suspect files offline with journal-inspect (runs in the image):
-docker run --rm -v ${PREFIX}_raft-3-data:/data trade-core-node \
-  'journal-inspect verify --path /data/journal/journal-shard-0.bin'
-#   (a reported gap / non-contiguous => that WAL is damaged.)
+# 2. Verify the backup manifest and supported segments offline (see
+#    docs/backup-restore.md). Raft/snapshot/proof cross-validation happens in
+#    boot recovery and must complete before the node becomes ready.
 # 3. Preferred fix: this node is one replica of an intact quorum. REBUILD it
 #    from a peer/backup rather than hand-editing files:
 #      - restore its volume from the latest good backup (docs/backup-restore.md),
-#        OR wipe the volume and let it re-sync from the leader as a fresh member
-#        (leader ships a snapshot + tail). Then `docker start` it.
+#        OR add an empty replacement member and let it receive the retained full
+#        Raft log. Then `docker start` it.
 # 4. NEVER delete individual records to "fix" a checksum error — that breaks the
 #    total order. Replace the whole file family from a consistent source.
 ```
-If the corruption is a snapshot but the journal is intact, restoring from backup
-(snapshot + journal tail) reproduces identical state deterministically.
+If only the memory snapshot is corrupt but `raft.state` is intact, quarantine
+the snapshot and rebuild it by replaying the full Raft WAL. Do not do this if
+the Raft log itself is damaged.
 
-**Verify recovery.** Node starts without panic; `journal-inspect verify` is
-clean; `tc_raft_commit_index`/`tc_journal_seq` converge to peers.
+**Verify recovery.** Node starts without panic; `tc_raft_commit_index` and
+`tc_raft_applied_index` converge to peers with `tc_raft_apply_lag=0`.
 
 ---
 
@@ -285,7 +286,8 @@ appears in the voter set; a test order commits under the new membership.
 
 **Impact.** Handled as a **rolling restart** one node at a time so quorum (and
 therefore availability) is never lost. On-disk formats are versioned
-(`JOURNAL_HEADER` TCJR, snapshot `TCS1` v3, outbox `TCEX`, raft `TCRF`); a
+(`JOURNAL_HEADER` TCJR for standalone mode, snapshot `TCS1` v4, outbox `TCEX`,
+application proof `TCAP`, raft `TCRF`); a
 version bump is rejected at open with a "migration required" error rather than
 misparsed — so verify format compatibility before rolling.
 
@@ -309,12 +311,10 @@ done
 # volume (not the image), rollback is just running the old binary against the
 # same /data.
 ```
-**Fingerprint verification** (cross-version state equivalence): after upgrading a
-node, confirm it recovered identical matching state by comparing per-asset WAL
-fingerprints with a peer. `journal-inspect verify` proves each WAL is contiguous;
-`journal-inspect diff --path A --path2 B` compares two copies of the same shard
-journal for byte-level divergence. A replica whose replayed report fingerprint
-(`AssetLogMeta.fingerprint`) matches its peers is confirmed equivalent.
+**Fingerprint verification** (cross-version replay equivalence): after upgrading
+a node, recovery recomputes every post-snapshot batch's result count and
+fingerprint and compares it with `raft-batches.applied.v2`. Any divergence is a
+startup failure, never a silently accepted state.
 
 **Verify recovery.** After each node: all 4 groups have a leader, `apply_lag→0`,
 `tc_journal_seq` non-decreasing across the restart. After the full roll: a test
@@ -331,7 +331,7 @@ and restore/verification steps. Recommended policy:
 - **Frequency.** Per-node consistent hot backup (`backup-node.sh --all --mysql
   --verify`) **every 6 h**; MySQL shards additionally lean on binlog for
   point-in-time recovery between full dumps. The engine snapshot cadence
-  (`TC_SNAPSHOT_EVERY_SECS=30`) already bounds journal-tail replay, so backups
+  (`TC_SNAPSHOT_EVERY_SECS=30`) bounds normal matching-state replay, so backups
   are cheap and recovery is fast.
 - **Retention.** Keep hourly/6-hourly for 48 h, daily for 14 days, weekly for
   90 days (adjust to compliance requirements). Always keep the last **verified**

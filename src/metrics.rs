@@ -154,13 +154,13 @@ impl Metrics {
             c("command_latency_ns_total", "Total matching command processing time in nanoseconds", self.command_latency_ns_total.load(Ordering::Relaxed)),
             c("command_latency_samples", "Matching command latency samples", self.command_latency_samples.load(Ordering::Relaxed)),
             format!("# HELP tc_command_latency_ns_max Maximum matching command processing time in nanoseconds\n# TYPE tc_command_latency_ns_max gauge\ntc_command_latency_ns_max {}\n", self.command_latency_ns_max.load(Ordering::Relaxed)),
-            c("asset_wal_errors", "Per-asset WAL append failures", self.asset_wal_errors.load(Ordering::Relaxed)),
+            c("asset_wal_errors", "Command/application durability failures", self.asset_wal_errors.load(Ordering::Relaxed)),
             c("raft_commit_ns_total", "Total Raft quorum commit time in nanoseconds", self.raft_commit_ns_total.load(Ordering::Relaxed)),
             c("raft_commit_samples", "Raft quorum commit batches", self.raft_commit_samples.load(Ordering::Relaxed)),
             format!("# HELP tc_raft_commit_ns_max Maximum Raft quorum commit time in nanoseconds\n# TYPE tc_raft_commit_ns_max gauge\ntc_raft_commit_ns_max {}\n", self.raft_commit_ns_max.load(Ordering::Relaxed)),
-            c("wal_fsync_ns_total", "Total asset WAL group fsync time in nanoseconds", self.wal_fsync_ns_total.load(Ordering::Relaxed)),
-            c("wal_fsync_samples", "Asset WAL group fsync batches", self.wal_fsync_samples.load(Ordering::Relaxed)),
-            format!("# HELP tc_wal_fsync_ns_max Maximum asset WAL group fsync time in nanoseconds\n# TYPE tc_wal_fsync_ns_max gauge\ntc_wal_fsync_ns_max {}\n", self.wal_fsync_ns_max.load(Ordering::Relaxed)),
+            c("wal_fsync_ns_total", "Total post-match durability barrier time in nanoseconds", self.wal_fsync_ns_total.load(Ordering::Relaxed)),
+            c("wal_fsync_samples", "Post-match durability barrier batches", self.wal_fsync_samples.load(Ordering::Relaxed)),
+            format!("# HELP tc_wal_fsync_ns_max Maximum post-match durability barrier time in nanoseconds\n# TYPE tc_wal_fsync_ns_max gauge\ntc_wal_fsync_ns_max {}\n", self.wal_fsync_ns_max.load(Ordering::Relaxed)),
             c("match_ns_total", "Total in-memory matching time in nanoseconds", self.match_ns_total.load(Ordering::Relaxed)),
             c("match_samples", "Commands matched", self.match_samples.load(Ordering::Relaxed)),
             format!("# HELP tc_match_ns_max Maximum in-memory matching time in nanoseconds\n# TYPE tc_match_ns_max gauge\ntc_match_ns_max {}\n", self.match_ns_max.load(Ordering::Relaxed)),
@@ -513,7 +513,10 @@ impl LatencyHistograms {
         const SPECS: [(&str, &str); 4] = [
             ("command_latency_ns", "Matching command processing latency (nanoseconds)"),
             ("raft_commit_ns", "Raft quorum commit latency (nanoseconds)"),
-            ("wal_fsync_ns", "Asset WAL group fsync latency (nanoseconds)"),
+            (
+                "wal_fsync_ns",
+                "Post-match durability barrier latency (nanoseconds)",
+            ),
             ("match_ns", "In-memory matching latency (nanoseconds)"),
         ];
         for (i, (base, help)) in SPECS.iter().enumerate() {

@@ -25,7 +25,9 @@ fn snapshot_restores_exact_ids_before_replaying_a_duplicate_tail() {
     let instrument = InstrumentId(9);
     let order = Order::limit(OrderId(900), Side::Buy, 100, 2).on(instrument);
     let snapshot = Snapshot {
+        format_version: 4,
         journal_seq: 1,
+        raft_applied_index: 0,
         max_cmd_id: 0,
         max_admin_id: 0,
         halted: Vec::new(),
