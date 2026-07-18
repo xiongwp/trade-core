@@ -31,3 +31,21 @@ HTTP 阶段虽然最终零错误，但发生 3,575,000 command-equivalent 的 42
 
 > Docker Desktop 的 fsync 与调度延迟不代表 Linux + NVMe 生产环境。本报告适合定位
 > 相对瓶颈，不应作为生产容量承诺。
+
+## 批量结果落库优化复测
+
+全量清空 Kafka、MySQL 和 Raft 数据后重新测试 100,000 条订单：
+
+- HTTP → Kafka：60,927 cmd/s，零错误。
+- 撮合输出：200,000 个结果事件。
+- 结果 Kafka → MySQL：420 个批量事务，平均约 476 events/批。
+- 批次延迟：p50 78.24ms，p90 223.33ms，p99 398.67ms。
+- 按 4 worker 累计服务时间折算约 18,224 events/s，较逐事件事务的约
+  2,638 events/s 提升约 **6.9 倍**。
+- 测试结束后约 5 秒内结果 Kafka lag 归零；命令 MySQL、撮合、结果 DB 计数一致，
+  DLQ 为 0。
+
+最终路由分为两条：HTTP 命令 Kafka 使用 `asset_category(instrument)`，保证同资产命令
+进入相同 topic/partition；撮合结果 Kafka 使用 `order_id`，保证同订单事件进入相同
+topic/partition。MySQL 只按 `order_id % 1000` 分到 10 DB × 100 table，不考虑资产；
+相同 `(db, table)` 的结果事件合并成一笔事务提交。

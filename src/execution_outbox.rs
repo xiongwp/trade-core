@@ -21,13 +21,9 @@ pub struct OutboxRecord {
 }
 
 impl OutboxRecord {
-    pub fn kafka_key(&self, category_size: u32) -> [u8; 4] {
-        let instrument = crate::InstrumentId(u32::from_le_bytes(
-            self.report_frame[4..8]
-                .try_into()
-                .expect("execution instrument"),
-        ));
-        crate::sharding::asset_category(instrument, category_size).to_be_bytes()
+    pub fn kafka_key(&self, _category_size: u32) -> [u8; 8] {
+        let report = wire::decode_report(&self.report_frame).expect("valid outbox report");
+        report.order_id.0.to_be_bytes()
     }
 
     pub fn kafka_payload(&self) -> [u8; EXECUTION_EVENT_LEN] {
@@ -636,7 +632,7 @@ mod tests {
         assert_eq!(got[0].raft_group, 3);
         assert_eq!(got[0].raft_index, 9);
         assert_eq!(got[0].ordinal, 2);
-        assert_eq!(got[0].kafka_key(10), 4u32.to_be_bytes());
+        assert_eq!(got[0].kafka_key(10), 7u64.to_be_bytes());
         let event = wire::decode_execution_event(&got[0].kafka_payload()).unwrap();
         assert_eq!(event.raft_group, 3);
         assert_eq!(event.raft_index, 9);

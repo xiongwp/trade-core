@@ -113,7 +113,7 @@ impl OrderPipelineMetrics {
         );
     }
 
-    fn record_execution_mysql(&self, elapsed: Duration) {
+    fn record_execution_mysql_batch(&self, elapsed: Duration, events: u64) {
         Self::record(
             &self.execution_mysql_commit_ns_total,
             &self.execution_mysql_commit_ns_max,
@@ -123,7 +123,7 @@ impl OrderPipelineMetrics {
         self.execution_mysql_commit_hist
             .record(elapsed.as_nanos() as u64);
         self.execution_mysql_completed_events
-            .fetch_add(1, AtomicOrdering::Relaxed);
+            .fetch_add(events, AtomicOrdering::Relaxed);
     }
 
     fn try_reserve(&self, commands: u64, max_backlog: u64) -> Result<(), u64> {
@@ -415,7 +415,7 @@ impl Backpressure {
                 if !self.soft_delay.is_zero() {
                     std::thread::sleep(self.soft_delay);
                 }
-                Ok(())
+                Ok::<(), String>(())
             }
             BackpressureTier::Hard => Err(format!(
                 "backpressure: category {category_id} throttled at hard limit {}",
@@ -536,6 +536,7 @@ impl DlqWriter {
 /// loop. Both variants advance the Kafka offset — a poison message must not
 /// wedge the partition forever.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
 enum PersistOutcome {
     Committed,
     DeadLettered,
@@ -545,6 +546,7 @@ enum PersistOutcome {
 /// the budget, dead-letter it and report `DeadLettered` so the caller advances
 /// the offset. A DLQ write failure is *not* treated as success — we keep
 /// retrying rather than silently drop the record.
+#[cfg_attr(not(test), allow(dead_code))]
 fn persist_with_retry<F>(
     mut persist: F,
     dlq: &Mutex<DlqWriter>,
@@ -762,13 +764,11 @@ impl KafkaIngress {
             db_consumers: env_number(
                 "TC_ORDER_KAFKA_DB_CONSUMERS",
                 env_number("TC_ORDER_KAFKA_CONSUMERS", partition_workers),
-            )
-            .max(1),
+            ),
             matcher_consumers: env_number(
                 "TC_ORDER_KAFKA_MATCH_CONSUMERS",
                 env_number("TC_ORDER_KAFKA_CONSUMERS", partition_workers),
-            )
-            .max(1),
+            ),
             db_group: std::env::var("TC_ORDER_KAFKA_DB_GROUP")
                 .unwrap_or_else(|_| "trade-order-persist-v1".into()),
             matcher_group: std::env::var("TC_ORDER_KAFKA_MATCH_GROUP")
@@ -777,7 +777,7 @@ impl KafkaIngress {
                 .unwrap_or_else(|_| "trade-executions-v1".into()),
             execution_group: std::env::var("TC_EXECUTION_KAFKA_MYSQL_GROUP")
                 .unwrap_or_else(|_| "trade-order-execution-mysql-v1".into()),
-            execution_consumers: env_number("TC_EXECUTION_KAFKA_MYSQL_CONSUMERS", 4usize).max(1),
+            execution_consumers: env_number("TC_EXECUTION_KAFKA_MYSQL_CONSUMERS", 4usize),
             raft_group_pins,
             batch_size: env_number("TC_ORDER_BATCH_SIZE", 500usize).max(1),
             linger: Duration::from_millis(env_number("TC_ORDER_BATCH_LINGER_MS", 2u64)),
@@ -967,6 +967,16 @@ fn command_id(command: &trade_core::Command) -> u64 {
     }
 }
 
+fn database_order_id(command: &trade_core::Command) -> u64 {
+    match command {
+        trade_core::Command::New(order) => order.id.0,
+        trade_core::Command::Cancel { order_id, .. }
+        | trade_core::Command::Modify { order_id, .. } => order_id.0,
+        trade_core::Command::ForceClose { close_order_id, .. } => close_order_id.0,
+        _ => command_id(command),
+    }
+}
+
 fn exec_multi_insert(
     tx: &mut Transaction<'_>,
     prefix: &str,
@@ -991,7 +1001,10 @@ fn exec_multi_insert(
 fn persist_kafka_batch(store: &OrderStore, records: &[KafkaRecord]) -> Result<(), String> {
     let mut by_db: HashMap<u32, Vec<&KafkaRecord>> = HashMap::new();
     for record in records {
-        let route = store.routing.route_category(record.category_id);
+        let command = wire::WireView::parse(&record.frame)
+            .and_then(|view| view.to_command())
+            .ok_or_else(|| "invalid Kafka command frame".to_string())?;
+        let route = store.routing.route_order_id(database_order_id(&command));
         by_db.entry(route.db).or_default().push(record);
     }
 
@@ -1028,11 +1041,11 @@ fn persist_mysql_shard(
     let mut cancels = Vec::new();
 
     for record in records {
-        let route = store.routing.route_category(record.category_id);
         let command = wire::WireView::parse(&record.frame)
             .and_then(|view| view.to_command())
             .ok_or_else(|| "invalid Kafka command frame".to_string())?;
         let id = command_id(&command);
+        let route = store.routing.route_order_id(database_order_id(&command));
         processed.extend([
             Value::from(record.category_id),
             Value::from(record.partition),
@@ -1411,10 +1424,10 @@ fn run_execution_mysql_consumer(
     );
     let mut last_failure_log = std::time::Instant::now() - Duration::from_secs(30);
     loop {
-        let Some(message) = consumer.poll(Duration::from_millis(100)) else {
+        let Some(first) = consumer.poll(Duration::from_millis(100)) else {
             continue;
         };
-        let message = match message {
+        let first = match first {
             Ok(message) => message,
             Err(error) => {
                 if last_failure_log.elapsed() >= Duration::from_secs(30) {
@@ -1424,67 +1437,211 @@ fn run_execution_mysql_consumer(
                 continue;
             }
         };
-        let partition = message.partition();
-        let offset = message.offset();
-        let Some(event) = message.payload().and_then(wire::decode_execution_event) else {
-            // Undecodable payload is poison by definition -> dead-letter and
-            // advance rather than reject-and-loop.
-            let payload = message.payload().unwrap_or(&[]).to_vec();
-            if let Ok(mut writer) = dlq.lock() {
-                if let Err(error) =
-                    writer.append(partition, offset, "invalid execution report", &payload)
-                {
-                    log_error!("execution-mysql", worker; "event=dlq_write_failed partition={partition} offset={offset} error={error}");
-                    continue; // keep offset; retry capturing it on next poll
+        let mut records = Vec::with_capacity(kafka.batch_size);
+        push_execution_record(&store, &dlq, &consumer, worker, &first, &mut records);
+        let deadline = std::time::Instant::now() + kafka.linger;
+        while records.len() < kafka.batch_size && std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match consumer.poll(remaining) {
+                Some(Ok(message)) => {
+                    push_execution_record(&store, &dlq, &consumer, worker, &message, &mut records)
+                }
+                Some(Err(error)) => log_warn!("execution-mysql", worker; "event=poll_failed error={error}"),
+                None => break,
+            }
+        }
+        if records.is_empty() {
+            continue;
+        }
+        let persist_started = std::time::Instant::now();
+        let mut committed = false;
+        for attempt in 0..max_retries {
+            match persist_execution_batch(&store, &records) {
+                Ok(()) => {
+                    committed = true;
+                    break;
+                }
+                Err(error) if attempt + 1 < max_retries => {
+                    let shift = attempt.min(6);
+                    std::thread::sleep(base_backoff * (1u32 << shift));
+                    if last_failure_log.elapsed() >= Duration::from_secs(30) {
+                        log_warn!("execution-mysql", worker; "event=batch_retry attempt={} records={} error={error}", attempt + 1, records.len());
+                        last_failure_log = std::time::Instant::now();
+                    }
+                }
+                Err(error) => {
+                    log_error!("execution-mysql", worker; "event=batch_failed records={} error={error}", records.len());
                 }
             }
-            store.metrics.dlq_total.fetch_add(1, AtomicOrdering::Relaxed);
-            log_warn!("execution-mysql", worker; "event=dead_lettered reason=undecodable partition={partition} offset={offset}");
-            let _ = consumer.commit_message(&message, CommitMode::Sync);
-            continue;
-        };
-        let payload = message.payload().unwrap_or(&[]).to_vec();
-        let persist_started = std::time::Instant::now();
-        let outcome = persist_with_retry(
-            || persist_execution_report(&store, partition, offset, event),
-            &dlq,
-            &store.metrics,
-            max_retries,
-            base_backoff,
-            partition,
-            offset,
-            &payload,
-        );
-        if outcome == PersistOutcome::DeadLettered {
-            log_warn!("execution-mysql", worker; "event=dead_lettered partition={partition} offset={offset} attempts={max_retries}");
-        } else {
-            store.metrics.record_execution_mysql(persist_started.elapsed());
         }
-        // Both Committed and DeadLettered advance the offset.
-        if let Err(error) = consumer.commit_message(&message, CommitMode::Sync) {
-            log_error!("execution-mysql", worker; "event=offset_commit_failed partition={partition} offset={offset} error={error}");
+        if committed {
+            store.metrics.record_execution_mysql_batch(
+                persist_started.elapsed(),
+                records.len() as u64,
+            );
+            if let Err(error) = commit_execution_batch(&consumer, &records) {
+                log_error!("execution-mysql", worker; "event=offset_commit_failed error={error}");
+            }
+        } else {
+            rewind_execution_batch(&consumer, &records);
         }
     }
 }
 
-fn persist_execution_report(
-    store: &OrderStore,
+#[derive(Clone)]
+struct ExecutionKafkaRecord {
+    topic: String,
     partition: i32,
     offset: i64,
     event: wire::ExecutionEvent,
+}
+
+fn push_execution_record(
+    store: &OrderStore,
+    dlq: &Arc<Mutex<DlqWriter>>,
+    consumer: &BaseConsumer,
+    worker: usize,
+    message: &rdkafka::message::BorrowedMessage<'_>,
+    records: &mut Vec<ExecutionKafkaRecord>,
+) {
+    let partition = message.partition();
+    let offset = message.offset();
+    if let Some(event) = message.payload().and_then(wire::decode_execution_event) {
+        records.push(ExecutionKafkaRecord {
+            topic: message.topic().to_string(),
+            partition,
+            offset,
+            event,
+        });
+        return;
+    }
+    let payload = message.payload().unwrap_or(&[]);
+    if let Ok(mut writer) = dlq.lock() {
+        if writer
+            .append(partition, offset, "invalid execution report", payload)
+            .is_ok()
+        {
+            store.metrics.dlq_total.fetch_add(1, AtomicOrdering::Relaxed);
+            let _ = consumer.commit_message(message, CommitMode::Sync);
+            log_warn!("execution-mysql", worker; "event=dead_lettered reason=undecodable partition={partition} offset={offset}");
+        }
+    }
+}
+
+fn commit_execution_batch(
+    consumer: &BaseConsumer,
+    records: &[ExecutionKafkaRecord],
+) -> Result<(), String> {
+    let mut offsets: HashMap<(&str, i32), i64> = HashMap::new();
+    for record in records {
+        offsets
+            .entry((&record.topic, record.partition))
+            .and_modify(|offset| *offset = (*offset).max(record.offset + 1))
+            .or_insert(record.offset + 1);
+    }
+    let mut list = TopicPartitionList::new();
+    for ((topic, partition), offset) in offsets {
+        list.add_partition_offset(topic, partition, Offset::Offset(offset))
+            .map_err(|error| error.to_string())?;
+    }
+    consumer
+        .commit(&list, CommitMode::Sync)
+        .map_err(|error| error.to_string())
+}
+
+fn rewind_execution_batch(consumer: &BaseConsumer, records: &[ExecutionKafkaRecord]) {
+    let mut offsets: HashMap<(&str, i32), i64> = HashMap::new();
+    for record in records {
+        offsets
+            .entry((&record.topic, record.partition))
+            .and_modify(|offset| *offset = (*offset).min(record.offset))
+            .or_insert(record.offset);
+    }
+    for ((topic, partition), offset) in offsets {
+        let _ = consumer.seek(
+            topic,
+            partition,
+            Offset::Offset(offset),
+            Duration::from_secs(1),
+        );
+    }
+}
+
+fn persist_execution_batch(
+    store: &OrderStore,
+    records: &[ExecutionKafkaRecord],
+) -> Result<(), String> {
+    let mut by_db: HashMap<u32, HashMap<u32, Vec<(&ExecutionKafkaRecord, u64)>>> = HashMap::new();
+    for record in records {
+        let order_id = record.event.report.order_id.0;
+        let route = store.routing.route_order_id(order_id);
+        by_db
+            .entry(route.db)
+            .or_default()
+            .entry(route.table)
+            .or_default()
+            .push((record, order_id));
+        if record.event.report.type_code == wire::RT_TRADE
+            && record.event.report.aux_id != order_id
+        {
+            let maker_id = record.event.report.aux_id;
+            let maker_route = store.routing.route_order_id(maker_id);
+            by_db
+                .entry(maker_route.db)
+                .or_default()
+                .entry(maker_route.table)
+                .or_default()
+                .push((record, maker_id));
+        }
+    }
+    std::thread::scope(|scope| {
+        let mut jobs = Vec::with_capacity(by_db.len());
+        for (shard_db, tables) in by_db {
+            jobs.push(scope.spawn(move || {
+                let db = format!("order_db_{shard_db}");
+                let mut conn = store
+                    .shard(shard_db)
+                    .get_conn()
+                    .map_err(|error| error.to_string())?;
+                for (shard_table, records) in tables {
+                    let table = format!("asset_orders_{shard_table:03}");
+                    let mut tx = conn
+                        .start_transaction(TxOpts::default())
+                        .map_err(|error| error.to_string())?;
+                    for (record, target_order_id) in records {
+                        apply_execution_report(
+                            &mut tx,
+                            &db,
+                            &table,
+                            record.partition,
+                            record.offset,
+                            record.event,
+                            target_order_id,
+                        )?;
+                    }
+                    tx.commit().map_err(|error| error.to_string())?;
+                }
+                Ok::<(), String>(())
+            }));
+        }
+        for job in jobs {
+            job.join()
+                .map_err(|_| "execution MySQL shard worker panicked".to_string())??;
+        }
+        Ok(())
+    })
+}
+
+fn apply_execution_report(
+    tx: &mut Transaction<'_>,
+    db: &str,
+    table: &str,
+    partition: i32,
+    offset: i64,
+    event: wire::ExecutionEvent,
+    target_order_id: u64,
 ) -> Result<(), String> {
     let report = event.report;
-    let category = sharding::asset_category(report.instrument, store.category_size);
-    let route = store.routing.route_category(category);
-    let db = route.db_name();
-    let table = route.table_name();
-    let mut conn = store
-        .shard(route.db)
-        .get_conn()
-        .map_err(|error| error.to_string())?;
-    let mut tx = conn
-        .start_transaction(TxOpts::default())
-        .map_err(|error| error.to_string())?;
     if event.raft_index == 0 {
         tx.exec_drop(
             format!("INSERT IGNORE INTO {db}.processed_executions (kafka_partition,kafka_offset,instrument) VALUES (:partition,:offset,:instrument)"),
@@ -1503,7 +1660,7 @@ fn persist_execution_report(
                 "raft_index" => event.raft_index,
                 "ordinal" => event.ordinal,
                 "instrument" => report.instrument.0,
-                "order_id" => report.order_id.0,
+                "order_id" => target_order_id,
                 "report_type" => report.type_code,
                 "partition" => partition,
                 "offset" => offset as u64,
@@ -1512,14 +1669,13 @@ fn persist_execution_report(
         .map_err(|error| error.to_string())?;
     }
     if tx.affected_rows() == 0 {
-        tx.commit().map_err(|error| error.to_string())?;
         return Ok(());
     }
     match report.type_code {
         wire::RT_TRADE => {
             tx.exec_drop(
-                format!("UPDATE {db}.{table} SET status=IF(LEAST(qty,filled_qty+:fill)>=qty,'FILLED','PARTIAL'), filled_qty=LEAST(qty,filled_qty+:fill) WHERE order_id IN (:taker,:maker)"),
-                params! {"fill" => report.qty, "taker" => report.order_id.0, "maker" => report.aux_id},
+                format!("UPDATE {db}.{table} SET status=IF(LEAST(qty,filled_qty+:fill)>=qty,'FILLED','PARTIAL'), filled_qty=LEAST(qty,filled_qty+:fill) WHERE order_id=:id"),
+                params! {"fill" => report.qty, "id" => target_order_id},
             )
             .map_err(|error| error.to_string())?;
         }
@@ -1533,28 +1689,28 @@ fn persist_execution_report(
             .map_err(|error| error.to_string())?;
         }
         wire::RT_PARTIAL => update_execution_status(
-            &mut tx,
-            &db,
-            &table,
+            tx,
+            db,
+            table,
             report.order_id.0,
             "PARTIAL",
             Some(report.qty),
         )?,
         wire::RT_RESTING | wire::RT_ACCEPTED => {
-            update_execution_status(&mut tx, &db, &table, report.order_id.0, "OPEN", None)?
+            update_execution_status(tx, db, table, report.order_id.0, "OPEN", None)?
         }
         wire::RT_CANCELLED => {
-            update_execution_status(&mut tx, &db, &table, report.order_id.0, "CANCELLED", None)?
+            update_execution_status(tx, db, table, report.order_id.0, "CANCELLED", None)?
         }
         wire::RT_REJECTED => {
-            update_execution_status(&mut tx, &db, &table, report.order_id.0, "REJECTED", None)?
+            update_execution_status(tx, db, table, report.order_id.0, "REJECTED", None)?
         }
         wire::RT_MODIFIED => {
-            update_execution_status(&mut tx, &db, &table, report.order_id.0, "OPEN", None)?
+            update_execution_status(tx, db, table, report.order_id.0, "OPEN", None)?
         }
         _ => {}
     }
-    tx.commit().map_err(|error| error.to_string())
+    Ok(())
 }
 
 fn update_execution_status(
@@ -2153,7 +2309,11 @@ mod tests {
     use super::*;
 
     fn batch_order(user: u64, instrument: u32) -> Vec<u8> {
-        let order = Order::limit(OrderId(99), Side::Buy, 1_000, 2)
+        batch_order_with_id(user, instrument, 99)
+    }
+
+    fn batch_order_with_id(user: u64, instrument: u32, order_id: u64) -> Vec<u8> {
+        let order = Order::limit(OrderId(order_id), Side::Buy, 1_000, 2)
             .on(InstrumentId(instrument))
             .by(user);
         let mut frame = [0u8; wire::MSG_LEN];
@@ -2174,6 +2334,24 @@ mod tests {
         assert_eq!(records[0].category_id, 0);
         assert_eq!(records[1].category_id, 2);
         assert_eq!(records[1].user, 100_001);
+    }
+
+    #[test]
+    fn same_asset_routes_to_same_topic_and_partition_for_different_orders() {
+        let mut body = batch_order_with_id(100_000, 42_001, 7);
+        body.extend_from_slice(&batch_order_with_id(200_000, 42_001, 9_999_999));
+        let records = decode_batch(&body, 1_000).unwrap();
+        let router = QueueRouter::new(
+            vec!["orders-0".into(), "orders-1".into(), "orders-2".into()],
+            8,
+            1,
+        );
+
+        assert_eq!(records[0].category_id, records[1].category_id);
+        assert_eq!(
+            router.route(records[0].category_id),
+            router.route(records[1].category_id)
+        );
     }
 
     #[test]

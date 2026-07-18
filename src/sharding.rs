@@ -102,6 +102,18 @@ impl RouteConfig {
     #[inline]
     pub fn route_category(&self, category_id: u32) -> ShardRoute {
         let slot = category_id as u64 % self.slots();
+        self.route_slot(slot)
+    }
+
+    /// Route an order row using only its order id. Asset/category is
+    /// deliberately not part of database placement.
+    #[inline]
+    pub fn route_order_id(&self, order_id: u64) -> ShardRoute {
+        self.route_slot(order_id % self.slots())
+    }
+
+    #[inline]
+    fn route_slot(&self, slot: u64) -> ShardRoute {
         ShardRoute {
             db: (slot % self.db_count) as u32,
             table: (slot / self.db_count) as u32,
@@ -279,6 +291,19 @@ mod tests {
         for category in [0u32, 1, 42, 999, 12_345, u32::MAX] {
             assert_eq!(cfg.route_category(category), route_category(category));
         }
+    }
+
+    #[test]
+    fn order_ids_stripe_evenly_across_databases_and_tables() {
+        let cfg = RouteConfig::default();
+        let mut slots = vec![0u64; cfg.slots() as usize];
+        for order_id in 0..100_000u64 {
+            let route = cfg.route_order_id(order_id);
+            let slot = route.table as usize * cfg.db_count as usize + route.db as usize;
+            slots[slot] += 1;
+        }
+        assert!(slots.iter().all(|count| *count == 100));
+        assert_eq!(cfg.route_order_id(42), cfg.route_order_id(1_042));
     }
 
     #[test]
