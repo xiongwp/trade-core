@@ -10,9 +10,12 @@ use std::time::{Duration, Instant};
 
 use protobuf::Message as PbMessage;
 use raft::prelude::Message;
+use trade_core::log_info;
 use trade_core::raft_log::{ClusterConfig, RaftNode, MAX_CLUSTER_SIZE};
 
 fn main() {
+    trade_core::oblog::init_from_env();
+    trade_core::oblog::set_panic_hook("raft-sim");
     let mut args = std::env::args().skip(1);
     let id: u64 = args
         .next()
@@ -55,14 +58,16 @@ fn main() {
             }
         }
         for committed in node.take_committed() {
-            eprintln!(
-                "[raft-sim node={id}] committed index={} term={} payload={:?}",
+            log_info!(
+                "raft-sim", format_args!("node={id}");
+                "committed index={} term={} payload={:?}",
                 committed.index, committed.term, committed.data
             );
         }
         if last_status.elapsed() >= Duration::from_secs(2) {
-            eprintln!(
-                "[raft-sim node={id}] leader={} is_leader={}",
+            log_info!(
+                "raft-sim", format_args!("node={id}");
+                "leader={} is_leader={}",
                 node.leader_id(),
                 node.is_leader()
             );

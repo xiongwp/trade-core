@@ -53,10 +53,11 @@ pub struct RepFanout {
 impl RepFanout {
     /// Accept standby connections on `listener` in a background thread.
     pub fn accept_on(listener: TcpListener, running: Arc<AtomicBool>) -> RepFanout {
-        eprintln!(
-            "[replication] WARNING: hot-standby replication is DEPRECATED and \
-             for single-machine development only (no quorum / no fencing). Use \
-             the Raft path (raft-node) for production high availability."
+        crate::log_warn!(
+            "replication",
+            "hot-standby replication is DEPRECATED and for single-machine \
+             development only (no quorum / no fencing). Use the Raft path \
+             (raft-node) for production high availability."
         );
         let fanout = RepFanout::default();
         let subs = fanout.subs.clone();
@@ -70,7 +71,7 @@ impl RepFanout {
                     }
                     if let Ok(s) = stream {
                         s.set_nodelay(true).ok();
-                        eprintln!("[replication] standby attached");
+                        crate::log_info!("replication", "standby attached");
                         subs.lock().unwrap().push(s);
                         attached.store(true, Ordering::Release);
                     }
@@ -123,9 +124,10 @@ pub fn run_replica(
     skip_seq: &HashMap<u32, u64>,
     applied: &AtomicU64,
 ) -> std::io::Result<Replica> {
-    eprintln!(
-        "[replication] WARNING: run_replica is DEPRECATED (development-only hot \
-         standby, no quorum / no fencing). Production HA uses the Raft path."
+    crate::log_warn!(
+        "replication",
+        "run_replica is DEPRECATED (development-only hot standby, no quorum / \
+         no fencing). Production HA uses the Raft path."
     );
     let mut sock = TcpStream::connect(primary_addr)?;
     sock.set_nodelay(true).ok();

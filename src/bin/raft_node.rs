@@ -19,12 +19,30 @@ use rdkafka::ClientConfig;
 use trade_core::asset_log;
 use trade_core::exchange::{build, ExchangeConfig};
 use trade_core::gateway;
+use trade_core::metrics::LatencyMetric;
 use trade_core::raft_log::{ClusterConfig, RaftNode, MAX_CLUSTER_SIZE};
 use trade_core::sharding::DEFAULT_ASSET_CATEGORY_SIZE;
 use trade_core::wire::{self, MSG_LEN};
+use trade_core::{log_error, log_info, log_warn};
 
 const PROPOSAL_BATCH: usize = 512;
 const MAX_RAFT_MESSAGE_BYTES: usize = 16 << 20;
+
+/// Set by the SIGTERM/SIGINT handler (async-signal-safe: a lone atomic store).
+/// A watcher thread turns it into the normal drain path.
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_signal(_sig: libc::c_int) {
+    SHUTDOWN.store(true, Ordering::SeqCst);
+}
+
+fn install_signal_handlers() {
+    let handler = on_signal as *const () as libc::sighandler_t;
+    unsafe {
+        libc::signal(libc::SIGTERM, handler);
+        libc::signal(libc::SIGINT, handler);
+    }
+}
 
 struct ProposalRequest {
     commands: Vec<trade_core::Command>,
@@ -32,6 +50,10 @@ struct ProposalRequest {
 }
 
 fn main() {
+    trade_core::oblog::init_from_env();
+    trade_core::oblog::set_panic_hook("raft-node");
+    install_signal_handlers();
+
     let mut args = std::env::args().skip(1);
     let id: u64 = args
         .next()
@@ -95,6 +117,9 @@ fn main() {
     });
     let metrics = handle.metrics.clone();
     metrics.set_ready(false);
+    // Single-group deployment: register one commit-latency series (group 0).
+    // A future split-matching topology registers one per group here.
+    metrics.register_raft_commit_groups(1);
     let execution_kafka_brokers = std::env::var("TC_EXECUTION_KAFKA_BROKERS").ok();
     metrics
         .execution_outbox_publish_healthy
@@ -156,8 +181,9 @@ fn main() {
                 runtime_metrics.set_raft_applied_index(index);
             }
             if let Some(reference) = node.take_installed_snapshot() {
-                eprintln!(
-                    "[raft-node] event=recovered_snapshot index={} reference_bytes={}",
+                log_info!(
+                    "raft-node",
+                    "event=recovered_snapshot raft_index={} reference_bytes={}",
                     node.snapshot_index(),
                     reference.len()
                 );
@@ -319,8 +345,11 @@ fn main() {
                     let payload = committed.data;
                     committed_batch_indexes.insert(index);
                     if let Some(started) = commit_started.remove(&index) {
+                        let commit_ns = started.elapsed().as_nanos() as u64;
+                        runtime_metrics.record_raft_commit_latency(commit_ns);
                         runtime_metrics
-                            .record_raft_commit_latency(started.elapsed().as_nanos() as u64);
+                            .record_latency_hist(LatencyMetric::RaftCommit, commit_ns);
+                        runtime_metrics.record_raft_commit_latency_group(0, commit_ns);
                     }
                     let waiters = commit_waiters.remove(&index);
                     let commands = wire::decode_raft_entry(&payload)
@@ -393,14 +422,15 @@ fn main() {
                         match node.compact(safe, reference) {
                             Ok(true) => {
                                 committed_batch_indexes.retain(|&idx| idx > safe);
-                                eprintln!(
-                                    "[raft-node] event=compacted snapshot_index={safe} first_log_index={}",
+                                log_info!(
+                                    "raft-node",
+                                    "event=compacted raft_index={safe} first_log_index={}",
                                     node.first_log_index()
                                 );
                             }
                             Ok(false) => {}
                             Err(error) => {
-                                eprintln!("[raft-node] event=compaction_failed error={error}");
+                                log_error!("raft-node", "event=compaction_failed raft_index={safe} error={error}");
                             }
                         }
                     }
@@ -446,6 +476,21 @@ fn main() {
             leadership,
         );
     }
+    // Graceful stop: SIGTERM/SIGINT (e.g. `docker stop`) clears `running` so the
+    // raft runtime loop and the committed ingress serve loop both wind down, and
+    // a throwaway self-connection unblocks a pending `accept()`. `handle.shutdown()`
+    // then drains and flushes rather than the process being SIGKILLed.
+    let watch_running = running.clone();
+    let watch_addr = order_addr.clone();
+    thread::spawn(move || {
+        while !SHUTDOWN.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(100));
+        }
+        log_info!("raft-node", "shutdown signal received, draining");
+        watch_running.store(false, Ordering::Release);
+        let _ = TcpStream::connect(&watch_addr);
+    });
+
     let ingress_running = running.clone();
     gateway::serve_committed_forever(
         listener,
@@ -511,7 +556,7 @@ fn spawn_execution_outbox_publisher(
                                 readers.insert(path, reader);
                             }
                             Err(error) => {
-                                eprintln!("[execution-outbox] event=open_failed error={error}");
+                                log_error!("execution-outbox", "event=open_failed path={} error={error}", path.display());
                             }
                         }
                     }
@@ -558,8 +603,9 @@ fn spawn_execution_outbox_publisher(
                                     metrics
                                         .execution_outbox_publish_healthy
                                         .store(0, Ordering::Release);
-                                    eprintln!(
-                                        "[execution-outbox] event=cursor_failed error={error}"
+                                    log_error!(
+                                        "execution-outbox",
+                                        "event=cursor_failed error={error}"
                                     );
                                 } else {
                                     metrics
@@ -576,8 +622,9 @@ fn spawn_execution_outbox_publisher(
                                 metrics
                                     .execution_outbox_publish_healthy
                                     .store(0, Ordering::Release);
-                                eprintln!(
-                                    "[execution-kafka] event=batch_not_acknowledged records={}",
+                                log_warn!(
+                                    "execution-kafka",
+                                    "event=batch_not_acknowledged records={}",
                                     records.len()
                                 );
                             }
@@ -594,7 +641,7 @@ fn spawn_execution_outbox_publisher(
                             metrics
                                 .execution_outbox_publish_healthy
                                 .store(0, Ordering::Release);
-                            eprintln!("[execution-outbox] event=read_failed error={error}");
+                            log_error!("execution-outbox", "event=read_failed error={error}");
                         }
                     }
                 }

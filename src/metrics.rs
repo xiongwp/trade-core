@@ -423,6 +423,22 @@ impl LatencyHistogram {
         Self::quantile_from(&self.snapshot(), q)
     }
 
+    /// Render this histogram as a self-contained Prometheus block under `base`
+    /// (metric name without the `tc_` prefix): `# HELP`/`# TYPE` headers, the
+    /// cumulative `_bucket`/`_sum`/`_count` series, and the derived
+    /// `p50`/`p90`/`p99` gauges. For callers outside this module that keep their
+    /// own [`LatencyHistogram`] (e.g. the order API's MySQL-commit latency) and
+    /// splice the block into their own exposition text.
+    pub fn render_standalone(&self, base: &str, help: &str) -> String {
+        let mut out = String::new();
+        let _ = write!(out, "# HELP tc_{base} {help}\n# TYPE tc_{base} histogram\n");
+        self.render_into(&mut out, base, None);
+        for suffix in ["p50", "p90", "p99"] {
+            let _ = write!(out, "# TYPE tc_{base}_{suffix} gauge\n");
+        }
+        out
+    }
+
     /// Render Prometheus histogram series plus derived p50/p90/p99 gauges.
     /// `base` is the metric base name (without the `tc_` prefix), e.g.
     /// `command_latency_ns`. When `extra_label` is set, every bucket line and
@@ -595,10 +611,10 @@ pub fn serve(addr: String, metrics: Arc<Metrics>) {
         .name("metrics".into())
         .spawn(move || {
             let Ok(listener) = TcpListener::bind(&addr) else {
-                eprintln!("[metrics] cannot bind {addr}");
+                crate::log_error!("metrics", "cannot bind {addr}");
                 return;
             };
-            eprintln!("[metrics] Prometheus on http://{addr}/metrics");
+            crate::log_info!("metrics", "Prometheus on http://{addr}/metrics");
             for mut s in listener.incoming().flatten() {
                 let mut request = [0u8; 1024];
                 let n = s.read(&mut request).unwrap_or(0);

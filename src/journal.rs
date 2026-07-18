@@ -290,22 +290,37 @@ pub fn spawn_fsyncer(
             // errors persist (ENOSPC/EIO). Count every failure, log the first
             // and every 60th thereafter to avoid flooding, and log recovery.
             let mut consecutive_failures: u64 = 0;
-            let mut sync = |file: &File| match file.sync_data() {
-                Ok(()) => {
-                    if consecutive_failures > 0 {
-                        eprintln!(
-                            "[journal-fsync] event=fsync_recovered after_failures={consecutive_failures}"
-                        );
+            let slow = crate::oblog::slow_fsync_threshold();
+            let mut sync = |file: &File| {
+                let started = Instant::now();
+                match file.sync_data() {
+                    Ok(()) => {
+                        let elapsed = started.elapsed();
+                        if consecutive_failures > 0 {
+                            crate::log_info!(
+                                "journal-fsync",
+                                "event=fsync_recovered after_failures={consecutive_failures}"
+                            );
+                        }
+                        consecutive_failures = 0;
+                        if elapsed >= slow {
+                            crate::log_warn!(
+                                "journal-fsync",
+                                "event=slow_fsync elapsed_ms={:.3} threshold_ms={:.3}",
+                                elapsed.as_secs_f64() * 1e3,
+                                slow.as_secs_f64() * 1e3
+                            );
+                        }
                     }
-                    consecutive_failures = 0;
-                }
-                Err(e) => {
-                    consecutive_failures += 1;
-                    metrics.asset_wal_errors.fetch_add(1, Ordering::Relaxed);
-                    if consecutive_failures == 1 || consecutive_failures % 60 == 0 {
-                        eprintln!(
-                            "[journal-fsync] event=fsync_failed consecutive={consecutive_failures} retry_in={interval:?} error={e} — durability window is growing"
-                        );
+                    Err(e) => {
+                        consecutive_failures += 1;
+                        metrics.asset_wal_errors.fetch_add(1, Ordering::Relaxed);
+                        if consecutive_failures == 1 || consecutive_failures % 60 == 0 {
+                            crate::log_error!(
+                                "journal-fsync",
+                                "event=fsync_failed consecutive={consecutive_failures} retry_in={interval:?} error={e} — durability window is growing"
+                            );
+                        }
                     }
                 }
             };

@@ -16,8 +16,11 @@ use std::time::Duration;
 use trade_core::prelude::*;
 use trade_core::wire::{self, MSG_LEN, REPORT_LEN};
 use trade_core::InstrumentId;
+use trade_core::log_error;
 
 fn main() {
+    trade_core::oblog::init_from_env();
+    trade_core::oblog::set_panic_hook("order-client");
     let addr = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "127.0.0.1:9001".to_string());
@@ -27,7 +30,7 @@ fn main() {
         .unwrap_or(0);
     let id = |value: u64| id_base.saturating_add(value);
     let mut sock = TcpStream::connect(&addr).unwrap_or_else(|e| {
-        eprintln!("cannot connect to {addr}: {e}");
+        log_error!("order-client", "cannot connect to {addr}: {e}");
         std::process::exit(1);
     });
     sock.set_nodelay(true).ok();
@@ -124,7 +127,7 @@ fn main() {
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut => {}
             Err(e) => {
-                eprintln!("[client] read error: {e}");
+                log_error!("order-client", "read error: {e}");
                 break;
             }
         }

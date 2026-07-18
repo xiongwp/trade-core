@@ -38,7 +38,7 @@
 
 use std::fmt;
 use std::io::Write;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Severity level. Ordinal doubles as the filter threshold: a record is emitted
@@ -108,6 +108,39 @@ fn threshold() -> u8 {
 /// after the environment is set) and for tests.
 pub fn init_from_env() {
     THRESHOLD.store(read_threshold_from_env(), Ordering::Relaxed);
+    SLOW_FSYNC_WARN_MS.store(read_slow_fsync_ms_from_env(), Ordering::Relaxed);
+}
+
+/// Default slow-fsync warn threshold in milliseconds when
+/// `TC_SLOW_FSYNC_WARN_MS` is unset or unparseable.
+const DEFAULT_SLOW_FSYNC_WARN_MS: u64 = 50;
+
+/// Cached slow-fsync threshold in milliseconds. Sentinel `u64::MAX` means "not
+/// yet read from the environment"; the steady-state check is one relaxed load.
+static SLOW_FSYNC_WARN_MS: AtomicU64 = AtomicU64::new(u64::MAX);
+
+fn read_slow_fsync_ms_from_env() -> u64 {
+    std::env::var("TC_SLOW_FSYNC_WARN_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SLOW_FSYNC_WARN_MS)
+}
+
+/// The configured slow-fsync warn threshold (`TC_SLOW_FSYNC_WARN_MS`, default
+/// 50 ms), read once and cached. Durability fsync paths compare an
+/// already-measured elapsed against this and emit a WARN when it is exceeded —
+/// the measurement itself stays on the hot path only where it already exists.
+#[inline]
+pub fn slow_fsync_threshold() -> Duration {
+    let cached = SLOW_FSYNC_WARN_MS.load(Ordering::Relaxed);
+    let ms = if cached != u64::MAX {
+        cached
+    } else {
+        let v = read_slow_fsync_ms_from_env();
+        SLOW_FSYNC_WARN_MS.store(v, Ordering::Relaxed);
+        v
+    };
+    Duration::from_millis(ms)
 }
 
 /// Force the threshold to a specific level, bypassing the environment. Mainly

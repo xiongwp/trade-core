@@ -16,7 +16,7 @@
 //! In a horizontally-scaled deployment, run one such node per machine and give
 //! each a disjoint instrument set via a `cluster::ClusterMap` on the order side.
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,6 +26,23 @@ use trade_core::risk::PriceGuard;
 use trade_core::strategy::{PriceTimePriority, ProRata, SizePriority};
 use trade_core::types::InstrumentId;
 use trade_core::OrderPool;
+use trade_core::{log_error, log_info};
+
+/// Set by the SIGTERM/SIGINT handler (async-signal-safe: a lone atomic store).
+/// A watcher thread observes it and drives the normal drain path.
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_signal(_sig: libc::c_int) {
+    SHUTDOWN.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn install_signal_handlers() {
+    let handler = on_signal as *const () as libc::sighandler_t;
+    unsafe {
+        libc::signal(libc::SIGTERM, handler);
+        libc::signal(libc::SIGINT, handler);
+    }
+}
 
 fn configured_instruments() -> Vec<InstrumentId> {
     let spec = std::env::var("TC_INSTRUMENTS").unwrap_or_else(|_| "0-15".to_string());
@@ -68,6 +85,10 @@ fn strategy_by_name(name: &str) -> Option<StrategyFactory> {
 }
 
 fn main() {
+    trade_core::oblog::init_from_env();
+    trade_core::oblog::set_panic_hook("trade-core");
+    install_signal_handlers();
+
     let mut args = std::env::args().skip(1);
     let addr = args.next().unwrap_or_else(|| "127.0.0.1:9001".to_string());
     let shards: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(4);
@@ -81,7 +102,7 @@ fn main() {
     });
 
     let Some(strategy) = strategy_by_name(&strat_name) else {
-        eprintln!("unknown strategy '{strat_name}' (price-time | pro-rata | size-priority)");
+        log_error!("trade-core", "unknown strategy '{strat_name}' (price-time | pro-rata | size-priority)");
         std::process::exit(2);
     };
 
@@ -91,8 +112,9 @@ fn main() {
     let instruments = configured_instruments();
     let slot = OrderPool::slot_bytes();
     let pool_orders_per_book = (pool_mb * 1024 * 1024) / slot / instruments.len().max(1);
-    eprintln!(
-        "[server] shards={shards} strategy={strat_name} | pool: {pool_mb} MB = \
+    log_info!(
+        "trade-core",
+        "shards={shards} strategy={strat_name} | pool: {pool_mb} MB = \
          {} instruments x {pool_orders_per_book} orders x {slot} B (prefaulted)",
         instruments.len()
     );
@@ -106,10 +128,10 @@ fn main() {
     }
 
     let journal = if journal_dir == "none" {
-        eprintln!("[server] journaling DISABLED");
+        log_info!("trade-core", "journaling DISABLED");
         None
     } else {
-        eprintln!("[server] journaling to {journal_dir} (flush 1s, fsync 1s)");
+        log_info!("trade-core", "journaling to {journal_dir} (flush 1s, fsync 1s)");
         Some(journal_dir.into())
     };
 
@@ -168,9 +190,25 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
+    // Graceful stop: a watcher thread turns a SIGTERM/SIGINT (e.g. `docker
+    // stop`) into the normal drain path — clear `running` so the gateway's
+    // serve loop returns, then nudge a possibly-blocked `accept()` by opening a
+    // throwaway self-connection. `handle.shutdown()` below then drains and does
+    // the final journal flush instead of the process being SIGKILLed.
+    let watch_running = running.clone();
+    let watch_addr = addr.clone();
+    std::thread::spawn(move || {
+        while !SHUTDOWN.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        log_info!("trade-core", "shutdown signal received, draining");
+        watch_running.store(false, Ordering::Release);
+        let _ = std::net::TcpStream::connect(&watch_addr);
+    });
+
     match gateway::serve_forever(listener, md_listener, gw, sink, running, rate) {
-        Ok(()) => eprintln!("[server] connection closed, shutting down"),
-        Err(e) => eprintln!("[server] error: {e}"),
+        Ok(()) => log_info!("trade-core", "connection closed, shutting down"),
+        Err(e) => log_error!("trade-core", "error: {e}"),
     }
     handle.shutdown();
 }

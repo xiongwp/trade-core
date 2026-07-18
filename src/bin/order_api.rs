@@ -19,11 +19,29 @@ use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::topic_partition_list::{Offset, TopicPartitionList};
 use rdkafka::ClientConfig;
 use trade_core::journal;
+use trade_core::metrics::LatencyHistogram;
 use trade_core::order::Order;
 use trade_core::order_queue::{encode_envelope, QueueEnvelope, QueueRouter};
 use trade_core::sharding::{self, DEFAULT_ASSET_CATEGORY_SIZE};
 use trade_core::types::{InstrumentId, OrderId, Side};
 use trade_core::wire;
+use trade_core::{log_error, log_info, log_warn};
+
+/// Set by the SIGTERM/SIGINT handler (async-signal-safe: a lone atomic store).
+/// The HTTP accept loop observes it and stops taking new connections.
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_signal(_sig: libc::c_int) {
+    SHUTDOWN.store(true, AtomicOrdering::SeqCst);
+}
+
+fn install_signal_handlers() {
+    let handler = on_signal as *const () as libc::sighandler_t;
+    unsafe {
+        libc::signal(libc::SIGTERM, handler);
+        libc::signal(libc::SIGINT, handler);
+    }
+}
 
 const BATCH_RECORD_LEN: usize = 8 + wire::MSG_LEN;
 
@@ -48,6 +66,9 @@ struct OrderPipelineMetrics {
     mysql_commit_ns_total: AtomicU64,
     mysql_commit_ns_max: AtomicU64,
     mysql_commit_samples: AtomicU64,
+    /// Parallel log-bucketed distribution of MySQL commit latency, backing the
+    /// p50/p90/p99 SLO gauges the `*_ns_total`/`*_ns_max` triple cannot answer.
+    mysql_commit_hist: LatencyHistogram,
     raft_forward_ns_total: AtomicU64,
     raft_forward_ns_max: AtomicU64,
     raft_forward_samples: AtomicU64,
@@ -75,6 +96,7 @@ impl OrderPipelineMetrics {
             &self.mysql_commit_samples,
             elapsed,
         );
+        self.mysql_commit_hist.record(elapsed.as_nanos() as u64);
     }
 
     fn record_raft(&self, elapsed: Duration) {
@@ -194,6 +216,9 @@ impl OrderPipelineMetrics {
             self.observed_mysql_lag.load(AtomicOrdering::Relaxed),
             self.observed_match_lag.load(AtomicOrdering::Relaxed),
             self.dlq_total.load(AtomicOrdering::Relaxed),
+        ) + &self.mysql_commit_hist.render_standalone(
+            "order_mysql_commit_ns",
+            "Order API MySQL commit latency (nanoseconds)",
         )
     }
 }
@@ -522,8 +547,9 @@ where
                         return PersistOutcome::DeadLettered;
                     }
                     Err(dlq_error) => {
-                        eprintln!(
-                            "[execution-mysql] DLQ write failed for p{partition}@{offset}, retrying: {dlq_error}"
+                        log_error!(
+                            "execution-mysql",
+                            "event=dlq_write_failed partition={partition} offset={offset} error={dlq_error} — retrying"
                         );
                         if !base_backoff.is_zero() {
                             std::thread::sleep(base_backoff);
@@ -1184,8 +1210,9 @@ fn run_kafka_stage<F>(
         .map(String::as_str)
         .collect::<Vec<_>>();
     consumer.subscribe(&topics).expect("subscribe order topics");
-    eprintln!(
-        "[order-kafka-{stage}-{worker}] group={group_id} subscribed to {} queue groups",
+    log_info!(
+        "order-kafka", format_args!("{stage}-{worker}");
+        "group={group_id} subscribed to {} queue groups",
         topics.len(),
     );
     let mut consecutive_failures = 0u32;
@@ -1200,12 +1227,12 @@ fn run_kafka_stage<F>(
             Ok(message) => match decode_kafka_record(&message, &kafka.router, category_size) {
                 Ok(record) => batch.push(record),
                 Err(error) => {
-                    eprintln!("[order-kafka-{stage}-{worker}] rejected message: {error}")
+                    log_warn!("order-kafka", format_args!("{stage}-{worker}"); "event=rejected_message partition={} offset={} error={error}", message.partition(), message.offset())
                 }
             },
             Err(error) => {
                 if last_failure_log.elapsed() >= Duration::from_secs(30) {
-                    eprintln!("[order-kafka-{stage}-{worker}] poll failed: {error}");
+                    log_warn!("order-kafka", format_args!("{stage}-{worker}"); "event=poll_failed error={error}");
                     last_failure_log = std::time::Instant::now();
                 }
                 continue;
@@ -1219,13 +1246,13 @@ fn run_kafka_stage<F>(
                     match decode_kafka_record(&message, &kafka.router, category_size) {
                         Ok(record) => batch.push(record),
                         Err(error) => {
-                            eprintln!("[order-kafka-{stage}-{worker}] rejected message: {error}")
+                            log_warn!("order-kafka", format_args!("{stage}-{worker}"); "event=rejected_message partition={} offset={} error={error}", message.partition(), message.offset())
                         }
                     }
                 }
                 Some(Err(error)) => {
                     if last_failure_log.elapsed() >= Duration::from_secs(30) {
-                        eprintln!("[order-kafka-{stage}-{worker}] poll failed: {error}");
+                        log_warn!("order-kafka", format_args!("{stage}-{worker}"); "event=poll_failed error={error}");
                         last_failure_log = std::time::Instant::now();
                     }
                 }
@@ -1242,8 +1269,9 @@ fn run_kafka_stage<F>(
                 if consecutive_failures == 1
                     || last_failure_log.elapsed() >= Duration::from_secs(30)
                 {
-                    eprintln!(
-                        "[order-kafka-{stage}-{worker}] batch retained for retry (failure {consecutive_failures}): {error}"
+                    log_warn!(
+                        "order-kafka", format_args!("{stage}-{worker}");
+                        "event=batch_retained_for_retry failures={consecutive_failures} error={error}"
                     );
                     last_failure_log = std::time::Instant::now();
                 }
@@ -1315,7 +1343,7 @@ fn run_consumer_lag_monitor(kafka: KafkaIngress, group_id: String, stage: &'stat
                 kafka.backpressure.set_partition_lags(stage, &lags);
             }
             Err(error) if last_error_log.elapsed() >= Duration::from_secs(30) => {
-                eprintln!("[order-kafka-{stage}-lag] failed to read {group_id}: {error}");
+                log_warn!("order-kafka", format_args!("{stage}-lag"); "event=lag_read_failed group={group_id} error={error}");
                 last_error_log = std::time::Instant::now();
             }
             Err(_) => {}
@@ -1346,8 +1374,9 @@ fn run_execution_mysql_consumer(
     // partition (was an unbounded seek-and-retry loop).
     let max_retries = env_number("TC_ORDER_PERSIST_MAX_RETRIES", 10u32).max(1);
     let base_backoff = Duration::from_millis(env_number("TC_ORDER_PERSIST_RETRY_BASE_MS", 100u64));
-    eprintln!(
-        "[execution-mysql-{worker}] group={} topic={} max_retries={max_retries}",
+    log_info!(
+        "execution-mysql", worker;
+        "group={} topic={} max_retries={max_retries}",
         kafka.execution_group, kafka.execution_topic
     );
     let mut last_failure_log = std::time::Instant::now() - Duration::from_secs(30);
@@ -1359,7 +1388,7 @@ fn run_execution_mysql_consumer(
             Ok(message) => message,
             Err(error) => {
                 if last_failure_log.elapsed() >= Duration::from_secs(30) {
-                    eprintln!("[execution-mysql-{worker}] poll failed: {error}");
+                    log_warn!("execution-mysql", worker; "event=poll_failed error={error}");
                     last_failure_log = std::time::Instant::now();
                 }
                 continue;
@@ -1375,12 +1404,12 @@ fn run_execution_mysql_consumer(
                 if let Err(error) =
                     writer.append(partition, offset, "invalid execution report", &payload)
                 {
-                    eprintln!("[execution-mysql-{worker}] DLQ write failed: {error}");
+                    log_error!("execution-mysql", worker; "event=dlq_write_failed partition={partition} offset={offset} error={error}");
                     continue; // keep offset; retry capturing it on next poll
                 }
             }
             store.metrics.dlq_total.fetch_add(1, AtomicOrdering::Relaxed);
-            eprintln!("[execution-mysql-{worker}] dead-lettered undecodable p{partition}@{offset}");
+            log_warn!("execution-mysql", worker; "event=dead_lettered reason=undecodable partition={partition} offset={offset}");
             let _ = consumer.commit_message(&message, CommitMode::Sync);
             continue;
         };
@@ -1396,11 +1425,11 @@ fn run_execution_mysql_consumer(
             &payload,
         );
         if outcome == PersistOutcome::DeadLettered {
-            eprintln!("[execution-mysql-{worker}] dead-lettered p{partition}@{offset} after {max_retries} attempts");
+            log_warn!("execution-mysql", worker; "event=dead_lettered partition={partition} offset={offset} attempts={max_retries}");
         }
         // Both Committed and DeadLettered advance the offset.
         if let Err(error) = consumer.commit_message(&message, CommitMode::Sync) {
-            eprintln!("[execution-mysql-{worker}] offset commit failed: {error}");
+            log_error!("execution-mysql", worker; "event=offset_commit_failed partition={partition} offset={offset} error={error}");
         }
     }
 }
@@ -1530,7 +1559,7 @@ fn parse_shard_urls(db_count: usize) -> Vec<String> {
             .collect::<Vec<_>>();
         match validate_shard_urls(&urls, db_count) {
             Ok(()) => return urls,
-            Err(error) => eprintln!("[order-api] {error}"),
+            Err(error) => log_warn!("order-api", "{error}"),
         }
     }
     let url = std::env::var("TC_ORDER_MYSQL_URL").expect("TC_ORDER_MYSQL_URL");
@@ -1569,7 +1598,7 @@ fn open_when_ready(shard_urls: &[String], routing: sharding::RouteConfig) -> Ord
         match opened {
             Ok(store) => return store,
             Err(error) => {
-                eprintln!("[order-api] waiting for MySQL/bootstrap: {error}");
+                log_warn!("order-api", "waiting for MySQL/bootstrap: {error}");
                 std::thread::sleep(Duration::from_secs(1));
             }
         }
@@ -1699,7 +1728,7 @@ fn parse_matcher_groups() -> Vec<Vec<MatcherTarget>> {
         if !groups.is_empty() && groups.iter().all(|group| !group.is_empty()) {
             return groups;
         }
-        eprintln!("[order-api] ignored invalid TC_RAFT_GROUP_MATCHERS");
+        log_warn!("order-api", "ignored invalid TC_RAFT_GROUP_MATCHERS");
     }
     if let Ok(value) = std::env::var("TC_RAFT_MATCHERS") {
         let targets = parse_matcher_list(&value);
@@ -1823,6 +1852,13 @@ fn handle(stream: TcpStream, store: Arc<OrderStore>, kafka: Arc<KafkaIngress>, t
                     ),
                     Err(error) => {
                         let status = ingress_error_status(&error);
+                        // Rejected ingress is an異常 path: keep it correlatable
+                        // (success stays silent — the metrics carry it).
+                        log_warn!(
+                            "order-api",
+                            "event=batch_rejected status=\"{status}\" count={} error={error}",
+                            records.len()
+                        );
                         respond(
                             reader.get_mut(),
                             status,
@@ -1831,29 +1867,36 @@ fn handle(stream: TcpStream, store: Arc<OrderStore>, kafka: Arc<KafkaIngress>, t
                         )
                     }
                 },
-                Err(error) => respond(
-                    reader.get_mut(),
-                    "400 Bad Request",
-                    &format!("{{\"error\":\"{error}\"}}"),
-                    keep_alive,
-                ),
+                Err(error) => {
+                    log_warn!("order-api", "event=batch_rejected status=\"400 Bad Request\" error={error}");
+                    respond(
+                        reader.get_mut(),
+                        "400 Bad Request",
+                        &format!("{{\"error\":\"{error}\"}}"),
+                        keep_alive,
+                    )
+                }
             }
             if !keep_alive {
                 return;
             }
             continue;
         }
+        // (order_id, category) of the request, for correlating a rejection.
+        let mut req_ctx: Option<(u64, u32)> = None;
         let persisted = match (method.as_str(), path) {
             ("POST", "/orders") => order_from_query(query).and_then(|order| {
                 let mut frame = [0u8; wire::MSG_LEN];
                 wire::encode_new(&order, &mut frame);
                 let category = sharding::asset_category(order.instrument, store.category_size);
+                req_ctx = Some((order.id.0, category));
                 kafka.publish(category, order.user, &frame)
             }),
             ("POST", "/cancels") => cancel_from_query(query).and_then(|(i, o, c, u)| {
                 let mut frame = [0u8; wire::MSG_LEN];
                 wire::encode_cancel(i, o, c, &mut frame);
                 let category = sharding::asset_category(i, store.category_size);
+                req_ctx = Some((o.0, category));
                 kafka.publish(category, u, &frame)
             }),
             _ => {
@@ -1879,12 +1922,25 @@ fn handle(stream: TcpStream, store: Arc<OrderStore>, kafka: Arc<KafkaIngress>, t
                 ),
                 keep_alive,
             ),
-            Err(error) => respond(
-                reader.get_mut(),
-                ingress_error_status(&error),
-                &format!("{{\"error\":\"{error}\"}}"),
-                keep_alive,
-            ),
+            Err(error) => {
+                let status = ingress_error_status(&error);
+                match req_ctx {
+                    Some((order_id, category)) => log_warn!(
+                        "order-api",
+                        "event=order_rejected status=\"{status}\" order_id={order_id} category={category} error={error}"
+                    ),
+                    None => log_warn!(
+                        "order-api",
+                        "event=order_rejected status=\"{status}\" error={error}"
+                    ),
+                }
+                respond(
+                    reader.get_mut(),
+                    status,
+                    &format!("{{\"error\":\"{error}\"}}"),
+                    keep_alive,
+                )
+            }
         }
         if !keep_alive {
             return;
@@ -1893,10 +1949,14 @@ fn handle(stream: TcpStream, store: Arc<OrderStore>, kafka: Arc<KafkaIngress>, t
 }
 
 fn main() {
+    trade_core::oblog::init_from_env();
+    trade_core::oblog::set_panic_hook("order-api");
+    install_signal_handlers();
+
     let routing = sharding::RouteConfig::from_env();
     let shard_urls = parse_shard_urls(routing.db_count as usize);
     if let Err(error) = validate_shard_urls(&shard_urls, routing.db_count as usize) {
-        panic!("[order-api] shard routing mismatch: {error}");
+        panic!("shard routing mismatch: {error}");
     }
     let matcher_groups = parse_matcher_groups();
     let token = std::env::var("TC_ORDER_API_TOKEN").expect("TC_ORDER_API_TOKEN");
@@ -1909,8 +1969,9 @@ fn main() {
     let dlq = Arc::new(Mutex::new(
         DlqWriter::open(Path::new(&dlq_path)).expect("open execution DLQ file"),
     ));
-    eprintln!(
-        "[order-api] category_size={} db_count={} tables_per_db={} route_version={} raft_groups={} db_consumers={} matcher_consumers={} execution_consumers={} max_pipeline_backlog={} bp_soft={} bp_hard={} bp_emergency={} dlq={} db_group={} matcher_group={} execution_group={} kafka=true",
+    log_info!(
+        "order-api",
+        "category_size={} db_count={} tables_per_db={} route_version={} raft_groups={} db_consumers={} matcher_consumers={} execution_consumers={} max_pipeline_backlog={} bp_soft={} bp_hard={} bp_emergency={} dlq={} db_group={} matcher_group={} execution_group={} kafka=true",
         store.category_size,
         routing.db_count,
         routing.tables_per_db,
@@ -2010,13 +2071,34 @@ fn main() {
             .expect("spawn execution MySQL projection consumer");
     }
     let listener = TcpListener::bind("0.0.0.0:9200").expect("bind order API");
+    // Non-blocking accept so a SIGTERM/SIGINT (e.g. `docker stop`) stops the API
+    // taking new connections and lets the process exit cleanly instead of being
+    // SIGKILLed. In-flight requests already commit Kafka offsets per batch, so
+    // the durable pipeline state is crash-safe regardless.
+    listener
+        .set_nonblocking(true)
+        .expect("set order API listener non-blocking");
     let shared_store = Arc::new(store);
     let shared_kafka = Arc::new(kafka);
-    for stream in listener.incoming().flatten() {
-        let store = shared_store.clone();
-        let kafka = shared_kafka.clone();
-        let token = token.clone();
-        std::thread::spawn(move || handle(stream, store, kafka, &token));
+    loop {
+        if SHUTDOWN.load(AtomicOrdering::SeqCst) {
+            log_info!("order-api", "shutdown signal received, no longer accepting connections");
+            break;
+        }
+        match listener.accept() {
+            Ok((stream, _peer)) => {
+                // Accepted sockets must be blocking for the handler's blocking reads.
+                stream.set_nonblocking(false).ok();
+                let store = shared_store.clone();
+                let kafka = shared_kafka.clone();
+                let token = token.clone();
+                std::thread::spawn(move || handle(stream, store, kafka, &token));
+            }
+            Err(ref error) if error.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(100)),
+        }
     }
 }
 

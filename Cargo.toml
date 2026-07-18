@@ -96,3 +96,7 @@ path = "src/bin/raft_multi_node.rs"
 [[bin]]
 name = "order-api"
 path = "src/bin/order_api.rs"
+
+[[bin]]
+name = "journal-inspect"
+path = "src/bin/journal_inspect.rs"

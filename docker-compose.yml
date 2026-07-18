@@ -112,6 +112,8 @@ services:
       TC_ORDER_API_ADDR: order:9200
       TC_ORDER_API_TOKEN: ${TC_ORDER_API_TOKEN:-local-order-api-token}
       TC_ORDER_API_MAX_IDLE_CONNECTIONS: ${TC_ORDER_API_MAX_IDLE_CONNECTIONS:-32}
+      TC_LOG: ${TC_LOG:-info}
+      RUST_BACKTRACE: ${RUST_BACKTRACE:-1}
     depends_on:
       # raft-* live in docker-compose.raft.yml and define no healthcheck, so
       # they stay service_started; order exposes one and gates the UI proxy.
@@ -239,6 +241,9 @@ services:
         condition: service_healthy
     command: ["exec order-api"]
     environment:
+      TC_LOG: ${TC_LOG:-info}
+      RUST_BACKTRACE: ${RUST_BACKTRACE:-1}
+      TC_SLOW_FSYNC_WARN_MS: ${TC_SLOW_FSYNC_WARN_MS:-50}
       TC_ORDER_MYSQL_SHARD_URLS: mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-0:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-1:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-2:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-3:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-4:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-5:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-6:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-7:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-8:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-9:3306/mysql
       TC_RAFT_GROUP_MATCHERS: "raft-1:9001@raft-1:9102,raft-2:9001@raft-2:9102,raft-3:9001@raft-3:9102,raft-4:9001@raft-4:9102,raft-5:9001@raft-5:9102;raft-1:9011@raft-1:9112,raft-2:9011@raft-2:9112,raft-3:9011@raft-3:9112,raft-4:9011@raft-4:9112,raft-5:9011@raft-5:9112;raft-1:9021@raft-1:9122,raft-2:9021@raft-2:9122,raft-3:9021@raft-3:9122,raft-4:9021@raft-4:9122,raft-5:9021@raft-5:9122;raft-1:9031@raft-1:9132,raft-2:9031@raft-2:9132,raft-3:9031@raft-3:9132,raft-4:9031@raft-4:9132,raft-5:9031@raft-5:9132"
       TC_ORDER_API_TOKEN: ${TC_ORDER_API_TOKEN:-local-order-api-token}

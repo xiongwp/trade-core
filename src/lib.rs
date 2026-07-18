@@ -46,6 +46,7 @@ pub mod fees;
 pub mod gateway;
 pub mod idgen;
 pub mod journal;
+pub mod journal_inspect;
 pub mod kline;
 pub mod lockfree;
 pub mod metrics;

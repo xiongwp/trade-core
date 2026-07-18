@@ -15,7 +15,8 @@ RUN cargo build --release \
     --bin raft-sim \
     --bin raft-node \
     --bin raft-multi-node \
-    --bin trade-core --bin order --bin order-api --bin market-data --bin order_client --bin order_load
+    --bin trade-core --bin order --bin order-api --bin market-data --bin order_client --bin order_load \
+    --bin journal-inspect
 
 FROM debian:stable-slim
 COPY --from=build /src/target/release/trade-core /usr/local/bin/trade-core
@@ -27,17 +28,21 @@ COPY --from=build /src/target/release/order_load /usr/local/bin/order_load
 COPY --from=build /src/target/release/raft-sim /usr/local/bin/raft-sim
 COPY --from=build /src/target/release/raft-node /usr/local/bin/raft-node
 COPY --from=build /src/target/release/raft-multi-node /usr/local/bin/raft-multi-node
+COPY --from=build /src/target/release/journal-inspect /usr/local/bin/journal-inspect
 
 EXPOSE 9001 9101 8080
 
 # Positional args: ADDR SHARDS STRATEGY JOURNAL_DIR POOL_MB BAND_BPS MD_ADDR
+# RUST_BACKTRACE=1 so a panic (aborting under panic="abort") leaves a backtrace
+# in the container logs; the structured panic hook also logs one ERROR line.
 ENV ADDR=0.0.0.0:9001 \
     SHARDS=4 \
     STRATEGY=price-time \
     JOURNAL_DIR=/data/journal \
     POOL_MB=3072 \
     BAND_BPS=1000 \
-    MD_ADDR=0.0.0.0:9101
+    MD_ADDR=0.0.0.0:9101 \
+    RUST_BACKTRACE=1
 
 # Default runs the matching node (trade-core); compose overrides `command`
 # per service to run market-data / order from the same image.

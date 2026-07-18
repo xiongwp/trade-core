@@ -1302,7 +1302,7 @@ impl Shard {
         self.processor.default_pool = self.default_pool;
         if let Some(core) = self.pin_core {
             if let Err(reason) = crate::affinity::pin_current_thread(core) {
-                eprintln!("[shard] CPU pin to core {core} not applied: {reason}");
+                crate::log_warn!("shard", self.shard_id; "CPU pin to core {core} not applied: {reason}");
             }
         }
 
@@ -1377,12 +1377,12 @@ impl Shard {
         // clean stop for durability needs to know the tail didn't make it.
         if let Some(j) = &mut self.journal {
             if let Err(e) = j.flush() {
-                eprintln!("[shard {}] event=shutdown_flush_failed target=journal error={e}", self.shard_id);
+                crate::log_error!("shard", self.shard_id; "event=shutdown_flush_failed target=journal error={e}");
             }
         }
         if let Some(j) = &mut self.asset_journal {
             if let Err(e) = j.flush_all() {
-                eprintln!("[shard {}] event=shutdown_flush_failed target=asset-journal error={e}", self.shard_id);
+                crate::log_error!("shard", self.shard_id; "event=shutdown_flush_failed target=asset-journal error={e}");
             }
         }
         if is_parked {
@@ -1571,7 +1571,12 @@ impl Shard {
                 self.metrics
                     .asset_wal_errors
                     .fetch_add(1, Ordering::Relaxed);
-                eprintln!("[asset-journal] event=append_failed action=reject error={error}");
+                crate::log_error!(
+                    "shard", self.shard_id;
+                    "event=append_failed target=asset-journal action=reject instrument={} raft_index={} error={error}",
+                    cmd.instrument().0,
+                    raft_index.map(|i| i as i64).unwrap_or(-1)
+                );
                 return;
             }
         }
@@ -1609,8 +1614,10 @@ impl Shard {
         if let Some(index) = raft_index {
             self.metrics.set_raft_applied_index(index);
         }
+        let command_ns = started.elapsed().as_nanos() as u64;
+        self.metrics.record_command_latency(command_ns);
         self.metrics
-            .record_command_latency(started.elapsed().as_nanos() as u64);
+            .record_latency_hist(crate::metrics::LatencyMetric::Command, command_ns);
     }
 
     fn process_and_emit(&mut self, command: Command, raft_index: Option<u64>, ordinal: &mut u32) {
@@ -1650,8 +1657,10 @@ impl Shard {
                 }
             }
         });
+        let match_ns = started.elapsed().as_nanos() as u64;
+        self.metrics.record_match_latency(match_ns);
         self.metrics
-            .record_match_latency(started.elapsed().as_nanos() as u64);
+            .record_latency_hist(crate::metrics::LatencyMetric::Match, match_ns);
     }
 
     fn handle_committed_batch(
@@ -1720,6 +1729,9 @@ impl Shard {
             .match_and_record_batch(commands, raft_index)
             .expect("append committed batch execution reports to durable outbox");
         // Group-commit barrier: command WAL(s) + execution outbox in one shot.
+        // Timed on its own so a slow durability barrier can be alerted without
+        // conflating it with the batch's matching/append work.
+        let fsync_started = Instant::now();
         if let Some(asset_journal) = &self.asset_journal {
             asset_journal
                 .sync_committed_batch(&touched)
@@ -1734,8 +1746,25 @@ impl Shard {
                 .sync_data()
                 .expect("group commit execution outbox with WAL barrier");
         }
+        let fsync_elapsed = fsync_started.elapsed();
+        let wal_ns = wal_started.elapsed().as_nanos() as u64;
+        self.metrics.record_wal_fsync_latency(wal_ns);
         self.metrics
-            .record_wal_fsync_latency(wal_started.elapsed().as_nanos() as u64);
+            .record_latency_hist(crate::metrics::LatencyMetric::WalFsync, wal_ns);
+        // Slow-fsync alert: the durability window widens whenever the group
+        // commit barrier stalls (disk pressure, contended fsync). Threshold is
+        // read once and cached; the timing above is unconditional, so this adds
+        // only a compare on the hot path.
+        let slow = crate::oblog::slow_fsync_threshold();
+        if fsync_elapsed >= slow && crate::oblog::enabled(crate::oblog::Level::Warn) {
+            crate::log_warn!(
+                "shard", self.shard_id;
+                "slow group-commit fsync: {:.3}ms >= {:.3}ms threshold (raft_index={raft_index}, wal_files={})",
+                fsync_elapsed.as_secs_f64() * 1e3,
+                slow.as_secs_f64() * 1e3,
+                touched.len()
+            );
+        }
         // Only now, with WAL and outbox both durable, is it safe to advance the
         // application watermark: a crash before this point re-applies the batch
         // and regenerates its (idempotent) outbox records; a crash after it
@@ -1766,8 +1795,10 @@ impl Shard {
             self.emit_report_event(event);
         }
         self.metrics.set_raft_applied_index(raft_index);
+        let command_ns = started.elapsed().as_nanos() as u64;
+        self.metrics.record_command_latency(command_ns);
         self.metrics
-            .record_command_latency(started.elapsed().as_nanos() as u64);
+            .record_latency_hist(crate::metrics::LatencyMetric::Command, command_ns);
     }
 
     /// Match every command in a committed batch, appending each resulting
@@ -1816,8 +1847,10 @@ impl Shard {
                 ordinal = ordinal.saturating_add(1);
             });
         }
+        let match_ns = started.elapsed().as_nanos() as u64;
+        self.metrics.record_match_latency(match_ns);
         self.metrics
-            .record_match_latency(started.elapsed().as_nanos() as u64);
+            .record_latency_hist(crate::metrics::LatencyMetric::Match, match_ns);
         match append_error {
             Some(error) => Err(error),
             None => Ok(emitted),

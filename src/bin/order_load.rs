@@ -24,6 +24,7 @@ use trade_core::prelude::*;
 use trade_core::sharding::{self, DB_COUNT, TABLES_PER_DB};
 use trade_core::wire::{self, MSG_LEN, REPORT_LEN};
 use trade_core::InstrumentId;
+use trade_core::log_info;
 
 struct Rng(u64);
 impl Rng {
@@ -41,6 +42,8 @@ impl Rng {
 }
 
 fn main() {
+    trade_core::oblog::init_from_env();
+    trade_core::oblog::set_panic_hook("order-load");
     let mut args = std::env::args().skip(1);
     let addr = args.next().unwrap_or_else(|| "127.0.0.1:9001".to_string());
     let total: u64 = args
@@ -149,7 +152,7 @@ fn main() {
                         filled -= off;
                     }
                     if term / 1_000_000 != t_term.load(Ordering::Relaxed) / 1_000_000 {
-                        eprintln!("[load] progress: {term} terminals, {trd} trades");
+                        log_info!("order-load", "progress: {term} terminals, {trd} trades");
                     }
                     t_term.store(term, Ordering::Release);
                     t_trade.store(trd, Ordering::Release);

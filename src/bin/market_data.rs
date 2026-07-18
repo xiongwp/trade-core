@@ -27,17 +27,27 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use trade_core::kline::KlineAggregator;
 use trade_core::wire::{self, REPORT_LEN, RT_DEPTH_END, RT_DEPTH_LEVEL};
-use trade_core::{InstrumentId, Order, OrderId, Price, Qty, Side};
+use trade_core::{log_info, log_warn, InstrumentId, Order, OrderId, Price, Qty, Side};
 
 const CHART_HTML: &str = include_str!("../../assets/kline.html");
 const ADMIN_HTML: &str = include_str!("../../assets/admin.html");
 const TRADE_HTML: &str = include_str!("../../assets/trade.html");
 const RT_TRADE: u8 = 2;
+
+/// Set by the SIGTERM/SIGINT handler so the main accept loop can break out and
+/// run the candle-history flush before exiting.
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+/// Async-signal-safe handler: touches only an atomic flag, nothing else.
+extern "C" fn on_signal(_sig: libc::c_int) {
+    SHUTDOWN.store(true, Ordering::SeqCst);
+}
 
 /// (ts, price, qty, maker_fee, taker_fee), newest last.
 type TradeRing = VecDeque<(u64, Price, Qty, u64, u64)>;
@@ -142,12 +152,12 @@ fn feed_one(md_addr: String, state: Arc<Mutex<State>>) {
         let mut sock = match TcpStream::connect(&md_addr) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("[md] waiting for trade-core fanout at {md_addr} ({e})");
+                log_warn!("market-data", "waiting for trade-core fanout at {md_addr} ({e})");
                 std::thread::sleep(Duration::from_secs(1));
                 continue;
             }
         };
-        eprintln!("[md] subscribed to {md_addr}");
+        log_info!("market-data", "subscribed to {md_addr}");
         let mut buf = vec![0u8; REPORT_LEN * 512];
         let mut filled = 0usize;
         loop {
@@ -206,7 +216,7 @@ fn feed_one(md_addr: String, state: Arc<Mutex<State>>) {
                 }
             }
         }
-        eprintln!("[md] feed disconnected, retrying…");
+        log_warn!("market-data", "feed disconnected, retrying…");
     }
 }
 
@@ -817,6 +827,17 @@ fn admin_access<'a>(
 }
 
 fn main() {
+    trade_core::oblog::init_from_env();
+    trade_core::oblog::set_panic_hook("market-data");
+
+    // Install the shutdown handler up front: it only flips an atomic flag, which
+    // is async-signal-safe. SIGTERM (orchestrator stop) and SIGINT (Ctrl-C) both
+    // trigger a graceful drain + final candle-history flush.
+    unsafe {
+        libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);
+    }
+
     let mut args = std::env::args().skip(1);
     let md_addr = args.next().unwrap_or_else(|| "127.0.0.1:9101".to_string());
     let http_addr = args.next().unwrap_or_else(|| "0.0.0.0:8080".to_string());
@@ -845,7 +866,7 @@ fn main() {
         .as_ref()
         .and_then(|p| match KlineAggregator::load(p) {
             Ok(a) => {
-                eprintln!("[md] loaded candle history from {}", p.display());
+                log_info!("market-data", "loaded candle history from {}", p.display());
                 Some(a)
             }
             Err(_) => None,
@@ -866,8 +887,9 @@ fn main() {
         .spawn(move || feed_loop(md_addr, feed_state))
         .expect("spawn feed");
 
-    // Persistence thread: atomic snapshot every 10 s.
-    if let Some(path) = persist {
+    // Persistence thread: atomic snapshot every 10 s. Keep the path so the main
+    // thread can take one final snapshot on graceful shutdown.
+    if let Some(path) = persist.clone() {
         let save_state = state.clone();
         std::thread::Builder::new()
             .name("md-persist".into())
@@ -877,25 +899,51 @@ fn main() {
                 let _ = st.agg.save(&path);
             })
             .expect("spawn persist");
-        eprintln!("[md] persisting candle history every 10s");
+        log_info!("market-data", "persisting candle history every 10s");
     }
 
     let listener = TcpListener::bind(&http_addr).expect("bind http");
-    eprintln!("[md] chart UI + API + WS on http://{http_addr}/");
-    for stream in listener.incoming().flatten() {
-        let state = state.clone();
-        let admin_token = admin_token.clone();
-        let trading_token = trading_token.clone();
-        let order_api = order_api_pool.clone();
-        std::thread::spawn(move || {
-            handle_http(
-                stream,
-                &state,
-                admin_token.as_deref(),
-                trading_token.as_deref(),
-                &order_api,
-            )
-        });
+    // Non-blocking accept so the loop has a natural poll point to observe the
+    // SHUTDOWN flag set by the signal handler.
+    listener
+        .set_nonblocking(true)
+        .expect("set http listener non-blocking");
+    log_info!("market-data", "chart UI + API + WS on http://{http_addr}/");
+    loop {
+        if SHUTDOWN.load(Ordering::SeqCst) {
+            log_info!("market-data", "shutdown signal received, draining");
+            break;
+        }
+        match listener.accept() {
+            Ok((stream, _)) => {
+                let state = state.clone();
+                let admin_token = admin_token.clone();
+                let trading_token = trading_token.clone();
+                let order_api = order_api_pool.clone();
+                std::thread::spawn(move || {
+                    handle_http(
+                        stream,
+                        &state,
+                        admin_token.as_deref(),
+                        trading_token.as_deref(),
+                        &order_api,
+                    )
+                });
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // No pending connection; nap briefly and re-check SHUTDOWN.
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
+
+    // Final flush of candle history so a graceful stop keeps the chart's
+    // history up to the moment of shutdown (mirrors the periodic snapshot).
+    if let Some(path) = persist {
+        let st = state.lock().unwrap();
+        let _ = st.agg.save(&path);
+        log_info!("market-data", "candle history flushed on shutdown");
     }
 }
 

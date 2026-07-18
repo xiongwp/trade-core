@@ -229,8 +229,9 @@ impl ExecutionOutboxWriter {
         self.segment_bytes = len;
         // Best-effort space reclamation; failure must not take down matching.
         if let Err(error) = self.remove_published_segments() {
-            eprintln!(
-                "[execution-outbox] event=segment_gc_failed base={} error={error}",
+            crate::log_warn!(
+                "execution-outbox",
+                "event=segment_gc_failed base={} error={error}",
                 self.base.display()
             );
         }

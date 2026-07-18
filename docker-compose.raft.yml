@@ -2,6 +2,12 @@
 # each group has one replica on every node and owns isolated consensus state,
 # matching journals and per-asset WALs.
 x-raft-environment: &raft-environment
+  # Structured-log level and panic backtraces for every Raft member.
+  TC_LOG: "${TC_LOG:-info}"
+  RUST_BACKTRACE: "${RUST_BACKTRACE:-1}"
+  # Warn when a durability fsync (asset WAL / journal / execution outbox group
+  # commit) exceeds this many milliseconds.
+  TC_SLOW_FSYNC_WARN_MS: "${TC_SLOW_FSYNC_WARN_MS:-50}"
   TC_MATCH_POOL_PER_ASSET: "${TC_MATCH_POOL_PER_ASSET:-2}"
   TC_WAL_PREALLOCATE_BYTES: "${TC_WAL_PREALLOCATE_BYTES:-0}"
   TC_ASSET_WAL_MAX_OPEN_WRITERS: "${TC_ASSET_WAL_MAX_OPEN_WRITERS:-1024}"

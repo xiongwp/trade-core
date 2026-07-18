@@ -54,7 +54,7 @@ impl MdFanout {
                     }
                     if let Ok(s) = stream {
                         s.set_nodelay(true).ok();
-                        eprintln!("[gateway] market-data subscriber connected");
+                        crate::log_info!("gateway", "market-data subscriber connected");
                         subs.lock().unwrap().push(s);
                     }
                 }
@@ -200,8 +200,9 @@ where
     R: Fn(&crate::exchange::ExecutionReportEvent) + Send + Sync + 'static,
 {
     let fanout = md_listener.map(|l| {
-        eprintln!(
-            "[gateway] market-data fanout on {}",
+        crate::log_info!(
+            "gateway",
+            "market-data fanout on {}",
             l.local_addr().unwrap()
         );
         MdFanout::accept_on(l, running.clone())
@@ -214,21 +215,21 @@ where
         .expect("spawn market-data report drain");
     let submit = Arc::new(submit);
     let local = listener.local_addr()?;
-    eprintln!("[gateway] committed ingress listening on {local}");
+    crate::log_info!("gateway", "committed ingress listening on {local}");
     while running.load(Ordering::Acquire) {
         let (stream, peer) = listener.accept()?;
         stream.set_nodelay(true).ok();
         let session_running = running.clone();
         let session_submit = submit.clone();
         thread::spawn(move || {
-            eprintln!("[gateway] committed client connected from {peer}");
+            crate::log_info!("gateway", "committed client connected from {peer}");
             if let Err(error) = read_loop_ack(
                 stream,
                 session_submit.as_ref(),
                 &session_running,
                 max_cmds_per_sec,
             ) {
-                eprintln!("[gateway] committed client {peer} disconnected: {error}");
+                crate::log_warn!("gateway", "committed client {peer} disconnected: {error}");
             }
         });
     }
@@ -270,8 +271,9 @@ where
 {
     let fanout = md_listener.map(|l| {
         let l = l.try_clone().expect("clone market-data listener");
-        eprintln!(
-            "[gateway] market-data fanout on {}",
+        crate::log_info!(
+            "gateway",
+            "market-data fanout on {}",
             l.local_addr().unwrap()
         );
         MdFanout::accept_on(l, running.clone())
@@ -291,11 +293,11 @@ where
     F: Fn(Command),
 {
     let local = listener.local_addr()?;
-    eprintln!("[gateway] listening on {local}, awaiting order-system connection…");
+    crate::log_info!("gateway", "listening on {local}, awaiting order-system connection…");
 
     let (stream, peer) = listener.accept()?;
     stream.set_nodelay(true).ok();
-    eprintln!("[gateway] order system connected from {peer}");
+    crate::log_info!("gateway", "order system connected from {peer}");
 
     let write_stream = stream.try_clone()?;
 
@@ -332,7 +334,7 @@ fn read_loop<S: Read, F: Fn(Command)>(
     while running.load(Ordering::Acquire) {
         let n = stream.read(&mut buf[filled..])?;
         if n == 0 {
-            eprintln!("[gateway] peer closed connection");
+            crate::log_info!("gateway", "peer closed connection");
             break;
         }
         filled += n;

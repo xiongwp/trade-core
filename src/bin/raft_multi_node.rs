@@ -5,6 +5,8 @@ use std::process::{Child, Command, ExitCode};
 use std::thread;
 use std::time::Duration;
 
+use trade_core::{log_error, log_info};
+
 /// Default replication factor. Override with `TC_RAFT_REPLICAS` (3, 5, 7, 9).
 const DEFAULT_REPLICAS: u16 = 5;
 
@@ -20,6 +22,8 @@ fn stop(children: &mut [Child]) {
 }
 
 fn main() -> ExitCode {
+    trade_core::oblog::init_from_env();
+    trade_core::oblog::set_panic_hook("raft-multi-node");
     let mut args = std::env::args().skip(1);
     let node: u16 = args
         .next()
@@ -65,8 +69,9 @@ fn main() -> ExitCode {
             data_root.join(format!("group-{group}"))
         };
         std::fs::create_dir_all(&data_dir).expect("create Raft group data directory");
-        eprintln!(
-            "[raft-multi-node] node={node} group={group} raft={raft_port} order={order_port} metrics={metrics_port} data={}",
+        log_info!(
+            "raft-multi-node",
+            "node={node} group={group} raft={raft_port} order={order_port} metrics={metrics_port} data={}",
             data_dir.display()
         );
         let child = Command::new(&binary)
@@ -87,15 +92,16 @@ fn main() -> ExitCode {
         for index in 0..children.len() {
             match children[index].try_wait() {
                 Ok(Some(status)) => {
-                    eprintln!(
-                        "[raft-multi-node] child group {index} exited with {status}; stopping node"
+                    log_error!(
+                        "raft-multi-node",
+                        "child group {index} exited with {status}; stopping node"
                     );
                     stop(&mut children);
                     return ExitCode::FAILURE;
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    eprintln!("[raft-multi-node] failed to inspect group {index}: {error}");
+                    log_error!("raft-multi-node", "failed to inspect group {index}: {error}");
                     stop(&mut children);
                     return ExitCode::FAILURE;
                 }

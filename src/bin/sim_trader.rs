@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use trade_core::prelude::*;
 use trade_core::wire::{self, MSG_LEN};
 use trade_core::InstrumentId;
+use trade_core::{log_error, log_info, log_warn};
 
 struct Rng(u64);
 impl Rng {
@@ -30,6 +31,8 @@ impl Rng {
 }
 
 fn main() {
+    trade_core::oblog::init_from_env();
+    trade_core::oblog::set_panic_hook("sim");
     let mut args = std::env::args().skip(1);
     let addr = args.next().unwrap_or_else(|| "127.0.0.1:9001".to_string());
     let rate: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(300);
@@ -38,13 +41,13 @@ fn main() {
         match TcpStream::connect(&addr) {
             Ok(s) => break s,
             Err(e) => {
-                eprintln!("[sim] waiting for exchange at {addr} ({e})");
+                log_warn!("sim", "waiting for exchange at {addr} ({e})");
                 std::thread::sleep(Duration::from_secs(1));
             }
         }
     };
     sock.set_nodelay(true).ok();
-    eprintln!("[sim] connected to {addr}, streaming ~{rate} orders/s");
+    log_info!("sim", "connected to {addr}, streaming ~{rate} orders/s");
 
     // Drain and discard the report stream on a separate thread so the server's
     // writer never blocks on a full socket buffer.
@@ -107,7 +110,7 @@ fn main() {
 
         wire::encode_new(&order, &mut frame);
         if sock.write_all(&frame).is_err() {
-            eprintln!("[sim] exchange connection lost, exiting");
+            log_error!("sim", "exchange connection lost, exiting");
             return;
         }
 
