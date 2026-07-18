@@ -79,9 +79,20 @@ flowchart LR
 partition 数，`N` 为对应角色的进程数。消费者全集群总数超过 partition 数不会增加并行度；
 撮合消费者总数明显超过 Raft group 数还会增加同一有序 group 的竞争和 leader 重试。
 
+当命令DB和结果DB consumer都为0时，进程不会连接MySQL、创建连接池或执行bootstrap DDL。
+因此API ingress和Match worker可以只配置Kafka/Raft依赖；只有两类DB worker需要注入
+`TC_ORDER_MYSQL_SHARD_URLS`。这避免连接数随所有无状态/撮合副本与分片数相乘。
+三类worker设置`TC_ORDER_HTTP_INGRESS_ENABLED=false`，保留`/metrics`和健康检查，但拒绝
+订单POST请求并停止入口专用的consumer lag轮询，避免流量误入后台worker。
+
 每个Order worker进程为每个Raft group建立一个长期forward worker和一组leader连接，所有
 Kafka消费者复用它；禁止恢复成“每消费者×每group”连接或按批次创建线程。每group队列由
 `TC_RAFT_FORWARD_QUEUE`限制，队列满时应向Kafka消费施加背压。
+
+每个Raft group的命令ID去重集合必须有界，使用`TC_RAFT_DEDUP_MAX_IDS`控制。容量按
+`单group峰值命令/s × Kafka最大重试或offset回放秒数 × 安全系数`计算；默认100万只适合
+开发和基线压测。生产必须让该窗口覆盖完整的重试SLA，否则超出窗口的旧消息只能依靠业务
+幂等键和下游唯一索引兜底。禁止恢复成保存节点生命周期内全部order_id的无界HashMap。
 
 API 本地只统计正在等待 Kafka delivery 的命令；持久流水线背压读取共享 consumer-group lag，
 因此某个 API 发布的命令可由其他 worker 完成，不会在发布实例上形成永不释放的本地积压。

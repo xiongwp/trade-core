@@ -54,7 +54,6 @@ struct MatcherTarget {
 #[derive(Clone)]
 struct OrderStore {
     shards: Arc<Vec<Pool>>,
-    category_size: u32,
     /// Versioned shard routing record. All row placement goes through this so a
     /// parameter change is a fenced migration (see [`sharding::RouteConfig`]).
     routing: sharding::RouteConfig,
@@ -952,6 +951,13 @@ where
         .unwrap_or(default)
 }
 
+fn env_enabled(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| !matches!(value.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"))
+        .unwrap_or(default)
+}
+
 #[derive(Clone)]
 struct KafkaRecord {
     topic: String,
@@ -1831,7 +1837,11 @@ fn validate_shard_urls(urls: &[String], db_count: usize) -> Result<(), String> {
     }
 }
 
-fn open_when_ready(shard_urls: &[String], routing: sharding::RouteConfig) -> OrderStore {
+fn open_when_ready(
+    shard_urls: &[String],
+    routing: sharding::RouteConfig,
+    metrics: Arc<OrderPipelineMetrics>,
+) -> OrderStore {
     loop {
         let opened = (|| -> mysql::Result<OrderStore> {
             let mut shards = Vec::with_capacity(shard_urls.len());
@@ -1847,9 +1857,8 @@ fn open_when_ready(shard_urls: &[String], routing: sharding::RouteConfig) -> Ord
             }
             let store = OrderStore {
                 shards: Arc::new(shards),
-                category_size: category_size(),
                 routing,
-                metrics: Arc::new(OrderPipelineMetrics::default()),
+                metrics: metrics.clone(),
             };
             bootstrap(&store)?;
             Ok(store)
@@ -1868,6 +1877,10 @@ fn open_when_ready(shard_urls: &[String], routing: sharding::RouteConfig) -> Ord
 /// carries credentials).
 fn io_shard_error(shard: usize, error: &dyn std::fmt::Display) -> std::io::Error {
     std::io::Error::other(format!("shard {shard}: {error}"))
+}
+
+fn role_needs_mysql(db_consumers: usize, execution_consumers: usize) -> bool {
+    db_consumers > 0 || execution_consumers > 0
 }
 
 fn category_size() -> u32 {
@@ -2030,7 +2043,14 @@ fn respond_content(
     let _ = stream.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: {connection}\r\n\r\n{body}", body.len()).as_bytes());
 }
 
-fn handle(stream: TcpStream, store: Arc<OrderStore>, kafka: Arc<KafkaIngress>, token: &str) {
+fn handle(
+    stream: TcpStream,
+    category_size: u32,
+    metrics: Arc<OrderPipelineMetrics>,
+    kafka: Arc<KafkaIngress>,
+    token: &str,
+    ingress_enabled: bool,
+) {
     stream.set_nodelay(true).ok();
     let mut reader = BufReader::new(stream);
     loop {
@@ -2090,7 +2110,7 @@ fn handle(stream: TcpStream, store: Arc<OrderStore>, kafka: Arc<KafkaIngress>, t
                 reader.get_mut(),
                 "200 OK",
                 "text/plain; version=0.0.4",
-                &(store.metrics.render() + &kafka.backpressure.render()),
+                &(metrics.render() + &kafka.backpressure.render()),
                 keep_alive,
             );
             if !keep_alive {
@@ -2110,9 +2130,21 @@ fn handle(stream: TcpStream, store: Arc<OrderStore>, kafka: Arc<KafkaIngress>, t
             }
             continue;
         }
+        if !ingress_enabled && method == "POST" {
+            respond(
+                reader.get_mut(),
+                "503 Service Unavailable",
+                "{\"error\":\"HTTP ingress disabled for this worker role\"}",
+                keep_alive,
+            );
+            if !keep_alive {
+                return;
+            }
+            continue;
+        }
 
         if method == "POST" && path == "/commands/batch" {
-            match decode_batch(&body, store.category_size) {
+            match decode_batch(&body, category_size) {
                 Ok(records) => match kafka.publish_batch(&records) {
                     Ok(()) => respond(
                         reader.get_mut(),
@@ -2161,14 +2193,14 @@ fn handle(stream: TcpStream, store: Arc<OrderStore>, kafka: Arc<KafkaIngress>, t
             ("POST", "/orders") => order_from_query(query).and_then(|order| {
                 let mut frame = [0u8; wire::MSG_LEN];
                 wire::encode_new(&order, &mut frame);
-                let category = sharding::asset_category(order.instrument, store.category_size);
+                let category = sharding::asset_category(order.instrument, category_size);
                 req_ctx = Some((order.id.0, category));
                 kafka.publish(category, order.user, &frame)
             }),
             ("POST", "/cancels") => cancel_from_query(query).and_then(|(i, o, c, u)| {
                 let mut frame = [0u8; wire::MSG_LEN];
                 wire::encode_cancel(i, o, c, &mut frame);
-                let category = sharding::asset_category(i, store.category_size);
+                let category = sharding::asset_category(i, category_size);
                 req_ctx = Some((o.0, category));
                 kafka.publish(category, u, &frame)
             }),
@@ -2227,17 +2259,26 @@ fn main() {
     install_signal_handlers();
 
     let routing = sharding::RouteConfig::from_env();
-    let shard_urls = parse_shard_urls(routing.db_count as usize);
-    if let Err(error) = validate_shard_urls(&shard_urls, routing.db_count as usize) {
-        panic!("shard routing mismatch: {error}");
-    }
+    let category_size = category_size();
+    let metrics = Arc::new(OrderPipelineMetrics::default());
     let matcher_groups = parse_matcher_groups();
     let token = std::env::var("TC_ORDER_API_TOKEN").expect("TC_ORDER_API_TOKEN");
-    let store = open_when_ready(&shard_urls, routing);
-    let kafka = KafkaIngress::from_env(store.metrics.clone(), matcher_groups.len())
+    let kafka = KafkaIngress::from_env(metrics.clone(), matcher_groups.len())
         .expect("configure Kafka order ingress")
         .expect("TC_ORDER_KAFKA_BROKERS is required");
+    // API ingress and matcher-forwarder roles do not touch MySQL. Requiring
+    // every replica to open a pool to every shard creates O(processes*shards)
+    // connections and repeats all bootstrap DDL, defeating horizontal scaling.
+    let needs_mysql = role_needs_mysql(kafka.db_consumers, kafka.execution_consumers);
+    let store = needs_mysql.then(|| {
+        let shard_urls = parse_shard_urls(routing.db_count as usize);
+        if let Err(error) = validate_shard_urls(&shard_urls, routing.db_count as usize) {
+            panic!("shard routing mismatch: {error}");
+        }
+        open_when_ready(&shard_urls, routing, metrics.clone())
+    });
     let matcher_group_count = matcher_groups.len();
+    let ingress_enabled = env_enabled("TC_ORDER_HTTP_INGRESS_ENABLED", true);
     let raft_forwarder = (kafka.matcher_consumers > 0)
         .then(|| RaftForwarder::spawn(matcher_groups, kafka.backpressure.clone()));
     let dlq_path = std::env::var("TC_ORDER_DLQ_PATH")
@@ -2248,7 +2289,7 @@ fn main() {
     log_info!(
         "order-api",
         "category_size={} db_count={} tables_per_db={} route_version={} raft_groups={} db_consumers={} matcher_consumers={} execution_consumers={} max_pipeline_backlog={} bp_soft={} bp_hard={} bp_emergency={} dlq={} db_group={} matcher_group={} execution_group={} kafka=true",
-        store.category_size,
+        category_size,
         routing.db_count,
         routing.tables_per_db,
         routing.route_version,
@@ -2265,21 +2306,26 @@ fn main() {
         kafka.matcher_group,
         kafka.execution_group,
     );
-    for (stage, group_id) in [
-        ("mysql", kafka.db_group.clone()),
-        ("match", kafka.matcher_group.clone()),
-    ] {
-        let monitor_kafka = kafka.clone();
-        std::thread::Builder::new()
-            .name(format!("order-kafka-{stage}-lag"))
-            .spawn(move || run_consumer_lag_monitor(monitor_kafka, group_id, stage))
-            .expect("spawn Kafka lag monitor");
+    if ingress_enabled {
+        for (stage, group_id) in [
+            ("mysql", kafka.db_group.clone()),
+            ("match", kafka.matcher_group.clone()),
+        ] {
+            let monitor_kafka = kafka.clone();
+            std::thread::Builder::new()
+                .name(format!("order-kafka-{stage}-lag"))
+                .spawn(move || run_consumer_lag_monitor(monitor_kafka, group_id, stage))
+                .expect("spawn Kafka lag monitor");
+        }
     }
     for worker in 0..kafka.db_consumers {
-        let consumer_store = store.clone();
+        let consumer_store = store
+            .as_ref()
+            .expect("DB consumers require MySQL")
+            .clone();
         let consumer_kafka = kafka.clone();
         let group_id = kafka.db_group.clone();
-        let category_size = store.category_size;
+        let category_size = category_size;
         std::thread::Builder::new()
             .name(format!("order-kafka-mysql-{worker}"))
             .spawn(move || {
@@ -2297,12 +2343,12 @@ fn main() {
     for worker in 0..kafka.matcher_consumers {
         let consumer_kafka = kafka.clone();
         let group_id = kafka.matcher_group.clone();
-        let category_size = store.category_size;
+        let category_size = category_size;
         let worker_forwarder = raft_forwarder
             .as_ref()
             .expect("matcher consumers require Raft forwarder")
             .clone();
-        let consumer_store_metrics = store.metrics.clone();
+        let consumer_store_metrics = metrics.clone();
         let raft_group_pins = kafka.raft_group_pins.clone();
         std::thread::Builder::new()
             .name(format!("order-kafka-match-{worker}"))
@@ -2328,7 +2374,10 @@ fn main() {
             .expect("spawn Kafka matching consumer");
     }
     for worker in 0..kafka.execution_consumers {
-        let execution_store = store.clone();
+        let execution_store = store
+            .as_ref()
+            .expect("execution DB consumers require MySQL")
+            .clone();
         let execution_kafka = kafka.clone();
         let execution_dlq = dlq.clone();
         std::thread::Builder::new()
@@ -2351,7 +2400,7 @@ fn main() {
     listener
         .set_nonblocking(true)
         .expect("set order API listener non-blocking");
-    let shared_store = Arc::new(store);
+    let shared_metrics = metrics;
     let shared_kafka = Arc::new(kafka);
     loop {
         if SHUTDOWN.load(AtomicOrdering::SeqCst) {
@@ -2362,10 +2411,19 @@ fn main() {
             Ok((stream, _peer)) => {
                 // Accepted sockets must be blocking for the handler's blocking reads.
                 stream.set_nonblocking(false).ok();
-                let store = shared_store.clone();
+                let metrics = shared_metrics.clone();
                 let kafka = shared_kafka.clone();
                 let token = token.clone();
-                std::thread::spawn(move || handle(stream, store, kafka, &token));
+                std::thread::spawn(move || {
+                    handle(
+                        stream,
+                        category_size,
+                        metrics,
+                        kafka,
+                        &token,
+                        ingress_enabled,
+                    )
+                });
             }
             Err(ref error) if error.kind() == io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(100));
@@ -2552,6 +2610,13 @@ mod tests {
         let err = validate_shard_urls(&three, 10).unwrap_err();
         assert!(err.contains("10"));
         assert!(validate_shard_urls(&[], 1).is_err());
+    }
+
+    #[test]
+    fn ingress_and_match_only_roles_do_not_require_mysql() {
+        assert!(!role_needs_mysql(0, 0));
+        assert!(role_needs_mysql(1, 0));
+        assert!(role_needs_mysql(0, 1));
     }
 
     fn dlq_temp_path(tag: &str) -> std::path::PathBuf {

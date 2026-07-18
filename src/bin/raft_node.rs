@@ -3,7 +3,7 @@
 //! Usage: `raft-node NODE_ID RAFT_ADDR PEERS ORDER_ADDR DATA_DIR [MD_ADDR] [METRICS_ADDR]`.
 //! Client frames reach the matching queue only through committed Raft entries.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -47,6 +47,50 @@ fn install_signal_handlers() {
 struct ProposalRequest {
     commands: Vec<trade_core::Command>,
     committed: mpsc::SyncSender<u64>,
+}
+
+/// Bounded retry/replay deduplication for commands already committed by Raft.
+///
+/// Keeping every command id forever makes resident memory proportional to the
+/// lifetime traffic of a group, which prevents long-lived nodes from scaling.
+/// Kafka retries and offset replays are time-bounded, so retain only the newest
+/// configured working set. Raft/WAL application watermarks remain the durable
+/// recovery guard; this window only suppresses command-level redelivery.
+struct CommittedIdWindow {
+    indexes: HashMap<u64, u64>,
+    insertion_order: VecDeque<u64>,
+    max_ids: usize,
+}
+
+impl CommittedIdWindow {
+    fn new(max_ids: usize) -> Self {
+        Self {
+            indexes: HashMap::with_capacity(max_ids.min(1 << 20)),
+            insertion_order: VecDeque::with_capacity(max_ids.min(1 << 20)),
+            max_ids: max_ids.max(1),
+        }
+    }
+
+    fn get(&self, id: u64) -> Option<u64> {
+        self.indexes.get(&id).copied()
+    }
+
+    fn contains(&self, id: u64) -> bool {
+        self.indexes.contains_key(&id)
+    }
+
+    fn remember(&mut self, id: u64, index: u64) {
+        if id == 0 || self.indexes.contains_key(&id) {
+            return;
+        }
+        self.indexes.insert(id, index);
+        self.insertion_order.push_back(id);
+        while self.indexes.len() > self.max_ids {
+            if let Some(expired) = self.insertion_order.pop_front() {
+                self.indexes.remove(&expired);
+            }
+        }
+    }
 }
 
 fn main() {
@@ -144,6 +188,11 @@ fn main() {
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(10_000);
+    let dedup_max_ids = std::env::var("TC_RAFT_DEDUP_MAX_IDS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1_000_000)
+        .max(1);
     let state_path = data_dir.join("raft.state");
     let asset_root = data_dir.join("journal").join("assets");
     thread::Builder::new()
@@ -154,7 +203,7 @@ fn main() {
             let mut pending = Vec::new();
             let mut commit_waiters: BTreeMap<u64, Vec<mpsc::SyncSender<u64>>> = BTreeMap::new();
             let mut commit_started: BTreeMap<u64, Instant> = BTreeMap::new();
-            let mut committed_ids: HashMap<u64, u64> = HashMap::new();
+            let mut committed_ids = CommittedIdWindow::new(dedup_max_ids);
             let mut was_leader = false;
             let mut last_tick = Instant::now();
             // Fencing: committed terms are monotonic within a member's stream.
@@ -208,9 +257,7 @@ fn main() {
                 if is_batch && applied_batches.contains(&index) {
                     for command in commands {
                         let command_id = command.id();
-                        if command_id != 0 {
-                            committed_ids.entry(command_id).or_insert(index);
-                        }
+                        committed_ids.remember(command_id, index);
                     }
                     runtime_metrics.set_raft_enqueued_index(index);
                     runtime_metrics.set_raft_applied_index(index);
@@ -219,9 +266,7 @@ fn main() {
                 let mut apply = Vec::new();
                 for command in commands {
                     let command_id = command.id();
-                    if command_id != 0 {
-                        committed_ids.entry(command_id).or_insert(index);
-                    }
+                    committed_ids.remember(command_id, index);
                     if is_batch
                         || asset_log::applied_raft_index(&asset_root, command.instrument())
                             .expect("read asset application watermark")
@@ -297,10 +342,10 @@ fn main() {
                         let committed_index = request
                             .commands
                             .iter()
-                            .filter_map(|command| committed_ids.get(&command.id()).copied())
+                            .filter_map(|command| committed_ids.get(command.id()))
                             .max();
                         if request.commands.iter().all(|command| {
-                            command.id() != 0 && committed_ids.contains_key(&command.id())
+                            command.id() != 0 && committed_ids.contains(command.id())
                         }) {
                             let _ = request.committed.send(committed_index.unwrap_or(0));
                             continue;
@@ -357,10 +402,8 @@ fn main() {
                     let mut apply = Vec::new();
                     for command in commands {
                         let id = command.id();
-                        let duplicate = id != 0 && committed_ids.contains_key(&id);
-                        if id != 0 {
-                            committed_ids.entry(id).or_insert(index);
-                        }
+                        let duplicate = id != 0 && committed_ids.contains(id);
+                        committed_ids.remember(id, index);
                         if !duplicate
                             && asset_log::applied_raft_index(&asset_root, command.instrument())
                                 .expect("read asset application watermark")
@@ -887,5 +930,26 @@ mod tests {
             &tx,
         );
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn committed_id_window_evicts_oldest_id() {
+        let mut window = CommittedIdWindow::new(2);
+        window.remember(11, 101);
+        window.remember(12, 102);
+        window.remember(13, 103);
+        assert!(!window.contains(11));
+        assert_eq!(window.get(12), Some(102));
+        assert_eq!(window.get(13), Some(103));
+    }
+
+    #[test]
+    fn committed_id_window_keeps_original_commit_index_for_duplicates() {
+        let mut window = CommittedIdWindow::new(2);
+        window.remember(11, 101);
+        window.remember(11, 999);
+        window.remember(12, 102);
+        assert_eq!(window.get(11), Some(101));
+        assert_eq!(window.get(12), Some(102));
     }
 }

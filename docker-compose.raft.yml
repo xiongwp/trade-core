@@ -15,6 +15,7 @@ x-raft-environment: &raft-environment
   TC_RAFT_TRANSPORT_QUEUE: "${TC_RAFT_TRANSPORT_QUEUE:-8192}"
   TC_RAFT_READY_MAX_APPLY_LAG: "${TC_RAFT_READY_MAX_APPLY_LAG:-32}"
   TC_RAFT_READY_MAX_OUTBOX_PENDING: "${TC_RAFT_READY_MAX_OUTBOX_PENDING:-10000}"
+  TC_RAFT_DEDUP_MAX_IDS: "${TC_RAFT_DEDUP_MAX_IDS:-1000000}"
   # Engine snapshot cadence (bounds per-asset WAL growth + recovery time).
   TC_SNAPSHOT_EVERY_SECS: "${TC_SNAPSHOT_EVERY_SECS:-30}"
   # Raft log compaction: fold + truncate the consensus WAL prefix once this many
