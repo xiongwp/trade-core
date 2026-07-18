@@ -79,6 +79,10 @@ flowchart LR
 partition 数，`N` 为对应角色的进程数。消费者全集群总数超过 partition 数不会增加并行度；
 撮合消费者总数明显超过 Raft group 数还会增加同一有序 group 的竞争和 leader 重试。
 
+每个Order worker进程为每个Raft group建立一个长期forward worker和一组leader连接，所有
+Kafka消费者复用它；禁止恢复成“每消费者×每group”连接或按批次创建线程。每group队列由
+`TC_RAFT_FORWARD_QUEUE`限制，队列满时应向Kafka消费施加背压。
+
 API 本地只统计正在等待 Kafka delivery 的命令；持久流水线背压读取共享 consumer-group lag，
 因此某个 API 发布的命令可由其他 worker 完成，不会在发布实例上形成永不释放的本地积压。
 

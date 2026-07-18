@@ -1181,59 +1181,106 @@ fn rewind_kafka_batch(consumer: &BaseConsumer, records: &[KafkaRecord]) {
     }
 }
 
-fn forward_kafka_batch(
-    matchers: &mut [MatcherConnection],
-    records: &[KafkaRecord],
-    pins: &HashMap<u32, usize>,
-    backpressure: &Backpressure,
-) -> Result<(), String> {
-    if matchers.is_empty() {
-        return Err("no Raft groups configured".into());
-    }
-    let mut grouped = (0..matchers.len())
-        .map(|_| BTreeMap::<u32, Vec<&KafkaRecord>>::new())
-        .collect::<Vec<_>>();
-    for record in records {
-        let group =
-            sharding::raft_group_for_category_pinned(record.category_id, matchers.len(), pins);
-        grouped[group]
-            .entry(record.category_id)
-            .or_default()
-            .push(record);
+struct RaftForwardJob {
+    batches: Vec<Vec<[u8; wire::MSG_LEN]>>,
+    reply: std::sync::mpsc::SyncSender<Result<(), String>>,
+}
+
+#[derive(Clone)]
+struct RaftForwarder {
+    groups: Arc<Vec<std::sync::mpsc::SyncSender<RaftForwardJob>>>,
+}
+
+impl RaftForwarder {
+    fn spawn(target_groups: Vec<Vec<MatcherTarget>>, backpressure: Arc<Backpressure>) -> Self {
+        let queue_capacity = env_number("TC_RAFT_FORWARD_QUEUE", 64usize).max(1);
+        let mut groups = Vec::with_capacity(target_groups.len());
+        for (group, targets) in target_groups.into_iter().enumerate() {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<RaftForwardJob>(queue_capacity);
+            let worker_backpressure = backpressure.clone();
+            std::thread::Builder::new()
+                .name(format!("raft-forward-{group}"))
+                .spawn(move || {
+                    let mut matcher = MatcherConnection::new(targets);
+                    while let Ok(job) = rx.recv() {
+                        let result = job.batches.iter().try_for_each(|frames| {
+                            matcher.send_frames(frames).map_err(|error| {
+                                format!("Raft group {group} batch commit failed: {error}")
+                            })
+                        });
+                        worker_backpressure.set_group_health(group, result.is_ok());
+                        let _ = job.reply.send(result);
+                    }
+                })
+                .expect("spawn Raft forwarding worker");
+            groups.push(tx);
+        }
+        Self {
+            groups: Arc::new(groups),
+        }
     }
 
-    // Independent groups commit concurrently. Records within one group remain
-    // in Kafka poll order; a retry may repeat a committed prefix and is made
-    // exact by the command-id deduplication in that Raft group.
-    std::thread::scope(|scope| {
-        let mut jobs = Vec::new();
-        for (group, (matcher, categories)) in matchers.iter_mut().zip(grouped).enumerate() {
+    fn submit(
+        &self,
+        records: &[KafkaRecord],
+        pins: &HashMap<u32, usize>,
+    ) -> Result<(), String> {
+        if self.groups.is_empty() {
+            return Err("no Raft groups configured".into());
+        }
+        let mut grouped = (0..self.groups.len())
+            .map(|_| BTreeMap::<u32, Vec<[u8; wire::MSG_LEN]>>::new())
+            .collect::<Vec<_>>();
+        for record in records {
+            let group = sharding::raft_group_for_category_pinned(
+                record.category_id,
+                self.groups.len(),
+                pins,
+            );
+            grouped[group]
+                .entry(record.category_id)
+                .or_default()
+                .push(record.frame);
+        }
+
+        let mut replies = Vec::new();
+        for (group, categories) in grouped.into_iter().enumerate() {
             if categories.is_empty() {
                 continue;
             }
-            jobs.push(scope.spawn(move || -> Result<(), String> {
-                for records in categories.into_values() {
-                    for batch in records.chunks(wire::RAFT_BATCH_MAX_COMMANDS) {
-                        if let Err(error) = matcher.send_batch(batch) {
-                            // Lost quorum/leader for this group -> categories on
-                            // it flip to the emergency tier until it recovers.
-                            backpressure.set_group_health(group, false);
-                            return Err(format!(
-                                "Raft group {group} batch commit failed: {error}"
-                            ));
-                        }
-                    }
-                }
-                backpressure.set_group_health(group, true);
-                Ok(())
-            }));
+            let batches = categories
+                .into_values()
+                .flat_map(|frames| {
+                    frames
+                        .chunks(wire::RAFT_BATCH_MAX_COMMANDS)
+                        .map(|chunk| chunk.to_vec())
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            let (reply, result) = std::sync::mpsc::sync_channel(1);
+            self.groups[group]
+                .send(RaftForwardJob { batches, reply })
+                .map_err(|_| format!("Raft group {group} forwarding worker stopped"))?;
+            replies.push(result);
         }
-        for job in jobs {
-            job.join()
-                .map_err(|_| "Raft group forwarding worker panicked".to_string())??;
+        for reply in replies {
+            reply
+                .recv()
+                .map_err(|_| "Raft forwarding worker dropped acknowledgement".to_string())??;
         }
         Ok(())
-    })
+    }
+}
+
+fn forward_kafka_batch(
+    forwarder: &RaftForwarder,
+    records: &[KafkaRecord],
+    pins: &HashMap<u32, usize>,
+) -> Result<(), String> {
+    if forwarder.groups.is_empty() {
+        return Err("no Raft groups configured".into());
+    }
+    forwarder.submit(records, pins)
 }
 
 fn run_kafka_stage<F>(
@@ -2190,6 +2237,9 @@ fn main() {
     let kafka = KafkaIngress::from_env(store.metrics.clone(), matcher_groups.len())
         .expect("configure Kafka order ingress")
         .expect("TC_ORDER_KAFKA_BROKERS is required");
+    let matcher_group_count = matcher_groups.len();
+    let raft_forwarder = (kafka.matcher_consumers > 0)
+        .then(|| RaftForwarder::spawn(matcher_groups, kafka.backpressure.clone()));
     let dlq_path = std::env::var("TC_ORDER_DLQ_PATH")
         .unwrap_or_else(|_| "order-execution-dlq.wal".into());
     let dlq = Arc::new(Mutex::new(
@@ -2202,7 +2252,7 @@ fn main() {
         routing.db_count,
         routing.tables_per_db,
         routing.route_version,
-        matcher_groups.len(),
+        matcher_group_count,
         kafka.db_consumers,
         kafka.matcher_consumers,
         kafka.execution_consumers,
@@ -2248,17 +2298,15 @@ fn main() {
         let consumer_kafka = kafka.clone();
         let group_id = kafka.matcher_group.clone();
         let category_size = store.category_size;
-        let worker_matchers = matcher_groups.clone();
+        let worker_forwarder = raft_forwarder
+            .as_ref()
+            .expect("matcher consumers require Raft forwarder")
+            .clone();
         let consumer_store_metrics = store.metrics.clone();
         let raft_group_pins = kafka.raft_group_pins.clone();
-        let backpressure = kafka.backpressure.clone();
         std::thread::Builder::new()
             .name(format!("order-kafka-match-{worker}"))
             .spawn(move || {
-                let mut matchers = worker_matchers
-                    .into_iter()
-                    .map(MatcherConnection::new)
-                    .collect::<Vec<_>>();
                 run_kafka_stage(
                     consumer_kafka,
                     category_size,
@@ -2268,10 +2316,9 @@ fn main() {
                     move |batch| {
                         let started = std::time::Instant::now();
                         let result = forward_kafka_batch(
-                            &mut matchers,
+                            &worker_forwarder,
                             batch,
                             &raft_group_pins,
-                            &backpressure,
                         );
                         consumer_store_metrics.record_raft(started.elapsed());
                         result
