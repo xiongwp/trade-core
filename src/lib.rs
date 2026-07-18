@@ -49,6 +49,7 @@ pub mod journal;
 pub mod kline;
 pub mod lockfree;
 pub mod metrics;
+pub mod oblog;
 pub mod order;
 pub mod order_queue;
 pub mod raft_log;
