@@ -79,6 +79,9 @@ pub struct Metrics {
     pub execution_outbox_published: AtomicU64,
     pub execution_outbox_publish_failures: AtomicU64,
     pub execution_outbox_publish_healthy: AtomicU64,
+    pub execution_kafka_publish_ns_total: AtomicU64,
+    pub execution_kafka_publish_ns_max: AtomicU64,
+    pub execution_kafka_publish_samples: AtomicU64,
     /// Log-bucketed latency distributions running in parallel with the
     /// `*_ns_total`/`*_ns_max`/`*_samples` triples above. The triples are kept
     /// for backward compatibility; these back the p50/p90/p99 SLO gauges.
@@ -165,6 +168,9 @@ impl Metrics {
             c("execution_outbox_published", "Execution events acknowledged by Kafka", self.execution_outbox_published.load(Ordering::Relaxed)),
             c("execution_outbox_publish_failures", "Execution outbox batches rejected or not acknowledged by Kafka", self.execution_outbox_publish_failures.load(Ordering::Relaxed)),
             format!("# HELP tc_execution_outbox_publish_healthy Execution publisher health (1 = initialized and last batch acknowledged)\n# TYPE tc_execution_outbox_publish_healthy gauge\ntc_execution_outbox_publish_healthy {}\n", self.execution_outbox_publish_healthy.load(Ordering::Relaxed)),
+            c("execution_kafka_publish_ns_total", "Total execution Kafka publish acknowledgement latency in nanoseconds", self.execution_kafka_publish_ns_total.load(Ordering::Relaxed)),
+            c("execution_kafka_publish_samples", "Execution Kafka publish batches acknowledged", self.execution_kafka_publish_samples.load(Ordering::Relaxed)),
+            format!("# HELP tc_execution_kafka_publish_ns_max Maximum execution Kafka publish acknowledgement latency in nanoseconds\n# TYPE tc_execution_kafka_publish_ns_max gauge\ntc_execution_kafka_publish_ns_max {}\n", self.execution_kafka_publish_ns_max.load(Ordering::Relaxed)),
         ]
         .concat();
         // Append the parallel latency histograms and their derived quantile
@@ -682,6 +688,12 @@ mod tests {
         m.record_raft_commit_latency(300);
         m.record_wal_fsync_latency(400);
         m.record_match_latency(50);
+        m.execution_kafka_publish_ns_total
+            .store(700, Ordering::Relaxed);
+        m.execution_kafka_publish_ns_max
+            .store(700, Ordering::Relaxed);
+        m.execution_kafka_publish_samples
+            .store(1, Ordering::Relaxed);
         m.asset_wal_errors.fetch_add(1, Ordering::Relaxed);
         m.set_raft_enqueued_index(12);
         m.set_raft_applied_index(9);
@@ -693,6 +705,9 @@ mod tests {
         assert!(text.contains("tc_raft_commit_ns_total 300"));
         assert!(text.contains("tc_wal_fsync_ns_max 400"));
         assert!(text.contains("tc_match_ns_total 50"));
+        assert!(text.contains("tc_execution_kafka_publish_ns_total 700"));
+        assert!(text.contains("tc_execution_kafka_publish_samples 1"));
+        assert!(text.contains("tc_execution_kafka_publish_ns_max 700"));
         assert!(text.contains("tc_raft_apply_lag 3"));
     }
 

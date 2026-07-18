@@ -581,6 +581,7 @@ fn spawn_execution_outbox_publisher(
                     }
                     match reader.read_batch(batch_size) {
                         Ok(records) if !records.is_empty() => {
+                            let publish_started = std::time::Instant::now();
                             let prepared = records
                                 .iter()
                                 .map(|record| {
@@ -596,6 +597,16 @@ fn spawn_execution_outbox_publisher(
                                 })),
                             );
                             if deliveries.iter().all(Result::is_ok) {
+                                let publish_ns = publish_started.elapsed().as_nanos() as u64;
+                                metrics
+                                    .execution_kafka_publish_ns_total
+                                    .fetch_add(publish_ns, Ordering::Relaxed);
+                                metrics
+                                    .execution_kafka_publish_ns_max
+                                    .fetch_max(publish_ns, Ordering::Relaxed);
+                                metrics
+                                    .execution_kafka_publish_samples
+                                    .fetch_add(1, Ordering::Relaxed);
                                 if let Err(error) = reader.acknowledge(records.len()) {
                                     metrics
                                         .execution_outbox_publish_failures

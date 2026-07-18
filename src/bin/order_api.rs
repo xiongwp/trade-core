@@ -72,6 +72,11 @@ struct OrderPipelineMetrics {
     raft_forward_ns_total: AtomicU64,
     raft_forward_ns_max: AtomicU64,
     raft_forward_samples: AtomicU64,
+    execution_mysql_commit_ns_total: AtomicU64,
+    execution_mysql_commit_ns_max: AtomicU64,
+    execution_mysql_commit_samples: AtomicU64,
+    execution_mysql_completed_events: AtomicU64,
+    execution_mysql_commit_hist: LatencyHistogram,
     published_commands: AtomicU64,
     mysql_completed_commands: AtomicU64,
     match_completed_commands: AtomicU64,
@@ -106,6 +111,19 @@ impl OrderPipelineMetrics {
             &self.raft_forward_samples,
             elapsed,
         );
+    }
+
+    fn record_execution_mysql(&self, elapsed: Duration) {
+        Self::record(
+            &self.execution_mysql_commit_ns_total,
+            &self.execution_mysql_commit_ns_max,
+            &self.execution_mysql_commit_samples,
+            elapsed,
+        );
+        self.execution_mysql_commit_hist
+            .record(elapsed.as_nanos() as u64);
+        self.execution_mysql_completed_events
+            .fetch_add(1, AtomicOrdering::Relaxed);
     }
 
     fn try_reserve(&self, commands: u64, max_backlog: u64) -> Result<(), u64> {
@@ -199,6 +217,15 @@ impl OrderPipelineMetrics {
             self.raft_forward_ns_max.load(AtomicOrdering::Relaxed),
             self.raft_forward_samples.load(AtomicOrdering::Relaxed),
         ) + &format!(
+            "# TYPE tc_execution_mysql_commit_ns_total counter\ntc_execution_mysql_commit_ns_total {}\n\
+# TYPE tc_execution_mysql_commit_ns_max gauge\ntc_execution_mysql_commit_ns_max {}\n\
+# TYPE tc_execution_mysql_commit_samples counter\ntc_execution_mysql_commit_samples {}\n\
+# TYPE tc_execution_mysql_completed_events counter\ntc_execution_mysql_completed_events {}\n",
+            self.execution_mysql_commit_ns_total.load(AtomicOrdering::Relaxed),
+            self.execution_mysql_commit_ns_max.load(AtomicOrdering::Relaxed),
+            self.execution_mysql_commit_samples.load(AtomicOrdering::Relaxed),
+            self.execution_mysql_completed_events.load(AtomicOrdering::Relaxed),
+        ) + &format!(
             "# TYPE tc_order_ingress_backlog gauge\ntc_order_ingress_backlog {}\n\
 # TYPE tc_order_published_commands counter\ntc_order_published_commands {}\n\
 # TYPE tc_order_mysql_completed_commands counter\ntc_order_mysql_completed_commands {}\n\
@@ -219,6 +246,9 @@ impl OrderPipelineMetrics {
         ) + &self.mysql_commit_hist.render_standalone(
             "order_mysql_commit_ns",
             "Order API MySQL commit latency (nanoseconds)",
+        ) + &self.execution_mysql_commit_hist.render_standalone(
+            "execution_mysql_commit_ns",
+            "Execution Kafka to MySQL commit processing latency (nanoseconds)",
         )
     }
 }
@@ -1414,6 +1444,7 @@ fn run_execution_mysql_consumer(
             continue;
         };
         let payload = message.payload().unwrap_or(&[]).to_vec();
+        let persist_started = std::time::Instant::now();
         let outcome = persist_with_retry(
             || persist_execution_report(&store, partition, offset, event),
             &dlq,
@@ -1426,6 +1457,8 @@ fn run_execution_mysql_consumer(
         );
         if outcome == PersistOutcome::DeadLettered {
             log_warn!("execution-mysql", worker; "event=dead_lettered partition={partition} offset={offset} attempts={max_retries}");
+        } else {
+            store.metrics.record_execution_mysql(persist_started.elapsed());
         }
         // Both Committed and DeadLettered advance the offset.
         if let Err(error) = consumer.commit_message(&message, CommitMode::Sync) {

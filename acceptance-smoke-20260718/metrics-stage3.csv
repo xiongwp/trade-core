@@ -1,0 +1,5 @@
+wall_ts,elapsed_s,phase,published,mysql_completed,match_completed,mysql_lag,match_lag,ingress_backlog,bp_rejections,dlq,max_apply_lag,leader_outbox_pending,groups_with_leader,groups_total,endpoints_up,endpoints_total,raft_commit_p99_ms,match_p99_ms,command_p99_ms,wal_fsync_p99_ms,max_cpu_pct,max_mem_pct
+1784342559.899,0.0,load,27000,27000,27000,0,0,0,0,0,0,0,4,4,20,20,292.0,8.9,1965.0,1965.0,9.9,2.7
+1784342564.901,5.0,load,42000,42000,42000,0,0,0,0,0,0,0,4,4,20,20,294.2,9.8,1947.5,1947.5,9.3,2.8
+1784342569.905,10.0,catchup,57000,57000,57000,0,0,0,0,0,0,0,4,4,20,20,295.3,17.3,1932.5,1932.5,9.3,2.9
+1784342572.113,12.2,final,57000,57000,57000,0,0,0,0,0,0,0,4,4,20,20,295.3,17.3,1932.5,1932.5,9.7,2.9
