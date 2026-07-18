@@ -174,12 +174,11 @@ impl OrderPipelineMetrics {
             "match" => &self.match_completed_commands,
             _ => return,
         };
-        let published = self.published_commands.load(AtomicOrdering::Acquire);
-        let _ = counter.fetch_update(
-            AtomicOrdering::AcqRel,
-            AtomicOrdering::Acquire,
-            |completed| Some(completed.saturating_add(commands).min(published)),
-        );
+        // Worker roles publish no HTTP commands in their own process, so this
+        // counter cannot be clamped to the process-local published counter.
+        // Kafka consumer-group lag is the durable shared backlog; this metric
+        // reports work completed by this replica and is aggregated by role.
+        counter.fetch_add(commands, AtomicOrdering::Relaxed);
     }
 
     fn set_observed_lag(&self, stage: &str, lag: u64) {
@@ -692,6 +691,7 @@ struct KafkaIngress {
     raft_group_pins: Arc<HashMap<u32, usize>>,
     batch_size: usize,
     linger: Duration,
+    async_offset_commits: bool,
     max_pipeline_backlog: u64,
     metrics: Arc<OrderPipelineMetrics>,
     /// Per-category three-tier ingress backpressure (production doc §5.3).
@@ -785,6 +785,7 @@ impl KafkaIngress {
             raft_group_pins,
             batch_size: env_number("TC_ORDER_BATCH_SIZE", 1_000usize).max(1),
             linger: Duration::from_millis(env_number("TC_ORDER_BATCH_LINGER_MS", 2u64)),
+            async_offset_commits: env_enabled("TC_KAFKA_OFFSET_COMMIT_ASYNC", true),
             max_pipeline_backlog: env_number("TC_ORDER_MAX_PIPELINE_BACKLOG", 50_000u64).max(1),
             metrics,
             backpressure,
@@ -1010,36 +1011,83 @@ fn exec_multi_insert(
     )
 }
 
-/// Persist one Kafka micro-batch with at most one MySQL commit per physical
-/// database. Records remain ordered within each category because Kafka assigns
-/// a partition to only one active consumer in the group.
-fn persist_kafka_batch(store: &OrderStore, records: &[KafkaRecord]) -> Result<(), String> {
-    let mut by_db: HashMap<u32, Vec<&KafkaRecord>> = HashMap::new();
-    for record in records {
-        let command = wire::WireView::parse(&record.frame)
-            .and_then(|view| view.to_command())
-            .ok_or_else(|| "invalid Kafka command frame".to_string())?;
-        let route = store.routing.route_order_id(database_order_id(&command));
-        by_db.entry(route.db).or_default().push(record);
-    }
-
-    std::thread::scope(|scope| {
-        let mut jobs = Vec::with_capacity(by_db.len());
-        for (shard_db, records) in by_db {
-            jobs.push(scope.spawn(move || persist_mysql_shard(store, shard_db, records)));
-        }
-        for job in jobs {
-            job.join()
-                .map_err(|_| "MySQL shard projection worker panicked".to_string())??;
-        }
-        Ok(())
-    })
+struct CommandShardJob {
+    records: Vec<KafkaRecord>,
+    reply: std::sync::mpsc::SyncSender<Result<(), String>>,
 }
 
+#[derive(Clone)]
+struct CommandDbForwarder {
+    shards: Arc<Vec<std::sync::mpsc::SyncSender<CommandShardJob>>>,
+}
+
+impl CommandDbForwarder {
+    fn spawn(store: OrderStore) -> Self {
+        let queue = env_number("TC_MYSQL_SHARD_QUEUE", 64usize).max(1);
+        let coalesce_jobs = env_number("TC_MYSQL_SHARD_COALESCE_JOBS", 16usize).max(1);
+        let mut shards = Vec::with_capacity(store.routing.db_count as usize);
+        for shard_db in 0..store.routing.db_count as u32 {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<CommandShardJob>(queue);
+            let shard_store = store.clone();
+            std::thread::Builder::new()
+                .name(format!("command-db-shard-{shard_db}"))
+                .spawn(move || {
+                    while let Ok(first) = rx.recv() {
+                        let mut jobs = vec![first];
+                        while jobs.len() < coalesce_jobs {
+                            let Ok(job) = rx.try_recv() else { break };
+                            jobs.push(job);
+                        }
+                        let records = jobs
+                            .iter()
+                            .flat_map(|job| job.records.iter().cloned())
+                            .collect::<Vec<_>>();
+                        let result = persist_mysql_shard(&shard_store, shard_db, &records);
+                        for job in jobs {
+                            let _ = job.reply.send(result.clone());
+                        }
+                    }
+                })
+                .expect("spawn command DB shard worker");
+            shards.push(tx);
+        }
+        Self {
+            shards: Arc::new(shards),
+        }
+    }
+
+    fn submit(&self, routing: sharding::RouteConfig, records: &[KafkaRecord]) -> Result<(), String> {
+        let mut by_db: HashMap<u32, Vec<KafkaRecord>> = HashMap::new();
+        for record in records {
+            let command = wire::WireView::parse(&record.frame)
+                .and_then(|view| view.to_command())
+                .ok_or_else(|| "invalid Kafka command frame".to_string())?;
+            let route = routing.route_order_id(database_order_id(&command));
+            by_db.entry(route.db).or_default().push(record.clone());
+        }
+        let mut replies = Vec::with_capacity(by_db.len());
+        for (db, records) in by_db {
+            let (reply, result) = std::sync::mpsc::sync_channel(1);
+            self.shards[db as usize]
+                .send(CommandShardJob { records, reply })
+                .map_err(|_| format!("command DB shard {db} worker stopped"))?;
+            replies.push(result);
+        }
+        for reply in replies {
+            reply
+                .recv()
+                .map_err(|_| "command DB shard worker dropped reply".to_string())??;
+        }
+        Ok(())
+    }
+}
+
+/// Persist one routed shard batch with one MySQL commit. Long-lived per-shard
+/// workers call this after coalescing jobs from concurrent Kafka consumers.
 fn persist_mysql_shard(
     store: &OrderStore,
     shard_db: u32,
-    records: Vec<&KafkaRecord>,
+    records: &[KafkaRecord],
 ) -> Result<(), String> {
     let started = std::time::Instant::now();
     let db = format!("order_db_{shard_db}");
@@ -1151,7 +1199,11 @@ fn decode_kafka_record(
     })
 }
 
-fn commit_kafka_batch(consumer: &BaseConsumer, records: &[KafkaRecord]) -> Result<(), String> {
+fn commit_kafka_batch(
+    consumer: &BaseConsumer,
+    records: &[KafkaRecord],
+    async_commit: bool,
+) -> Result<(), String> {
     let mut offsets: HashMap<(&str, i32), i64> = HashMap::new();
     for record in records {
         offsets
@@ -1165,7 +1217,14 @@ fn commit_kafka_batch(consumer: &BaseConsumer, records: &[KafkaRecord]) -> Resul
             .map_err(|error| error.to_string())?;
     }
     consumer
-        .commit(&list, CommitMode::Sync)
+        .commit(
+            &list,
+            if async_commit {
+                CommitMode::Async
+            } else {
+                CommitMode::Sync
+            },
+        )
         .map_err(|error| error.to_string())
 }
 
@@ -1362,7 +1421,9 @@ fn run_kafka_stage<F>(
                 None => break,
             }
         }
-        match process(&batch).and_then(|()| commit_kafka_batch(&consumer, &batch)) {
+        match process(&batch).and_then(|()| {
+            commit_kafka_batch(&consumer, &batch, kafka.async_offset_commits)
+        }) {
             Ok(()) => {
                 kafka.metrics.complete(stage, batch.len() as u64);
                 consecutive_failures = 0;
@@ -1467,7 +1528,8 @@ fn run_consumer_lag_monitor(kafka: KafkaIngress, group_id: String, stage: &'stat
 }
 
 fn run_execution_mysql_consumer(
-    store: OrderStore,
+    forwarder: ExecutionDbForwarder,
+    metrics: Arc<OrderPipelineMetrics>,
     kafka: KafkaIngress,
     worker: usize,
     dlq: Arc<Mutex<DlqWriter>>,
@@ -1507,13 +1569,29 @@ fn run_execution_mysql_consumer(
             }
         };
         let mut records = Vec::with_capacity(kafka.batch_size);
-        push_execution_record(&store, &dlq, &consumer, worker, &first, &mut records);
+        push_execution_record(
+            &metrics,
+            &dlq,
+            &consumer,
+            worker,
+            kafka.async_offset_commits,
+            &first,
+            &mut records,
+        );
         let deadline = std::time::Instant::now() + kafka.linger;
         while records.len() < kafka.batch_size && std::time::Instant::now() < deadline {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             match consumer.poll(remaining) {
                 Some(Ok(message)) => {
-                    push_execution_record(&store, &dlq, &consumer, worker, &message, &mut records)
+                    push_execution_record(
+                        &metrics,
+                        &dlq,
+                        &consumer,
+                        worker,
+                        kafka.async_offset_commits,
+                        &message,
+                        &mut records,
+                    )
                 }
                 Some(Err(error)) => log_warn!("execution-mysql", worker; "event=poll_failed error={error}"),
                 None => break,
@@ -1525,7 +1603,7 @@ fn run_execution_mysql_consumer(
         let persist_started = std::time::Instant::now();
         let mut committed = false;
         for attempt in 0..max_retries {
-            match persist_execution_batch(&store, &records) {
+            match forwarder.submit(&records) {
                 Ok(()) => {
                     committed = true;
                     break;
@@ -1544,11 +1622,13 @@ fn run_execution_mysql_consumer(
             }
         }
         if committed {
-            store.metrics.record_execution_mysql_batch(
+            metrics.record_execution_mysql_batch(
                 persist_started.elapsed(),
                 records.len() as u64,
             );
-            if let Err(error) = commit_execution_batch(&consumer, &records) {
+            if let Err(error) =
+                commit_execution_batch(&consumer, &records, kafka.async_offset_commits)
+            {
                 log_error!("execution-mysql", worker; "event=offset_commit_failed error={error}");
             }
         } else {
@@ -1566,10 +1646,11 @@ struct ExecutionKafkaRecord {
 }
 
 fn push_execution_record(
-    store: &OrderStore,
+    metrics: &OrderPipelineMetrics,
     dlq: &Arc<Mutex<DlqWriter>>,
     consumer: &BaseConsumer,
     worker: usize,
+    async_commit: bool,
     message: &rdkafka::message::BorrowedMessage<'_>,
     records: &mut Vec<ExecutionKafkaRecord>,
 ) {
@@ -1590,8 +1671,15 @@ fn push_execution_record(
             .append(partition, offset, "invalid execution report", payload)
             .is_ok()
         {
-            store.metrics.dlq_total.fetch_add(1, AtomicOrdering::Relaxed);
-            let _ = consumer.commit_message(message, CommitMode::Sync);
+            metrics.dlq_total.fetch_add(1, AtomicOrdering::Relaxed);
+            let _ = consumer.commit_message(
+                message,
+                if async_commit {
+                    CommitMode::Async
+                } else {
+                    CommitMode::Sync
+                },
+            );
             log_warn!("execution-mysql", worker; "event=dead_lettered reason=undecodable partition={partition} offset={offset}");
         }
     }
@@ -1600,6 +1688,7 @@ fn push_execution_record(
 fn commit_execution_batch(
     consumer: &BaseConsumer,
     records: &[ExecutionKafkaRecord],
+    async_commit: bool,
 ) -> Result<(), String> {
     let mut offsets: HashMap<(&str, i32), i64> = HashMap::new();
     for record in records {
@@ -1614,7 +1703,14 @@ fn commit_execution_batch(
             .map_err(|error| error.to_string())?;
     }
     consumer
-        .commit(&list, CommitMode::Sync)
+        .commit(
+            &list,
+            if async_commit {
+                CommitMode::Async
+            } else {
+                CommitMode::Sync
+            },
+        )
         .map_err(|error| error.to_string())
 }
 
@@ -1636,69 +1732,133 @@ fn rewind_execution_batch(consumer: &BaseConsumer, records: &[ExecutionKafkaReco
     }
 }
 
-fn persist_execution_batch(
-    store: &OrderStore,
-    records: &[ExecutionKafkaRecord],
-) -> Result<(), String> {
-    let mut by_db: HashMap<u32, HashMap<u32, Vec<(&ExecutionKafkaRecord, u64)>>> = HashMap::new();
-    for record in records {
-        let order_id = record.event.report.order_id.0;
-        let route = store.routing.route_order_id(order_id);
-        by_db
-            .entry(route.db)
-            .or_default()
-            .entry(route.table)
-            .or_default()
-            .push((record, order_id));
-        if record.event.report.type_code == wire::RT_TRADE
-            && record.event.report.aux_id != order_id
-        {
-            let maker_id = record.event.report.aux_id;
-            let maker_route = store.routing.route_order_id(maker_id);
-            by_db
-                .entry(maker_route.db)
-                .or_default()
-                .entry(maker_route.table)
-                .or_default()
-                .push((record, maker_id));
+type ExecutionShardTables = HashMap<u32, Vec<(ExecutionKafkaRecord, u64)>>;
+
+struct ExecutionShardJob {
+    tables: ExecutionShardTables,
+    reply: std::sync::mpsc::SyncSender<Result<(), String>>,
+}
+
+#[derive(Clone)]
+struct ExecutionDbForwarder {
+    routing: sharding::RouteConfig,
+    shards: Arc<Vec<std::sync::mpsc::SyncSender<ExecutionShardJob>>>,
+}
+
+impl ExecutionDbForwarder {
+    fn spawn(store: OrderStore) -> Self {
+        let queue = env_number("TC_MYSQL_SHARD_QUEUE", 64usize).max(1);
+        let coalesce_jobs = env_number("TC_MYSQL_SHARD_COALESCE_JOBS", 16usize).max(1);
+        let mut shards = Vec::with_capacity(store.routing.db_count as usize);
+        for shard_db in 0..store.routing.db_count as u32 {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<ExecutionShardJob>(queue);
+            let shard_store = store.clone();
+            std::thread::Builder::new()
+                .name(format!("execution-db-shard-{shard_db}"))
+                .spawn(move || {
+                    while let Ok(first) = rx.recv() {
+                        let mut jobs = vec![first];
+                        while jobs.len() < coalesce_jobs {
+                            let Ok(job) = rx.try_recv() else { break };
+                            jobs.push(job);
+                        }
+                        let mut tables = ExecutionShardTables::new();
+                        for job in &jobs {
+                            for (&table, records) in &job.tables {
+                                tables
+                                    .entry(table)
+                                    .or_default()
+                                    .extend(records.iter().cloned());
+                            }
+                        }
+                        let result = persist_execution_shard(
+                            &shard_store,
+                            shard_db,
+                            tables,
+                        );
+                        for job in jobs {
+                            let _ = job.reply.send(result.clone());
+                        }
+                    }
+                })
+                .expect("spawn execution DB shard worker");
+            shards.push(tx);
+        }
+        Self {
+            routing: store.routing,
+            shards: Arc::new(shards),
         }
     }
-    std::thread::scope(|scope| {
-        let mut jobs = Vec::with_capacity(by_db.len());
-        for (shard_db, tables) in by_db {
-            jobs.push(scope.spawn(move || {
-                let db = format!("order_db_{shard_db}");
-                let mut conn = store
-                    .shard(shard_db)
-                    .get_conn()
-                    .map_err(|error| error.to_string())?;
-                for (shard_table, records) in tables {
-                    let table = format!("asset_orders_{shard_table:03}");
-                    let mut tx = conn
-                        .start_transaction(TxOpts::default())
-                        .map_err(|error| error.to_string())?;
-                    for (record, target_order_id) in records {
-                        apply_execution_report(
-                            &mut tx,
-                            &db,
-                            &table,
-                            record.partition,
-                            record.offset,
-                            record.event,
-                            target_order_id,
-                        )?;
-                    }
-                    tx.commit().map_err(|error| error.to_string())?;
-                }
-                Ok::<(), String>(())
-            }));
+
+    fn submit(&self, records: &[ExecutionKafkaRecord]) -> Result<(), String> {
+        let mut by_db = HashMap::<u32, ExecutionShardTables>::new();
+        for record in records {
+            let order_id = record.event.report.order_id.0;
+            let route = self.routing.route_order_id(order_id);
+            by_db
+                .entry(route.db)
+                .or_default()
+                .entry(route.table)
+                .or_default()
+                .push((record.clone(), order_id));
+            if record.event.report.type_code == wire::RT_TRADE
+                && record.event.report.aux_id != order_id
+            {
+                let maker_id = record.event.report.aux_id;
+                let maker_route = self.routing.route_order_id(maker_id);
+                by_db
+                    .entry(maker_route.db)
+                    .or_default()
+                    .entry(maker_route.table)
+                    .or_default()
+                    .push((record.clone(), maker_id));
+            }
         }
-        for job in jobs {
-            job.join()
-                .map_err(|_| "execution MySQL shard worker panicked".to_string())??;
+        let mut replies = Vec::with_capacity(by_db.len());
+        for (db, tables) in by_db {
+            let (reply, result) = std::sync::mpsc::sync_channel(1);
+            self.shards[db as usize]
+                .send(ExecutionShardJob { tables, reply })
+                .map_err(|_| format!("execution DB shard {db} worker stopped"))?;
+            replies.push(result);
+        }
+        for reply in replies {
+            reply
+                .recv()
+                .map_err(|_| "execution DB shard worker dropped reply".to_string())??;
         }
         Ok(())
-    })
+    }
+}
+
+fn persist_execution_shard(
+    store: &OrderStore,
+    shard_db: u32,
+    tables: ExecutionShardTables,
+) -> Result<(), String> {
+    let db = format!("order_db_{shard_db}");
+    let mut conn = store
+        .shard(shard_db)
+        .get_conn()
+        .map_err(|error| error.to_string())?;
+    let mut tx = conn
+        .start_transaction(TxOpts::default())
+        .map_err(|error| error.to_string())?;
+    for (shard_table, records) in tables {
+        let table = format!("asset_orders_{shard_table:03}");
+        for (record, target_order_id) in records {
+            apply_execution_report(
+                &mut tx,
+                &db,
+                &table,
+                record.partition,
+                record.offset,
+                record.event,
+                target_order_id,
+            )?;
+        }
+    }
+    tx.commit().map_err(|error| error.to_string())
 }
 
 fn apply_execution_report(
@@ -2277,6 +2437,22 @@ fn main() {
         }
         open_when_ready(&shard_urls, routing, metrics.clone())
     });
+    let command_db_forwarder = (kafka.db_consumers > 0).then(|| {
+        CommandDbForwarder::spawn(
+            store
+                .as_ref()
+                .expect("DB consumers require MySQL")
+                .clone(),
+        )
+    });
+    let execution_db_forwarder = (kafka.execution_consumers > 0).then(|| {
+        ExecutionDbForwarder::spawn(
+            store
+                .as_ref()
+                .expect("execution DB consumers require MySQL")
+                .clone(),
+        )
+    });
     let matcher_group_count = matcher_groups.len();
     let ingress_enabled = env_enabled("TC_ORDER_HTTP_INGRESS_ENABLED", true);
     let raft_forwarder = (kafka.matcher_consumers > 0)
@@ -2319,9 +2495,9 @@ fn main() {
         }
     }
     for worker in 0..kafka.db_consumers {
-        let consumer_store = store
+        let consumer_forwarder = command_db_forwarder
             .as_ref()
-            .expect("DB consumers require MySQL")
+            .expect("DB consumers require shard forwarder")
             .clone();
         let consumer_kafka = kafka.clone();
         let group_id = kafka.db_group.clone();
@@ -2335,7 +2511,7 @@ fn main() {
                     group_id,
                     "mysql",
                     worker,
-                    move |batch| persist_kafka_batch(&consumer_store, batch),
+                    move |batch| consumer_forwarder.submit(routing, batch),
                 )
             })
             .expect("spawn Kafka MySQL projection consumer");
@@ -2374,17 +2550,19 @@ fn main() {
             .expect("spawn Kafka matching consumer");
     }
     for worker in 0..kafka.execution_consumers {
-        let execution_store = store
+        let execution_forwarder = execution_db_forwarder
             .as_ref()
-            .expect("execution DB consumers require MySQL")
+            .expect("execution DB consumers require shard forwarder")
             .clone();
+        let execution_metrics = metrics.clone();
         let execution_kafka = kafka.clone();
         let execution_dlq = dlq.clone();
         std::thread::Builder::new()
             .name(format!("execution-kafka-mysql-{worker}"))
             .spawn(move || {
                 run_execution_mysql_consumer(
-                    execution_store,
+                    execution_forwarder,
+                    execution_metrics,
                     execution_kafka,
                     worker,
                     execution_dlq,
@@ -2617,6 +2795,25 @@ mod tests {
         assert!(!role_needs_mysql(0, 0));
         assert!(role_needs_mysql(1, 0));
         assert!(role_needs_mysql(0, 1));
+    }
+
+    #[test]
+    fn worker_completion_is_not_clamped_by_process_local_publishes() {
+        let metrics = OrderPipelineMetrics::default();
+        metrics.complete("mysql", 500);
+        metrics.complete("match", 700);
+        assert_eq!(
+            metrics
+                .mysql_completed_commands
+                .load(AtomicOrdering::Relaxed),
+            500
+        );
+        assert_eq!(
+            metrics
+                .match_completed_commands
+                .load(AtomicOrdering::Relaxed),
+            700
+        );
     }
 
     fn dlq_temp_path(tag: &str) -> std::path::PathBuf {

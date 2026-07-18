@@ -533,6 +533,30 @@ impl ExecutionOutboxReader {
         Ok(())
     }
 
+    /// Advance to a broker-acknowledged offset learned from the shared Kafka
+    /// checkpoint topic. This lets followers track the leader's side-effect
+    /// progress and makes a later promotion resume near the current tail.
+    pub fn acknowledge_to(&mut self, offset: u64) -> io::Result<()> {
+        if offset <= self.offset {
+            return Ok(());
+        }
+        let len = std::fs::metadata(&self.path)?.len();
+        if offset < OUTBOX_HEADER.len() as u64
+            || (offset - OUTBOX_HEADER.len() as u64) % OUTBOX_RECORD_LEN as u64 != 0
+            || offset > len
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "shared execution outbox cursor is invalid or ahead of local WAL",
+            ));
+        }
+        if let Some(path) = &self.cursor_path {
+            persist_cursor(path, offset)?;
+        }
+        self.offset = offset;
+        Ok(())
+    }
+
     pub fn pending_records(&self) -> io::Result<u64> {
         let len = match std::fs::metadata(&self.path) {
             Ok(meta) => meta.len(),
@@ -869,6 +893,18 @@ mod tests {
         assert_eq!(reader.pending_records().unwrap(), 3);
         reader.acknowledge(2).unwrap();
         assert_eq!(reader.pending_records().unwrap(), 1);
+        let follower_cursor = root.join("follower.published.cursor");
+        let mut follower =
+            ExecutionOutboxReader::open_with_cursor(path.clone(), follower_cursor.clone()).unwrap();
+        follower.acknowledge_to(reader.offset()).unwrap();
+        assert_eq!(follower.pending_records().unwrap(), 1);
+        drop(follower);
+        assert_eq!(
+            ExecutionOutboxReader::open_with_cursor(path.clone(), follower_cursor)
+                .unwrap()
+                .offset(),
+            reader.offset()
+        );
         drop(reader);
 
         let mut restored = ExecutionOutboxReader::open_with_cursor(path, cursor).unwrap();

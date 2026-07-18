@@ -3,7 +3,7 @@
 //! Usage: `raft-node NODE_ID RAFT_ADDR PEERS ORDER_ADDR DATA_DIR [MD_ADDR] [METRICS_ADDR]`.
 //! Client frames reach the matching queue only through committed Raft entries.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -14,7 +14,10 @@ use std::time::{Duration, Instant};
 
 use protobuf::Message as PbMessage;
 use raft::prelude::Message;
+use rdkafka::consumer::{BaseConsumer, Consumer};
+use rdkafka::message::Message as KafkaMessage;
 use rdkafka::producer::{FutureProducer, FutureRecord};
+use rdkafka::topic_partition_list::{Offset, TopicPartitionList};
 use rdkafka::ClientConfig;
 use trade_core::asset_log;
 use trade_core::exchange::{build, ExchangeConfig};
@@ -496,7 +499,7 @@ fn main() {
     let execution_producer = execution_kafka_brokers.map(|brokers| {
         let mut config = ClientConfig::new();
         config
-            .set("bootstrap.servers", brokers)
+            .set("bootstrap.servers", &brokers)
             .set("acks", "all")
             .set("enable.idempotence", "true")
             .set("linger.ms", std::env::var("TC_EXECUTION_KAFKA_LINGER_MS").unwrap_or_else(|_| "2".into()))
@@ -508,15 +511,29 @@ fn main() {
                 std::env::var("TC_EXECUTION_KAFKA_DELIVERY_TIMEOUT_MS")
                     .unwrap_or_else(|_| "5000".into()),
             );
-        config.create::<FutureProducer>()
-            .expect("create execution Kafka producer")
+        let producer = config
+            .create::<FutureProducer>()
+            .expect("create execution Kafka producer");
+        (brokers, producer)
     });
-    if let Some(producer) = execution_producer.clone() {
+    if let Some((brokers, producer)) = execution_producer.clone() {
+        let checkpoint_topic = std::env::var("TC_EXECUTION_CURSOR_TOPIC")
+            .unwrap_or_else(|_| "trade-execution-outbox-cursors-v1".into());
+        let checkpoint_partitions = std::env::var("TC_EXECUTION_CURSOR_PARTITIONS")
+            .ok()
+            .and_then(|value| value.parse::<i32>().ok())
+            .unwrap_or(16)
+            .max(1);
         spawn_execution_outbox_publisher(
             execution_outbox_dir,
             execution_topic.clone(),
+            checkpoint_topic,
+            checkpoint_partitions,
+            brokers,
             producer,
             category_size,
+            raft_group_id,
+            id,
             running.clone(),
             metrics.clone(),
             leadership,
@@ -570,8 +587,13 @@ fn main() {
 fn spawn_execution_outbox_publisher(
     root: PathBuf,
     topic: String,
+    checkpoint_topic: String,
+    checkpoint_partitions: i32,
+    brokers: String,
     producer: FutureProducer,
     category_size: u32,
+    raft_group: u32,
+    node_id: u64,
     running: Arc<AtomicBool>,
     metrics: Arc<trade_core::metrics::Metrics>,
     leadership: Arc<AtomicBool>,
@@ -581,12 +603,79 @@ fn spawn_execution_outbox_publisher(
         .spawn(move || {
             let mut readers: HashMap<PathBuf, trade_core::execution_outbox::ExecutionOutboxReader> =
                 HashMap::new();
+            let checkpoint_partition = (raft_group % checkpoint_partitions as u32) as i32;
+            let checkpoint_consumer: BaseConsumer = ClientConfig::new()
+                .set("bootstrap.servers", &brokers)
+                .set(
+                    "group.id",
+                    format!("raft-outbox-cursor-{raft_group}-{node_id}"),
+                )
+                .set("enable.auto.commit", "false")
+                .set("auto.offset.reset", "earliest")
+                .create()
+                .expect("create execution cursor consumer");
+            let mut assignment = TopicPartitionList::new();
+            assignment
+                .add_partition_offset(&checkpoint_topic, checkpoint_partition, Offset::Beginning)
+                .expect("assign execution cursor partition");
+            checkpoint_consumer
+                .assign(&assignment)
+                .expect("start execution cursor consumer");
+            let mut shared_offsets = HashMap::<String, u64>::new();
+            let mut pending_checkpoints = HashMap::<String, u64>::new();
+            let mut batches_since_checkpoint = HashMap::<String, usize>::new();
+            let checkpoint_every_batches = std::env::var("TC_EXECUTION_CURSOR_EVERY_BATCHES")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(16)
+                .max(1);
             let batch_size = std::env::var("TC_EXECUTION_PUBLISH_BATCH")
                 .ok()
                 .and_then(|value| value.parse::<usize>().ok())
                 .unwrap_or(512)
                 .clamp(1, 10_000);
             while running.load(Ordering::Acquire) {
+                while let Some(message) = checkpoint_consumer.poll(Duration::ZERO) {
+                    match message {
+                        Ok(message) => {
+                            if let Some((name, offset)) = decode_outbox_checkpoint(
+                                raft_group,
+                                message.key(),
+                                message.payload(),
+                            ) {
+                                shared_offsets
+                                    .entry(name)
+                                    .and_modify(|current| *current = (*current).max(offset))
+                                    .or_insert(offset);
+                            }
+                        }
+                        Err(error) => {
+                            metrics
+                                .execution_outbox_publish_healthy
+                                .store(0, Ordering::Release);
+                            log_warn!("execution-outbox", "event=cursor_poll_failed error={error}");
+                        }
+                    }
+                }
+                for (name, offset) in pending_checkpoints.clone() {
+                    let key = outbox_checkpoint_key(raft_group, &name);
+                    let value = offset.to_le_bytes();
+                    let delivered = futures::executor::block_on(producer.send(
+                        FutureRecord::to(&checkpoint_topic)
+                            .partition(checkpoint_partition)
+                            .key(&key)
+                            .payload(&value),
+                        Duration::from_secs(5),
+                    ));
+                    if delivered.is_ok() {
+                        pending_checkpoints.remove(&name);
+                        shared_offsets.insert(name, offset);
+                    } else {
+                        metrics
+                            .execution_outbox_publish_healthy
+                            .store(0, Ordering::Release);
+                    }
+                }
                 if let Ok(entries) = std::fs::read_dir(&root) {
                     for entry in entries.flatten() {
                         let path = entry.path();
@@ -607,6 +696,20 @@ fn spawn_execution_outbox_publisher(
                         }
                     }
                 }
+                readers.retain(|path, _| path.exists());
+                // Every replica follows the broker-acknowledged cursor, so
+                // followers can reclaim sealed segments and a promoted leader
+                // does not replay the full lifetime outbox.
+                for (path, reader) in readers.iter_mut() {
+                    let Some(name) = outbox_checkpoint_name(path) else {
+                        continue;
+                    };
+                    if let Some(offset) = shared_offsets.get(&name).copied() {
+                        // A follower may not have applied up to this offset yet;
+                        // leave it pending and retry after its WAL catches up.
+                        let _ = reader.acknowledge_to(offset);
+                    }
+                }
                 if !leadership.load(Ordering::Acquire) {
                     // Followers retain the durable outbox for failover but do
                     // not own the external side effect.
@@ -621,10 +724,26 @@ fn spawn_execution_outbox_publisher(
                 metrics
                     .execution_outbox_pending
                     .store(pending_before_publish, Ordering::Release);
-                for reader in readers.values_mut() {
+                let mut publish_paths = readers.keys().cloned().collect::<Vec<_>>();
+                publish_paths.sort_by_key(|path| outbox_segment_order(path).unwrap_or((u32::MAX, u64::MAX)));
+                let mut visited_shards = HashSet::new();
+                for path in publish_paths {
+                    let Some((shard, _)) = outbox_segment_order(&path) else {
+                        continue;
+                    };
+                    // Advancing more than one segment of the same engine shard
+                    // in a pass could publish a newer segment while the older
+                    // one still has records after the current batch.
+                    if !visited_shards.insert(shard) {
+                        continue;
+                    }
+                    let Some(reader) = readers.get_mut(&path) else {
+                        continue;
+                    };
                     if !leadership.load(Ordering::Acquire) {
                         continue;
                     }
+                    let pending_in_segment = reader.pending_records().unwrap_or(u64::MAX);
                     match reader.read_batch(batch_size) {
                         Ok(records) if !records.is_empty() => {
                             let publish_started = std::time::Instant::now();
@@ -653,6 +772,22 @@ fn spawn_execution_outbox_publisher(
                                 metrics
                                     .execution_kafka_publish_samples
                                     .fetch_add(1, Ordering::Relaxed);
+                                let Some(name) = outbox_checkpoint_name(&path) else {
+                                    continue;
+                                };
+                                let next_offset = reader.offset()
+                                    + records.len() as u64
+                                        * trade_core::execution_outbox::OUTBOX_RECORD_LEN as u64;
+                                let batch_count = batches_since_checkpoint
+                                    .entry(name.clone())
+                                    .and_modify(|count| *count += 1)
+                                    .or_insert(1);
+                                let checkpoint_due = *batch_count >= checkpoint_every_batches
+                                    || pending_in_segment <= records.len() as u64;
+                                if checkpoint_due {
+                                    pending_checkpoints.insert(name.clone(), next_offset);
+                                    *batch_count = 0;
+                                }
                                 if let Err(error) = reader.acknowledge(records.len()) {
                                     metrics
                                         .execution_outbox_publish_failures
@@ -670,7 +805,7 @@ fn spawn_execution_outbox_publisher(
                                         .fetch_add(records.len() as u64, Ordering::Relaxed);
                                     metrics
                                         .execution_outbox_publish_healthy
-                                        .store(1, Ordering::Release);
+                                        .store(pending_checkpoints.is_empty() as u64, Ordering::Release);
                                 }
                             } else {
                                 metrics
@@ -689,7 +824,7 @@ fn spawn_execution_outbox_publisher(
                         Ok(_) => {
                             metrics
                                 .execution_outbox_publish_healthy
-                                .store(1, Ordering::Release);
+                                .store(pending_checkpoints.is_empty() as u64, Ordering::Release);
                         }
                         Err(error) => {
                             metrics
@@ -721,6 +856,45 @@ fn is_execution_outbox_file(path: &std::path::Path) -> bool {
             .file_stem()
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.starts_with("outbox-shard-"))
+}
+
+fn outbox_checkpoint_name(path: &std::path::Path) -> Option<String> {
+    path.file_name()?.to_str().map(str::to_owned)
+}
+
+fn outbox_segment_order(path: &std::path::Path) -> Option<(u32, u64)> {
+    let stem = path.file_stem()?.to_str()?.strip_prefix("outbox-shard-")?;
+    if let Some((shard, segment)) = stem.split_once("-seg-") {
+        Some((shard.parse().ok()?, segment.parse().ok()?))
+    } else {
+        Some((stem.parse().ok()?, 0))
+    }
+}
+
+fn outbox_checkpoint_key(raft_group: u32, name: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(4 + name.len());
+    key.extend_from_slice(&raft_group.to_be_bytes());
+    key.extend_from_slice(name.as_bytes());
+    key
+}
+
+fn decode_outbox_checkpoint(
+    expected_group: u32,
+    key: Option<&[u8]>,
+    payload: Option<&[u8]>,
+) -> Option<(String, u64)> {
+    let key = key?;
+    let payload = payload?;
+    if key.len() <= 4 || payload.len() != 8 {
+        return None;
+    }
+    let group = u32::from_be_bytes(key[..4].try_into().ok()?);
+    if group != expected_group {
+        return None;
+    }
+    let name = std::str::from_utf8(&key[4..]).ok()?.to_owned();
+    let offset = u64::from_le_bytes(payload.try_into().ok()?);
+    Some((name, offset))
 }
 
 #[cfg(test)]
@@ -900,6 +1074,26 @@ mod tests {
         assert!(!is_execution_outbox_file(std::path::Path::new(
             "unrelated.bin"
         )));
+    }
+
+    #[test]
+    fn shared_outbox_checkpoint_is_scoped_by_raft_group() {
+        let key = outbox_checkpoint_key(7, "outbox-shard-3.bin");
+        let payload = 12_345u64.to_le_bytes();
+        assert_eq!(
+            decode_outbox_checkpoint(7, Some(&key), Some(&payload)),
+            Some(("outbox-shard-3.bin".into(), 12_345))
+        );
+        assert_eq!(decode_outbox_checkpoint(8, Some(&key), Some(&payload)), None);
+    }
+
+    #[test]
+    fn outbox_segments_sort_oldest_first_within_each_shard() {
+        let base = std::path::Path::new("outbox-shard-9.bin");
+        let newer = std::path::Path::new("outbox-shard-9-seg-0000000002.bin");
+        assert_eq!(outbox_segment_order(base), Some((9, 0)));
+        assert_eq!(outbox_segment_order(newer), Some((9, 2)));
+        assert!(outbox_segment_order(base) < outbox_segment_order(newer));
     }
 
     #[test]

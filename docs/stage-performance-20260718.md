@@ -67,3 +67,25 @@ Kafka → 撮合隔离采样表明，32 个消费者争抢 4 个有序 Raft grou
 1,000 后采样约 97,000 cmd/s，但开发机上的 4-group Raft 集群仍出现 leader 重试，
 后续提升必须增加 Raft group 和物理节点。默认撮合消费者因此改为 4，默认消费批次改为
 1,000。
+
+## 水平扩展改建后分阶段复测
+
+使用独立 `trade-core-stage` Compose project 和全新 Kafka/MySQL/Raft 数据卷，按阶段只开启
+目标 consumer。负载为 1,000,000 条命令、32 HTTP 长连接、500 条/请求、10,000 个资产。
+
+| 阶段 | 数据量 | 实测吞吐 | 延迟/说明 |
+|---|---:|---:|---|
+| HTTP → 命令 Kafka | 1,000,000 commands | **1,152,232 cmd/s** | 0错误；p50 10.58ms，p95 29.07ms，p99 73.18ms |
+| 命令 Kafka → MySQL | 1,000,000 commands | 约 **110k–160k cmd/s** | lag采样窗口6–9s；事务p50 31.43ms，p90 80.92ms，p99 297.18ms |
+| 命令 Kafka → Raft/撮合 | 1,000,000 commands | 约 **22k cmd/s** | 1030批，平均转发约233ms，max 5.49s |
+| 撮合 Outbox → 结果 Kafka | 2,000,000 events | 不低于 **44k events/s** | 与45s撮合并行完成；leader pending=0、失败=0 |
+| 结果 Kafka → MySQL | 2,000,000 events | 约 **60.6k events/s** | 约33s；p50 94.13ms，p90 340.49ms，p99 498.68ms |
+
+一致性检查：三个consumer group总lag均为0；execution topic 16个partition各125,000条；
+10个MySQL分片各100,000条命令、200,000条execution event，分布完全均匀。
+
+结果落库从最初逐事件事务的约2,638 events/s提升到约60.6k events/s，约**23倍**。
+本轮撮合低于此前约97k cmd/s基线，采样显示20个Raft replica共享Docker Desktop虚拟磁盘时，
+WAL fsync p99为1.49–2.00s，leader Raft commit p99为94.75–698ms；这是本机磁盘同步瓶颈，
+不是CPU或Kafka consumer不足。生产扩展必须把同group副本分散到独立本地NVMe故障域，增加
+物理group后再做500万TPS验收。

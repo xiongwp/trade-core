@@ -85,6 +85,14 @@ partition 数，`N` 为对应角色的进程数。消费者全集群总数超过
 三类worker设置`TC_ORDER_HTTP_INGRESS_ENABLED=false`，保留`/metrics`和健康检查，但拒绝
 订单POST请求并停止入口专用的consumer lag轮询，避免流量误入后台worker。
 
+命令DB与结果DB worker都为每个物理MySQL shard建立一个长期写worker，所有Kafka consumer通过
+`TC_MYSQL_SHARD_QUEUE`有界队列复用；worker最多合并`TC_MYSQL_SHARD_COALESCE_JOBS`个并发
+job后一次提交。禁止按“每Kafka batch×每DB”创建临时线程，否则线程数随吞吐和分片数爆炸。
+
+三条Kafka消费链默认`TC_KAFKA_OFFSET_COMMIT_ASYNC=true`，处理结果持久化/Raft commit成功后
+异步提交offset，避免每批串行等待broker RTT。进程在异步提交落盘前崩溃只会造成批次重放；
+Raft命令去重窗口、命令唯一键和结果event唯一键必须覆盖该at-least-once语义。
+
 每个Order worker进程为每个Raft group建立一个长期forward worker和一组leader连接，所有
 Kafka消费者复用它；禁止恢复成“每消费者×每group”连接或按批次创建线程。每group队列由
 `TC_RAFT_FORWARD_QUEUE`限制，队列满时应向Kafka消费施加背压。
@@ -196,6 +204,11 @@ emergency: lag >= 15 秒或 quorum 丢失 -> 停止该 category 写入
 - 数据 WAL 持久化完成后，才允许持久化 applied watermark。
 - Leader fencing 绑定 term、leader ID 和 route_version。
 - readiness 必须同时满足 leader 已知、quorum 可用、replay 完成、WAL 可写。
+- 结果Kafka确认后写入compact的`TC_EXECUTION_CURSOR_TOPIC`；key包含Raft group和Outbox
+  segment文件名，value为broker已确认offset。所有副本持续消费并落盘该水位，因此follower
+  可回收已发布segment，切主只会重放checkpoint尚未确认的最后一个批次，而不是全量历史。
+  `TC_EXECUTION_CURSOR_EVERY_BATCHES`控制checkpoint频率，默认16批并在segment尾强制写入；
+  该值是在failover重复上限与checkpoint topic写放大之间取舍。
 
 50 台 Raft 机器承载 100 group 时，每台平均运行 10 个 replica。需要将线程固定到 CPU，并让空载线程休眠；禁止空载 busy-spin 消耗所有核心。
 
@@ -225,6 +238,8 @@ emergency: lag >= 15 秒或 quorum 丢失 -> 停止该 category 写入
 - 100 个物理写分片，每库 100 张订单表，总计 10000 表。
 - 只以 `order_id` 路由，不使用资产、category 或 user ID 参与数据库位置计算。
 - 相同 `(database, table)` 的事件聚合后批量写入 500-2000 行/事务。
+- 一个Kafka micro-batch在每个物理库只开启并提交一次事务；事务内再遍历已按table聚合的
+  事件。禁止按table逐次commit，否则均匀order_id会把一次批处理放大为近千次redo fsync。
 - 成交同时影响 maker/taker 时，按两个订单各自的 `order_id` 分别路由和更新。
 - 主键使用订单 ID，另建 `(category_id, category_seq)` 唯一索引。
 - 成交投影使用确定性 event ID 唯一索引。

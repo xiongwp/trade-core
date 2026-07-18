@@ -107,6 +107,10 @@ services:
         rpk topic create --if-not-exists --brokers=redpanda:9092 \
           --partitions=${TC_EXECUTION_KAFKA_PARTITIONS:-16} --replicas=3 \
           "${TC_EXECUTION_KAFKA_TOPIC:-trade-executions-v1}"
+        rpk topic create --if-not-exists --brokers=redpanda:9092 \
+          --partitions=${TC_EXECUTION_CURSOR_PARTITIONS:-16} --replicas=3 \
+          --topic-config cleanup.policy=compact \
+          "${TC_EXECUTION_CURSOR_TOPIC:-trade-execution-outbox-cursors-v1}"
     restart: "no"
 
   market-data:
