@@ -641,7 +641,7 @@ fn build_inner(
             // The journal seq IS the total order: continue it, never restart it.
             w.resume_from(last_seq);
             if let Ok(fh) = w.file_handle() {
-                journal::spawn_fsyncer(fh, config.journal_fsync, running.clone());
+                journal::spawn_fsyncer(fh, config.journal_fsync, running.clone(), metrics.clone());
             }
             journal_w = Some(w);
             asset_journal = Some(
@@ -651,13 +651,48 @@ fn build_inner(
             snapshot_path = Some(spath);
         }
         if let Some(dir) = &config.execution_outbox_dir {
+            let outbox_path = dir.join(format!("outbox-shard-{shard_id}.bin"));
+            // Recovery barrier for the execution outbox. A batch's reports are
+            // fsynced before its Raft application watermark is persisted, and
+            // recovery re-applies (and re-appends) any batch past that
+            // watermark. Trim every record beyond the last durably applied
+            // batch so replay is exactly-once here: nothing lost, nothing
+            // duplicated. Records are ordered by ascending raft_index and
+            // segments rotate only after a watermark advance, so only the
+            // newest segment can hold unwatermarked records.
+            let max_applied = config.journal_dir.as_ref().and_then(|journal_dir| {
+                crate::asset_log::load_applied_batches(&journal_dir.join("assets"))
+                    .ok()
+                    .and_then(|batches| batches.into_iter().max())
+            });
+            let newest = crate::execution_outbox::latest_segment(&outbox_path).unwrap_or_else(
+                |error| panic!("scan execution outbox segments {}: {error}", dir.display()),
+            );
+            crate::execution_outbox::truncate_after_applied(&newest, max_applied).unwrap_or_else(
+                |error| {
+                    panic!(
+                        "trim execution outbox {} to last durable Raft batch: {error}",
+                        newest.display()
+                    )
+                },
+            );
+            // Bound outbox disk growth: rotate to a new segment once the
+            // current one reaches this size; fully published segments are then
+            // garbage collected. 0 disables rotation.
+            let rotate_bytes = std::env::var("TC_EXECUTION_OUTBOX_ROTATE_BYTES")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(128 * 1024 * 1024);
             execution_outbox = Some(
                 crate::execution_outbox::ExecutionOutboxWriter::open(
-                    &dir.join(format!("outbox-shard-{shard_id}.bin")),
+                    &outbox_path,
                     config.journal_flush,
                     config.execution_outbox_sync_every,
                 )
-                .expect("open execution outbox"),
+                .unwrap_or_else(|error| {
+                    panic!("open execution outbox {}: {error}", outbox_path.display())
+                })
+                .with_rotate_bytes(Some(rotate_bytes)),
             );
         }
 
@@ -1338,11 +1373,17 @@ impl Shard {
         if self.snapshot_every.is_some() {
             self.take_snapshot();
         }
+        // Shutdown flush failures must be visible: an operator relying on a
+        // clean stop for durability needs to know the tail didn't make it.
         if let Some(j) = &mut self.journal {
-            let _ = j.flush();
+            if let Err(e) = j.flush() {
+                eprintln!("[shard {}] event=shutdown_flush_failed target=journal error={e}", self.shard_id);
+            }
         }
         if let Some(j) = &mut self.asset_journal {
-            let _ = j.flush_all();
+            if let Err(e) = j.flush_all() {
+                eprintln!("[shard {}] event=shutdown_flush_failed target=asset-journal error={e}", self.shard_id);
+            }
         }
         if is_parked {
             self.parked.fetch_sub(1, Ordering::Release);
@@ -1580,10 +1621,14 @@ impl Shard {
         let raft_group_id = self.raft_group_id;
         self.processor.process(command, &mut |report| {
             if let (Some(index), Some(outbox)) = (raft_index, outbox.as_mut()) {
+                // Fail loud: a durable-outbox append failure (disk full, IO
+                // error) must never silently drop an execution event. The
+                // committed-batch path is fail-fast via match_and_record_batch;
+                // this single-command path is reachable only for non-batch Raft
+                // commands, and it too must halt rather than lose a fill.
                 if let Err(error) = outbox.append(raft_group_id, index, *ordinal, &report) {
                     metrics.asset_wal_errors.fetch_add(1, Ordering::Relaxed);
-                    eprintln!("[execution-outbox] event=append_failed action=reject error={error}");
-                    return;
+                    panic!("append execution report to durable outbox: {error}");
                 }
             }
             metrics.record(&report);
@@ -1619,6 +1664,10 @@ impl Shard {
             return;
         }
         let wal_started = Instant::now();
+        // Persistence failures on the quorum-committed path are fail-stop:
+        // skipping a committed batch (while later batches keep applying) would
+        // silently fork this replica's book state away from Raft and the other
+        // members. Halting instead leaves a clean replay point.
         let touched = match &mut self.asset_journal {
             Some(asset_journal) => match asset_journal.append_committed_batch(&commands) {
                 Ok(touched) => touched,
@@ -1626,22 +1675,30 @@ impl Shard {
                     self.metrics
                         .asset_wal_errors
                         .fetch_add(1, Ordering::Relaxed);
-                    eprintln!(
-                        "[asset-journal] event=batch_append_failed action=reject error={error}"
+                    panic!(
+                        "[shard {}] append committed Raft batch (index {raft_index}) to asset WAL: {error}",
+                        self.shard_id
                     );
-                    return;
                 }
             },
             None => Vec::new(),
         };
+        let shard_id = self.shard_id;
         let mut replicated = Vec::with_capacity(commands.len());
         for command in &commands {
             let mut frame = [0u8; wire::MSG_LEN];
             wire::encode_command(command, &mut frame);
             let seq = match &mut self.journal {
-                Some(journal) => journal
-                    .append(journal::now_nanos(), &frame)
-                    .unwrap_or_else(|_| self.rep_seq + 1),
+                // A fabricated sequence after a failed append would desync the
+                // durable journal from replication; committed commands must
+                // fail-stop here too.
+                Some(journal) => journal.append(journal::now_nanos(), &frame).unwrap_or_else(
+                    |error| {
+                        panic!(
+                            "[shard {shard_id}] append committed Raft command (index {raft_index}) to shard journal: {error}"
+                        )
+                    },
+                ),
                 None => self.rep_seq + 1,
             };
             self.rep_seq = seq;
@@ -1652,6 +1709,17 @@ impl Shard {
                 .flush_to_os()
                 .expect("flush committed Raft command batch journal");
         }
+        // Match the batch and append every execution report to the outbox
+        // *before* the durability barrier, so the outbox shares the batch's
+        // single group-commit fsync and is guaranteed on disk before the
+        // application watermark advances. This closes the crash window where a
+        // watermarked-but-unwritten batch would be skipped on recovery and its
+        // execution events lost forever. Reports are held back and delivered to
+        // the order system only after the batch is durable (see below).
+        let emitted = self
+            .match_and_record_batch(commands, raft_index)
+            .expect("append committed batch execution reports to durable outbox");
+        // Group-commit barrier: command WAL(s) + execution outbox in one shot.
         if let Some(asset_journal) = &self.asset_journal {
             asset_journal
                 .sync_committed_batch(&touched)
@@ -1661,12 +1729,30 @@ impl Shard {
                 .sync_data()
                 .expect("sync committed Raft command batch journal");
         }
+        if let Some(outbox) = &mut self.execution_outbox {
+            outbox
+                .sync_data()
+                .expect("group commit execution outbox with WAL barrier");
+        }
         self.metrics
             .record_wal_fsync_latency(wal_started.elapsed().as_nanos() as u64);
+        // Only now, with WAL and outbox both durable, is it safe to advance the
+        // application watermark: a crash before this point re-applies the batch
+        // and regenerates its (idempotent) outbox records; a crash after it
+        // finds those records already present.
         if let Some(asset_journal) = &self.asset_journal {
             asset_journal
                 .mark_raft_batch_applied(&touched, raft_index)
                 .expect("persist Raft batch application watermarks");
+        }
+        // Safe rotation point: the watermark now covers everything in the
+        // current outbox segment, so a sealed segment never holds records that
+        // recovery would need to trim, and fully published segments can be
+        // garbage collected (bounding disk growth).
+        if let Some(outbox) = &mut self.execution_outbox {
+            outbox
+                .maybe_rotate()
+                .expect("rotate execution outbox segment");
         }
         if let Some(rep) = &self.rep {
             for (seq, frame) in replicated {
@@ -1676,13 +1762,81 @@ impl Shard {
         self.metrics
             .journal_seq
             .fetch_max(self.rep_seq, Ordering::Relaxed);
-        let mut ordinal = 0;
-        for command in commands {
-            self.process_and_emit(command, Some(raft_index), &mut ordinal);
+        for event in emitted {
+            self.emit_report_event(event);
         }
         self.metrics.set_raft_applied_index(raft_index);
         self.metrics
             .record_command_latency(started.elapsed().as_nanos() as u64);
+    }
+
+    /// Match every command in a committed batch, appending each resulting
+    /// execution report to the durable outbox in deterministic
+    /// `(raft_index, ordinal)` order. The reports are returned rather than
+    /// delivered immediately: the caller folds the outbox fsync into the batch
+    /// group-commit barrier and only then delivers them downstream, so the
+    /// order system never observes a fill that is not yet durable.
+    ///
+    /// An outbox append failure (disk full, IO error) is surfaced as an error
+    /// so the caller fails the whole batch without advancing the watermark —
+    /// execution events are never silently dropped.
+    fn match_and_record_batch(
+        &mut self,
+        commands: Vec<Command>,
+        raft_index: u64,
+    ) -> std::io::Result<Vec<ExecutionReportEvent>> {
+        let started = Instant::now();
+        let metrics = &self.metrics;
+        let outbox = &mut self.execution_outbox;
+        let raft_group_id = self.raft_group_id;
+        let mut emitted: Vec<ExecutionReportEvent> = Vec::new();
+        let mut ordinal: u32 = 0;
+        let mut append_error: Option<std::io::Error> = None;
+        for command in commands {
+            self.processor.process(command, &mut |report| {
+                // Keep matching to completion even after a failure so book
+                // state stays deterministic; the recorded error aborts the
+                // batch before the watermark advances.
+                if let Some(outbox) = outbox.as_mut() {
+                    if append_error.is_none() {
+                        if let Err(error) =
+                            outbox.append_deferred(raft_group_id, raft_index, ordinal, &report)
+                        {
+                            metrics.asset_wal_errors.fetch_add(1, Ordering::Relaxed);
+                            append_error = Some(error);
+                        }
+                    }
+                }
+                metrics.record(&report);
+                emitted.push(ExecutionReportEvent {
+                    raft_index: Some(raft_index),
+                    ordinal,
+                    report,
+                });
+                ordinal = ordinal.saturating_add(1);
+            });
+        }
+        self.metrics
+            .record_match_latency(started.elapsed().as_nanos() as u64);
+        match append_error {
+            Some(error) => Err(error),
+            None => Ok(emitted),
+        }
+    }
+
+    /// Deliver one already-durable execution report event to the order system,
+    /// applying backpressure (spin+yield) until the consumer drains.
+    fn emit_report_event(&self, event: ExecutionReportEvent) {
+        let mut pending = event;
+        loop {
+            match self.result_tx.push(pending) {
+                Ok(()) => return,
+                Err(returned) => {
+                    pending = returned;
+                    thread::yield_now();
+                }
+            }
+        }
     }
 }
 

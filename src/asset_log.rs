@@ -188,14 +188,34 @@ impl AssetJournalSet {
     /// same filesystem. Must be called only after every userspace buffer has
     /// been flushed.
     pub fn sync_committed_batch(&self, touched: &[InstrumentId]) -> io::Result<()> {
-        let Some(instrument) = touched.first() else {
-            return Ok(());
-        };
-        self.writers
-            .get(instrument)
-            .expect("writer opened by batch append")
-            .writer
-            .sync_filesystem()
+        #[cfg(target_os = "linux")]
+        {
+            // A single syncfs(2) on any one writer flushes every dirty file on
+            // the shared filesystem, so the whole batch (and the co-located
+            // shard journal) is made durable by one barrier.
+            let Some(instrument) = touched.first() else {
+                return Ok(());
+            };
+            self.writers
+                .get(instrument)
+                .expect("writer opened by batch append")
+                .writer
+                .sync_filesystem()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // No filesystem-wide barrier available: fsync every touched writer
+            // individually. Slower, but each committed asset WAL is genuinely
+            // durable rather than only the first one.
+            for instrument in touched {
+                self.writers
+                    .get(instrument)
+                    .expect("writer opened by batch append")
+                    .writer
+                    .sync_filesystem()?;
+            }
+            Ok(())
+        }
     }
 
     pub fn mark_raft_applied(&self, instrument: InstrumentId, raft_index: u64) -> io::Result<()> {
