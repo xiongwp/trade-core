@@ -24,7 +24,7 @@ impl MatchingStrategy for PriceTimePriority {
 
     fn allocate_into(&self, resting: &[RestingOrder], incoming: Qty, out: &mut Vec<Allocation>) {
         let mut remaining = incoming;
-        for r in resting {
+        for (i, r) in resting.iter().enumerate() {
             if remaining == 0 {
                 break;
             }
@@ -33,6 +33,7 @@ impl MatchingStrategy for PriceTimePriority {
                 out.push(Allocation {
                     id: r.id,
                     qty: fill,
+                    idx: i as u32,
                 });
                 remaining -= fill;
             }

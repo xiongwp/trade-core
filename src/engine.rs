@@ -351,11 +351,12 @@ impl MatchingEngine {
                 if a.qty == 0 {
                     continue;
                 }
-                let maker_user = self
-                    .view_buf
-                    .iter()
-                    .find(|r| r.id == a.id)
-                    .map_or(0, |r| r.user);
+                // O(1) maker resolution via the allocation's slice index (a
+                // per-allocation scan of the view is quadratic on deep levels;
+                // validate() enforces idx/id consistency).
+                let maker = self.view_buf[a.idx as usize];
+                debug_assert_eq!(maker.id, a.id, "allocation idx/id mismatch");
+                let maker_user = maker.user;
                 trades.push(Trade {
                     taker: order.id,
                     maker: a.id,

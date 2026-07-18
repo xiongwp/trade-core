@@ -42,10 +42,17 @@ pub struct RestingOrder {
 }
 
 /// A strategy's decision to fill `qty` from resting maker order `id`.
+///
+/// `idx` is the order's position in the `resting` slice the strategy was
+/// handed. It lets the engine resolve the maker in O(1) instead of scanning
+/// the level view per allocation (which is quadratic when a deep level is
+/// swept). The contract check in [`MatchingStrategy::validate`] enforces that
+/// `resting[idx].id == id`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Allocation {
     pub id: OrderId,
     pub qty: Qty,
+    pub idx: u32,
 }
 
 /// Defines how liquidity at a single price level is consumed.
@@ -103,8 +110,19 @@ pub trait MatchingStrategy: Send + Sync {
             if a.qty == 0 {
                 return Err(format!("zero-qty allocation for {}", a.id));
             }
-            match resting.iter().find(|r| r.id == a.id) {
-                None => return Err(format!("allocation for unknown order {}", a.id)),
+            match resting.get(a.idx as usize) {
+                None => {
+                    return Err(format!(
+                        "allocation for {} has out-of-range idx {}",
+                        a.id, a.idx
+                    ));
+                }
+                Some(r) if r.id != a.id => {
+                    return Err(format!(
+                        "allocation idx {} points at order {}, not {}",
+                        a.idx, r.id, a.id
+                    ));
+                }
                 Some(r) if a.qty > r.remaining => {
                     return Err(format!(
                         "over-allocated {}: {} > {}",
