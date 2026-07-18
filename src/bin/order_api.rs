@@ -1583,8 +1583,15 @@ fn open_when_ready(shard_urls: &[String], routing: sharding::RouteConfig) -> Ord
     loop {
         let opened = (|| -> mysql::Result<OrderStore> {
             let mut shards = Vec::with_capacity(shard_urls.len());
-            for url in shard_urls {
-                shards.push(Pool::new(url.as_str())?);
+            for (idx, url) in shard_urls.iter().enumerate() {
+                // Probe each shard eagerly so a bad shard is named in the
+                // startup warning (Pool::new is lazy; without this the retry
+                // loop reports bare auth/DNS errors with no shard context).
+                let pool = Pool::new(url.as_str())
+                    .map_err(|e| mysql::Error::from(io_shard_error(idx, &e)))?;
+                pool.get_conn()
+                    .map_err(|e| mysql::Error::from(io_shard_error(idx, &e)))?;
+                shards.push(pool);
             }
             let store = OrderStore {
                 shards: Arc::new(shards),
@@ -1603,6 +1610,12 @@ fn open_when_ready(shard_urls: &[String], routing: sharding::RouteConfig) -> Ord
             }
         }
     }
+}
+
+/// Wrap a shard connection error with the shard index (never the URL — it
+/// carries credentials).
+fn io_shard_error(shard: usize, error: &dyn std::fmt::Display) -> std::io::Error {
+    std::io::Error::other(format!("shard {shard}: {error}"))
 }
 
 fn category_size() -> u32 {

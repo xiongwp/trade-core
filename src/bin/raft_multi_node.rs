@@ -77,7 +77,11 @@ fn main() -> ExitCode {
         let child = Command::new(&binary)
             .env("TC_RAFT_GROUP_ID", group.to_string())
             .arg(node.to_string())
-            .arg(format!("raft-{node}:{raft_port}"))
+            // Bind on all interfaces: binding to the service hostname needs a
+            // DNS round-trip at startup and panics the node when the embedded
+            // DNS is slow/unready (observed on fresh compose networks). Peers
+            // still *dial* raft-{n} by name, and that path retries.
+            .arg(format!("0.0.0.0:{raft_port}"))
             .arg(peers)
             .arg(format!("0.0.0.0:{order_port}"))
             .arg(data_dir)
