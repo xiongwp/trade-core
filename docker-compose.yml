@@ -4,6 +4,14 @@
 include:
   - path: docker-compose.raft.yml
 
+x-mysql-command: &mysql-command
+  - --innodb-buffer-pool-size=${TC_MYSQL_BUFFER_POOL_SIZE:-64M}
+  - --innodb-log-buffer-size=${TC_MYSQL_LOG_BUFFER_SIZE:-16M}
+  - --innodb-redo-log-capacity=${TC_MYSQL_REDO_CAPACITY:-256M}
+  - --innodb-flush-log-at-trx-commit=1
+  - --performance-schema=OFF
+  - --max-connections=${TC_MYSQL_MAX_CONNECTIONS:-100}
+
 #   market-data  — K-lines + depth ladder + chart UI/WS    http://localhost:8081
 #   order        — persistent order API (10 MySQL databases x 100 tables)
 #   raft-1..5    — durable matching cluster and market-data fanout
@@ -22,8 +30,8 @@ services:
       - --rpc-addr=redpanda:33145
       - --advertise-rpc-addr=redpanda:33145
       - --mode=dev-container
-      - --smp=1
-      - --memory=384M
+      - --smp=${TC_KAFKA_SMP:-1}
+      - --memory=${TC_KAFKA_MEMORY:-384M}
       - --default-log-level=warn
     ports:
       - "19092:19092"
@@ -49,8 +57,8 @@ services:
       - --advertise-rpc-addr=redpanda-2:33145
       - --seeds=redpanda:33145
       - --mode=dev-container
-      - --smp=1
-      - --memory=384M
+      - --smp=${TC_KAFKA_SMP:-1}
+      - --memory=${TC_KAFKA_MEMORY:-384M}
       - --default-log-level=warn
     ports: ["19093:19093", "19645:9644"]
     volumes: ["redpanda-2-data:/var/lib/redpanda/data"]
@@ -68,8 +76,8 @@ services:
       - --advertise-rpc-addr=redpanda-3:33145
       - --seeds=redpanda:33145
       - --mode=dev-container
-      - --smp=1
-      - --memory=384M
+      - --smp=${TC_KAFKA_SMP:-1}
+      - --memory=${TC_KAFKA_MEMORY:-384M}
       - --default-log-level=warn
     ports: ["19094:19094", "19646:9644"]
     volumes: ["redpanda-3-data:/var/lib/redpanda/data"]
@@ -144,70 +152,70 @@ services:
 
   mysql-order-0:
     image: mysql:8.4
-    command: ["--innodb-buffer-pool-size=64M", "--performance-schema=OFF", "--max-connections=100"]
+    command: *mysql-command
     environment: { MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD:-local-root-password}" }
     volumes: ["order-mysql-0:/var/lib/mysql"]
     healthcheck: { test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"], interval: 3s, timeout: 3s, retries: 40, start_period: 10s }
     restart: unless-stopped
   mysql-order-1:
     image: mysql:8.4
-    command: ["--innodb-buffer-pool-size=64M", "--performance-schema=OFF", "--max-connections=100"]
+    command: *mysql-command
     environment: { MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD:-local-root-password}" }
     volumes: ["order-mysql-1:/var/lib/mysql"]
     healthcheck: { test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"], interval: 3s, timeout: 3s, retries: 40, start_period: 10s }
     restart: unless-stopped
   mysql-order-2:
     image: mysql:8.4
-    command: ["--innodb-buffer-pool-size=64M", "--performance-schema=OFF", "--max-connections=100"]
+    command: *mysql-command
     environment: { MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD:-local-root-password}" }
     volumes: ["order-mysql-2:/var/lib/mysql"]
     healthcheck: { test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"], interval: 3s, timeout: 3s, retries: 40, start_period: 10s }
     restart: unless-stopped
   mysql-order-3:
     image: mysql:8.4
-    command: ["--innodb-buffer-pool-size=64M", "--performance-schema=OFF", "--max-connections=100"]
+    command: *mysql-command
     environment: { MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD:-local-root-password}" }
     volumes: ["order-mysql-3:/var/lib/mysql"]
     healthcheck: { test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"], interval: 3s, timeout: 3s, retries: 40, start_period: 10s }
     restart: unless-stopped
   mysql-order-4:
     image: mysql:8.4
-    command: ["--innodb-buffer-pool-size=64M", "--performance-schema=OFF", "--max-connections=100"]
+    command: *mysql-command
     environment: { MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD:-local-root-password}" }
     volumes: ["order-mysql-4:/var/lib/mysql"]
     healthcheck: { test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"], interval: 3s, timeout: 3s, retries: 40, start_period: 10s }
     restart: unless-stopped
   mysql-order-5:
     image: mysql:8.4
-    command: ["--innodb-buffer-pool-size=64M", "--performance-schema=OFF", "--max-connections=100"]
+    command: *mysql-command
     environment: { MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD:-local-root-password}" }
     volumes: ["order-mysql-5:/var/lib/mysql"]
     healthcheck: { test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"], interval: 3s, timeout: 3s, retries: 40, start_period: 10s }
     restart: unless-stopped
   mysql-order-6:
     image: mysql:8.4
-    command: ["--innodb-buffer-pool-size=64M", "--performance-schema=OFF", "--max-connections=100"]
+    command: *mysql-command
     environment: { MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD:-local-root-password}" }
     volumes: ["order-mysql-6:/var/lib/mysql"]
     healthcheck: { test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"], interval: 3s, timeout: 3s, retries: 40, start_period: 10s }
     restart: unless-stopped
   mysql-order-7:
     image: mysql:8.4
-    command: ["--innodb-buffer-pool-size=64M", "--performance-schema=OFF", "--max-connections=100"]
+    command: *mysql-command
     environment: { MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD:-local-root-password}" }
     volumes: ["order-mysql-7:/var/lib/mysql"]
     healthcheck: { test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"], interval: 3s, timeout: 3s, retries: 40, start_period: 10s }
     restart: unless-stopped
   mysql-order-8:
     image: mysql:8.4
-    command: ["--innodb-buffer-pool-size=64M", "--performance-schema=OFF", "--max-connections=100"]
+    command: *mysql-command
     environment: { MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD:-local-root-password}" }
     volumes: ["order-mysql-8:/var/lib/mysql"]
     healthcheck: { test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"], interval: 3s, timeout: 3s, retries: 40, start_period: 10s }
     restart: unless-stopped
   mysql-order-9:
     image: mysql:8.4
-    command: ["--innodb-buffer-pool-size=64M", "--performance-schema=OFF", "--max-connections=100"]
+    command: *mysql-command
     environment: { MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD:-local-root-password}" }
     volumes: ["order-mysql-9:/var/lib/mysql"]
     healthcheck: { test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"], interval: 3s, timeout: 3s, retries: 40, start_period: 10s }
@@ -244,11 +252,14 @@ services:
       TC_LOG: ${TC_LOG:-info}
       RUST_BACKTRACE: ${RUST_BACKTRACE:-1}
       TC_SLOW_FSYNC_WARN_MS: ${TC_SLOW_FSYNC_WARN_MS:-50}
-      TC_ORDER_MYSQL_SHARD_URLS: mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-0:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-1:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-2:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-3:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-4:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-5:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-6:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-7:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-8:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-9:3306/mysql
-      TC_RAFT_GROUP_MATCHERS: "raft-1:9001@raft-1:9102,raft-2:9001@raft-2:9102,raft-3:9001@raft-3:9102,raft-4:9001@raft-4:9102,raft-5:9001@raft-5:9102;raft-1:9011@raft-1:9112,raft-2:9011@raft-2:9112,raft-3:9011@raft-3:9112,raft-4:9011@raft-4:9112,raft-5:9011@raft-5:9112;raft-1:9021@raft-1:9122,raft-2:9021@raft-2:9122,raft-3:9021@raft-3:9122,raft-4:9021@raft-4:9122,raft-5:9021@raft-5:9122;raft-1:9031@raft-1:9132,raft-2:9031@raft-2:9132,raft-3:9031@raft-3:9132,raft-4:9031@raft-4:9132,raft-5:9031@raft-5:9132"
+      TC_ORDER_MYSQL_SHARD_URLS: ${TC_ORDER_MYSQL_SHARD_URLS:-mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-0:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-1:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-2:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-3:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-4:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-5:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-6:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-7:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-8:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-9:3306/mysql}
+      TC_DB_COUNT: ${TC_DB_COUNT:-10}
+      TC_TABLES_PER_DB: ${TC_TABLES_PER_DB:-100}
+      TC_SHARD_ROUTE_VERSION: ${TC_SHARD_ROUTE_VERSION:-1}
+      TC_RAFT_GROUP_MATCHERS: "${TC_RAFT_GROUP_MATCHERS:-raft-1:9001@raft-1:9102,raft-2:9001@raft-2:9102,raft-3:9001@raft-3:9102,raft-4:9001@raft-4:9102,raft-5:9001@raft-5:9102;raft-1:9011@raft-1:9112,raft-2:9011@raft-2:9112,raft-3:9011@raft-3:9112,raft-4:9011@raft-4:9112,raft-5:9011@raft-5:9112;raft-1:9021@raft-1:9122,raft-2:9021@raft-2:9122,raft-3:9021@raft-3:9122,raft-4:9021@raft-4:9122,raft-5:9021@raft-5:9122;raft-1:9031@raft-1:9132,raft-2:9031@raft-2:9132,raft-3:9031@raft-3:9132,raft-4:9031@raft-4:9132,raft-5:9031@raft-5:9132}"
       TC_ORDER_API_TOKEN: ${TC_ORDER_API_TOKEN:-local-order-api-token}
       TC_ORDER_CATEGORY_SIZE: ${TC_ORDER_CATEGORY_SIZE:-1000}
-      TC_ORDER_KAFKA_BROKERS: redpanda:9092,redpanda-2:9092,redpanda-3:9092
+      TC_ORDER_KAFKA_BROKERS: ${TC_ORDER_KAFKA_BROKERS:-redpanda:9092,redpanda-2:9092,redpanda-3:9092}
       TC_ORDER_KAFKA_TOPIC_PREFIX: ${TC_ORDER_KAFKA_TOPIC_PREFIX:-orders-v2-g}
       # Raise to 16+ on production-sized Kafka brokers.
       TC_ORDER_KAFKA_TOPIC_COUNT: ${TC_ORDER_KAFKA_TOPIC_COUNT:-4}
@@ -257,7 +268,9 @@ services:
       # One consumer per physical partition keeps independent offset/retry pipelines.
       TC_ORDER_KAFKA_CONSUMERS: ${TC_ORDER_KAFKA_CONSUMERS:-32}
       TC_ORDER_KAFKA_DB_CONSUMERS: ${TC_ORDER_KAFKA_DB_CONSUMERS:-32}
-      TC_ORDER_KAFKA_MATCH_CONSUMERS: ${TC_ORDER_KAFKA_MATCH_CONSUMERS:-32}
+      # More submitters than ordered Raft groups cause contention and leader
+      # retries. Scale this with TC_RAFT_GROUPS, not with Kafka partitions.
+      TC_ORDER_KAFKA_MATCH_CONSUMERS: ${TC_ORDER_KAFKA_MATCH_CONSUMERS:-4}
       TC_ORDER_KAFKA_DB_GROUP: ${TC_ORDER_KAFKA_DB_GROUP:-trade-order-persist-v1}
       TC_ORDER_KAFKA_MATCH_GROUP: ${TC_ORDER_KAFKA_MATCH_GROUP:-trade-order-match-v1}
       TC_EXECUTION_KAFKA_TOPIC: ${TC_EXECUTION_KAFKA_TOPIC:-trade-executions-v1}
@@ -266,7 +279,14 @@ services:
       # Example: "12:4,99:5" pins hot categories to dedicated Raft groups.
       TC_RAFT_CATEGORY_PINS: ${TC_RAFT_CATEGORY_PINS:-}
       TC_ORDER_KAFKA_ROUTE_VERSION: ${TC_ORDER_KAFKA_ROUTE_VERSION:-1}
-      TC_ORDER_BATCH_SIZE: ${TC_ORDER_BATCH_SIZE:-500}
+      TC_ORDER_KAFKA_LINGER_MS: ${TC_ORDER_KAFKA_LINGER_MS:-1}
+      TC_ORDER_KAFKA_BATCH_MESSAGES: ${TC_ORDER_KAFKA_BATCH_MESSAGES:-10000}
+      TC_ORDER_KAFKA_COMPRESSION: ${TC_ORDER_KAFKA_COMPRESSION:-lz4}
+      TC_ORDER_KAFKA_QUEUE_KBYTES: ${TC_ORDER_KAFKA_QUEUE_KBYTES:-1048576}
+      TC_KAFKA_FETCH_MIN_BYTES: ${TC_KAFKA_FETCH_MIN_BYTES:-1}
+      TC_KAFKA_FETCH_WAIT_MS: ${TC_KAFKA_FETCH_WAIT_MS:-10}
+      TC_KAFKA_FETCH_MAX_BYTES: ${TC_KAFKA_FETCH_MAX_BYTES:-52428800}
+      TC_ORDER_BATCH_SIZE: ${TC_ORDER_BATCH_SIZE:-1000}
       TC_ORDER_BATCH_LINGER_MS: ${TC_ORDER_BATCH_LINGER_MS:-2}
       # Hard bound for commands accepted by Kafka but not completed by both
       # MySQL and matching. Production sets this to roughly two seconds of

@@ -77,6 +77,9 @@ struct OrderPipelineMetrics {
     execution_mysql_commit_samples: AtomicU64,
     execution_mysql_completed_events: AtomicU64,
     execution_mysql_commit_hist: LatencyHistogram,
+    /// Commands currently waiting for Kafka delivery in this API process.
+    /// Durable downstream backlog is read from the shared consumer groups.
+    inflight_publish_commands: AtomicU64,
     published_commands: AtomicU64,
     mysql_completed_commands: AtomicU64,
     match_completed_commands: AtomicU64,
@@ -128,12 +131,8 @@ impl OrderPipelineMetrics {
 
     fn try_reserve(&self, commands: u64, max_backlog: u64) -> Result<(), u64> {
         loop {
-            let published = self.published_commands.load(AtomicOrdering::Acquire);
-            let completed = self
-                .mysql_completed_commands
-                .load(AtomicOrdering::Acquire)
-                .min(self.match_completed_commands.load(AtomicOrdering::Acquire));
-            let backlog = published.saturating_sub(completed).max(
+            let inflight = self.inflight_publish_commands.load(AtomicOrdering::Acquire);
+            let backlog = inflight.saturating_add(
                 self.observed_mysql_lag
                     .load(AtomicOrdering::Acquire)
                     .max(self.observed_match_lag.load(AtomicOrdering::Acquire)),
@@ -144,10 +143,10 @@ impl OrderPipelineMetrics {
                 return Err(backlog);
             }
             if self
-                .published_commands
+                .inflight_publish_commands
                 .compare_exchange_weak(
-                    published,
-                    published.saturating_add(commands),
+                    inflight,
+                    inflight.saturating_add(commands),
                     AtomicOrdering::AcqRel,
                     AtomicOrdering::Acquire,
                 )
@@ -159,8 +158,15 @@ impl OrderPipelineMetrics {
     }
 
     fn rollback_reservation(&self, commands: u64) {
-        self.published_commands
+        self.inflight_publish_commands
             .fetch_sub(commands, AtomicOrdering::AcqRel);
+    }
+
+    fn finish_reservation(&self, reserved: u64, published: u64) {
+        self.inflight_publish_commands
+            .fetch_sub(reserved, AtomicOrdering::AcqRel);
+        self.published_commands
+            .fetch_add(published, AtomicOrdering::Relaxed);
     }
 
     fn complete(&self, stage: &str, commands: u64) {
@@ -187,19 +193,13 @@ impl OrderPipelineMetrics {
     }
 
     fn backlog(&self) -> u64 {
-        let completed = self
-            .mysql_completed_commands
+        self.inflight_publish_commands
             .load(AtomicOrdering::Acquire)
-            .min(self.match_completed_commands.load(AtomicOrdering::Acquire));
-        let local = self
-            .published_commands
-            .load(AtomicOrdering::Acquire)
-            .saturating_sub(completed);
-        local.max(
-            self.observed_mysql_lag
+            .saturating_add(
+                self.observed_mysql_lag
                 .load(AtomicOrdering::Acquire)
                 .max(self.observed_match_lag.load(AtomicOrdering::Acquire)),
-        )
+            )
     }
 
     fn render(&self) -> String {
@@ -739,15 +739,18 @@ impl KafkaIngress {
                 })
                 .unwrap_or_default(),
         );
-        let producer = ClientConfig::new()
+        let mut producer_config = ClientConfig::new();
+        producer_config
             .set("bootstrap.servers", &brokers)
             .set("acks", "all")
             .set("enable.idempotence", "true")
             .set("max.in.flight.requests.per.connection", "5")
             .set("delivery.timeout.ms", "10000")
-            .set("linger.ms", "1")
-            .set("batch.num.messages", "10000")
-            .create::<FutureProducer>()
+            .set("linger.ms", env_number("TC_ORDER_KAFKA_LINGER_MS", 1u64).to_string())
+            .set("batch.num.messages", env_number("TC_ORDER_KAFKA_BATCH_MESSAGES", 10_000usize).to_string())
+            .set("compression.type", std::env::var("TC_ORDER_KAFKA_COMPRESSION").unwrap_or_else(|_| "lz4".into()))
+            .set("queue.buffering.max.kbytes", env_number("TC_ORDER_KAFKA_QUEUE_KBYTES", 1_048_576usize).to_string());
+        let producer = producer_config.create::<FutureProducer>()
             .map_err(|error| error.to_string())?;
         let topic_count = topics.len();
         let backpressure = Arc::new(Backpressure::from_env(
@@ -767,7 +770,7 @@ impl KafkaIngress {
             ),
             matcher_consumers: env_number(
                 "TC_ORDER_KAFKA_MATCH_CONSUMERS",
-                env_number("TC_ORDER_KAFKA_CONSUMERS", partition_workers),
+                raft_group_count.max(1),
             ),
             db_group: std::env::var("TC_ORDER_KAFKA_DB_GROUP")
                 .unwrap_or_else(|_| "trade-order-persist-v1".into()),
@@ -779,7 +782,7 @@ impl KafkaIngress {
                 .unwrap_or_else(|_| "trade-order-execution-mysql-v1".into()),
             execution_consumers: env_number("TC_EXECUTION_KAFKA_MYSQL_CONSUMERS", 4usize),
             raft_group_pins,
-            batch_size: env_number("TC_ORDER_BATCH_SIZE", 500usize).max(1),
+            batch_size: env_number("TC_ORDER_BATCH_SIZE", 1_000usize).max(1),
             linger: Duration::from_millis(env_number("TC_ORDER_BATCH_LINGER_MS", 2u64)),
             max_pipeline_backlog: env_number("TC_ORDER_MAX_PIPELINE_BACKLOG", 50_000u64).max(1),
             metrics,
@@ -847,6 +850,7 @@ impl KafkaIngress {
                 return Err(error.to_string());
             }
         };
+        self.metrics.finish_reservation(1, 1);
         Ok(CategorySequence {
             category_id,
             category_seq: (offset as u64).saturating_add(1),
@@ -886,8 +890,11 @@ impl KafkaIngress {
                 first_error.get_or_insert_with(|| error.to_string());
             }
         }
+        self.metrics.finish_reservation(
+            records.len() as u64,
+            records.len() as u64 - failed,
+        );
         if failed > 0 {
-            self.metrics.rollback_reservation(failed);
             return Err(first_error.unwrap_or_else(|| "Kafka batch publish failed".into()));
         }
         Ok(())
@@ -1237,9 +1244,7 @@ fn run_kafka_stage<F>(
 ) where
     F: FnMut(&[KafkaRecord]) -> Result<(), String>,
 {
-    let consumer: BaseConsumer = ClientConfig::new()
-        .set("bootstrap.servers", &kafka.brokers)
-        .set("group.id", &group_id)
+    let consumer: BaseConsumer = kafka_consumer_config(&kafka.brokers, &group_id)
         .set("enable.auto.commit", "false")
         .set("enable.auto.offset.store", "false")
         .set("auto.offset.reset", "earliest")
@@ -1327,6 +1332,17 @@ fn run_kafka_stage<F>(
     }
 }
 
+fn kafka_consumer_config(brokers: &str, group_id: &str) -> ClientConfig {
+    let mut config = ClientConfig::new();
+    config
+        .set("bootstrap.servers", brokers)
+        .set("group.id", group_id)
+        .set("fetch.min.bytes", env_number("TC_KAFKA_FETCH_MIN_BYTES", 1usize).to_string())
+        .set("fetch.wait.max.ms", env_number("TC_KAFKA_FETCH_WAIT_MS", 10u64).to_string())
+        .set("fetch.message.max.bytes", env_number("TC_KAFKA_FETCH_MAX_BYTES", 52_428_800usize).to_string());
+    config
+}
+
 /// Per-partition consumer lag, indexed by the router's global partition index
 /// (`topic_pos * partitions_per_topic + partition`). Per-category backpressure
 /// keys off this; the caller also sums it for the market-wide backlog switch.
@@ -1401,9 +1417,7 @@ fn run_execution_mysql_consumer(
     worker: usize,
     dlq: Arc<Mutex<DlqWriter>>,
 ) {
-    let consumer: BaseConsumer = ClientConfig::new()
-        .set("bootstrap.servers", &kafka.brokers)
-        .set("group.id", &kafka.execution_group)
+    let consumer: BaseConsumer = kafka_consumer_config(&kafka.brokers, &kafka.execution_group)
         .set("enable.auto.commit", "false")
         .set("enable.auto.offset.store", "false")
         .set("auto.offset.reset", "earliest")
@@ -2370,15 +2384,17 @@ mod tests {
     }
 
     #[test]
-    fn ingress_backpressure_waits_for_both_fanout_stages() {
+    fn ingress_backpressure_uses_shared_group_lag_and_local_inflight() {
         let metrics = OrderPipelineMetrics::default();
         metrics.try_reserve(3, 5).unwrap();
-        metrics.complete("mysql", 3);
         assert_eq!(metrics.backlog(), 3);
+        metrics.finish_reservation(3, 3);
+        assert_eq!(metrics.backlog(), 0);
 
-        metrics.complete("match", 2);
-        assert_eq!(metrics.backlog(), 1);
-        metrics.try_reserve(4, 5).unwrap();
+        metrics.set_observed_lag("mysql", 2);
+        metrics.set_observed_lag("match", 3);
+        assert_eq!(metrics.backlog(), 3);
+        metrics.try_reserve(2, 5).unwrap();
         assert!(metrics.try_reserve(1, 5).is_err());
         assert_eq!(
             ingress_error_status("backpressure: full"),

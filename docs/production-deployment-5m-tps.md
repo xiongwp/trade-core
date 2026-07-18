@@ -136,7 +136,7 @@ delivery.timeout.ms=10000
 ### 5.2 成交事件
 
 - 独立 execution topics，至少 200 partitions。
-- key 仍为 category，保证同 category 成交事件有序。
+- key 为 `order_id`，保证同一订单的全部状态变化进入相同 partition 并保持顺序。
 - 事件 ID 使用 `(raft_group, raft_index, report_ordinal)`，不能只用 `order_id`。
 - 撮合报告先进入持久化 execution WAL/outbox，Kafka ACK 后推进发布水位。
 - MySQL 以 event ID 唯一键幂等投影；Kafka offset 只用于消费进度，不作为业务唯一键。
@@ -181,22 +181,27 @@ emergency: lag >= 15 秒或 quorum 丢失 -> 停止该 category 写入
 
 推荐第一阶段共进程，减少一次网络跳转；完成 500 万验收后再评估拆分。
 
-## 8. MySQL：100 库、10000 表
+## 8. MySQL：按 order_id 水平分片
 
 - 100 个物理写分片，每库 100 张订单表，总计 10000 表。
-- 以 category 路由，不以 user ID 路由。
-- category 内请求天然进入同一写分片；批量写入 500-1000 行/事务。
+- 只以 `order_id` 路由，不使用资产、category 或 user ID 参与数据库位置计算。
+- 相同 `(database, table)` 的事件聚合后批量写入 500-2000 行/事务。
+- 成交同时影响 maker/taker 时，按两个订单各自的 `order_id` 分别路由和更新。
 - 主键使用订单 ID，另建 `(category_id, category_seq)` 唯一索引。
 - 成交投影使用确定性 event ID 唯一索引。
 - 禁止在高峰期执行 DDL；新表直接使用目标 `CREATE TABLE` 模板创建，不依赖在线 migration SQL。
 - 历史订单按时间分区/归档，活跃索引控制在 buffer pool 内。
 
-每个写主的设计值：
+每个写主的最低命令投影设计值：
 
 ```text
 7,150,000 / 100 = 71,500 rows/s
 batch=1000 -> 约 72 个事务/s/实例
 ```
+
+撮合结果通常多于命令数。若容量模型按每命令平均 2 个结果事件，则结果投影需要
+14,300,000 events/s 的设计容量，即每个写主约 143,000 events/s；数据库验收必须同时
+报告 commands/s、events/s 和实际 SQL row mutations/s，不能只用入口命令数推算。
 
 该目标必须使用批量 prepared statement、最小必要索引和本地 NVMe。逐订单事务不能通过验收。
 

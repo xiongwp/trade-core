@@ -451,18 +451,21 @@ fn main() {
         .unwrap_or(DEFAULT_ASSET_CATEGORY_SIZE)
         .max(1);
     let execution_producer = execution_kafka_brokers.map(|brokers| {
-        ClientConfig::new()
+        let mut config = ClientConfig::new();
+        config
             .set("bootstrap.servers", brokers)
             .set("acks", "all")
             .set("enable.idempotence", "true")
-            .set("linger.ms", "2")
-            .set("batch.num.messages", "10000")
+            .set("linger.ms", std::env::var("TC_EXECUTION_KAFKA_LINGER_MS").unwrap_or_else(|_| "2".into()))
+            .set("batch.num.messages", std::env::var("TC_EXECUTION_KAFKA_BATCH_MESSAGES").unwrap_or_else(|_| "10000".into()))
+            .set("compression.type", std::env::var("TC_EXECUTION_KAFKA_COMPRESSION").unwrap_or_else(|_| "lz4".into()))
+            .set("queue.buffering.max.kbytes", std::env::var("TC_EXECUTION_KAFKA_QUEUE_KBYTES").unwrap_or_else(|_| "1048576".into()))
             .set(
                 "message.timeout.ms",
                 std::env::var("TC_EXECUTION_KAFKA_DELIVERY_TIMEOUT_MS")
                     .unwrap_or_else(|_| "5000".into()),
-            )
-            .create::<FutureProducer>()
+            );
+        config.create::<FutureProducer>()
             .expect("create execution Kafka producer")
     });
     if let Some(producer) = execution_producer.clone() {
