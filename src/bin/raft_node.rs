@@ -167,7 +167,20 @@ fn main() {
     // Single-group deployment: register one commit-latency series (group 0).
     // A future split-matching topology registers one per group here.
     metrics.register_raft_commit_groups(1);
-    let execution_kafka_brokers = std::env::var("TC_EXECUTION_KAFKA_BROKERS").ok();
+    // Keep result publication independently switchable for staged capacity
+    // tests. The durable execution outbox is still written and fsynced when
+    // publication is disabled, so this isolates Raft/WAL/matching without
+    // weakening crash recovery.
+    let execution_publish_enabled = std::env::var("TC_EXECUTION_PUBLISH_ENABLED")
+        .map(|value| {
+            !["0", "false", "no", "off"]
+                .iter()
+                .any(|disabled| value.eq_ignore_ascii_case(disabled))
+        })
+        .unwrap_or(true);
+    let execution_kafka_brokers = execution_publish_enabled
+        .then(|| std::env::var("TC_EXECUTION_KAFKA_BROKERS").ok())
+        .flatten();
     metrics
         .execution_outbox_publish_healthy
         .store(execution_kafka_brokers.is_none() as u64, Ordering::Release);

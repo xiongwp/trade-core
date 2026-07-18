@@ -1358,6 +1358,25 @@ fn run_kafka_stage<F>(
 ) where
     F: FnMut(&[KafkaRecord]) -> Result<(), String>,
 {
+    // Matching has a much more expensive durability boundary than the command
+    // DB projection: each Raft application batch crosses quorum WAL plus the
+    // matching WAL/outbox barrier.  Give it an independent, larger microbatch
+    // so scaling match throughput does not also inflate MySQL transactions.
+    let (batch_size, linger) = if stage == "match" {
+        (
+            env_number(
+                "TC_ORDER_MATCH_BATCH_SIZE",
+                wire::RAFT_BATCH_MAX_COMMANDS,
+            )
+            .clamp(1, wire::RAFT_BATCH_MAX_COMMANDS),
+            Duration::from_millis(env_number(
+                "TC_ORDER_MATCH_BATCH_LINGER_MS",
+                kafka.linger.as_millis() as u64,
+            )),
+        )
+    } else {
+        (kafka.batch_size, kafka.linger)
+    };
     let consumer: BaseConsumer = kafka_consumer_config(&kafka.brokers, &group_id)
         .set("enable.auto.commit", "false")
         .set("enable.auto.offset.store", "false")
@@ -1381,7 +1400,7 @@ fn run_kafka_stage<F>(
     let mut last_failure_log = std::time::Instant::now() - Duration::from_secs(30);
 
     loop {
-        let mut batch = Vec::with_capacity(kafka.batch_size);
+        let mut batch = Vec::with_capacity(batch_size);
         let Some(first) = consumer.poll(Duration::from_millis(100)) else {
             continue;
         };
@@ -1400,8 +1419,8 @@ fn run_kafka_stage<F>(
                 continue;
             }
         }
-        let deadline = std::time::Instant::now() + kafka.linger;
-        while batch.len() < kafka.batch_size && std::time::Instant::now() < deadline {
+        let deadline = std::time::Instant::now() + linger;
+        while batch.len() < batch_size && std::time::Instant::now() < deadline {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             match consumer.poll(remaining) {
                 Some(Ok(message)) => {

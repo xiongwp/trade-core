@@ -246,6 +246,7 @@ def render_node_compose(topo, n):
         '  TC_EXECUTION_KAFKA_BROKERS: "${TC_EXECUTION_KAFKA_BROKERS'
         ':-redpanda:9092,redpanda-2:9092,redpanda-3:9092}"'
     )
+    lines.append('  TC_EXECUTION_PUBLISH_ENABLED: "${TC_EXECUTION_PUBLISH_ENABLED:-true}"')
     lines += ["", "services:"]
 
     for (g, r) in hosted:
@@ -437,6 +438,8 @@ def render_gateway_compose(topo):
         f"      TC_ORDER_KAFKA_TOPIC_COUNT: ${{TC_ORDER_KAFKA_TOPIC_COUNT:-{groups}}}",
         "      TC_ORDER_KAFKA_DB_CONSUMERS: 0",
         "      TC_ORDER_KAFKA_MATCH_CONSUMERS: ${TC_MATCH_CONSUMERS_PER_REPLICA:-4}",
+        "      TC_ORDER_MATCH_BATCH_SIZE: ${TC_ORDER_MATCH_BATCH_SIZE:-10000}",
+        "      TC_ORDER_MATCH_BATCH_LINGER_MS: ${TC_ORDER_MATCH_BATCH_LINGER_MS:-2}",
         "      TC_EXECUTION_KAFKA_MYSQL_CONSUMERS: 0",
         "      TC_ORDER_HTTP_INGRESS_ENABLED: false",
         "    restart: unless-stopped",

@@ -295,6 +295,8 @@ services:
       TC_KAFKA_FETCH_MAX_BYTES: ${TC_KAFKA_FETCH_MAX_BYTES:-52428800}
       TC_ORDER_BATCH_SIZE: ${TC_ORDER_BATCH_SIZE:-1000}
       TC_ORDER_BATCH_LINGER_MS: ${TC_ORDER_BATCH_LINGER_MS:-2}
+      TC_ORDER_MATCH_BATCH_SIZE: ${TC_ORDER_MATCH_BATCH_SIZE:-10000}
+      TC_ORDER_MATCH_BATCH_LINGER_MS: ${TC_ORDER_MATCH_BATCH_LINGER_MS:-2}
       # Hard bound for commands accepted by Kafka but not completed by both
       # MySQL and matching. Production sets this to roughly two seconds of
       # designed traffic and clients retry HTTP 429 with jitter.

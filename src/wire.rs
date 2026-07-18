@@ -41,7 +41,11 @@ use std::fmt;
 /// Fixed wire frame length in bytes.
 pub const MSG_LEN: usize = 40;
 pub const RAFT_BATCH_HEADER_LEN: usize = 12;
-pub const RAFT_BATCH_MAX_COMMANDS: usize = 1_000;
+/// High-throughput Raft application batch.  At 40 bytes per command the
+/// maximum entry is about 400 KiB, small enough for replication while
+/// amortizing quorum WAL and application durability barriers over 10x more
+/// commands than the original 1,000-command limit.
+pub const RAFT_BATCH_MAX_COMMANDS: usize = 10_000;
 const RAFT_BATCH_MAGIC: [u8; 4] = *b"RB01";
 
 /// Encode multiple command frames into one Raft application entry. Consensus
