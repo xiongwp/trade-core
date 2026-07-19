@@ -517,13 +517,27 @@ fn main() {
         })
         .expect("spawn raft runtime");
 
-    // Serve route-migration fingerprint queries off the same admin port:
-    // `GET /fingerprint?category=N` answers the per-category matching-state
-    // fingerprint (and the applied index it was taken at) from the durable
-    // engine snapshot, so the order system's control plane can verify a cutover
-    // against real state on both the source and target groups.
+    // Serve route-migration queries off the same admin port:
+    //  * `GET /fingerprint?category=N` answers the per-category matching-state
+    //    fingerprint (and the applied index it was taken at) from the durable
+    //    engine snapshot, so the control plane can verify a cutover against real
+    //    state on both the source and target groups;
+    //  * `GET /applied-index` answers this node's current live Raft applied
+    //    index, so the control plane can auto-capture a migration's freeze index
+    //    from the source group instead of an operator hand-supplying it.
     let fingerprint_snapshot_path = engine_snapshot_path.clone();
+    let applied_index_metrics = metrics.clone();
     let fingerprint_route: trade_core::metrics::ExtraRoute = Box::new(move |line: &str| {
+        if trade_core::migration::is_applied_index_request(line) {
+            let index = applied_index_metrics
+                .raft_applied_index
+                .load(std::sync::atomic::Ordering::Acquire);
+            return Some((
+                "200 OK".to_string(),
+                "application/json".to_string(),
+                trade_core::migration::applied_index_response_json(index),
+            ));
+        }
         let category = match trade_core::migration::parse_fingerprint_request(line)? {
             Ok(category) => category,
             Err(reason) => {

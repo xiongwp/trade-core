@@ -190,18 +190,39 @@ pub fn fetch_category_fingerprint(
     category_id: u32,
     timeout: Duration,
 ) -> io::Result<Option<CategoryFingerprint>> {
+    let (status, body) = http_get(addr, &format!("/fingerprint?category={category_id}"), timeout)?;
+    // 503: no durable snapshot yet — caller must wait, not treat as agreement.
+    if status == 503 {
+        return Ok(None);
+    }
+    if status != 200 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("fingerprint endpoint {addr} returned HTTP {status}"),
+        ));
+    }
+    parse_fingerprint_response(&body).map(Some).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unparseable fingerprint response from {addr}"),
+        )
+    })
+}
+
+/// Minimal dependency-free HTTP/1.1 GET returning `(status_code, body)`.
+///
+/// Tolerates a connection reset *after* bytes arrive: a `Connection: close`
+/// peer that closes without draining our request can make the OS deliver an
+/// RST, surfacing as ConnectionReset on the trailing read even though the full
+/// response is already in hand. Only an error with no bytes received is fatal.
+fn http_get(addr: &str, path: &str, timeout: Duration) -> io::Result<(u16, String)> {
     let mut stream = TcpStream::connect(addr)?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
     write!(
         stream,
-        "GET /fingerprint?category={category_id} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+        "GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
     )?;
-    // Read until EOF, tolerating a connection reset *after* bytes arrive: a
-    // `Connection: close` peer that closes without draining our request can
-    // make the OS deliver an RST, which surfaces as ConnectionReset on the
-    // trailing read even though the full response is already in hand. Only an
-    // error with no bytes received at all is fatal.
     let mut raw = Vec::new();
     let mut chunk = [0u8; 2048];
     loop {
@@ -224,25 +245,62 @@ pub fn fetch_category_fingerprint(
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|code| code.parse::<u16>().ok())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing HTTP status line"))?;
-    if status == 503 {
-        return Ok(None);
-    }
+    let body = text
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_string())
+        .unwrap_or_default();
+    Ok((status, body))
+}
+
+/// Fetch a matching node's current live Raft applied index from its
+/// `/applied-index` route. Used to auto-capture a migration's freeze index from
+/// the source group instead of having an operator hand-supply it.
+///
+/// Correctness note: the caller must have already frozen writes for the
+/// category (`RouteControlPlane::begin`) and allowed the source's in-flight
+/// command pipeline to drain, so the returned index is the *final* index for
+/// that category. This function only reads the value; it does not enforce the
+/// drain.
+pub fn fetch_applied_index(addr: &str, timeout: Duration) -> io::Result<u64> {
+    let (status, body) = http_get(addr, "/applied-index", timeout)?;
     if status != 200 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("fingerprint endpoint {addr} returned HTTP {status}"),
+            format!("applied-index endpoint {addr} returned HTTP {status}"),
         ));
     }
-    let body = text
-        .split_once("\r\n\r\n")
-        .map(|(_, body)| body)
-        .unwrap_or("");
-    parse_fingerprint_response(body).map(Some).ok_or_else(|| {
+    parse_applied_index_response(&body).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("unparseable fingerprint response from {addr}"),
+            format!("unparseable applied-index response from {addr}"),
         )
     })
+}
+
+/// True when `line` is the `GET /applied-index` route (query ignored).
+pub fn is_applied_index_request(line: &str) -> bool {
+    let mut parts = line.split_whitespace();
+    let _method = parts.next();
+    parts
+        .next()
+        .map(|target| target.split('?').next() == Some("/applied-index"))
+        .unwrap_or(false)
+}
+
+/// Render the `/applied-index` JSON body.
+pub fn applied_index_response_json(raft_applied_index: u64) -> String {
+    format!("{{\"raft_applied_index\":{raft_applied_index}}}")
+}
+
+/// Parse the body produced by [`applied_index_response_json`].
+pub fn parse_applied_index_response(body: &str) -> Option<u64> {
+    let key = "\"raft_applied_index\"";
+    let start = body.find(key)? + key.len();
+    let rest = body[start..].trim_start_matches([':', ' ']);
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest[..end].parse().ok()
 }
 
 /// Parse the JSON body produced by [`fingerprint_response_json`] back into a
@@ -341,6 +399,40 @@ mod tests {
         let path = dir.join("does-not-exist.bin");
         assert_eq!(snapshot_category_fingerprint(&path, 0, CAT_SIZE).unwrap(), None);
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn applied_index_request_and_response_round_trip() {
+        assert!(is_applied_index_request("GET /applied-index HTTP/1.1"));
+        assert!(is_applied_index_request("GET /applied-index?x=1 HTTP/1.1"));
+        assert!(!is_applied_index_request("GET /fingerprint?category=1 HTTP/1.1"));
+        let body = applied_index_response_json(9_876);
+        assert_eq!(parse_applied_index_response(&body), Some(9_876));
+        assert_eq!(parse_applied_index_response("garbage"), None);
+    }
+
+    #[test]
+    fn fetch_applied_index_reads_a_served_value() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let handle = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 512];
+            let _ = s.read(&mut buf);
+            let body = applied_index_response_json(4_242);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = s.write_all(response.as_bytes());
+        });
+        assert_eq!(
+            fetch_applied_index(&addr, Duration::from_secs(2)).unwrap(),
+            4_242
+        );
+        handle.join().unwrap();
     }
 
     #[test]

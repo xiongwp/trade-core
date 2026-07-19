@@ -647,6 +647,59 @@ fn verify_caught_up(kafka: &KafkaIngress, category: u32, query: &str) -> Result<
     )
 }
 
+/// Handle `/admin/routes/frozen`. The freeze index may be supplied explicitly
+/// (`?raft_index=N`); otherwise, when the source group has a configured
+/// endpoint, it is auto-captured from that node's current live applied index so
+/// an operator no longer hand-supplies it. The caller must have let the source
+/// pipeline drain first — `begin` already stopped accepting the category's
+/// writes — so the captured index is the category's final index.
+fn freeze_migration(kafka: &KafkaIngress, category: u32, query: &str) -> Result<String, String> {
+    let timeout = Duration::from_millis(env_number("TC_MIGRATION_FINGERPRINT_TIMEOUT_MS", 2_000u64));
+    freeze_migration_inner(
+        &kafka.route_control,
+        &kafka.migration_endpoints,
+        category,
+        query,
+        timeout,
+    )
+}
+
+/// Testable core of [`freeze_migration`], decoupled from `KafkaIngress`.
+fn freeze_migration_inner(
+    route_control: &trade_core::cluster::RouteControlPlane,
+    endpoints: &HashMap<usize, String>,
+    category: u32,
+    query: &str,
+    timeout: Duration,
+) -> Result<String, String> {
+    let migration = route_control
+        .active(category)
+        .ok_or("category migration is not active")?;
+
+    let (index, captured_from) = match query_param(query, "raft_index") {
+        Some(_) => (required::<u64>(query, "raft_index")?, "caller"),
+        None => {
+            let source_addr = endpoints.get(&migration.from_group).ok_or_else(|| {
+                format!(
+                    "no endpoint for source group {}; supply raft_index explicitly",
+                    migration.from_group
+                )
+            })?;
+            let index = trade_core::migration::fetch_applied_index(source_addr, timeout)
+                .map_err(|error| {
+                    format!("applied-index fetch from {source_addr} failed: {error}")
+                })?;
+            (index, "source-node")
+        }
+    };
+
+    route_control.frozen(category, index).map(|_| {
+        format!(
+            "{{\"accepted\":true,\"state\":\"CATCHING_UP\",\"frozen_index\":{index},\"captured_from\":\"{captured_from}\"}}"
+        )
+    })
+}
+
 /// Testable core of [`verify_caught_up`], decoupled from `KafkaIngress` so it
 /// can be driven against stub fingerprint servers. `endpoints` maps a Raft
 /// group id to the address serving its `/fingerprint` route.
@@ -2787,10 +2840,7 @@ fn handle(
                             migration.route_version
                         )
                     }),
-                "/admin/routes/frozen" => kafka
-                    .route_control
-                    .frozen(category, required::<u64>(query, "raft_index")?)
-                    .map(|_| "{\"accepted\":true,\"state\":\"CATCHING_UP\"}".into()),
+                "/admin/routes/frozen" => freeze_migration(&kafka, category, query),
                 "/admin/routes/caught-up" => verify_caught_up(&kafka, category, query),
                 "/admin/routes/activate" => kafka.route_control.activate(category).map(|version| {
                     format!(
@@ -3692,6 +3742,79 @@ mod tests {
         assert_eq!(migration.to_group, 2);
         rc.frozen(category, frozen_index).unwrap();
         (rc, category, migration.from_group, migration.to_group)
+    }
+
+    /// A one-shot stub of a node's `GET /applied-index` route.
+    fn stub_applied_index_node(index: u64) -> String {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            let Ok((mut s, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 512];
+            let _ = s.read(&mut buf);
+            let body = trade_core::migration::applied_index_response_json(index);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = s.write_all(response.as_bytes());
+        });
+        addr
+    }
+
+    #[test]
+    fn frozen_auto_captures_source_applied_index() {
+        let rc = RouteControlPlane::new(4, HashMap::new());
+        let category = 1u32;
+        let migration = rc.begin(category, 2).unwrap();
+        let mut endpoints = HashMap::new();
+        endpoints.insert(migration.from_group, stub_applied_index_node(4_242));
+
+        // No raft_index in the query → auto-capture from the source node.
+        let body = freeze_migration_inner(&rc, &endpoints, category, "", Duration::from_secs(2))
+            .expect("auto-capture freezes at the source's applied index");
+        assert!(body.contains("\"frozen_index\":4242"), "got: {body}");
+        assert!(body.contains("\"captured_from\":\"source-node\""));
+        // The migration advanced to CatchingUp at exactly that index.
+        assert_eq!(rc.active(category).unwrap().frozen_index, 4_242);
+    }
+
+    #[test]
+    fn frozen_honors_explicit_index_over_auto_capture() {
+        let rc = RouteControlPlane::new(4, HashMap::new());
+        let category = 1u32;
+        let migration = rc.begin(category, 2).unwrap();
+        let mut endpoints = HashMap::new();
+        // Endpoint would answer 999, but an explicit index must win.
+        endpoints.insert(migration.from_group, stub_applied_index_node(999));
+
+        let body = freeze_migration_inner(
+            &rc,
+            &endpoints,
+            category,
+            "raft_index=50",
+            Duration::from_secs(2),
+        )
+        .expect("explicit index is accepted");
+        assert!(body.contains("\"frozen_index\":50"));
+        assert!(body.contains("\"captured_from\":\"caller\""));
+        assert_eq!(rc.active(category).unwrap().frozen_index, 50);
+    }
+
+    #[test]
+    fn frozen_without_index_or_endpoint_is_an_error() {
+        let rc = RouteControlPlane::new(4, HashMap::new());
+        let category = 1u32;
+        rc.begin(category, 2).unwrap();
+        let endpoints = HashMap::new(); // no source endpoint
+        assert!(
+            freeze_migration_inner(&rc, &endpoints, category, "", Duration::from_secs(1)).is_err(),
+            "no index and no endpoint must fail rather than freeze at a bogus value"
+        );
     }
 
     #[test]
