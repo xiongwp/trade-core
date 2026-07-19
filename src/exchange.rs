@@ -965,6 +965,32 @@ impl Processor {
     /// Order-sensitive fingerprint of the complete matching state (books +
     /// sequence counters). Equal fingerprints = identical state.
     pub fn state_fingerprint(&self) -> u64 {
+        self.fingerprint_state(|_| true)
+    }
+
+    /// Order-sensitive fingerprint of just the instruments in one asset
+    /// category (`asset_category(instrument, category_size) == category_id`).
+    ///
+    /// A route migration moves a category's *matching ownership* from one Raft
+    /// group to another; the cutover is only safe once the source and target
+    /// groups have byte-identical book state for that category. This computes
+    /// the value both sides must agree on, so [`crate::cluster::RouteControlPlane::caught_up`]
+    /// can verify equality against real state instead of trusting a
+    /// caller-supplied number. Determinism holds because [`export_state`] sorts
+    /// by instrument and the category filter preserves that order.
+    ///
+    /// [`export_state`]: Self::export_state
+    pub fn category_fingerprint(&self, category_id: u32, category_size: u32) -> u64 {
+        self.fingerprint_state(|instrument| {
+            crate::sharding::asset_category(instrument, category_size) == category_id
+        })
+    }
+
+    /// Shared fingerprint core: fold every selected engine's sequence and
+    /// resting orders into one FNV-1a hash. `select` filters by instrument so
+    /// the whole-state and per-category fingerprints stay bit-compatible for
+    /// the instruments they share.
+    fn fingerprint_state(&self, select: impl Fn(InstrumentId) -> bool) -> u64 {
         let mut h: u64 = 0xcbf29ce484222325;
         let mut mix = |v: u64| {
             for b in v.to_le_bytes() {
@@ -973,6 +999,9 @@ impl Processor {
             }
         };
         for s in self.export_state() {
+            if !select(s.instrument) {
+                continue;
+            }
             mix(s.instrument.0 as u64);
             mix(s.engine_seq);
             for o in &s.orders {
