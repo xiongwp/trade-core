@@ -50,6 +50,7 @@ pub mod journal_inspect;
 pub mod kline;
 pub mod lockfree;
 pub mod metrics;
+pub mod migration;
 pub mod oblog;
 pub mod order;
 pub mod order_queue;

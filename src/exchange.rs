@@ -987,32 +987,12 @@ impl Processor {
     }
 
     /// Shared fingerprint core: fold every selected engine's sequence and
-    /// resting orders into one FNV-1a hash. `select` filters by instrument so
-    /// the whole-state and per-category fingerprints stay bit-compatible for
-    /// the instruments they share.
+    /// resting orders into one FNV-1a hash. Delegates to the free
+    /// [`fingerprint_engine_states`] so a fingerprint computed from a durable
+    /// snapshot (see [`crate::migration`]) is bit-identical to one computed
+    /// from the live processor — a migration cutover compares the two.
     fn fingerprint_state(&self, select: impl Fn(InstrumentId) -> bool) -> u64 {
-        let mut h: u64 = 0xcbf29ce484222325;
-        let mut mix = |v: u64| {
-            for b in v.to_le_bytes() {
-                h ^= b as u64;
-                h = h.wrapping_mul(0x100000001b3);
-            }
-        };
-        for s in self.export_state() {
-            if !select(s.instrument) {
-                continue;
-            }
-            mix(s.instrument.0 as u64);
-            mix(s.engine_seq);
-            for o in &s.orders {
-                mix(o.id.0);
-                mix(o.price);
-                mix(o.remaining);
-                mix(o.timestamp);
-                mix(o.user);
-            }
-        }
-        h
+        fingerprint_engine_states(&self.export_state(), select)
     }
 
     /// Apply one command, emitting every resulting report through `emit`.
@@ -2208,6 +2188,42 @@ fn accept_replay_command(
             format!("command id {id} has conflicting journal payloads"),
         )),
     }
+}
+
+/// Order-sensitive FNV-1a fingerprint of a set of engine states, keeping only
+/// the instruments for which `select` returns true. This is the shared core
+/// behind [`Processor::state_fingerprint`]/[`Processor::category_fingerprint`]
+/// and the durable-snapshot fingerprint in [`crate::migration`], so a value
+/// computed from live processor state and one recomputed from a snapshot of
+/// that same state are bit-identical. Callers must pass states in a stable
+/// order (`Processor::export_state` sorts by instrument; a snapshot preserves
+/// that capture order).
+pub fn fingerprint_engine_states(
+    states: &[EngineState],
+    select: impl Fn(InstrumentId) -> bool,
+) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    let mut mix = |v: u64| {
+        for b in v.to_le_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+    };
+    for s in states {
+        if !select(s.instrument) {
+            continue;
+        }
+        mix(s.instrument.0 as u64);
+        mix(s.engine_seq);
+        for o in &s.orders {
+            mix(o.id.0);
+            mix(o.price);
+            mix(o.remaining);
+            mix(o.timestamp);
+            mix(o.user);
+        }
+    }
+    h
 }
 
 /// FNV-1a fingerprint of a report stream (order-sensitive). Two runs with equal

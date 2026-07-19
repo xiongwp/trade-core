@@ -630,6 +630,61 @@ fn required<T: std::str::FromStr>(query: &str, key: &str) -> Result<T, String> {
         .map_err(|_| format!("invalid {key}"))
 }
 
+/// Handle `/admin/routes/caught-up`. When `TC_MIGRATION_GROUP_ENDPOINTS` maps
+/// both the migration's source and target Raft groups, this fetches each side's
+/// per-category matching-state fingerprint from that group's node and verifies
+/// the cutover against real state — the operator no longer supplies (and the
+/// control plane no longer trusts) fingerprints as query parameters. Without an
+/// endpoint map, it falls back to the legacy caller-supplied fingerprints.
+fn verify_caught_up(kafka: &KafkaIngress, category: u32, query: &str) -> Result<String, String> {
+    let migration = kafka
+        .route_control
+        .active(category)
+        .ok_or("category migration is not active")?;
+
+    let source_addr = kafka.migration_endpoints.get(&migration.from_group);
+    let target_addr = kafka.migration_endpoints.get(&migration.to_group);
+    let (Some(source_addr), Some(target_addr)) = (source_addr, target_addr) else {
+        // Legacy path: no endpoint map for these groups, trust the caller.
+        return kafka
+            .route_control
+            .caught_up(
+                category,
+                required::<u64>(query, "raft_index")?,
+                required::<u64>(query, "source_fingerprint")?,
+                required::<u64>(query, "target_fingerprint")?,
+            )
+            .map(|_| "{\"accepted\":true,\"state\":\"VERIFIED\",\"verified_by\":\"caller\"}".into());
+    };
+
+    let timeout = Duration::from_millis(env_number("TC_MIGRATION_FINGERPRINT_TIMEOUT_MS", 2_000u64));
+    let fetch = |addr: &str| -> Result<trade_core::migration::CategoryFingerprint, String> {
+        trade_core::migration::fetch_category_fingerprint(addr, category, timeout)
+            .map_err(|error| format!("fingerprint fetch from {addr} failed: {error}"))?
+            .ok_or_else(|| format!("group node {addr} has no durable snapshot yet; retry"))
+    };
+    let source = fetch(source_addr)?;
+    let target = fetch(target_addr)?;
+
+    let verified = trade_core::migration::verify_cutover(migration.frozen_index, source, target)?;
+    // Feed the verified, node-reported values into the fenced state machine;
+    // the equality check inside caught_up is now backed by real state.
+    kafka
+        .route_control
+        .caught_up(
+            category,
+            verified.raft_applied_index,
+            verified.fingerprint,
+            verified.fingerprint,
+        )
+        .map(|_| {
+            format!(
+                "{{\"accepted\":true,\"state\":\"VERIFIED\",\"verified_by\":\"nodes\",\"raft_applied_index\":{},\"fingerprint\":{}}}",
+                verified.raft_applied_index, verified.fingerprint
+            )
+        })
+}
+
 fn ingress_error_status(error: &str) -> &'static str {
     if error.starts_with("backpressure-emergency:") {
         // Emergency tier / lost quorum: stop writes for this category.
@@ -715,6 +770,11 @@ struct KafkaIngress {
     execution_batch_size: usize,
     execution_linger: Duration,
     route_control: Arc<trade_core::cluster::RouteControlPlane>,
+    /// Raft group id → matching-node admin address serving `/fingerprint`.
+    /// When both a migration's source and target groups are present, the
+    /// `/admin/routes/caught-up` handler fetches and compares real state
+    /// fingerprints itself instead of trusting caller-supplied numbers.
+    migration_endpoints: Arc<HashMap<usize, String>>,
     batch_size: usize,
     linger: Duration,
     async_offset_commits: bool,
@@ -803,6 +863,21 @@ impl KafkaIngress {
             raft_group_count.max(1),
             (*raft_group_pins).clone(),
         ));
+        // Optional: group→matching-node address map enabling automatic cutover
+        // verification. Absent/empty leaves the legacy behavior where an
+        // operator supplies fingerprints to /admin/routes/caught-up.
+        let migration_endpoints = Arc::new(
+            std::env::var("TC_MIGRATION_GROUP_ENDPOINTS")
+                .ok()
+                .filter(|spec| !spec.trim().is_empty())
+                .map(|spec| {
+                    trade_core::migration::parse_group_endpoints(&spec).unwrap_or_else(|error| {
+                        log_warn!("order-api", "ignoring TC_MIGRATION_GROUP_ENDPOINTS: {error}");
+                        HashMap::new()
+                    })
+                })
+                .unwrap_or_default(),
+        );
         Ok(Some(Self {
             producer,
             brokers,
@@ -850,6 +925,7 @@ impl KafkaIngress {
                 10u64,
             )),
             route_control,
+            migration_endpoints,
             batch_size: env_number("TC_ORDER_BATCH_SIZE", 1_000usize).max(1),
             linger: Duration::from_millis(env_number("TC_ORDER_BATCH_LINGER_MS", 2u64)),
             async_offset_commits: env_enabled("TC_KAFKA_OFFSET_COMMIT_ASYNC", true),
@@ -2699,15 +2775,7 @@ fn handle(
                     .route_control
                     .frozen(category, required::<u64>(query, "raft_index")?)
                     .map(|_| "{\"accepted\":true,\"state\":\"CATCHING_UP\"}".into()),
-                "/admin/routes/caught-up" => kafka
-                    .route_control
-                    .caught_up(
-                        category,
-                        required::<u64>(query, "raft_index")?,
-                        required::<u64>(query, "source_fingerprint")?,
-                        required::<u64>(query, "target_fingerprint")?,
-                    )
-                    .map(|_| "{\"accepted\":true,\"state\":\"VERIFIED\"}".into()),
+                "/admin/routes/caught-up" => verify_caught_up(&kafka, category, query),
                 "/admin/routes/activate" => kafka.route_control.activate(category).map(|version| {
                     format!(
                         "{{\"accepted\":true,\"route_version\":{version},\"state\":\"ACTIVE\"}}"

@@ -205,6 +205,14 @@ impl RouteControlPlane {
         !self.migrations.read().unwrap().contains_key(&category_id)
     }
 
+    /// The in-flight migration for a category, if one is active. Lets a driver
+    /// read `from_group`/`to_group`/`frozen_index` so it can fetch and compare
+    /// both sides' state fingerprints itself instead of trusting numbers a
+    /// caller supplies to `caught_up`.
+    pub fn active(&self, category_id: u32) -> Option<CategoryMigration> {
+        self.migrations.read().unwrap().get(&category_id).copied()
+    }
+
     pub fn begin(&self, category_id: u32, to_group: usize) -> Result<CategoryMigration, String> {
         if to_group >= self.group_count {
             return Err(format!("target group {to_group} is out of range"));

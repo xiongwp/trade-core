@@ -615,7 +615,21 @@ impl LabeledHistogram {
 
 /// Serve `GET /metrics` on `addr` in a background thread (thread per request;
 /// scrape traffic is tiny).
+/// A route handler for requests the metrics server does not itself serve.
+/// Given the first request line (`"GET /path?query HTTP/1.1"`), it returns
+/// `Some((status, content_type, body))` if it owns that route, or `None` to
+/// fall through to the default (`/metrics`). Used by the matching node to serve
+/// route-migration fingerprint queries off the same admin port.
+pub type ExtraRoute = Box<dyn Fn(&str) -> Option<(String, String, String)> + Send>;
+
 pub fn serve(addr: String, metrics: Arc<Metrics>) {
+    serve_with_extra(addr, metrics, None);
+}
+
+/// Like [`serve`], but consults `extra` before falling back to `/metrics`, so a
+/// binary can register additional read-only routes without duplicating the HTTP
+/// plumbing or opening a second port.
+pub fn serve_with_extra(addr: String, metrics: Arc<Metrics>, extra: Option<ExtraRoute>) {
     std::thread::Builder::new()
         .name("metrics".into())
         .spawn(move || {
@@ -632,19 +646,33 @@ pub fn serve(addr: String, metrics: Arc<Metrics>) {
                     .and_then(|r| r.lines().next())
                     .unwrap_or("");
                 let (status, content_type, body) = if line.starts_with("GET /healthz ") {
-                    ("200 OK", "text/plain", "ok\n".to_string())
+                    (
+                        "200 OK".to_string(),
+                        "text/plain".to_string(),
+                        "ok\n".to_string(),
+                    )
                 } else if line.starts_with("GET /readyz ") {
                     if metrics.is_ready() {
-                        ("200 OK", "text/plain", "ready\n".to_string())
+                        (
+                            "200 OK".to_string(),
+                            "text/plain".to_string(),
+                            "ready\n".to_string(),
+                        )
                     } else {
                         (
-                            "503 Service Unavailable",
-                            "text/plain",
+                            "503 Service Unavailable".to_string(),
+                            "text/plain".to_string(),
                             "not ready\n".to_string(),
                         )
                     }
+                } else if let Some(handled) = extra.as_ref().and_then(|handler| handler(line)) {
+                    handled
                 } else {
-                    ("200 OK", "text/plain; version=0.0.4", metrics.render())
+                    (
+                        "200 OK".to_string(),
+                        "text/plain; version=0.0.4".to_string(),
+                        metrics.render(),
+                    )
                 };
                 let _ = s.write_all(
                     format!(

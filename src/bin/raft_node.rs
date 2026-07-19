@@ -241,11 +241,16 @@ fn main() {
             // refuse to matching it. route_version is reserved for the future
             // split-matching topology (single group => 0 today).
             let mut fence_term = 0u64;
-            // Opt-in Raft log compaction. Once the durably-applied contiguous
+            // Raft log compaction cadence. Once the durably-applied contiguous
             // prefix has grown by this many entries past the last snapshot, the
             // consensus log prefix (in memory and on the WAL) is folded into a
-            // snapshot point. Disabled (0) by default so it never races the
-            // engine's own snapshot/journal maintenance unless deliberately on.
+            // snapshot point — but only when that snapshot index is already
+            // covered by a durable matching snapshot AND the execution outbox is
+            // drained and healthy (see the compaction guard below), so it never
+            // races the engine's own snapshot/journal maintenance. Defaults to
+            // 1000 entries. Note the default is enabled: a value of 0 is an
+            // explicit "compact as soon as any applied prefix exists" threshold,
+            // not "disabled" — the guard's other conditions still apply.
             let compact_threshold = std::env::var("TC_RAFT_COMPACT_APPLIED_THRESHOLD")
                 .ok()
                 .and_then(|value| value.parse::<u64>().ok())
@@ -512,7 +517,49 @@ fn main() {
         })
         .expect("spawn raft runtime");
 
-    trade_core::metrics::serve(metrics_addr, metrics.clone());
+    // Serve route-migration fingerprint queries off the same admin port:
+    // `GET /fingerprint?category=N` answers the per-category matching-state
+    // fingerprint (and the applied index it was taken at) from the durable
+    // engine snapshot, so the order system's control plane can verify a cutover
+    // against real state on both the source and target groups.
+    let fingerprint_snapshot_path = engine_snapshot_path.clone();
+    let fingerprint_route: trade_core::metrics::ExtraRoute = Box::new(move |line: &str| {
+        let category = match trade_core::migration::parse_fingerprint_request(line)? {
+            Ok(category) => category,
+            Err(reason) => {
+                return Some((
+                    "400 Bad Request".to_string(),
+                    "text/plain".to_string(),
+                    format!("{reason}\n"),
+                ));
+            }
+        };
+        let response = match trade_core::migration::snapshot_category_fingerprint(
+            &fingerprint_snapshot_path,
+            category,
+            trade_core::sharding::DEFAULT_ASSET_CATEGORY_SIZE,
+        ) {
+            Ok(Some(fp)) => (
+                "200 OK".to_string(),
+                "application/json".to_string(),
+                trade_core::migration::fingerprint_response_json(category, fp),
+            ),
+            // No snapshot yet: the node cannot answer, so the verifier must
+            // wait rather than treat an absent value as agreement.
+            Ok(None) => (
+                "503 Service Unavailable".to_string(),
+                "text/plain".to_string(),
+                "no durable snapshot yet\n".to_string(),
+            ),
+            Err(error) => (
+                "500 Internal Server Error".to_string(),
+                "text/plain".to_string(),
+                format!("snapshot fingerprint failed: {error}\n"),
+            ),
+        };
+        Some(response)
+    });
+    trade_core::metrics::serve_with_extra(metrics_addr, metrics.clone(), Some(fingerprint_route));
     let listener = TcpListener::bind(&order_addr).expect("bind order listener");
     let md_listener = TcpListener::bind(md_addr).expect("bind market-data fanout");
     let execution_topic =
