@@ -2422,24 +2422,28 @@ fn apply_pending_execution_table(
     let table = format!("asset_orders_{shard_table:03}");
     // MySQL 8 window functions select the last event per order while the
     // aggregate folds all trades into one set-based row mutation.
+    // NOTE: every line ends with a SPACE before the `\` continuation. Rust's
+    // string `\`-newline escape strips the newline *and the next line's leading
+    // whitespace*, so without the trailing space keyword boundaries collapse
+    // (`latest_type` + `FROM` -> `latest_typeFROM`), producing MySQL error 1064.
     tx.query_drop(format!(
-        "UPDATE {db}.{table} o INNER JOIN (\
-         SELECT target_order_id,\
-                SUM(IF(report_type={trade},event_qty,0)) trade_qty,\
-                MAX(IF(report_type={partial},event_qty,0)) partial_qty,\
-                MAX(IF(report_type={filled},1,0)) has_filled,\
-                MAX(IF(rn=1,report_type,0)) latest_type\
-         FROM (\
-           SELECT p.*, ROW_NUMBER() OVER (PARTITION BY target_order_id ORDER BY raft_index DESC,report_ordinal DESC) rn\
-           FROM {db}.pending_execution_events p WHERE shard_table={shard_table}\
-         ) ranked GROUP BY target_order_id\
-         ) e ON e.target_order_id=o.order_id\
-         SET o.status=CASE\
-               WHEN e.has_filled=1 OR GREATEST(o.filled_qty+e.trade_qty,e.partial_qty)>=o.qty THEN 'FILLED'\
-               WHEN e.latest_type={cancelled} THEN 'CANCELLED'\
-               WHEN e.latest_type={rejected} THEN 'REJECTED'\
-               WHEN GREATEST(o.filled_qty+e.trade_qty,e.partial_qty)>0 THEN 'PARTIAL'\
-               ELSE 'OPEN' END,\
+        "UPDATE {db}.{table} o INNER JOIN ( \
+         SELECT target_order_id, \
+                SUM(IF(report_type={trade},event_qty,0)) trade_qty, \
+                MAX(IF(report_type={partial},event_qty,0)) partial_qty, \
+                MAX(IF(report_type={filled},1,0)) has_filled, \
+                MAX(IF(rn=1,report_type,0)) latest_type \
+         FROM ( \
+           SELECT p.*, ROW_NUMBER() OVER (PARTITION BY target_order_id ORDER BY raft_index DESC,report_ordinal DESC) rn \
+           FROM {db}.pending_execution_events p WHERE shard_table={shard_table} \
+         ) ranked GROUP BY target_order_id \
+         ) e ON e.target_order_id=o.order_id \
+         SET o.status=CASE \
+               WHEN e.has_filled=1 OR GREATEST(o.filled_qty+e.trade_qty,e.partial_qty)>=o.qty THEN 'FILLED' \
+               WHEN e.latest_type={cancelled} THEN 'CANCELLED' \
+               WHEN e.latest_type={rejected} THEN 'REJECTED' \
+               WHEN GREATEST(o.filled_qty+e.trade_qty,e.partial_qty)>0 THEN 'PARTIAL' \
+               ELSE 'OPEN' END, \
              o.filled_qty=LEAST(o.qty,GREATEST(o.filled_qty+e.trade_qty,e.partial_qty,IF(e.has_filled=1,o.qty,0)))",
         trade = wire::RT_TRADE,
         partial = wire::RT_PARTIAL,
