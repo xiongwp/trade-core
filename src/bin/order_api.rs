@@ -637,17 +637,35 @@ fn required<T: std::str::FromStr>(query: &str, key: &str) -> Result<T, String> {
 /// control plane no longer trusts) fingerprints as query parameters. Without an
 /// endpoint map, it falls back to the legacy caller-supplied fingerprints.
 fn verify_caught_up(kafka: &KafkaIngress, category: u32, query: &str) -> Result<String, String> {
-    let migration = kafka
-        .route_control
+    let timeout = Duration::from_millis(env_number("TC_MIGRATION_FINGERPRINT_TIMEOUT_MS", 2_000u64));
+    verify_caught_up_inner(
+        &kafka.route_control,
+        &kafka.migration_endpoints,
+        category,
+        query,
+        timeout,
+    )
+}
+
+/// Testable core of [`verify_caught_up`], decoupled from `KafkaIngress` so it
+/// can be driven against stub fingerprint servers. `endpoints` maps a Raft
+/// group id to the address serving its `/fingerprint` route.
+fn verify_caught_up_inner(
+    route_control: &trade_core::cluster::RouteControlPlane,
+    endpoints: &HashMap<usize, String>,
+    category: u32,
+    query: &str,
+    timeout: Duration,
+) -> Result<String, String> {
+    let migration = route_control
         .active(category)
         .ok_or("category migration is not active")?;
 
-    let source_addr = kafka.migration_endpoints.get(&migration.from_group);
-    let target_addr = kafka.migration_endpoints.get(&migration.to_group);
+    let source_addr = endpoints.get(&migration.from_group);
+    let target_addr = endpoints.get(&migration.to_group);
     let (Some(source_addr), Some(target_addr)) = (source_addr, target_addr) else {
         // Legacy path: no endpoint map for these groups, trust the caller.
-        return kafka
-            .route_control
+        return route_control
             .caught_up(
                 category,
                 required::<u64>(query, "raft_index")?,
@@ -657,7 +675,6 @@ fn verify_caught_up(kafka: &KafkaIngress, category: u32, query: &str) -> Result<
             .map(|_| "{\"accepted\":true,\"state\":\"VERIFIED\",\"verified_by\":\"caller\"}".into());
     };
 
-    let timeout = Duration::from_millis(env_number("TC_MIGRATION_FINGERPRINT_TIMEOUT_MS", 2_000u64));
     let fetch = |addr: &str| -> Result<trade_core::migration::CategoryFingerprint, String> {
         trade_core::migration::fetch_category_fingerprint(addr, category, timeout)
             .map_err(|error| format!("fingerprint fetch from {addr} failed: {error}"))?
@@ -669,8 +686,7 @@ fn verify_caught_up(kafka: &KafkaIngress, category: u32, query: &str) -> Result<
     let verified = trade_core::migration::verify_cutover(migration.frozen_index, source, target)?;
     // Feed the verified, node-reported values into the fenced state machine;
     // the equality check inside caught_up is now backed by real state.
-    kafka
-        .route_control
+    route_control
         .caught_up(
             category,
             verified.raft_applied_index,
@@ -3634,5 +3650,100 @@ mod tests {
         assert_eq!(metrics.dlq_total.load(AtomicOrdering::Relaxed), 0);
         assert!(read_dlq(&path).is_empty(), "no dead-letter on success");
         std::fs::remove_file(&path).ok();
+    }
+
+    // ---- route-migration cutover auto-verification --------------------------
+
+    use trade_core::cluster::RouteControlPlane;
+    use trade_core::migration::{fingerprint_response_json, CategoryFingerprint};
+
+    /// A one-shot stub of a matching node's `GET /fingerprint?category=N` route.
+    /// Returns its address; the thread serves exactly `serves` requests.
+    fn stub_fingerprint_node(fp: CategoryFingerprint, serves: usize) -> String {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            for _ in 0..serves {
+                let Ok((mut s, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buf = [0u8; 512];
+                let _ = s.read(&mut buf);
+                let body = fingerprint_response_json(0, fp);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(response.as_bytes());
+            }
+        });
+        addr
+    }
+
+    /// Drive a migration to the point where caught-up can be verified: group
+    /// count 4, category 1 → from_group 1, migrate to group 2, frozen at index.
+    fn begin_and_freeze(frozen_index: u64) -> (RouteControlPlane, u32, usize, usize) {
+        let rc = RouteControlPlane::new(4, HashMap::new());
+        let category = 1u32;
+        let migration = rc.begin(category, 2).unwrap();
+        assert_eq!(migration.from_group, 1, "category 1 % 4 == 1");
+        assert_eq!(migration.to_group, 2);
+        rc.frozen(category, frozen_index).unwrap();
+        (rc, category, migration.from_group, migration.to_group)
+    }
+
+    #[test]
+    fn caught_up_verifies_against_matching_node_fingerprints() {
+        let (rc, category, from_group, to_group) = begin_and_freeze(100);
+        let agreed = CategoryFingerprint {
+            raft_applied_index: 100,
+            fingerprint: 0xabcd_1234,
+        };
+        let mut endpoints = HashMap::new();
+        endpoints.insert(from_group, stub_fingerprint_node(agreed, 1));
+        endpoints.insert(to_group, stub_fingerprint_node(agreed, 1));
+
+        let body = verify_caught_up_inner(&rc, &endpoints, category, "", Duration::from_secs(2))
+            .expect("matching fingerprints at the freeze index verify");
+        assert!(body.contains("\"verified_by\":\"nodes\""));
+        // The state machine advanced to Verified, so activate now succeeds.
+        assert!(rc.activate(category).is_ok());
+    }
+
+    #[test]
+    fn caught_up_rejects_divergent_node_fingerprints() {
+        let (rc, category, from_group, to_group) = begin_and_freeze(100);
+        let source = CategoryFingerprint {
+            raft_applied_index: 100,
+            fingerprint: 1,
+        };
+        let target = CategoryFingerprint {
+            raft_applied_index: 100,
+            fingerprint: 2, // diverged book state
+        };
+        let mut endpoints = HashMap::new();
+        endpoints.insert(from_group, stub_fingerprint_node(source, 1));
+        endpoints.insert(to_group, stub_fingerprint_node(target, 1));
+
+        let error = verify_caught_up_inner(&rc, &endpoints, category, "", Duration::from_secs(2))
+            .expect_err("divergent fingerprints must be rejected");
+        assert!(error.contains("fingerprints differ"), "got: {error}");
+        // Verification failed, so the migration is NOT verified: activate refuses.
+        assert!(rc.activate(category).is_err());
+    }
+
+    #[test]
+    fn caught_up_without_endpoints_falls_back_to_caller_supplied_values() {
+        let (rc, category, _from, _to) = begin_and_freeze(50);
+        // No endpoints configured for these groups → legacy path reads the
+        // fingerprints from the query string.
+        let endpoints = HashMap::new();
+        let query = "raft_index=50&source_fingerprint=7&target_fingerprint=7";
+        let body = verify_caught_up_inner(&rc, &endpoints, category, query, Duration::from_secs(2))
+            .expect("legacy path accepts equal caller fingerprints");
+        assert!(body.contains("\"verified_by\":\"caller\""));
+        assert!(rc.activate(category).is_ok());
     }
 }
