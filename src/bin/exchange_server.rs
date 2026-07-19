@@ -102,7 +102,10 @@ fn main() {
     });
 
     let Some(strategy) = strategy_by_name(&strat_name) else {
-        log_error!("trade-core", "unknown strategy '{strat_name}' (price-time | pro-rata | size-priority)");
+        log_error!(
+            "trade-core",
+            "unknown strategy '{strat_name}' (price-time | pro-rata | size-priority)"
+        );
         std::process::exit(2);
     };
 
@@ -131,7 +134,10 @@ fn main() {
         log_info!("trade-core", "journaling DISABLED");
         None
     } else {
-        log_info!("trade-core", "journaling to {journal_dir} (flush 1s, fsync 1s)");
+        log_info!(
+            "trade-core",
+            "journaling to {journal_dir} (flush 1s, fsync 1s)"
+        );
         Some(journal_dir.into())
     };
 

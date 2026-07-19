@@ -152,7 +152,10 @@ fn feed_one(md_addr: String, state: Arc<Mutex<State>>) {
         let mut sock = match TcpStream::connect(&md_addr) {
             Ok(s) => s,
             Err(e) => {
-                log_warn!("market-data", "waiting for trade-core fanout at {md_addr} ({e})");
+                log_warn!(
+                    "market-data",
+                    "waiting for trade-core fanout at {md_addr} ({e})"
+                );
                 std::thread::sleep(Duration::from_secs(1));
                 continue;
             }

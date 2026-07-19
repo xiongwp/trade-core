@@ -13,10 +13,10 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
+use trade_core::log_error;
 use trade_core::prelude::*;
 use trade_core::wire::{self, MSG_LEN, REPORT_LEN};
 use trade_core::InstrumentId;
-use trade_core::log_error;
 
 fn main() {
     trade_core::oblog::init_from_env();

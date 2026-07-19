@@ -20,11 +20,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use trade_core::log_info;
 use trade_core::prelude::*;
 use trade_core::sharding::{self, DB_COUNT, TABLES_PER_DB};
 use trade_core::wire::{self, MSG_LEN, REPORT_LEN};
 use trade_core::InstrumentId;
-use trade_core::log_info;
 
 struct Rng(u64);
 impl Rng {

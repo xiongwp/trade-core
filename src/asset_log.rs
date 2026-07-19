@@ -819,20 +819,16 @@ mod tests {
         let assets = base.join("assets");
         std::fs::create_dir_all(&assets).unwrap();
         let instrument = InstrumentId(77);
-        let command = Command::New(
-            Order::limit(OrderId(7_700), Side::Buy, 100, 1).on(instrument),
-        );
+        let command = Command::New(Order::limit(OrderId(7_700), Side::Buy, 100, 1).on(instrument));
         let mut asset_logs = AssetJournalSet::open(&assets, Duration::from_millis(1)).unwrap();
         asset_logs.append(&command).unwrap();
         asset_logs.flush_all().unwrap();
 
         let mut frame = [0u8; MSG_LEN];
         wire::encode_command(&command, &mut frame);
-        let mut shard_log = JournalWriter::open(
-            &base.join("journal-shard-0.bin"),
-            Duration::from_millis(1),
-        )
-        .unwrap();
+        let mut shard_log =
+            JournalWriter::open(&base.join("journal-shard-0.bin"), Duration::from_millis(1))
+                .unwrap();
         shard_log.append(1, &frame).unwrap();
         shard_log.sync_data().unwrap();
 
@@ -842,10 +838,11 @@ mod tests {
             .expect("equal WAL and shard sequence counts prove full coverage");
         assert_eq!(recovered[&command.id()], journal::fnv1a(&frame));
 
-        asset_logs.append(&Command::New(
-            Order::limit(OrderId(7_701), Side::Sell, 101, 1).on(instrument),
-        ))
-        .unwrap();
+        asset_logs
+            .append(&Command::New(
+                Order::limit(OrderId(7_701), Side::Sell, 101, 1).on(instrument),
+            ))
+            .unwrap();
         asset_logs.flush_all().unwrap();
         assert!(recovered_command_fingerprints(&assets, &base, &wanted)
             .unwrap()

@@ -32,13 +32,18 @@ struct Args {
 
 fn parse_args() -> Result<Args, String> {
     let mut args = std::env::args().skip(1);
-    let command = args.next().ok_or("missing sub-command (dump|verify|diff)")?;
+    let command = args
+        .next()
+        .ok_or("missing sub-command (dump|verify|diff)")?;
     let mut path = None;
     let mut path2 = None;
     let mut outbox = false;
     let mut filter = DumpFilter::default();
     while let Some(flag) = args.next() {
-        let mut value = || args.next().ok_or_else(|| format!("{flag} requires a value"));
+        let mut value = || {
+            args.next()
+                .ok_or_else(|| format!("{flag} requires a value"))
+        };
         match flag.as_str() {
             "--outbox" => outbox = true,
             "--path" => path = Some(PathBuf::from(value()?)),
@@ -87,8 +92,8 @@ fn run() -> Result<(), String> {
             );
         }
         "verify" => {
-            let report =
-                verify_journal(&path).map_err(|error| format!("verify {}: {error}", path.display()))?;
+            let report = verify_journal(&path)
+                .map_err(|error| format!("verify {}: {error}", path.display()))?;
             writeln!(
                 out,
                 "records={} first_seq={:?} last_valid_seq={:?} contiguous={} first_gap_after={:?}",
@@ -113,8 +118,9 @@ fn run() -> Result<(), String> {
         }
         "diff" => {
             let path2 = args.path2.ok_or("diff requires --path and --path2")?;
-            let diff = diff_journals(&path, &path2)
-                .map_err(|error| format!("diff {} vs {}: {error}", path.display(), path2.display()))?;
+            let diff = diff_journals(&path, &path2).map_err(|error| {
+                format!("diff {} vs {}: {error}", path.display(), path2.display())
+            })?;
             match &diff {
                 JournalDiff::Identical => {
                     writeln!(out, "identical").ok();
@@ -125,9 +131,16 @@ fn run() -> Result<(), String> {
                 JournalDiff::SeqMismatch { a_seq, b_seq } => {
                     writeln!(out, "diverges: seq mismatch a={a_seq} b={b_seq}").ok();
                 }
-                JournalDiff::LengthMismatch { at_seq, longer_is_a } => {
+                JournalDiff::LengthMismatch {
+                    at_seq,
+                    longer_is_a,
+                } => {
                     let longer = if *longer_is_a { "path" } else { "path2" };
-                    writeln!(out, "diverges: length mismatch, {longer} has extra record at seq={at_seq}").ok();
+                    writeln!(
+                        out,
+                        "diverges: length mismatch, {longer} has extra record at seq={at_seq}"
+                    )
+                    .ok();
                 }
             }
             out.flush().ok();

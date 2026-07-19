@@ -42,8 +42,7 @@ fn collect_events(sink: &trade_core::ResultSink, want: usize) -> Vec<ExecutionRe
 
 #[test]
 fn committed_batch_is_durable_in_outbox_before_watermark_and_survives_restart() {
-    let root =
-        std::env::temp_dir().join(format!("tc-outbox-recovery-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("tc-outbox-recovery-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let journal_dir = root.join("journal");
     let outbox_dir = root.join("execution-outbox");

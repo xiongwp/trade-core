@@ -31,9 +31,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use protobuf::Message as PbMessage;
-use raft::eraftpb::{
-    ConfChange, ConfChangeType, ConfState, Entry, EntryType, HardState, Snapshot,
-};
+use raft::eraftpb::{ConfChange, ConfChangeType, ConfState, Entry, EntryType, HardState, Snapshot};
 use raft::prelude::Message;
 use raft::storage::MemStorage;
 use raft::{Config, GetEntriesContext, RaftState, RawNode, StateRole, Storage};
@@ -322,8 +320,7 @@ impl DurableRaftLog {
                 )?;
             }
             for entry in entries {
-                writer
-                    .write_record(ENTRY_RECORD, &entry.write_to_bytes().map_err(proto_error)?)?;
+                writer.write_record(ENTRY_RECORD, &entry.write_to_bytes().map_err(proto_error)?)?;
             }
             if *hard_state != HardState::default() {
                 writer.write_record(
@@ -817,9 +814,14 @@ impl RaftNode {
     /// recovered from disk at open), consumed once. The application rebuilds its
     /// state machine from this before resuming apply of the committed stream.
     pub fn take_installed_snapshot(&mut self) -> Option<Vec<u8>> {
+        self.take_installed_snapshot_with_index()
+            .map(|(_, data)| data)
+    }
+
+    pub fn take_installed_snapshot_with_index(&mut self) -> Option<(u64, Vec<u8>)> {
         self.installed_snapshot
             .take()
-            .map(|snapshot| snapshot.get_data().to_vec())
+            .map(|snapshot| (snapshot.get_metadata().index, snapshot.get_data().to_vec()))
     }
 
     fn drive(&mut self) {
@@ -1120,7 +1122,10 @@ mod tests {
             if active[index] {
                 let committed = node.take_committed();
                 assert_eq!(committed.len(), 1);
-                assert!(committed[0].index > 2, "new leader may append a no-op first");
+                assert!(
+                    committed[0].index > 2,
+                    "new leader may append a no-op first"
+                );
                 assert_eq!(committed[0].data, b"after-failure".to_vec());
             }
         }

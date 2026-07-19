@@ -91,7 +91,10 @@ pub fn decode_raft_entry(payload: &[u8]) -> Option<Vec<Command>> {
 
 /// Fixed execution-report frame length in bytes (v2: 56 — adds fee fields).
 pub const REPORT_LEN: usize = 56;
-pub const EXECUTION_EVENT_LEN: usize = 88;
+pub const EXECUTION_EVENT_V1_LEN: usize = 88;
+/// Version 2 adds the target order id. A trade is published once for the taker
+/// and once for the maker, each keyed and partitioned by this field.
+pub const EXECUTION_EVENT_LEN: usize = 96;
 const EXECUTION_EVENT_MAGIC: [u8; 4] = *b"EX01";
 
 const MT_NEW: u8 = 1;
@@ -542,6 +545,7 @@ pub struct ExecutionEvent {
     pub raft_group: u32,
     pub raft_index: u64,
     pub ordinal: u32,
+    pub target_order_id: u64,
     pub report: DecodedReport,
 }
 
@@ -552,31 +556,66 @@ pub fn encode_execution_event(
     report: &ExecReport,
     out: &mut [u8; EXECUTION_EVENT_LEN],
 ) {
+    let target_order_id = match report {
+        ExecReport::Trade { taker, .. } => taker.0,
+        _ => {
+            let mut frame = [0u8; REPORT_LEN];
+            encode_report(report, &mut frame);
+            decode_report(&frame).map_or(0, |decoded| decoded.order_id.0)
+        }
+    };
+    encode_execution_event_for_target(
+        raft_group,
+        raft_index,
+        ordinal,
+        target_order_id,
+        report,
+        out,
+    );
+}
+
+pub fn encode_execution_event_for_target(
+    raft_group: u32,
+    raft_index: u64,
+    ordinal: u32,
+    target_order_id: u64,
+    report: &ExecReport,
+    out: &mut [u8; EXECUTION_EVENT_LEN],
+) {
     out.fill(0);
     out[..4].copy_from_slice(&EXECUTION_EVENT_MAGIC);
-    out[4..8].copy_from_slice(&1u32.to_le_bytes());
+    out[4..8].copy_from_slice(&2u32.to_le_bytes());
     out[8..12].copy_from_slice(&raft_group.to_le_bytes());
     out[16..24].copy_from_slice(&raft_index.to_le_bytes());
     out[24..28].copy_from_slice(&ordinal.to_le_bytes());
+    out[32..40].copy_from_slice(&target_order_id.to_le_bytes());
     let mut frame = [0u8; REPORT_LEN];
     encode_report(report, &mut frame);
-    out[24 + 8..].copy_from_slice(&frame);
+    out[40..].copy_from_slice(&frame);
 }
 
 pub fn decode_execution_event(buf: &[u8]) -> Option<ExecutionEvent> {
-    if buf.len() >= EXECUTION_EVENT_LEN && buf[..4] == EXECUTION_EVENT_MAGIC {
+    if buf.len() >= EXECUTION_EVENT_V1_LEN && buf[..4] == EXECUTION_EVENT_MAGIC {
         let version = u32::from_le_bytes(buf[4..8].try_into().ok()?);
-        if version != 1 {
-            return None;
-        }
         let raft_group = u32::from_le_bytes(buf[8..12].try_into().ok()?);
         let raft_index = u64::from_le_bytes(buf[16..24].try_into().ok()?);
         let ordinal = u32::from_le_bytes(buf[24..28].try_into().ok()?);
-        let report = decode_report(&buf[32..32 + REPORT_LEN])?;
+        let (target_order_id, report) = match version {
+            1 => {
+                let report = decode_report(&buf[32..32 + REPORT_LEN])?;
+                (report.order_id.0, report)
+            }
+            2 if buf.len() >= EXECUTION_EVENT_LEN => (
+                u64::from_le_bytes(buf[32..40].try_into().ok()?),
+                decode_report(&buf[40..40 + REPORT_LEN])?,
+            ),
+            _ => return None,
+        };
         return Some(ExecutionEvent {
             raft_group,
             raft_index,
             ordinal,
+            target_order_id,
             report,
         });
     }
@@ -585,6 +624,7 @@ pub fn decode_execution_event(buf: &[u8]) -> Option<ExecutionEvent> {
         raft_group: 0,
         raft_index: 0,
         ordinal: 0,
+        target_order_id: report.order_id.0,
         report,
     })
 }

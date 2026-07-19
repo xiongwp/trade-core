@@ -24,7 +24,6 @@ use trade_core::exchange::{build, ExchangeConfig};
 use trade_core::gateway;
 use trade_core::metrics::LatencyMetric;
 use trade_core::raft_log::{ClusterConfig, RaftNode, MAX_CLUSTER_SIZE};
-use trade_core::sharding::DEFAULT_ASSET_CATEGORY_SIZE;
 use trade_core::wire::{self, MSG_LEN};
 use trade_core::{log_error, log_info, log_warn};
 
@@ -132,6 +131,16 @@ fn main() {
         .max(1);
 
     let config = ClusterConfig::new(id, voters).expect("valid cluster membership");
+    let state_path = data_dir.join("raft.state");
+    let engine_snapshot_path = data_dir.join("journal").join("snapshot-shard-0.bin");
+    // Open consensus before constructing the matching engine. A follower may
+    // have durably installed a Raft snapshot immediately before a crash; its
+    // embedded matching snapshot must become the engine recovery point first.
+    let mut raft_node = RaftNode::open(config, state_path).expect("open durable raft state");
+    if let Some((index, bytes)) = raft_node.take_installed_snapshot_with_index() {
+        trade_core::snapshot::install_bytes(&engine_snapshot_path, &bytes, index)
+            .expect("atomically install matching snapshot recovered from Raft");
+    }
     // Bound recovery time and per-asset WAL growth: without periodic engine
     // snapshots the production node would replay from genesis and grow its
     // journals forever. Each shard writes `snapshot-shard-N.bin` and truncates
@@ -165,10 +174,9 @@ fn main() {
         ..ExchangeConfig::default()
     });
     let metrics = handle.metrics.clone();
-    let engine_snapshot_index =
-        trade_core::snapshot::load(&data_dir.join("journal").join("snapshot-shard-0.bin"))
-            .map(|snapshot| snapshot.raft_applied_index)
-            .unwrap_or(0);
+    let engine_snapshot_index = trade_core::snapshot::load(&engine_snapshot_path)
+        .map(|snapshot| snapshot.raft_applied_index)
+        .unwrap_or(0);
     metrics.set_ready(false);
     // Single-group deployment: register one commit-latency series (group 0).
     // A future split-matching topology registers one per group here.
@@ -215,12 +223,12 @@ fn main() {
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(1_000_000)
         .max(1);
-    let state_path = data_dir.join("raft.state");
     let asset_root = data_dir.join("journal").join("assets");
+    let runtime_snapshot_path = engine_snapshot_path.clone();
     thread::Builder::new()
         .name("raft-runtime".into())
         .spawn(move || {
-            let mut node = RaftNode::open(config, state_path).expect("open durable raft state");
+            let mut node = raft_node;
             let transport = PeerTransport::spawn(runtime_peers, runtime_metrics.clone());
             let mut pending = Vec::new();
             let mut commit_waiters: BTreeMap<u64, Vec<mpsc::SyncSender<u64>>> = BTreeMap::new();
@@ -241,24 +249,13 @@ fn main() {
             let compact_threshold = std::env::var("TC_RAFT_COMPACT_APPLIED_THRESHOLD")
                 .ok()
                 .and_then(|value| value.parse::<u64>().ok())
-                .unwrap_or(0);
-            assert_eq!(
-                compact_threshold, 0,
-                "Raft log compaction is disabled in authoritative-WAL mode until engine snapshot transfer is atomic"
-            );
+                .unwrap_or(1_000);
             let applied_batches = asset_log::load_applied_batches(&asset_root)
                 .expect("load applied Raft batch watermarks");
             let applied_proofs = asset_log::load_applied_batch_proofs(&asset_root)
                 .expect("load exact Raft replay proofs");
             runtime_metrics.set_raft_enqueued_index(engine_snapshot_index);
             runtime_metrics.set_raft_applied_index(engine_snapshot_index);
-            if let Some(reference) = node.take_installed_snapshot() {
-                panic!(
-                    "Raft state contains an installed consensus snapshot at index {} ({} bytes), but no atomically installed matching snapshot; refusing unsafe startup",
-                    node.snapshot_index(),
-                    reference.len()
-                );
-            }
 
             let recovered_committed = node.take_committed();
             // Rebuild exact idempotency and matching state before this member
@@ -324,6 +321,26 @@ fn main() {
             while runtime_running.load(Ordering::Acquire) {
                 while let Ok(message) = message_rx.try_recv() {
                     node.step(message).expect("step raft message");
+                }
+                if let Some((index, bytes)) = node.take_installed_snapshot_with_index() {
+                    runtime_accepting.store(false, Ordering::Release);
+                    runtime_metrics.set_ready(false);
+                    trade_core::snapshot::install_bytes(
+                        &runtime_snapshot_path,
+                        &bytes,
+                        index,
+                    )
+                    .expect("atomically install matching snapshot received from Raft");
+                    log_info!(
+                        "raft-node",
+                        "installed matching snapshot at index {index}; restarting state machine"
+                    );
+                    // The live Processor cannot be replaced underneath its
+                    // lock-free shard. Stop cleanly; the supervisor restarts
+                    // this process, which loads the installed snapshot before
+                    // reopening the compacted Raft tail.
+                    runtime_running.store(false, Ordering::Release);
+                    return;
                 }
                 while pending.len() < PROPOSAL_BATCH {
                     let Ok(command) = proposal_rx.try_recv() else {
@@ -457,6 +474,39 @@ fn main() {
                         }
                     }
                 }
+                if compact_threshold > 0
+                    && runtime_metrics
+                        .execution_outbox_pending
+                        .load(Ordering::Acquire)
+                        == 0
+                    && runtime_metrics
+                        .execution_outbox_publish_healthy
+                        .load(Ordering::Acquire)
+                        == 1
+                {
+                    if let Ok(snapshot) = trade_core::snapshot::load(&runtime_snapshot_path) {
+                        let index = snapshot.raft_applied_index;
+                        if index <= node.applied_index()
+                            && index
+                                >= node
+                                    .snapshot_index()
+                                    .saturating_add(compact_threshold)
+                        {
+                            match std::fs::read(&runtime_snapshot_path)
+                                .and_then(|bytes| node.compact(index, bytes).map(|_| ()))
+                            {
+                                Ok(()) => log_info!(
+                                    "raft-node",
+                                    "compacted Raft WAL through matching snapshot index {index}"
+                                ),
+                                Err(error) => log_warn!(
+                                    "raft-node",
+                                    "event=raft_compaction_failed index={index} error={error}"
+                                ),
+                            }
+                        }
+                    }
+                }
                 thread::sleep(Duration::from_millis(2));
             }
         })
@@ -467,17 +517,16 @@ fn main() {
     let md_listener = TcpListener::bind(md_addr).expect("bind market-data fanout");
     let execution_topic =
         std::env::var("TC_EXECUTION_KAFKA_TOPIC").unwrap_or_else(|_| "trade-executions-v1".into());
-    let category_size = std::env::var("TC_ORDER_CATEGORY_SIZE")
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok())
-        .unwrap_or(DEFAULT_ASSET_CATEGORY_SIZE)
-        .max(1);
     let execution_producer = execution_kafka_brokers.map(|brokers| {
         let mut config = ClientConfig::new();
         config
             .set("bootstrap.servers", &brokers)
             .set("acks", "all")
             .set("enable.idempotence", "true")
+            .set(
+                "max.in.flight.requests.per.connection",
+                std::env::var("TC_EXECUTION_KAFKA_MAX_IN_FLIGHT").unwrap_or_else(|_| "5".into()),
+            )
             .set(
                 "linger.ms",
                 std::env::var("TC_EXECUTION_KAFKA_LINGER_MS").unwrap_or_else(|_| "2".into()),
@@ -521,7 +570,7 @@ fn main() {
             checkpoint_partitions,
             brokers,
             producer,
-            category_size,
+            trade_core::sharding::RouteConfig::from_env(),
             raft_group_id,
             id,
             running.clone(),
@@ -581,7 +630,7 @@ fn spawn_execution_outbox_publisher(
     checkpoint_partitions: i32,
     brokers: String,
     producer: FutureProducer,
-    category_size: u32,
+    routing: trade_core::sharding::RouteConfig,
     raft_group: u32,
     node_id: u64,
     running: Arc<AtomicBool>,
@@ -622,9 +671,21 @@ fn spawn_execution_outbox_publisher(
             let batch_size = std::env::var("TC_EXECUTION_PUBLISH_BATCH")
                 .ok()
                 .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(512)
+                .unwrap_or(4_096)
                 .clamp(1, 10_000);
+            let execution_partitions = std::env::var("TC_EXECUTION_KAFKA_PARTITIONS")
+                .ok()
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or(16)
+                .max(1);
+            let idle_sleep = Duration::from_millis(
+                std::env::var("TC_EXECUTION_PUBLISH_IDLE_MS")
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(1),
+            );
             while running.load(Ordering::Acquire) {
+                let mut published_any = false;
                 while let Some(message) = checkpoint_consumer.poll(Duration::ZERO) {
                     match message {
                         Ok(message) => {
@@ -746,19 +807,38 @@ fn spawn_execution_outbox_publisher(
                             let publish_started = std::time::Instant::now();
                             let prepared = records
                                 .iter()
-                                .map(|record| {
-                                    (record.kafka_key(category_size), record.kafka_payload())
+                                .flat_map(|record| {
+                                    record
+                                        .target_order_ids()
+                                        .into_iter()
+                                        .map(|target_order_id| {
+                                            let partition = routing.execution_partition(
+                                                target_order_id,
+                                                execution_partitions,
+                                            )
+                                                as i32;
+                                            (
+                                                target_order_id.to_be_bytes(),
+                                                partition,
+                                                record.kafka_payload_for(target_order_id),
+                                            )
+                                        })
                                 })
                                 .collect::<Vec<_>>();
-                            let deliveries = futures::executor::block_on(
-                                futures::future::join_all(prepared.iter().map(|(key, payload)| {
-                                    producer.send(
-                                        FutureRecord::to(&topic).key(key).payload(payload),
-                                        Duration::from_secs(5),
-                                    )
-                                })),
-                            );
+                            let deliveries =
+                                futures::executor::block_on(futures::future::join_all(
+                                    prepared.iter().map(|(key, partition, payload)| {
+                                        producer.send(
+                                            FutureRecord::to(&topic)
+                                                .partition(*partition)
+                                                .key(key)
+                                                .payload(payload),
+                                            Duration::from_secs(5),
+                                        )
+                                    }),
+                                ));
                             if deliveries.iter().all(Result::is_ok) {
+                                published_any = true;
                                 let publish_ns = publish_started.elapsed().as_nanos() as u64;
                                 metrics
                                     .execution_kafka_publish_ns_total
@@ -799,7 +879,7 @@ fn spawn_execution_outbox_publisher(
                                 } else {
                                     metrics
                                         .execution_outbox_published
-                                        .fetch_add(records.len() as u64, Ordering::Relaxed);
+                                        .fetch_add(prepared.len() as u64, Ordering::Relaxed);
                                     metrics.execution_outbox_publish_healthy.store(
                                         pending_checkpoints.is_empty() as u64,
                                         Ordering::Release,
@@ -842,7 +922,9 @@ fn spawn_execution_outbox_publisher(
                 metrics
                     .execution_outbox_pending
                     .store(pending, Ordering::Release);
-                thread::sleep(Duration::from_millis(25));
+                if !published_any && !idle_sleep.is_zero() {
+                    thread::sleep(idle_sleep);
+                }
             }
         })
         .expect("spawn execution outbox publisher");

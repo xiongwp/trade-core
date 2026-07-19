@@ -511,7 +511,10 @@ impl Default for LatencyHistograms {
 impl LatencyHistograms {
     fn render_into(&self, out: &mut String) {
         const SPECS: [(&str, &str); 4] = [
-            ("command_latency_ns", "Matching command processing latency (nanoseconds)"),
+            (
+                "command_latency_ns",
+                "Matching command processing latency (nanoseconds)",
+            ),
             ("raft_commit_ns", "Raft quorum commit latency (nanoseconds)"),
             (
                 "wal_fsync_ns",
@@ -520,10 +523,7 @@ impl LatencyHistograms {
             ("match_ns", "In-memory matching latency (nanoseconds)"),
         ];
         for (i, (base, help)) in SPECS.iter().enumerate() {
-            let _ = write!(
-                out,
-                "# HELP tc_{base} {help}\n# TYPE tc_{base} histogram\n"
-            );
+            let _ = write!(out, "# HELP tc_{base} {help}\n# TYPE tc_{base} histogram\n");
             self.hists[i].render_into(out, base, None);
             // Quantile gauges share the base name with a suffix; declare their
             // TYPE so scrapers treat them as gauges rather than histogram parts.
@@ -841,8 +841,8 @@ mod tests {
         let total: u64 = counts.iter().sum();
         assert_eq!(total, threads as u64 * per);
         // sum_ns must equal the arithmetic sum of every recorded value.
-        let expected_sum: u64 = (0..per).map(|i| 1_000 + (i % 7) * 3_000).sum::<u64>()
-            * threads as u64;
+        let expected_sum: u64 =
+            (0..per).map(|i| 1_000 + (i % 7) * 3_000).sum::<u64>() * threads as u64;
         assert_eq!(h.sum_ns.load(Ordering::Relaxed), expected_sum);
     }
 }

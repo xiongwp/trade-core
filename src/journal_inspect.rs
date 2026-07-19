@@ -57,11 +57,7 @@ pub fn format_record(record: &Record) -> String {
 /// Dump every journal record matching `filter` to `out`, one per line. Returns
 /// the number of records written. Stops cleanly at the first torn/corrupt
 /// record (inherited from [`JournalReader`]).
-pub fn dump_journal(
-    path: &Path,
-    filter: &DumpFilter,
-    out: &mut impl Write,
-) -> io::Result<usize> {
+pub fn dump_journal(path: &Path, filter: &DumpFilter, out: &mut impl Write) -> io::Result<usize> {
     let reader = JournalReader::open(path)?;
     let mut written = 0;
     for record in reader {
@@ -192,11 +188,7 @@ pub fn format_outbox_record(record: &OutboxRecord) -> String {
 /// (the outbox has no monotonic per-record sequence of its own); the timestamp
 /// bounds are ignored (outbox records carry no timestamp). Returns the number
 /// of records written.
-pub fn dump_outbox(
-    path: &Path,
-    filter: &DumpFilter,
-    out: &mut impl Write,
-) -> io::Result<usize> {
+pub fn dump_outbox(path: &Path, filter: &DumpFilter, out: &mut impl Write) -> io::Result<usize> {
     let mut reader = ExecutionOutboxReader::open(path.to_path_buf())?;
     let mut records = Vec::new();
     reader.read_available(|record| records.push(record))?;
@@ -264,7 +256,10 @@ mod tests {
         );
         // No filter -> all three.
         let mut buf = Vec::new();
-        assert_eq!(dump_journal(&path, &DumpFilter::default(), &mut buf).unwrap(), 3);
+        assert_eq!(
+            dump_journal(&path, &DumpFilter::default(), &mut buf).unwrap(),
+            3
+        );
         let text = String::from_utf8(buf).unwrap();
         assert_eq!(text.lines().count(), 3);
         assert!(text.contains("seq=1 ts_nanos=1000"));
@@ -294,7 +289,10 @@ mod tests {
     fn verify_reports_contiguous_and_last_valid_seq() {
         let dir = scratch_dir("verify");
         let path = dir.join("j.bin");
-        write_journal(&path, &[(1, cancel(1, 1)), (2, cancel(2, 2)), (3, cancel(3, 3))]);
+        write_journal(
+            &path,
+            &[(1, cancel(1, 1)), (2, cancel(2, 2)), (3, cancel(3, 3))],
+        );
         let report = verify_journal(&path).unwrap();
         assert_eq!(report.records, 3);
         assert_eq!(report.first_seq, Some(1));

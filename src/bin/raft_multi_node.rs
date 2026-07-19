@@ -116,7 +116,10 @@ fn main() -> ExitCode {
             })
             .collect(),
     };
-    assert!(!placements.is_empty(), "at least one local Raft replica is required");
+    assert!(
+        !placements.is_empty(),
+        "at least one local Raft replica is required"
+    );
     let binary = std::env::var("TC_RAFT_NODE_BIN").unwrap_or_else(|_| "raft-node".into());
     let mut children = Vec::with_capacity(placements.len());
     for placement in placements {
@@ -170,7 +173,10 @@ fn main() -> ExitCode {
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    log_error!("raft-multi-node", "failed to inspect group {index}: {error}");
+                    log_error!(
+                        "raft-multi-node",
+                        "failed to inspect group {index}: {error}"
+                    );
                     stop(&mut children);
                     return ExitCode::FAILURE;
                 }

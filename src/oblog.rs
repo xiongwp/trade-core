@@ -193,9 +193,7 @@ fn format_timestamp(now: SystemTime) -> String {
     let tod = secs % 86_400;
     let (h, m, s) = (tod / 3_600, (tod % 3_600) / 60, tod % 60);
     let (year, month, day) = civil_from_days(days);
-    format!(
-        "{year:04}-{month:02}-{day:02}T{h:02}:{m:02}:{s:02}.{millis:03}Z"
-    )
+    format!("{year:04}-{month:02}-{day:02}T{h:02}:{m:02}:{s:02}.{millis:03}Z")
 }
 
 // --- Emission -------------------------------------------------------------
@@ -203,7 +201,12 @@ fn format_timestamp(now: SystemTime) -> String {
 /// Format and write one record. Callers should gate on [`enabled`] first (the
 /// macros do); this function does not re-check the level so it can also serve
 /// the panic hook, which must always print.
-pub fn emit(level: Level, component: &str, instance: Option<fmt::Arguments>, message: fmt::Arguments) {
+pub fn emit(
+    level: Level,
+    component: &str,
+    instance: Option<fmt::Arguments>,
+    message: fmt::Arguments,
+) {
     let mut line = String::with_capacity(128);
     line.push_str(&format_timestamp(SystemTime::now()));
     line.push(' ');

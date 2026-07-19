@@ -39,10 +39,7 @@ fn snapshot_restores_exact_ids_before_replaying_a_duplicate_tail() {
             orders: vec![order],
         }],
     };
-    let mut processor = trade_core::exchange::Processor::new(
-        || Box::new(PriceTimePriority),
-        None,
-    );
+    let mut processor = trade_core::exchange::Processor::new(|| Box::new(PriceTimePriority), None);
     processor.restore_state(&snapshot);
     let mut reports = Vec::new();
     processor.process(Command::New(order), &mut |report| reports.push(report));
@@ -50,7 +47,10 @@ fn snapshot_restores_exact_ids_before_replaying_a_duplicate_tail() {
     assert_eq!(processor.engine(instrument).unwrap().book().len(), 1);
     assert!(matches!(
         reports.as_slice(),
-        [ExecReport::Rejected { reason: "duplicate", .. }]
+        [ExecReport::Rejected {
+            reason: "duplicate",
+            ..
+        }]
     ));
 }
 

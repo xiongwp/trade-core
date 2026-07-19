@@ -293,7 +293,10 @@ where
     F: Fn(Command),
 {
     let local = listener.local_addr()?;
-    crate::log_info!("gateway", "listening on {local}, awaiting order-system connection…");
+    crate::log_info!(
+        "gateway",
+        "listening on {local}, awaiting order-system connection…"
+    );
 
     let (stream, peer) = listener.accept()?;
     stream.set_nodelay(true).ok();

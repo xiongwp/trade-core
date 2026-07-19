@@ -22,22 +22,39 @@ pub struct OutboxRecord {
 
 impl OutboxRecord {
     pub fn kafka_key(&self, _category_size: u32) -> [u8; 8] {
-        let report = wire::decode_report(&self.report_frame).expect("valid outbox report");
-        report.order_id.0.to_be_bytes()
+        self.target_order_ids()[0].to_be_bytes()
     }
 
     pub fn kafka_payload(&self) -> [u8; EXECUTION_EVENT_LEN] {
+        self.kafka_payload_for(self.target_order_ids()[0])
+    }
+
+    /// One target for ordinary reports, two targets for a trade. Keeping the
+    /// durable Outbox record canonical avoids duplicating recovery state while
+    /// the publisher materializes independently ordered maker/taker events.
+    pub fn target_order_ids(&self) -> Vec<u64> {
         let report = wire::decode_report(&self.report_frame).expect("valid outbox report");
+        if report.type_code == wire::RT_TRADE && report.aux_id != report.order_id.0 {
+            vec![report.order_id.0, report.aux_id]
+        } else {
+            vec![report.order_id.0]
+        }
+    }
+
+    pub fn kafka_payload_for(&self, target_order_id: u64) -> [u8; EXECUTION_EVENT_LEN] {
         let mut payload = [0u8; EXECUTION_EVENT_LEN];
         payload[..4].copy_from_slice(b"EX01");
-        payload[4..8].copy_from_slice(&1u32.to_le_bytes());
+        payload[4..8].copy_from_slice(&2u32.to_le_bytes());
         payload[8..12].copy_from_slice(&self.raft_group.to_le_bytes());
         payload[16..24].copy_from_slice(&self.raft_index.to_le_bytes());
         payload[24..28].copy_from_slice(&self.ordinal.to_le_bytes());
-        payload[32..32 + REPORT_LEN].copy_from_slice(&self.report_frame);
+        payload[32..40].copy_from_slice(&target_order_id.to_le_bytes());
+        payload[40..40 + REPORT_LEN].copy_from_slice(&self.report_frame);
         debug_assert_eq!(
-            wire::decode_execution_event(&payload).unwrap().report,
-            report
+            wire::decode_execution_event(&payload)
+                .unwrap()
+                .target_order_id,
+            target_order_id
         );
         payload
     }
@@ -681,6 +698,37 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[test]
+    fn trade_materializes_independent_taker_and_maker_events() {
+        let mut frame = [0u8; REPORT_LEN];
+        wire::encode_report(
+            &ExecReport::Trade {
+                instrument: InstrumentId(9),
+                taker: OrderId(101),
+                maker: OrderId(202),
+                aggressor: crate::types::Side::Buy,
+                price: 100,
+                qty: 7,
+                maker_fee: 1,
+                taker_fee: 2,
+            },
+            &mut frame,
+        );
+        let record = OutboxRecord {
+            raft_group: 4,
+            raft_index: 55,
+            ordinal: 3,
+            report_frame: frame,
+        };
+        assert_eq!(record.target_order_ids(), vec![101, 202]);
+        for target in [101, 202] {
+            let event = wire::decode_execution_event(&record.kafka_payload_for(target)).unwrap();
+            assert_eq!(event.target_order_id, target);
+            assert_eq!(event.raft_index, 55);
+            assert_eq!(event.ordinal, 3);
+        }
+    }
+
     // ---- P0-1 crash-order recovery contract ---------------------------------
 
     fn write_batches(path: &Path, batches: &[(u64, u32)]) {
@@ -717,8 +765,8 @@ mod tests {
 
     #[test]
     fn rotation_seals_segments_and_gc_reclaims_fully_published_ones() {
-        let root = std::env::temp_dir()
-            .join(format!("tc-outbox-rotate-{}", crate::journal::now_nanos()));
+        let root =
+            std::env::temp_dir().join(format!("tc-outbox-rotate-{}", crate::journal::now_nanos()));
         std::fs::create_dir_all(&root).unwrap();
         let base = root.join("outbox-shard-0.bin");
         // Rotate once a segment holds two records.
@@ -739,7 +787,10 @@ mod tests {
         assert!(writer.maybe_rotate().unwrap());
         let seg1 = writer.current_segment().to_path_buf();
         assert_ne!(seg1, base);
-        assert_eq!(segment_paths(&base).unwrap(), vec![base.clone(), seg1.clone()]);
+        assert_eq!(
+            segment_paths(&base).unwrap(),
+            vec![base.clone(), seg1.clone()]
+        );
         // Segment names must be discoverable by the publisher's scan rules.
         let stem = seg1.file_stem().unwrap().to_str().unwrap();
         assert!(stem.starts_with("outbox-shard-"));
@@ -797,8 +848,8 @@ mod tests {
         // Crash after outbox append+fsync of batch 3 but before its watermark
         // was persisted: the durable max applied index is 2. Recovery must trim
         // batch 3 so its re-application does not duplicate execution events.
-        let root = std::env::temp_dir()
-            .join(format!("tc-outbox-trim-{}", crate::journal::now_nanos()));
+        let root =
+            std::env::temp_dir().join(format!("tc-outbox-trim-{}", crate::journal::now_nanos()));
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("outbox-shard-0.bin");
         write_batches(&path, &[(1, 1), (2, 2), (3, 2)]);
@@ -817,8 +868,8 @@ mod tests {
         // Watermark reached batch 3, so batch 3's reports must already be on
         // disk (they were fsynced before the watermark advanced): trimming to
         // the same index removes nothing.
-        let root = std::env::temp_dir()
-            .join(format!("tc-outbox-keep-{}", crate::journal::now_nanos()));
+        let root =
+            std::env::temp_dir().join(format!("tc-outbox-keep-{}", crate::journal::now_nanos()));
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("outbox-shard-0.bin");
         write_batches(&path, &[(1, 1), (2, 2), (3, 2)]);
@@ -831,8 +882,8 @@ mod tests {
 
     #[test]
     fn recovery_with_no_watermark_and_torn_tail_trims_cleanly() {
-        let root = std::env::temp_dir()
-            .join(format!("tc-outbox-torn-{}", crate::journal::now_nanos()));
+        let root =
+            std::env::temp_dir().join(format!("tc-outbox-torn-{}", crate::journal::now_nanos()));
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("outbox-shard-0.bin");
         write_batches(&path, &[(1, 2)]);

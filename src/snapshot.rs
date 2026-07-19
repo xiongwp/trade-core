@@ -201,6 +201,42 @@ pub fn write(path: &Path, data: SnapshotData<'_>) -> io::Result<()> {
     Ok(())
 }
 
+/// Atomically install an application snapshot received through Raft. The blob
+/// is fully decoded and its embedded applied index is verified before rename,
+/// so a corrupt or mismatched consensus snapshot can never replace the live
+/// recovery point.
+pub fn install_bytes(path: &Path, bytes: &[u8], expected_index: u64) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("installing");
+    {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
+    let decoded = load(&tmp)?;
+    if decoded.format_version < 4 || decoded.raft_applied_index != expected_index {
+        let _ = fs::remove_file(&tmp);
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "matching snapshot index {} does not match Raft snapshot index {expected_index}",
+                decoded.raft_applied_index
+            ),
+        ));
+    }
+    fs::rename(&tmp, path)?;
+    if let Some(parent) = path.parent() {
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
 /// Load a snapshot; `Err` on missing file, corruption, or version mismatch.
 pub fn load(path: &Path) -> io::Result<Snapshot> {
     let mut buf = Vec::new();

@@ -13,6 +13,7 @@
 //! new node — the journal (see [`crate::journal`]) is per-shard, so an
 //! instrument's command history moves with it.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -145,6 +146,153 @@ impl ClusterRouter {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MigrationState {
+    Freezing,
+    CatchingUp,
+    Verified,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CategoryMigration {
+    pub category_id: u32,
+    pub route_version: u64,
+    pub from_group: usize,
+    pub to_group: usize,
+    pub state: MigrationState,
+    pub frozen_index: u64,
+    pub target_index: u64,
+    pub fingerprint: u64,
+}
+
+/// Fenced category migration state machine. Data movement may replay Kafka or
+/// install a matching snapshot, but routing cannot activate the destination
+/// until both sides report the same durable index and state fingerprint.
+#[derive(Clone)]
+pub struct RouteControlPlane {
+    group_count: usize,
+    pins: Arc<RwLock<HashMap<u32, usize>>>,
+    migrations: Arc<RwLock<HashMap<u32, CategoryMigration>>>,
+    version: Arc<AtomicU64>,
+}
+
+impl RouteControlPlane {
+    pub fn new(group_count: usize, pins: HashMap<u32, usize>) -> Self {
+        assert!(group_count > 0, "route control plane needs a Raft group");
+        assert!(pins.values().all(|group| *group < group_count));
+        Self {
+            group_count,
+            pins: Arc::new(RwLock::new(pins)),
+            migrations: Arc::new(RwLock::new(HashMap::new())),
+            version: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    pub fn version(&self) -> u64 {
+        self.version.load(Ordering::Acquire)
+    }
+
+    pub fn group_for(&self, category_id: u32) -> usize {
+        self.pins
+            .read()
+            .unwrap()
+            .get(&category_id)
+            .copied()
+            .unwrap_or(category_id as usize % self.group_count)
+    }
+
+    pub fn accepts(&self, category_id: u32) -> bool {
+        !self.migrations.read().unwrap().contains_key(&category_id)
+    }
+
+    pub fn begin(&self, category_id: u32, to_group: usize) -> Result<CategoryMigration, String> {
+        if to_group >= self.group_count {
+            return Err(format!("target group {to_group} is out of range"));
+        }
+        let from_group = self.group_for(category_id);
+        if from_group == to_group {
+            return Err("category already belongs to target group".into());
+        }
+        let mut migrations = self.migrations.write().unwrap();
+        if migrations.contains_key(&category_id) {
+            return Err("category migration already active".into());
+        }
+        let migration = CategoryMigration {
+            category_id,
+            route_version: self.version.fetch_add(1, Ordering::AcqRel) + 1,
+            from_group,
+            to_group,
+            state: MigrationState::Freezing,
+            frozen_index: 0,
+            target_index: 0,
+            fingerprint: 0,
+        };
+        migrations.insert(category_id, migration);
+        Ok(migration)
+    }
+
+    pub fn frozen(&self, category_id: u32, index: u64) -> Result<CategoryMigration, String> {
+        let mut migrations = self.migrations.write().unwrap();
+        let migration = migrations
+            .get_mut(&category_id)
+            .ok_or("category migration is not active")?;
+        if migration.state != MigrationState::Freezing || index == 0 {
+            return Err("migration is not waiting for a valid freeze index".into());
+        }
+        migration.frozen_index = index;
+        migration.state = MigrationState::CatchingUp;
+        Ok(*migration)
+    }
+
+    pub fn caught_up(
+        &self,
+        category_id: u32,
+        target_index: u64,
+        source_fingerprint: u64,
+        target_fingerprint: u64,
+    ) -> Result<CategoryMigration, String> {
+        let mut migrations = self.migrations.write().unwrap();
+        let migration = migrations
+            .get_mut(&category_id)
+            .ok_or("category migration is not active")?;
+        if migration.state != MigrationState::CatchingUp || target_index < migration.frozen_index {
+            return Err("target has not caught up to the freeze index".into());
+        }
+        if source_fingerprint != target_fingerprint {
+            return Err("source/target matching fingerprints differ".into());
+        }
+        migration.target_index = target_index;
+        migration.fingerprint = source_fingerprint;
+        migration.state = MigrationState::Verified;
+        Ok(*migration)
+    }
+
+    pub fn activate(&self, category_id: u32) -> Result<u64, String> {
+        let mut migrations = self.migrations.write().unwrap();
+        let migration = migrations
+            .get(&category_id)
+            .copied()
+            .ok_or("category migration is not active")?;
+        if migration.state != MigrationState::Verified {
+            return Err("migration fingerprint is not verified".into());
+        }
+        self.pins
+            .write()
+            .unwrap()
+            .insert(category_id, migration.to_group);
+        migrations.remove(&category_id);
+        Ok(self.version.fetch_add(1, Ordering::AcqRel) + 1)
+    }
+
+    pub fn abort(&self, category_id: u32) -> bool {
+        self.migrations
+            .write()
+            .unwrap()
+            .remove(&category_id)
+            .is_some()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,5 +348,22 @@ mod tests {
         );
         assert_eq!(version, 2);
         assert_eq!(router.node_for(InstrumentId(42)), (1, 2));
+    }
+
+    #[test]
+    fn category_migration_freezes_verifies_and_switches_atomically() {
+        let control = RouteControlPlane::new(4, HashMap::new());
+        assert_eq!(control.group_for(1), 1);
+        let started = control.begin(1, 3).unwrap();
+        assert_eq!(started.state, MigrationState::Freezing);
+        assert!(!control.accepts(1));
+        assert!(control.activate(1).is_err());
+        control.frozen(1, 90).unwrap();
+        assert!(control.caught_up(1, 89, 7, 7).is_err());
+        assert!(control.caught_up(1, 90, 7, 8).is_err());
+        control.caught_up(1, 90, 7, 7).unwrap();
+        control.activate(1).unwrap();
+        assert!(control.accepts(1));
+        assert_eq!(control.group_for(1), 3);
     }
 }

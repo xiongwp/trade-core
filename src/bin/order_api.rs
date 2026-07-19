@@ -53,7 +53,8 @@ struct MatcherTarget {
 
 #[derive(Clone)]
 struct OrderStore {
-    shards: Arc<Vec<Pool>>,
+    shards: Arc<Vec<Option<Pool>>>,
+    owned_dbs: Arc<std::collections::HashSet<u32>>,
     /// Versioned shard routing record. All row placement goes through this so a
     /// parameter change is a fenced migration (see [`sharding::RouteConfig`]).
     routing: sharding::RouteConfig,
@@ -195,8 +196,8 @@ impl OrderPipelineMetrics {
             .load(AtomicOrdering::Acquire)
             .saturating_add(
                 self.observed_mysql_lag
-                .load(AtomicOrdering::Acquire)
-                .max(self.observed_match_lag.load(AtomicOrdering::Acquire)),
+                    .load(AtomicOrdering::Acquire)
+                    .max(self.observed_match_lag.load(AtomicOrdering::Acquire)),
             )
     }
 
@@ -255,7 +256,13 @@ impl OrderPipelineMetrics {
 
 impl OrderStore {
     fn shard(&self, db: u32) -> &Pool {
-        &self.shards[db as usize]
+        self.shards[db as usize]
+            .as_ref()
+            .unwrap_or_else(|| panic!("physical DB {db} is not owned by this worker"))
+    }
+
+    fn owns(&self, db: u32) -> bool {
+        self.owned_dbs.contains(&db)
     }
 }
 
@@ -360,8 +367,14 @@ impl Backpressure {
     }
 
     fn partition_lag(&self, index: usize) -> u64 {
-        let mysql = self.mysql_lag.get(index).map_or(0, |v| v.load(AtomicOrdering::Acquire));
-        let matcher = self.match_lag.get(index).map_or(0, |v| v.load(AtomicOrdering::Acquire));
+        let mysql = self
+            .mysql_lag
+            .get(index)
+            .map_or(0, |v| v.load(AtomicOrdering::Acquire));
+        let matcher = self
+            .match_lag
+            .get(index)
+            .map_or(0, |v| v.load(AtomicOrdering::Acquire));
         mysql.max(matcher)
     }
 
@@ -656,12 +669,16 @@ fn cancel_from_query(query: &str) -> Result<(InstrumentId, OrderId, u64, u64), S
 
 fn bootstrap(store: &OrderStore) -> mysql::Result<()> {
     for db in 0..store.routing.db_count {
+        if !store.owns(db as u32) {
+            continue;
+        }
         let mut conn = store.shard(db as u32).get_conn()?;
         let db_name = format!("order_db_{db}");
         conn.query_drop(format!("CREATE DATABASE IF NOT EXISTS {db_name}"))?;
         conn.query_drop(format!("CREATE TABLE IF NOT EXISTS {db_name}.processed_commands (category_id INT UNSIGNED NOT NULL, kafka_partition INT NOT NULL, kafka_offset BIGINT UNSIGNED NOT NULL, command_id BIGINT UNSIGNED NOT NULL UNIQUE, user_id BIGINT UNSIGNED NOT NULL, shard_table INT UNSIGNED NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(category_id,kafka_offset), KEY idx_partition_offset (kafka_partition,kafka_offset)) ENGINE=InnoDB"))?;
         conn.query_drop(format!("CREATE TABLE IF NOT EXISTS {db_name}.processed_executions (kafka_partition INT NOT NULL, kafka_offset BIGINT UNSIGNED NOT NULL, instrument INT UNSIGNED NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(kafka_partition,kafka_offset), KEY idx_instrument_offset (instrument,kafka_offset)) ENGINE=InnoDB"))?;
-        conn.query_drop(format!("CREATE TABLE IF NOT EXISTS {db_name}.processed_execution_events (raft_group INT UNSIGNED NOT NULL, raft_index BIGINT UNSIGNED NOT NULL, report_ordinal INT UNSIGNED NOT NULL, instrument INT UNSIGNED NOT NULL, order_id BIGINT UNSIGNED NOT NULL, report_type TINYINT UNSIGNED NOT NULL, kafka_partition INT NOT NULL, kafka_offset BIGINT UNSIGNED NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(raft_group,raft_index,report_ordinal), KEY idx_instrument_index (instrument,raft_index), KEY idx_order_event (order_id,raft_index)) ENGINE=InnoDB"))?;
+        conn.query_drop(format!("CREATE TABLE IF NOT EXISTS {db_name}.processed_execution_events (raft_group INT UNSIGNED NOT NULL, raft_index BIGINT UNSIGNED NOT NULL, report_ordinal INT UNSIGNED NOT NULL, target_order_id BIGINT UNSIGNED NOT NULL, shard_table INT UNSIGNED NOT NULL, instrument INT UNSIGNED NOT NULL, report_type TINYINT UNSIGNED NOT NULL, kafka_partition INT NOT NULL, kafka_offset BIGINT UNSIGNED NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(raft_group,raft_index,report_ordinal,target_order_id), KEY idx_instrument_index (instrument,raft_index), KEY idx_order_event (target_order_id,raft_index)) ENGINE=InnoDB"))?;
+        conn.query_drop(format!("CREATE TABLE IF NOT EXISTS {db_name}.pending_execution_events (raft_group INT UNSIGNED NOT NULL, raft_index BIGINT UNSIGNED NOT NULL, report_ordinal INT UNSIGNED NOT NULL, target_order_id BIGINT UNSIGNED NOT NULL, shard_table INT UNSIGNED NOT NULL, instrument INT UNSIGNED NOT NULL, report_type TINYINT UNSIGNED NOT NULL, event_qty BIGINT UNSIGNED NOT NULL, kafka_partition INT NOT NULL, kafka_offset BIGINT UNSIGNED NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(raft_group,raft_index,report_ordinal,target_order_id), KEY idx_pending_table_order (shard_table,target_order_id,raft_index,report_ordinal)) ENGINE=InnoDB"))?;
         for table in 0..store.routing.tables_per_db {
             conn.query_drop(format!("CREATE TABLE IF NOT EXISTS {db_name}.asset_orders_{table:03} (row_seq BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, order_id BIGINT UNSIGNED NOT NULL UNIQUE, category_id INT UNSIGNED NOT NULL, user_id BIGINT UNSIGNED NOT NULL, instrument INT UNSIGNED NOT NULL, side TINYINT NOT NULL, price BIGINT UNSIGNED NOT NULL, qty BIGINT UNSIGNED NOT NULL, filled_qty BIGINT UNSIGNED NOT NULL DEFAULT 0, status VARCHAR(16) NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, KEY idx_category_row (category_id,row_seq), KEY idx_user_created (user_id,created_at)) ENGINE=InnoDB"))?;
         }
@@ -682,17 +699,22 @@ struct KafkaIngress {
     router: QueueRouter,
     partitions_per_topic: u32,
     db_consumers: usize,
+    db_router_consumers: usize,
     matcher_consumers: usize,
     db_group: String,
+    db_router_group: String,
+    db_route_topic: String,
+    db_route_partitions: u32,
     matcher_group: String,
     execution_topic: String,
+    execution_partitions: u32,
     execution_group: String,
     execution_consumers: usize,
     /// Maximum execution events collected from Kafka before dispatching them
     /// to order-id-routed DB workers.
     execution_batch_size: usize,
     execution_linger: Duration,
-    raft_group_pins: Arc<HashMap<u32, usize>>,
+    route_control: Arc<trade_core::cluster::RouteControlPlane>,
     batch_size: usize,
     linger: Duration,
     async_offset_commits: bool,
@@ -751,11 +773,24 @@ impl KafkaIngress {
             .set("enable.idempotence", "true")
             .set("max.in.flight.requests.per.connection", "5")
             .set("delivery.timeout.ms", "10000")
-            .set("linger.ms", env_number("TC_ORDER_KAFKA_LINGER_MS", 1u64).to_string())
-            .set("batch.num.messages", env_number("TC_ORDER_KAFKA_BATCH_MESSAGES", 10_000usize).to_string())
-            .set("compression.type", std::env::var("TC_ORDER_KAFKA_COMPRESSION").unwrap_or_else(|_| "lz4".into()))
-            .set("queue.buffering.max.kbytes", env_number("TC_ORDER_KAFKA_QUEUE_KBYTES", 1_048_576usize).to_string());
-        let producer = producer_config.create::<FutureProducer>()
+            .set(
+                "linger.ms",
+                env_number("TC_ORDER_KAFKA_LINGER_MS", 1u64).to_string(),
+            )
+            .set(
+                "batch.num.messages",
+                env_number("TC_ORDER_KAFKA_BATCH_MESSAGES", 10_000usize).to_string(),
+            )
+            .set(
+                "compression.type",
+                std::env::var("TC_ORDER_KAFKA_COMPRESSION").unwrap_or_else(|_| "lz4".into()),
+            )
+            .set(
+                "queue.buffering.max.kbytes",
+                env_number("TC_ORDER_KAFKA_QUEUE_KBYTES", 1_048_576usize).to_string(),
+            );
+        let producer = producer_config
+            .create::<FutureProducer>()
             .map_err(|error| error.to_string())?;
         let topic_count = topics.len();
         let backpressure = Arc::new(Backpressure::from_env(
@@ -763,6 +798,10 @@ impl KafkaIngress {
             partitions,
             raft_group_count,
             Arc::clone(&raft_group_pins),
+        ));
+        let route_control = Arc::new(trade_core::cluster::RouteControlPlane::new(
+            raft_group_count.max(1),
+            (*raft_group_pins).clone(),
         ));
         Ok(Some(Self {
             producer,
@@ -773,16 +812,29 @@ impl KafkaIngress {
                 "TC_ORDER_KAFKA_DB_CONSUMERS",
                 env_number("TC_ORDER_KAFKA_CONSUMERS", partition_workers),
             ),
+            db_router_consumers: env_number(
+                "TC_ORDER_KAFKA_DB_ROUTER_CONSUMERS",
+                partition_workers,
+            ),
             matcher_consumers: env_number(
                 "TC_ORDER_KAFKA_MATCH_CONSUMERS",
                 raft_group_count.max(1),
             ),
             db_group: std::env::var("TC_ORDER_KAFKA_DB_GROUP")
                 .unwrap_or_else(|_| "trade-order-persist-v1".into()),
+            db_router_group: std::env::var("TC_ORDER_KAFKA_DB_ROUTER_GROUP")
+                .unwrap_or_else(|_| "trade-order-db-route-v1".into()),
+            db_route_topic: std::env::var("TC_ORDER_DB_KAFKA_TOPIC")
+                .unwrap_or_else(|_| "trade-order-db-v1".into()),
+            db_route_partitions: env_number(
+                "TC_ORDER_DB_KAFKA_PARTITIONS",
+                env_number("TC_DB_COUNT", sharding::DB_COUNT as u32),
+            ),
             matcher_group: std::env::var("TC_ORDER_KAFKA_MATCH_GROUP")
                 .unwrap_or_else(|_| "trade-order-match-v1".into()),
             execution_topic: std::env::var("TC_EXECUTION_KAFKA_TOPIC")
                 .unwrap_or_else(|_| "trade-executions-v1".into()),
+            execution_partitions: env_number("TC_EXECUTION_KAFKA_PARTITIONS", 16u32),
             execution_group: std::env::var("TC_EXECUTION_KAFKA_MYSQL_GROUP")
                 .unwrap_or_else(|_| "trade-order-execution-mysql-v1".into()),
             execution_consumers: env_number("TC_EXECUTION_KAFKA_MYSQL_CONSUMERS", 4usize),
@@ -797,7 +849,7 @@ impl KafkaIngress {
                 "TC_EXECUTION_MYSQL_BATCH_LINGER_MS",
                 10u64,
             )),
-            raft_group_pins,
+            route_control,
             batch_size: env_number("TC_ORDER_BATCH_SIZE", 1_000usize).max(1),
             linger: Duration::from_millis(env_number("TC_ORDER_BATCH_LINGER_MS", 2u64)),
             async_offset_commits: env_enabled("TC_KAFKA_OFFSET_COMMIT_ASYNC", true),
@@ -823,6 +875,15 @@ impl KafkaIngress {
     /// still isolates other categories' *separate* requests, which is the
     /// isolation the design requires.
     fn admit_batch(&self, records: &[BatchRecord]) -> Result<(), String> {
+        if let Some(record) = records
+            .iter()
+            .find(|record| !self.route_control.accepts(record.category_id))
+        {
+            return Err(format!(
+                "backpressure-emergency: category {} is frozen for route migration",
+                record.category_id
+            ));
+        }
         let Some(worst) = records
             .iter()
             .map(|record| {
@@ -846,6 +907,11 @@ impl KafkaIngress {
     ) -> Result<CategorySequence, String> {
         // Per-category tier first (soft slowdown / hard 429 / emergency 503),
         // then the market-wide backlog master switch.
+        if !self.route_control.accepts(category_id) {
+            return Err(format!(
+                "backpressure-emergency: category {category_id} is frozen for route migration"
+            ));
+        }
         self.backpressure.admit(category_id)?;
         self.reserve(1)?;
         let route = self.router.route(category_id);
@@ -907,10 +973,8 @@ impl KafkaIngress {
                 first_error.get_or_insert_with(|| error.to_string());
             }
         }
-        self.metrics.finish_reservation(
-            records.len() as u64,
-            records.len() as u64 - failed,
-        );
+        self.metrics
+            .finish_reservation(records.len() as u64, records.len() as u64 - failed);
         if failed > 0 {
             return Err(first_error.unwrap_or_else(|| "Kafka batch publish failed".into()));
         }
@@ -970,7 +1034,12 @@ where
 fn env_enabled(name: &str, default: bool) -> bool {
     std::env::var(name)
         .ok()
-        .map(|value| !matches!(value.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"))
+        .map(|value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
         .unwrap_or(default)
 }
 
@@ -1037,7 +1106,9 @@ struct CommandShardJob {
 
 #[derive(Clone)]
 struct CommandDbForwarder {
-    shards: Arc<Vec<std::sync::mpsc::SyncSender<CommandShardJob>>>,
+    shards: Arc<Vec<Option<std::sync::mpsc::SyncSender<CommandShardJob>>>>,
+    routing: sharding::RouteConfig,
+    owned_dbs: Arc<std::collections::HashSet<u32>>,
 }
 
 impl CommandDbForwarder {
@@ -1046,6 +1117,10 @@ impl CommandDbForwarder {
         let coalesce_jobs = env_number("TC_MYSQL_SHARD_COALESCE_JOBS", 16usize).max(1);
         let mut shards = Vec::with_capacity(store.routing.db_count as usize);
         for shard_db in 0..store.routing.db_count as u32 {
+            if !store.owns(shard_db) {
+                shards.push(None);
+                continue;
+            }
             let (tx, rx) = std::sync::mpsc::sync_channel::<CommandShardJob>(queue);
             let shard_store = store.clone();
             std::thread::Builder::new()
@@ -1068,14 +1143,20 @@ impl CommandDbForwarder {
                     }
                 })
                 .expect("spawn command DB shard worker");
-            shards.push(tx);
+            shards.push(Some(tx));
         }
         Self {
             shards: Arc::new(shards),
+            routing: store.routing,
+            owned_dbs: store.owned_dbs.clone(),
         }
     }
 
-    fn submit(&self, routing: sharding::RouteConfig, records: &[KafkaRecord]) -> Result<(), String> {
+    fn submit(
+        &self,
+        routing: sharding::RouteConfig,
+        records: &[KafkaRecord],
+    ) -> Result<(), String> {
         let mut by_db: HashMap<u32, Vec<KafkaRecord>> = HashMap::new();
         for record in records {
             let command = wire::WireView::parse(&record.frame)
@@ -1088,6 +1169,8 @@ impl CommandDbForwarder {
         for (db, records) in by_db {
             let (reply, result) = std::sync::mpsc::sync_channel(1);
             self.shards[db as usize]
+                .as_ref()
+                .ok_or_else(|| format!("command DB {db} is not owned by this worker"))?
                 .send(CommandShardJob { records, reply })
                 .map_err(|_| format!("command DB shard {db} worker stopped"))?;
             replies.push(result);
@@ -1098,6 +1181,10 @@ impl CommandDbForwarder {
                 .map_err(|_| "command DB shard worker dropped reply".to_string())??;
         }
         Ok(())
+    }
+
+    fn owns(&self, db: u32) -> bool {
+        self.owned_dbs.contains(&db)
     }
 }
 
@@ -1121,6 +1208,7 @@ fn persist_mysql_shard(
     let mut processed = Vec::with_capacity(records.len() * 6);
     let mut orders_by_table: BTreeMap<u32, Vec<Value>> = BTreeMap::new();
     let mut cancels = Vec::new();
+    let mut modifies = Vec::new();
 
     for record in records {
         let command = wire::WireView::parse(&record.frame)
@@ -1153,6 +1241,36 @@ fn persist_mysql_shard(
             trade_core::Command::Cancel { order_id, .. } => {
                 cancels.push((route.table_name(), order_id.0, record.user));
             }
+            trade_core::Command::Modify {
+                order_id,
+                new_price,
+                new_qty,
+                ..
+            } => modifies.push((
+                route.table_name(),
+                order_id.0,
+                record.user,
+                new_price,
+                new_qty,
+            )),
+            trade_core::Command::ForceClose {
+                instrument,
+                user,
+                close_order_id,
+                close_side,
+                close_qty,
+            } if close_qty > 0 => {
+                orders_by_table.entry(route.table).or_default().extend([
+                    Value::from(close_order_id.0),
+                    Value::from(record.category_id),
+                    Value::from(user),
+                    Value::from(instrument.0),
+                    Value::from(if close_side == Side::Buy { 0u8 } else { 1u8 }),
+                    Value::from(0u64),
+                    Value::from(close_qty),
+                    Value::from("PENDING"),
+                ]);
+            }
             _ => {}
         }
     }
@@ -1164,6 +1282,7 @@ fn persist_mysql_shard(
             processed,
         )
         .map_err(|error| error.to_string())?;
+    let pending_tables = orders_by_table.keys().copied().collect::<Vec<_>>();
     for (table, values) in orders_by_table {
         exec_multi_insert(
                 &mut tx,
@@ -1179,6 +1298,19 @@ fn persist_mysql_shard(
                 params! {"id" => order_id, "user" => user},
             )
             .map_err(|error| error.to_string())?;
+    }
+    for (table, order_id, user, new_price, new_qty) in modifies {
+        tx.exec_drop(
+                format!("UPDATE {db}.{table} SET price=:price,qty=:qty,status='MODIFY_PENDING' WHERE order_id=:id AND user_id=:user"),
+                params! {"price" => new_price, "qty" => new_qty, "id" => order_id, "user" => user},
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    // Results may have reached this database before the command projection.
+    // Once the order rows exist, drain their durable pending events in the same
+    // transaction so no external scheduler is required for the common race.
+    for table in pending_tables {
+        apply_pending_execution_table(&mut tx, &db, table)?;
     }
     tx.commit().map_err(|error| error.to_string())?;
     store.metrics.record_mysql(started.elapsed());
@@ -1307,7 +1439,7 @@ impl RaftForwarder {
     fn submit(
         &self,
         records: &[KafkaRecord],
-        pins: &HashMap<u32, usize>,
+        control: &trade_core::cluster::RouteControlPlane,
     ) -> Result<(), String> {
         if self.groups.is_empty() {
             return Err("no Raft groups configured".into());
@@ -1316,11 +1448,13 @@ impl RaftForwarder {
             .map(|_| BTreeMap::<u32, Vec<[u8; wire::MSG_LEN]>>::new())
             .collect::<Vec<_>>();
         for record in records {
-            let group = sharding::raft_group_for_category_pinned(
-                record.category_id,
-                self.groups.len(),
-                pins,
-            );
+            if !control.accepts(record.category_id) {
+                return Err(format!(
+                    "category {} is frozen for migration",
+                    record.category_id
+                ));
+            }
+            let group = control.group_for(record.category_id);
             grouped[group]
                 .entry(record.category_id)
                 .or_default()
@@ -1359,12 +1493,155 @@ impl RaftForwarder {
 fn forward_kafka_batch(
     forwarder: &RaftForwarder,
     records: &[KafkaRecord],
-    pins: &HashMap<u32, usize>,
+    control: &trade_core::cluster::RouteControlPlane,
 ) -> Result<(), String> {
     if forwarder.groups.is_empty() {
         return Err("no Raft groups configured".into());
     }
-    forwarder.submit(records, pins)
+    forwarder.submit(records, control)
+}
+
+fn route_command_db_batch(
+    kafka: &KafkaIngress,
+    routing: sharding::RouteConfig,
+    records: &[KafkaRecord],
+) -> Result<(), String> {
+    assert!(
+        kafka.db_route_partitions >= routing.db_count as u32,
+        "command DB route partitions must cover every physical DB"
+    );
+    let prepared = records
+        .iter()
+        .map(|record| {
+            let command = wire::WireView::parse(&record.frame)
+                .and_then(|view| view.to_command())
+                .expect("validated command Kafka frame");
+            let order_id = database_order_id(&command);
+            let partition = routing.execution_partition(order_id, kafka.db_route_partitions);
+            let payload = encode_envelope(record.user, routing.route_version, &record.frame);
+            let key = order_id.to_be_bytes();
+            (partition, key, payload)
+        })
+        .collect::<Vec<_>>();
+    let deliveries = futures::executor::block_on(futures::future::join_all(prepared.iter().map(
+        |(partition, key, payload)| {
+            kafka.producer.send(
+                FutureRecord::to(&kafka.db_route_topic)
+                    .partition(*partition as i32)
+                    .key(key)
+                    .payload(payload),
+                Duration::from_secs(5),
+            )
+        },
+    )));
+    deliveries
+        .into_iter()
+        .find_map(Result::err)
+        .map_or(Ok(()), |(error, _)| Err(error.to_string()))
+}
+
+fn decode_db_kafka_record(
+    message: &rdkafka::message::BorrowedMessage<'_>,
+    category_size: u32,
+    routing: sharding::RouteConfig,
+) -> Result<KafkaRecord, String> {
+    let payload = message.payload().ok_or("Kafka message has no payload")?;
+    let envelope = QueueEnvelope::decode(payload).ok_or("invalid DB command envelope")?;
+    if envelope.route_version != routing.route_version {
+        return Err(format!(
+            "stale DB route version {}, expected {}",
+            envelope.route_version, routing.route_version
+        ));
+    }
+    let command = wire::WireView::parse(envelope.frame)
+        .and_then(|view| view.to_command())
+        .ok_or("invalid DB command frame")?;
+    let expected = routing.execution_partition(
+        database_order_id(&command),
+        env_number("TC_ORDER_DB_KAFKA_PARTITIONS", routing.db_count as u32),
+    );
+    if message.partition() != expected as i32 {
+        return Err(format!(
+            "DB command partition {} does not match expected {expected}",
+            message.partition()
+        ));
+    }
+    Ok(KafkaRecord {
+        topic: message.topic().to_string(),
+        partition: message.partition(),
+        offset: message.offset(),
+        category_id: sharding::asset_category(command.instrument(), category_size),
+        user: envelope.user,
+        frame: *envelope.frame,
+    })
+}
+
+fn run_db_kafka_stage(
+    kafka: KafkaIngress,
+    category_size: u32,
+    worker: usize,
+    forwarder: CommandDbForwarder,
+) {
+    let consumer: BaseConsumer = kafka_consumer_config(&kafka.brokers, &kafka.db_group)
+        .set("enable.auto.commit", "false")
+        .set("enable.auto.offset.store", "false")
+        .set("auto.offset.reset", "earliest")
+        .create()
+        .expect("create routed command DB consumer");
+    let usable = kafka.db_route_partitions / forwarder.routing.db_count as u32
+        * forwarder.routing.db_count as u32;
+    let owned = (0..usable)
+        .filter(|partition| forwarder.owns(*partition % forwarder.routing.db_count as u32))
+        .collect::<Vec<_>>();
+    let mut assignment = TopicPartitionList::new();
+    for (position, partition) in owned.into_iter().enumerate() {
+        if position % kafka.db_consumers.max(1) == worker {
+            assignment
+                .add_partition_offset(&kafka.db_route_topic, partition as i32, Offset::Stored)
+                .expect("assign routed command DB partition");
+        }
+    }
+    consumer
+        .assign(&assignment)
+        .expect("assign routed command DB ownership");
+    loop {
+        let Some(first) = consumer.poll(Duration::from_millis(100)) else {
+            continue;
+        };
+        let mut batch = Vec::with_capacity(kafka.batch_size);
+        if let Ok(message) = first {
+            if let Ok(record) = decode_db_kafka_record(&message, category_size, forwarder.routing) {
+                batch.push(record);
+            }
+        }
+        let deadline = std::time::Instant::now() + kafka.linger;
+        while batch.len() < kafka.batch_size && std::time::Instant::now() < deadline {
+            match consumer.poll(deadline.saturating_duration_since(std::time::Instant::now())) {
+                Some(Ok(message)) => {
+                    if let Ok(record) =
+                        decode_db_kafka_record(&message, category_size, forwarder.routing)
+                    {
+                        batch.push(record);
+                    }
+                }
+                _ => break,
+            }
+        }
+        if batch.is_empty() {
+            continue;
+        }
+        match forwarder
+            .submit(forwarder.routing, &batch)
+            .and_then(|()| commit_kafka_batch(&consumer, &batch, kafka.async_offset_commits))
+        {
+            Ok(()) => kafka.metrics.complete("mysql", batch.len() as u64),
+            Err(error) => {
+                log_warn!("order-db", worker; "event=batch_retry error={error}");
+                rewind_kafka_batch(&consumer, &batch);
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
 }
 
 fn run_kafka_stage<F>(
@@ -1383,11 +1660,8 @@ fn run_kafka_stage<F>(
     // so scaling match throughput does not also inflate MySQL transactions.
     let (batch_size, linger) = if stage == "match" {
         (
-            env_number(
-                "TC_ORDER_MATCH_BATCH_SIZE",
-                wire::RAFT_BATCH_MAX_COMMANDS,
-            )
-            .clamp(1, wire::RAFT_BATCH_MAX_COMMANDS),
+            env_number("TC_ORDER_MATCH_BATCH_SIZE", wire::RAFT_BATCH_MAX_COMMANDS)
+                .clamp(1, wire::RAFT_BATCH_MAX_COMMANDS),
             Duration::from_millis(env_number(
                 "TC_ORDER_MATCH_BATCH_LINGER_MS",
                 kafka.linger.as_millis() as u64,
@@ -1459,9 +1733,9 @@ fn run_kafka_stage<F>(
                 None => break,
             }
         }
-        match process(&batch).and_then(|()| {
-            commit_kafka_batch(&consumer, &batch, kafka.async_offset_commits)
-        }) {
+        match process(&batch)
+            .and_then(|()| commit_kafka_batch(&consumer, &batch, kafka.async_offset_commits))
+        {
             Ok(()) => {
                 kafka.metrics.complete(stage, batch.len() as u64);
                 consecutive_failures = 0;
@@ -1491,9 +1765,18 @@ fn kafka_consumer_config(brokers: &str, group_id: &str) -> ClientConfig {
     config
         .set("bootstrap.servers", brokers)
         .set("group.id", group_id)
-        .set("fetch.min.bytes", env_number("TC_KAFKA_FETCH_MIN_BYTES", 1usize).to_string())
-        .set("fetch.wait.max.ms", env_number("TC_KAFKA_FETCH_WAIT_MS", 10u64).to_string())
-        .set("fetch.message.max.bytes", env_number("TC_KAFKA_FETCH_MAX_BYTES", 52_428_800usize).to_string());
+        .set(
+            "fetch.min.bytes",
+            env_number("TC_KAFKA_FETCH_MIN_BYTES", 1usize).to_string(),
+        )
+        .set(
+            "fetch.wait.max.ms",
+            env_number("TC_KAFKA_FETCH_WAIT_MS", 10u64).to_string(),
+        )
+        .set(
+            "fetch.message.max.bytes",
+            env_number("TC_KAFKA_FETCH_MAX_BYTES", 52_428_800usize).to_string(),
+        );
     config
 }
 
@@ -1579,9 +1862,27 @@ fn run_execution_mysql_consumer(
         .set("partition.assignment.strategy", "cooperative-sticky")
         .create()
         .expect("create execution MySQL consumer");
+    assert!(
+        kafka.execution_partitions >= forwarder.routing.db_count as u32,
+        "execution partitions must be >= physical DB count for DB ownership routing"
+    );
+    let mut assignment = TopicPartitionList::new();
+    let usable_execution_partitions = kafka.execution_partitions
+        / forwarder.routing.db_count as u32
+        * forwarder.routing.db_count as u32;
+    let owned_partitions = (0..usable_execution_partitions)
+        .filter(|partition| forwarder.owns(*partition % forwarder.routing.db_count as u32))
+        .collect::<Vec<_>>();
+    for (position, partition) in owned_partitions.into_iter().enumerate() {
+        if position % kafka.execution_consumers.max(1) == worker {
+            assignment
+                .add_partition_offset(&kafka.execution_topic, partition as i32, Offset::Stored)
+                .expect("assign owned execution partition");
+        }
+    }
     consumer
-        .subscribe(&[&kafka.execution_topic])
-        .expect("subscribe execution topic");
+        .assign(&assignment)
+        .expect("assign execution DB ownership partitions");
     // Bounded retry then dead-letter: a poison message must never wedge the
     // partition (was an unbounded seek-and-retry loop).
     let max_retries = env_number("TC_ORDER_PERSIST_MAX_RETRIES", 10u32).max(1);
@@ -1620,18 +1921,18 @@ fn run_execution_mysql_consumer(
         while records.len() < kafka.execution_batch_size && std::time::Instant::now() < deadline {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             match consumer.poll(remaining) {
-                Some(Ok(message)) => {
-                    push_execution_record(
-                        &metrics,
-                        &dlq,
-                        &consumer,
-                        worker,
-                        kafka.async_offset_commits,
-                        &message,
-                        &mut records,
-                    )
+                Some(Ok(message)) => push_execution_record(
+                    &metrics,
+                    &dlq,
+                    &consumer,
+                    worker,
+                    kafka.async_offset_commits,
+                    &message,
+                    &mut records,
+                ),
+                Some(Err(error)) => {
+                    log_warn!("execution-mysql", worker; "event=poll_failed error={error}")
                 }
-                Some(Err(error)) => log_warn!("execution-mysql", worker; "event=poll_failed error={error}"),
                 None => break,
             }
         }
@@ -1660,10 +1961,7 @@ fn run_execution_mysql_consumer(
             }
         }
         if committed {
-            metrics.record_execution_mysql_batch(
-                persist_started.elapsed(),
-                records.len() as u64,
-            );
+            metrics.record_execution_mysql_batch(persist_started.elapsed(), records.len() as u64);
             if let Err(error) =
                 commit_execution_batch(&consumer, &records, kafka.async_offset_commits)
             {
@@ -1780,23 +2078,40 @@ struct ExecutionShardJob {
 #[derive(Clone)]
 struct ExecutionDbForwarder {
     routing: sharding::RouteConfig,
-    shards: Arc<Vec<std::sync::mpsc::SyncSender<ExecutionShardJob>>>,
+    shards: Arc<Vec<Option<std::sync::mpsc::SyncSender<ExecutionShardJob>>>>,
+    owned_dbs: Arc<std::collections::HashSet<u32>>,
 }
 
 impl ExecutionDbForwarder {
     fn spawn(store: OrderStore) -> Self {
         let queue = env_number("TC_MYSQL_SHARD_QUEUE", 64usize).max(1);
         let coalesce_jobs = env_number("TC_MYSQL_SHARD_COALESCE_JOBS", 16usize).max(1);
-        let tx_max_records =
-            env_number("TC_EXECUTION_MYSQL_BATCH_PER_DB", 500usize).max(1);
+        let tx_max_records = env_number("TC_EXECUTION_MYSQL_BATCH_PER_DB", 500usize).max(1);
         let mut shards = Vec::with_capacity(store.routing.db_count as usize);
         for shard_db in 0..store.routing.db_count as u32 {
+            if !store.owns(shard_db) {
+                shards.push(None);
+                continue;
+            }
             let (tx, rx) = std::sync::mpsc::sync_channel::<ExecutionShardJob>(queue);
             let shard_store = store.clone();
             std::thread::Builder::new()
                 .name(format!("execution-db-shard-{shard_db}"))
                 .spawn(move || {
-                    while let Ok(first) = rx.recv() {
+                    loop {
+                        let first = match rx.recv_timeout(Duration::from_millis(250)) {
+                            Ok(first) => first,
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                                if let Err(error) = sweep_pending_execution_shard(
+                                    &shard_store,
+                                    shard_db,
+                                ) {
+                                    log_warn!("execution-db", shard_db; "event=pending_sweep_failed error={error}");
+                                }
+                                continue;
+                            }
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                        };
                         let mut jobs = vec![first];
                         while jobs.len() < coalesce_jobs {
                             let Ok(job) = rx.try_recv() else { break };
@@ -1823,18 +2138,19 @@ impl ExecutionDbForwarder {
                     }
                 })
                 .expect("spawn execution DB shard worker");
-            shards.push(tx);
+            shards.push(Some(tx));
         }
         Self {
             routing: store.routing,
             shards: Arc::new(shards),
+            owned_dbs: store.owned_dbs.clone(),
         }
     }
 
     fn submit(&self, records: &[ExecutionKafkaRecord]) -> Result<(), String> {
         let mut by_db = HashMap::<u32, ExecutionShardTables>::new();
         for record in records {
-            let order_id = record.event.report.order_id.0;
+            let order_id = record.event.target_order_id;
             let route = self.routing.route_order_id(order_id);
             by_db
                 .entry(route.db)
@@ -1842,23 +2158,13 @@ impl ExecutionDbForwarder {
                 .entry(route.table)
                 .or_default()
                 .push((record.clone(), order_id));
-            if record.event.report.type_code == wire::RT_TRADE
-                && record.event.report.aux_id != order_id
-            {
-                let maker_id = record.event.report.aux_id;
-                let maker_route = self.routing.route_order_id(maker_id);
-                by_db
-                    .entry(maker_route.db)
-                    .or_default()
-                    .entry(maker_route.table)
-                    .or_default()
-                    .push((record.clone(), maker_id));
-            }
         }
         let mut replies = Vec::with_capacity(by_db.len());
         for (db, tables) in by_db {
             let (reply, result) = std::sync::mpsc::sync_channel(1);
             self.shards[db as usize]
+                .as_ref()
+                .ok_or_else(|| format!("execution DB {db} is not owned by this worker"))?
                 .send(ExecutionShardJob { tables, reply })
                 .map_err(|_| format!("execution DB shard {db} worker stopped"))?;
             replies.push(result);
@@ -1870,6 +2176,33 @@ impl ExecutionDbForwarder {
         }
         Ok(())
     }
+
+    fn owns(&self, db: u32) -> bool {
+        self.owned_dbs.contains(&db)
+    }
+}
+
+fn sweep_pending_execution_shard(store: &OrderStore, shard_db: u32) -> Result<(), String> {
+    let db = format!("order_db_{shard_db}");
+    let mut conn = store
+        .shard(shard_db)
+        .get_conn()
+        .map_err(|error| error.to_string())?;
+    let tables: Vec<u32> = conn
+        .query(format!(
+            "SELECT DISTINCT shard_table FROM {db}.pending_execution_events LIMIT 100"
+        ))
+        .map_err(|error| error.to_string())?;
+    if tables.is_empty() {
+        return Ok(());
+    }
+    let mut tx = conn
+        .start_transaction(TxOpts::default())
+        .map_err(|error| error.to_string())?;
+    for table in tables {
+        apply_pending_execution_table(&mut tx, &db, table)?;
+    }
+    tx.commit().map_err(|error| error.to_string())
 }
 
 fn persist_execution_shard(
@@ -1885,9 +2218,8 @@ fn persist_execution_shard(
         .map_err(|error| error.to_string())?;
     let mut updates = Vec::new();
     for (shard_table, records) in tables {
-        let table = format!("asset_orders_{shard_table:03}");
         for (record, target_order_id) in records {
-            updates.push((table.clone(), record, target_order_id));
+            updates.push((shard_table, record, target_order_id));
         }
     }
     // Coalescing several consumer jobs is useful for queue efficiency, but it
@@ -1898,122 +2230,90 @@ fn persist_execution_shard(
         let mut tx = conn
             .start_transaction(TxOpts::default())
             .map_err(|error| error.to_string())?;
+        let mut values = Vec::with_capacity(chunk.len() * 10);
+        let mut touched = std::collections::BTreeSet::new();
         for (table, record, target_order_id) in chunk {
-            apply_execution_report(
-                &mut tx,
-                &db,
-                table,
-                record.partition,
-                record.offset,
-                record.event,
-                *target_order_id,
-            )?;
+            touched.insert(*table);
+            let event = record.event;
+            values.extend([
+                Value::from(event.raft_group),
+                Value::from(event.raft_index),
+                Value::from(event.ordinal),
+                Value::from(*target_order_id),
+                Value::from(*table),
+                Value::from(event.report.instrument.0),
+                Value::from(event.report.type_code),
+                Value::from(event.report.qty),
+                Value::from(record.partition),
+                Value::from(record.offset as u64),
+            ]);
+        }
+        exec_multi_insert(
+            &mut tx,
+            &format!("INSERT IGNORE INTO {db}.pending_execution_events (raft_group,raft_index,report_ordinal,target_order_id,shard_table,instrument,report_type,event_qty,kafka_partition,kafka_offset)"),
+            10,
+            values,
+        )
+        .map_err(|error| error.to_string())?;
+        // A Kafka retry can reinsert an already-processed event into pending;
+        // discard it before applying any mutations.
+        tx.query_drop(format!(
+            "DELETE p FROM {db}.pending_execution_events p INNER JOIN {db}.processed_execution_events e ON e.raft_group=p.raft_group AND e.raft_index=p.raft_index AND e.report_ordinal=p.report_ordinal AND e.target_order_id=p.target_order_id"
+        ))
+        .map_err(|error| error.to_string())?;
+        for table in touched {
+            apply_pending_execution_table(&mut tx, &db, table)?;
         }
         tx.commit().map_err(|error| error.to_string())?;
     }
     Ok(())
 }
 
-fn apply_execution_report(
+fn apply_pending_execution_table(
     tx: &mut Transaction<'_>,
     db: &str,
-    table: &str,
-    partition: i32,
-    offset: i64,
-    event: wire::ExecutionEvent,
-    target_order_id: u64,
+    shard_table: u32,
 ) -> Result<(), String> {
-    let report = event.report;
-    if event.raft_index == 0 {
-        tx.exec_drop(
-            format!("INSERT IGNORE INTO {db}.processed_executions (kafka_partition,kafka_offset,instrument) VALUES (:partition,:offset,:instrument)"),
-            params! {
-                "partition" => partition,
-                "offset" => offset as u64,
-                "instrument" => report.instrument.0,
-            },
-        )
-        .map_err(|error| error.to_string())?;
-    } else {
-        tx.exec_drop(
-            format!("INSERT IGNORE INTO {db}.processed_execution_events (raft_group,raft_index,report_ordinal,instrument,order_id,report_type,kafka_partition,kafka_offset) VALUES (:raft_group,:raft_index,:ordinal,:instrument,:order_id,:report_type,:partition,:offset)"),
-            params! {
-                "raft_group" => event.raft_group,
-                "raft_index" => event.raft_index,
-                "ordinal" => event.ordinal,
-                "instrument" => report.instrument.0,
-                "order_id" => target_order_id,
-                "report_type" => report.type_code,
-                "partition" => partition,
-                "offset" => offset as u64,
-            },
-        )
-        .map_err(|error| error.to_string())?;
-    }
-    if tx.affected_rows() == 0 {
-        return Ok(());
-    }
-    match report.type_code {
-        wire::RT_TRADE => {
-            tx.exec_drop(
-                format!("UPDATE {db}.{table} SET status=IF(LEAST(qty,filled_qty+:fill)>=qty,'FILLED','PARTIAL'), filled_qty=LEAST(qty,filled_qty+:fill) WHERE order_id=:id"),
-                params! {"fill" => report.qty, "id" => target_order_id},
-            )
-            .map_err(|error| error.to_string())?;
-        }
-        wire::RT_FILLED => {
-            tx.exec_drop(
-                format!(
-                    "UPDATE {db}.{table} SET status='FILLED',filled_qty=qty WHERE order_id=:id"
-                ),
-                params! {"id" => report.order_id.0},
-            )
-            .map_err(|error| error.to_string())?;
-        }
-        wire::RT_PARTIAL => update_execution_status(
-            tx,
-            db,
-            table,
-            report.order_id.0,
-            "PARTIAL",
-            Some(report.qty),
-        )?,
-        wire::RT_RESTING | wire::RT_ACCEPTED => {
-            update_execution_status(tx, db, table, report.order_id.0, "OPEN", None)?
-        }
-        wire::RT_CANCELLED => {
-            update_execution_status(tx, db, table, report.order_id.0, "CANCELLED", None)?
-        }
-        wire::RT_REJECTED => {
-            update_execution_status(tx, db, table, report.order_id.0, "REJECTED", None)?
-        }
-        wire::RT_MODIFIED => {
-            update_execution_status(tx, db, table, report.order_id.0, "OPEN", None)?
-        }
-        _ => {}
-    }
+    let table = format!("asset_orders_{shard_table:03}");
+    // MySQL 8 window functions select the last event per order while the
+    // aggregate folds all trades into one set-based row mutation.
+    tx.query_drop(format!(
+        "UPDATE {db}.{table} o INNER JOIN (\
+         SELECT target_order_id,\
+                SUM(IF(report_type={trade},event_qty,0)) trade_qty,\
+                MAX(IF(report_type={partial},event_qty,0)) partial_qty,\
+                MAX(IF(report_type={filled},1,0)) has_filled,\
+                MAX(IF(rn=1,report_type,0)) latest_type\
+         FROM (\
+           SELECT p.*, ROW_NUMBER() OVER (PARTITION BY target_order_id ORDER BY raft_index DESC,report_ordinal DESC) rn\
+           FROM {db}.pending_execution_events p WHERE shard_table={shard_table}\
+         ) ranked GROUP BY target_order_id\
+         ) e ON e.target_order_id=o.order_id\
+         SET o.status=CASE\
+               WHEN e.has_filled=1 OR GREATEST(o.filled_qty+e.trade_qty,e.partial_qty)>=o.qty THEN 'FILLED'\
+               WHEN e.latest_type={cancelled} THEN 'CANCELLED'\
+               WHEN e.latest_type={rejected} THEN 'REJECTED'\
+               WHEN GREATEST(o.filled_qty+e.trade_qty,e.partial_qty)>0 THEN 'PARTIAL'\
+               ELSE 'OPEN' END,\
+             o.filled_qty=LEAST(o.qty,GREATEST(o.filled_qty+e.trade_qty,e.partial_qty,IF(e.has_filled=1,o.qty,0)))",
+        trade = wire::RT_TRADE,
+        partial = wire::RT_PARTIAL,
+        filled = wire::RT_FILLED,
+        cancelled = wire::RT_CANCELLED,
+        rejected = wire::RT_REJECTED,
+    ))
+    .map_err(|error| error.to_string())?;
+    tx.query_drop(format!(
+        "INSERT IGNORE INTO {db}.processed_execution_events (raft_group,raft_index,report_ordinal,target_order_id,shard_table,instrument,report_type,kafka_partition,kafka_offset) \
+         SELECT p.raft_group,p.raft_index,p.report_ordinal,p.target_order_id,p.shard_table,p.instrument,p.report_type,p.kafka_partition,p.kafka_offset \
+         FROM {db}.pending_execution_events p INNER JOIN {db}.{table} o ON o.order_id=p.target_order_id WHERE p.shard_table={shard_table}"
+    ))
+    .map_err(|error| error.to_string())?;
+    tx.query_drop(format!(
+        "DELETE p FROM {db}.pending_execution_events p INNER JOIN {db}.processed_execution_events e ON e.raft_group=p.raft_group AND e.raft_index=p.raft_index AND e.report_ordinal=p.report_ordinal AND e.target_order_id=p.target_order_id WHERE p.shard_table={shard_table}"
+    ))
+    .map_err(|error| error.to_string())?;
     Ok(())
-}
-
-fn update_execution_status(
-    tx: &mut Transaction<'_>,
-    db: &str,
-    table: &str,
-    order_id: u64,
-    status: &str,
-    filled: Option<u64>,
-) -> Result<(), String> {
-    match filled {
-        Some(filled) => tx.exec_drop(
-            format!("UPDATE {db}.{table} SET status=:status,filled_qty=GREATEST(filled_qty,:filled) WHERE order_id=:id"),
-            params! {"status" => status, "filled" => filled, "id" => order_id},
-        ),
-        None => tx.exec_drop(
-            format!("UPDATE {db}.{table} SET status=:status WHERE order_id=:id"),
-            params! {"status" => status, "id" => order_id},
-        ),
-    }
-    .map_err(|error| error.to_string())
 }
 
 /// One MySQL URL per physical database. An explicit `TC_ORDER_MYSQL_SHARD_URLS`
@@ -2054,11 +2354,16 @@ fn open_when_ready(
     shard_urls: &[String],
     routing: sharding::RouteConfig,
     metrics: Arc<OrderPipelineMetrics>,
+    owned_dbs: Arc<std::collections::HashSet<u32>>,
 ) -> OrderStore {
     loop {
         let opened = (|| -> mysql::Result<OrderStore> {
             let mut shards = Vec::with_capacity(shard_urls.len());
             for (idx, url) in shard_urls.iter().enumerate() {
+                if !owned_dbs.contains(&(idx as u32)) {
+                    shards.push(None);
+                    continue;
+                }
                 // Probe each shard eagerly so a bad shard is named in the
                 // startup warning (Pool::new is lazy; without this the retry
                 // loop reports bare auth/DNS errors with no shard context).
@@ -2066,14 +2371,17 @@ fn open_when_ready(
                     .map_err(|e| mysql::Error::from(io_shard_error(idx, &e)))?;
                 pool.get_conn()
                     .map_err(|e| mysql::Error::from(io_shard_error(idx, &e)))?;
-                shards.push(pool);
+                shards.push(Some(pool));
             }
             let store = OrderStore {
                 shards: Arc::new(shards),
+                owned_dbs: owned_dbs.clone(),
                 routing,
                 metrics: metrics.clone(),
             };
-            bootstrap(&store)?;
+            if env_enabled("TC_MYSQL_BOOTSTRAP_SCHEMA", true) {
+                bootstrap(&store)?;
+            }
             Ok(store)
         })();
         match opened {
@@ -2084,6 +2392,43 @@ fn open_when_ready(
             }
         }
     }
+}
+
+fn parse_owned_dbs(db_count: u32) -> Result<std::collections::HashSet<u32>, String> {
+    let Some(spec) = std::env::var("TC_MYSQL_OWNED_DBS").ok() else {
+        return Ok((0..db_count).collect());
+    };
+    let mut owned = std::collections::HashSet::new();
+    for token in spec
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if let Some((start, end)) = token.split_once('-') {
+            let start: u32 = start
+                .parse()
+                .map_err(|_| format!("invalid DB range {token}"))?;
+            let end: u32 = end
+                .parse()
+                .map_err(|_| format!("invalid DB range {token}"))?;
+            if start > end {
+                return Err(format!("invalid descending DB range {token}"));
+            }
+            owned.extend(start..=end);
+        } else {
+            owned.insert(
+                token
+                    .parse()
+                    .map_err(|_| format!("invalid DB id {token}"))?,
+            );
+        }
+    }
+    if owned.is_empty() || owned.iter().any(|db| *db >= db_count) {
+        return Err(format!(
+            "TC_MYSQL_OWNED_DBS must select DB ids in 0..{db_count}"
+        ));
+    }
+    Ok(owned)
 }
 
 /// Wrap a shard connection error with the shard index (never the URL — it
@@ -2108,10 +2453,7 @@ fn is_leader(metrics_addr: &str) -> bool {
     let Ok(mut stream) = TcpStream::connect(metrics_addr) else {
         return false;
     };
-    let timeout = Duration::from_millis(env_number(
-        "TC_RAFT_LEADER_PROBE_TIMEOUT_MS",
-        1_000u64,
-    ));
+    let timeout = Duration::from_millis(env_number("TC_RAFT_LEADER_PROBE_TIMEOUT_MS", 1_000u64));
     let _ = stream.set_read_timeout(Some(timeout));
     let _ = stream.set_write_timeout(Some(timeout));
     let _ = stream.write_all(b"GET /metrics HTTP/1.1\r\nHost: raft\r\nConnection: close\r\n\r\n");
@@ -2156,10 +2498,8 @@ impl MatcherConnection {
                 continue;
             };
             stream.set_nodelay(true)?;
-            let timeout = Duration::from_millis(env_number(
-                "TC_RAFT_MATCHER_IO_TIMEOUT_MS",
-                5_000u64,
-            ));
+            let timeout =
+                Duration::from_millis(env_number("TC_RAFT_MATCHER_IO_TIMEOUT_MS", 5_000u64));
             stream.set_read_timeout(Some(timeout))?;
             stream.set_write_timeout(Some(timeout))?;
             self.stream = Some(stream);
@@ -2343,6 +2683,56 @@ fn handle(
             }
             continue;
         }
+        if method == "POST" && path.starts_with("/admin/routes/") {
+            let category = required::<u32>(query, "category");
+            let result: Result<String, String> = category.and_then(|category| match path {
+                "/admin/routes/begin" => kafka
+                    .route_control
+                    .begin(category, required::<usize>(query, "to_group")?)
+                    .map(|migration| {
+                        format!(
+                            "{{\"accepted\":true,\"route_version\":{},\"state\":\"FREEZING\"}}",
+                            migration.route_version
+                        )
+                    }),
+                "/admin/routes/frozen" => kafka
+                    .route_control
+                    .frozen(category, required::<u64>(query, "raft_index")?)
+                    .map(|_| "{\"accepted\":true,\"state\":\"CATCHING_UP\"}".into()),
+                "/admin/routes/caught-up" => kafka
+                    .route_control
+                    .caught_up(
+                        category,
+                        required::<u64>(query, "raft_index")?,
+                        required::<u64>(query, "source_fingerprint")?,
+                        required::<u64>(query, "target_fingerprint")?,
+                    )
+                    .map(|_| "{\"accepted\":true,\"state\":\"VERIFIED\"}".into()),
+                "/admin/routes/activate" => kafka.route_control.activate(category).map(|version| {
+                    format!(
+                        "{{\"accepted\":true,\"route_version\":{version},\"state\":\"ACTIVE\"}}"
+                    )
+                }),
+                "/admin/routes/abort" => Ok(format!(
+                    "{{\"accepted\":{},\"state\":\"ABORTED\"}}",
+                    kafka.route_control.abort(category)
+                )),
+                _ => Err("unknown route migration action".into()),
+            });
+            match result {
+                Ok(body) => respond(reader.get_mut(), "200 OK", &body, keep_alive),
+                Err(error) => respond(
+                    reader.get_mut(),
+                    "409 Conflict",
+                    &format!("{{\"error\":\"{error}\"}}"),
+                    keep_alive,
+                ),
+            }
+            if !keep_alive {
+                return;
+            }
+            continue;
+        }
         if !ingress_enabled && method == "POST" {
             respond(
                 reader.get_mut(),
@@ -2386,7 +2776,10 @@ fn handle(
                     }
                 },
                 Err(error) => {
-                    log_warn!("order-api", "event=batch_rejected status=\"400 Bad Request\" error={error}");
+                    log_warn!(
+                        "order-api",
+                        "event=batch_rejected status=\"400 Bad Request\" error={error}"
+                    );
                     respond(
                         reader.get_mut(),
                         "400 Bad Request",
@@ -2483,20 +2876,19 @@ fn main() {
     // every replica to open a pool to every shard creates O(processes*shards)
     // connections and repeats all bootstrap DDL, defeating horizontal scaling.
     let needs_mysql = role_needs_mysql(kafka.db_consumers, kafka.execution_consumers);
+    let owned_dbs = Arc::new(
+        parse_owned_dbs(routing.db_count as u32)
+            .unwrap_or_else(|error| panic!("invalid MySQL ownership: {error}")),
+    );
     let store = needs_mysql.then(|| {
         let shard_urls = parse_shard_urls(routing.db_count as usize);
         if let Err(error) = validate_shard_urls(&shard_urls, routing.db_count as usize) {
             panic!("shard routing mismatch: {error}");
         }
-        open_when_ready(&shard_urls, routing, metrics.clone())
+        open_when_ready(&shard_urls, routing, metrics.clone(), owned_dbs.clone())
     });
     let command_db_forwarder = (kafka.db_consumers > 0).then(|| {
-        CommandDbForwarder::spawn(
-            store
-                .as_ref()
-                .expect("DB consumers require MySQL")
-                .clone(),
-        )
+        CommandDbForwarder::spawn(store.as_ref().expect("DB consumers require MySQL").clone())
     });
     let execution_db_forwarder = (kafka.execution_consumers > 0).then(|| {
         ExecutionDbForwarder::spawn(
@@ -2510,19 +2902,22 @@ fn main() {
     let ingress_enabled = env_enabled("TC_ORDER_HTTP_INGRESS_ENABLED", true);
     let raft_forwarder = (kafka.matcher_consumers > 0)
         .then(|| RaftForwarder::spawn(matcher_groups, kafka.backpressure.clone()));
-    let dlq_path = std::env::var("TC_ORDER_DLQ_PATH")
-        .unwrap_or_else(|_| "order-execution-dlq.wal".into());
+    let dlq_path =
+        std::env::var("TC_ORDER_DLQ_PATH").unwrap_or_else(|_| "order-execution-dlq.wal".into());
     let dlq = Arc::new(Mutex::new(
         DlqWriter::open(Path::new(&dlq_path)).expect("open execution DLQ file"),
     ));
     log_info!(
         "order-api",
-        "category_size={} db_count={} tables_per_db={} route_version={} raft_groups={} db_consumers={} matcher_consumers={} execution_consumers={} max_pipeline_backlog={} bp_soft={} bp_hard={} bp_emergency={} dlq={} db_group={} matcher_group={} execution_group={} kafka=true",
+        "category_size={} db_count={} tables_per_db={} virtual_dbs={} virtual_tables={} route_version={} raft_groups={} db_router_consumers={} db_consumers={} matcher_consumers={} execution_consumers={} max_pipeline_backlog={} bp_soft={} bp_hard={} bp_emergency={} dlq={} db_group={} matcher_group={} execution_group={} kafka=true",
         category_size,
         routing.db_count,
         routing.tables_per_db,
+        routing.virtual_db_count,
+        routing.virtual_table_count,
         routing.route_version,
         matcher_group_count,
+        kafka.db_router_consumers,
         kafka.db_consumers,
         kafka.matcher_consumers,
         kafka.execution_consumers,
@@ -2547,25 +2942,35 @@ fn main() {
                 .expect("spawn Kafka lag monitor");
         }
     }
+    for worker in 0..kafka.db_router_consumers {
+        let router_kafka = kafka.clone();
+        let group_id = kafka.db_router_group.clone();
+        std::thread::Builder::new()
+            .name(format!("order-kafka-db-route-{worker}"))
+            .spawn(move || {
+                let process_kafka = router_kafka.clone();
+                run_kafka_stage(
+                    router_kafka,
+                    category_size,
+                    group_id,
+                    "db-route",
+                    worker,
+                    move |batch| route_command_db_batch(&process_kafka, routing, batch),
+                )
+            })
+            .expect("spawn command DB route consumer");
+    }
     for worker in 0..kafka.db_consumers {
         let consumer_forwarder = command_db_forwarder
             .as_ref()
             .expect("DB consumers require shard forwarder")
             .clone();
         let consumer_kafka = kafka.clone();
-        let group_id = kafka.db_group.clone();
         let category_size = category_size;
         std::thread::Builder::new()
             .name(format!("order-kafka-mysql-{worker}"))
             .spawn(move || {
-                run_kafka_stage(
-                    consumer_kafka,
-                    category_size,
-                    group_id,
-                    "mysql",
-                    worker,
-                    move |batch| consumer_forwarder.submit(routing, batch),
-                )
+                run_db_kafka_stage(consumer_kafka, category_size, worker, consumer_forwarder)
             })
             .expect("spawn Kafka MySQL projection consumer");
     }
@@ -2578,7 +2983,7 @@ fn main() {
             .expect("matcher consumers require Raft forwarder")
             .clone();
         let consumer_store_metrics = metrics.clone();
-        let raft_group_pins = kafka.raft_group_pins.clone();
+        let route_control = kafka.route_control.clone();
         std::thread::Builder::new()
             .name(format!("order-kafka-match-{worker}"))
             .spawn(move || {
@@ -2590,11 +2995,7 @@ fn main() {
                     worker,
                     move |batch| {
                         let started = std::time::Instant::now();
-                        let result = forward_kafka_batch(
-                            &worker_forwarder,
-                            batch,
-                            &raft_group_pins,
-                        );
+                        let result = forward_kafka_batch(&worker_forwarder, batch, &route_control);
                         consumer_store_metrics.record_raft(started.elapsed());
                         result
                     },
@@ -2635,7 +3036,10 @@ fn main() {
     let shared_kafka = Arc::new(kafka);
     loop {
         if SHUTDOWN.load(AtomicOrdering::SeqCst) {
-            log_info!("order-api", "shutdown signal received, no longer accepting connections");
+            log_info!(
+                "order-api",
+                "shutdown signal received, no longer accepting connections"
+            );
             break;
         }
         match listener.accept() {
@@ -2668,6 +3072,88 @@ fn main() {
 mod tests {
     use super::*;
 
+    fn mysql_test_store() -> Option<OrderStore> {
+        let url = std::env::var("TC_TEST_MYSQL_URL").ok()?;
+        let routing = sharding::RouteConfig::with_virtual(1, 8, 1_000, 10_000, 1);
+        let pool = Pool::new(url.as_str()).expect("open isolated MySQL 8 test server");
+        pool.get_conn()
+            .expect("connect isolated MySQL 8 test server");
+        let store = OrderStore {
+            shards: Arc::new(vec![Some(pool)]),
+            owned_dbs: Arc::new([0u32].into_iter().collect()),
+            routing,
+            metrics: Arc::new(OrderPipelineMetrics::default()),
+        };
+        bootstrap(&store).expect("bootstrap isolated MySQL test schema");
+        Some(store)
+    }
+
+    fn kafka_new(order_id: u64, user: u64, instrument: u32, qty: u64, offset: i64) -> KafkaRecord {
+        let order = Order::limit(OrderId(order_id), Side::Buy, 1_000, qty)
+            .on(InstrumentId(instrument))
+            .by(user);
+        let mut frame = [0u8; wire::MSG_LEN];
+        wire::encode_new(&order, &mut frame);
+        KafkaRecord {
+            topic: "mysql-it".into(),
+            partition: 0,
+            offset,
+            category_id: sharding::asset_category(InstrumentId(instrument), 1_000),
+            user,
+            frame,
+        }
+    }
+
+    fn trade_event(
+        target_order_id: u64,
+        other_order_id: u64,
+        instrument: u32,
+        qty: u64,
+        raft_index: u64,
+        ordinal: u32,
+        offset: i64,
+    ) -> ExecutionKafkaRecord {
+        ExecutionKafkaRecord {
+            topic: "execution-it".into(),
+            partition: 0,
+            offset,
+            event: wire::ExecutionEvent {
+                raft_group: 7,
+                raft_index,
+                ordinal,
+                target_order_id,
+                report: wire::DecodedReport {
+                    type_code: wire::RT_TRADE,
+                    maker_fee: 0,
+                    taker_fee: 0,
+                    instrument: InstrumentId(instrument),
+                    order_id: OrderId(target_order_id),
+                    aux_id: other_order_id,
+                    price: 1_000,
+                    qty,
+                    side: Side::Buy,
+                },
+            },
+        }
+    }
+
+    fn persist_events(
+        store: &OrderStore,
+        records: Vec<ExecutionKafkaRecord>,
+    ) -> Result<(), String> {
+        let mut tables = ExecutionShardTables::new();
+        for record in records {
+            let target = record.event.target_order_id;
+            let route = store.routing.route_order_id(target);
+            assert_eq!(route.db, 0);
+            tables
+                .entry(route.table)
+                .or_default()
+                .push((record, target));
+        }
+        persist_execution_shard(store, 0, tables, 500)
+    }
+
     fn batch_order(user: u64, instrument: u32) -> Vec<u8> {
         batch_order_with_id(user, instrument, 99)
     }
@@ -2688,6 +3174,98 @@ mod tests {
         assert_eq!(execution_consumer_batch_size(100, 10), 1_000);
         assert_eq!(execution_consumer_batch_size(500, 10), 5_000);
         assert_eq!(execution_consumer_batch_size(0, 0), 1);
+    }
+
+    /// Run explicitly against a disposable MySQL 8 instance:
+    /// `TC_TEST_MYSQL_URL=mysql://root:test@127.0.0.1:33306/mysql cargo test
+    ///  --bin order-api mysql8_projection_is_race_safe_and_idempotent -- --ignored`
+    #[test]
+    #[ignore = "requires disposable MySQL 8 via TC_TEST_MYSQL_URL"]
+    fn mysql8_projection_is_race_safe_and_idempotent() {
+        let store = mysql_test_store().expect("TC_TEST_MYSQL_URL must be set");
+        let seed = (std::process::id() as u64) << 32 | journal::now_nanos() as u64 & 0xffff_ffff;
+        let taker = seed | 1;
+        let maker = seed | 2;
+        let raced = seed | 3;
+        let user = 55_001;
+        let instrument = 42_001;
+
+        // Result-before-order: staging remains durable, then the command-side
+        // transaction drains it as soon as the order row becomes visible.
+        persist_events(
+            &store,
+            vec![trade_event(taker, maker, instrument, 3, seed, 0, 1)],
+        )
+        .unwrap();
+        persist_mysql_shard(&store, 0, &[kafka_new(taker, user, instrument, 10, 1)]).unwrap();
+
+        // One Trade has two independently keyed target events. The idempotency
+        // key includes target_order_id, so maker and taker cannot collapse.
+        persist_mysql_shard(&store, 0, &[kafka_new(maker, user + 1, instrument, 10, 2)]).unwrap();
+        let dual = vec![
+            trade_event(taker, maker, instrument, 2, seed + 1, 0, 2),
+            trade_event(maker, taker, instrument, 2, seed + 1, 0, 3),
+        ];
+        persist_events(&store, dual.clone()).unwrap();
+        persist_events(&store, dual).unwrap(); // Kafka replay must not double-fill.
+
+        // Deliberately race the command and execution transactions. Whichever
+        // commits first, either the command drain, execution UPDATE, or sweeper
+        // must converge to the same projection.
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let command_store = store.clone();
+        let command_barrier = barrier.clone();
+        let command = std::thread::spawn(move || {
+            command_barrier.wait();
+            persist_mysql_shard(
+                &command_store,
+                0,
+                &[kafka_new(raced, user + 2, instrument, 5, 4)],
+            )
+        });
+        let execution_store = store.clone();
+        let execution = std::thread::spawn(move || {
+            barrier.wait();
+            persist_events(
+                &execution_store,
+                vec![trade_event(raced, maker, instrument, 5, seed + 2, 0, 4)],
+            )
+        });
+        command.join().unwrap().unwrap();
+        execution.join().unwrap().unwrap();
+        sweep_pending_execution_shard(&store, 0).unwrap();
+
+        let mut conn = store.shard(0).get_conn().unwrap();
+        for (order_id, expected_fill, expected_status) in [
+            (taker, 5u64, "PARTIAL"),
+            (maker, 2u64, "PARTIAL"),
+            (raced, 5u64, "FILLED"),
+        ] {
+            let route = store.routing.route_order_id(order_id);
+            let row: Option<(u64, String)> = conn
+                .exec_first(
+                    format!(
+                        "SELECT filled_qty,status FROM order_db_0.{} WHERE order_id=:id",
+                        route.table_name()
+                    ),
+                    params! {"id" => order_id},
+                )
+                .unwrap();
+            assert_eq!(row, Some((expected_fill, expected_status.into())));
+        }
+        let targets: u64 = conn
+            .exec_first(
+                "SELECT COUNT(*) FROM order_db_0.processed_execution_events WHERE raft_group=7 AND raft_index=:idx AND report_ordinal=0",
+                params! {"idx" => seed + 1},
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(targets, 2, "maker and taker use distinct idempotency keys");
+        let pending: u64 = conn
+            .query_first("SELECT COUNT(*) FROM order_db_0.pending_execution_events")
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending, 0);
     }
 
     #[test]
@@ -2755,7 +3333,13 @@ mod tests {
         );
     }
 
-    fn test_backpressure(soft: u64, hard: u64, emergency: u64, partitions: usize, groups: usize) -> Backpressure {
+    fn test_backpressure(
+        soft: u64,
+        hard: u64,
+        emergency: u64,
+        partitions: usize,
+        groups: usize,
+    ) -> Backpressure {
         Backpressure {
             soft,
             hard,
@@ -2802,7 +3386,7 @@ mod tests {
         assert_eq!(bp.tier_for_category(0), BackpressureTier::Hard);
         assert_eq!(bp.tier_for_category(1), BackpressureTier::Normal);
         assert_eq!(bp.tier_for_category(4), BackpressureTier::Hard); // 4 -> partition 0
-        // Match-group lag on partition 1 dominates via max().
+                                                                     // Match-group lag on partition 1 dominates via max().
         bp.set_partition_lags("match", &[0, 800, 0, 0]);
         assert_eq!(bp.tier_for_category(1), BackpressureTier::Emergency);
         // Drain both groups -> everything recovers to normal.
@@ -2879,10 +3463,7 @@ mod tests {
     fn dlq_temp_path(tag: &str) -> std::path::PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
-        std::env::temp_dir().join(format!(
-            "tc-dlq-{}-{tag}-{n}.wal",
-            std::process::id()
-        ))
+        std::env::temp_dir().join(format!("tc-dlq-{}-{tag}-{n}.wal", std::process::id()))
     }
 
     fn read_dlq(path: &Path) -> Vec<(i32, i64, String, Vec<u8>)> {
@@ -2939,7 +3520,11 @@ mod tests {
         );
 
         assert_eq!(outcome, PersistOutcome::DeadLettered);
-        assert_eq!(attempts.load(AtomicOrdering::Relaxed), 3, "tries up to the retry cap");
+        assert_eq!(
+            attempts.load(AtomicOrdering::Relaxed),
+            3,
+            "tries up to the retry cap"
+        );
         assert_eq!(metrics.dlq_total.load(AtomicOrdering::Relaxed), 1);
 
         let records = read_dlq(&path);

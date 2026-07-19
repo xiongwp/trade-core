@@ -1,5 +1,5 @@
-//! Order-system database sharding: **10 databases × 100 tables** by asset
-//! category.
+//! Order-system database sharding: a stable virtual consistent-hash space
+//! mapped onto physical MySQL databases and tables.
 //!
 //! Orders for one category stay together so Kafka partition order, the MySQL
 //! projection and the matching route all share the same ownership boundary.
@@ -21,6 +21,10 @@ pub const DB_COUNT: u64 = 10;
 pub const TABLES_PER_DB: u64 = 100;
 /// Total shard slots for the default configuration.
 pub const SLOTS: u64 = DB_COUNT * TABLES_PER_DB;
+/// Stable logical database buckets. These do not represent MySQL instances.
+pub const VIRTUAL_DB_COUNT: u64 = 1_000;
+/// Stable logical table buckets across all virtual databases.
+pub const VIRTUAL_TABLE_COUNT: u64 = 10_000;
 /// Default number of instruments in one ordering category. With the default,
 /// instruments 1..=1000 share one ordered stream, 1001..=2000 the next, etc.
 pub const DEFAULT_ASSET_CATEGORY_SIZE: u32 = 1_000;
@@ -48,6 +52,10 @@ pub struct RouteConfig {
     pub db_count: u64,
     /// Tables per database. Same migration caveat as `db_count`.
     pub tables_per_db: u64,
+    /// Stable logical database buckets used before physical placement.
+    pub virtual_db_count: u64,
+    /// Stable logical table buckets used before physical placement.
+    pub virtual_table_count: u64,
     /// Version this parameter set belongs to; part of the routing record so a
     /// parameter change is a fenced, versioned migration.
     pub route_version: u32,
@@ -58,6 +66,8 @@ impl Default for RouteConfig {
         Self {
             db_count: DB_COUNT,
             tables_per_db: TABLES_PER_DB,
+            virtual_db_count: VIRTUAL_DB_COUNT,
+            virtual_table_count: VIRTUAL_TABLE_COUNT,
             route_version: DEFAULT_ROUTE_VERSION,
         }
     }
@@ -67,11 +77,40 @@ impl RouteConfig {
     /// Build an explicit routing record. Panics on zero parameters — a shard
     /// map with no databases or no tables cannot route anything.
     pub fn new(db_count: u64, tables_per_db: u64, route_version: u32) -> Self {
+        Self::with_virtual(
+            db_count,
+            tables_per_db,
+            VIRTUAL_DB_COUNT,
+            VIRTUAL_TABLE_COUNT,
+            route_version,
+        )
+    }
+
+    pub fn with_virtual(
+        db_count: u64,
+        tables_per_db: u64,
+        virtual_db_count: u64,
+        virtual_table_count: u64,
+        route_version: u32,
+    ) -> Self {
         assert!(db_count > 0, "at least one physical database is required");
-        assert!(tables_per_db > 0, "at least one table per database is required");
+        assert!(
+            tables_per_db > 0,
+            "at least one table per database is required"
+        );
+        assert!(
+            virtual_db_count > 0,
+            "at least one virtual database is required"
+        );
+        assert!(
+            virtual_table_count >= virtual_db_count && virtual_table_count % virtual_db_count == 0,
+            "virtual table count must be a multiple of virtual database count"
+        );
         Self {
             db_count,
             tables_per_db,
+            virtual_db_count,
+            virtual_table_count,
             route_version,
         }
     }
@@ -83,11 +122,19 @@ impl RouteConfig {
     pub fn from_env() -> Self {
         let db_count = env_u64("TC_DB_COUNT").unwrap_or(DB_COUNT);
         let tables_per_db = env_u64("TC_TABLES_PER_DB").unwrap_or(TABLES_PER_DB);
+        let virtual_db_count = env_u64("TC_VIRTUAL_DB_COUNT").unwrap_or(VIRTUAL_DB_COUNT);
+        let virtual_table_count = env_u64("TC_VIRTUAL_TABLE_COUNT").unwrap_or(VIRTUAL_TABLE_COUNT);
         let route_version = std::env::var("TC_SHARD_ROUTE_VERSION")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(DEFAULT_ROUTE_VERSION);
-        Self::new(db_count, tables_per_db, route_version)
+        Self::with_virtual(
+            db_count,
+            tables_per_db,
+            virtual_db_count,
+            virtual_table_count,
+            route_version,
+        )
     }
 
     /// Total shard slots (`db_count * tables_per_db`).
@@ -109,7 +156,55 @@ impl RouteConfig {
     /// deliberately not part of database placement.
     #[inline]
     pub fn route_order_id(&self, order_id: u64) -> ShardRoute {
-        self.route_slot(order_id % self.slots())
+        self.route_order_id_full(order_id).physical
+    }
+
+    /// Resolve the stable virtual buckets and their current physical
+    /// placement. Jump consistent hash moves only about `1/(N+1)` keys when a
+    /// physical bucket is added, unlike modulo routing which remaps nearly all
+    /// rows. The virtual 1000/10000 space remains fixed across expansions.
+    #[inline]
+    pub fn route_order_id_full(&self, order_id: u64) -> ConsistentRoute {
+        let primary = mix64(order_id);
+        let virtual_db = jump_consistent_hash(primary, self.virtual_db_count as u32);
+        let virtual_tables_per_db = self.virtual_table_count / self.virtual_db_count;
+        let virtual_table_local = jump_consistent_hash(
+            mix64(primary ^ 0x9e37_79b9_7f4a_7c15),
+            virtual_tables_per_db as u32,
+        );
+        let virtual_table = virtual_db as u64 * virtual_tables_per_db + virtual_table_local as u64;
+        let db = jump_consistent_hash(
+            mix64(virtual_db as u64 ^ 0xa076_1d64_78bd_642f),
+            self.db_count as u32,
+        );
+        // A second independent jump hash places rows inside the selected
+        // physical database. Hashing the order key (rather than only ten child
+        // virtual tables) keeps all 100 physical tables evenly loaded while
+        // retaining minimal movement when table capacity is expanded.
+        let table = jump_consistent_hash(
+            mix64(primary ^ virtual_table ^ 0xe703_7ed1_a0b4_28db),
+            self.tables_per_db as u32,
+        );
+        ConsistentRoute {
+            virtual_db,
+            virtual_table: virtual_table as u32,
+            physical: ShardRoute { db, table },
+        }
+    }
+
+    /// Partition an order-targeted execution event so every partition belongs
+    /// to exactly one physical DB (`partition % db_count == db`). Multiple
+    /// lanes per DB preserve parallelism without reintroducing cross-DB work.
+    #[inline]
+    pub fn execution_partition(&self, order_id: u64, partition_count: u32) -> u32 {
+        assert!(
+            partition_count >= self.db_count as u32,
+            "execution partition count must cover every physical DB"
+        );
+        let route = self.route_order_id_full(order_id);
+        let lanes = (partition_count as u64 / self.db_count).max(1);
+        let lane = route.virtual_table as u64 % lanes;
+        (route.physical.db as u64 + lane * self.db_count) as u32
     }
 
     #[inline]
@@ -134,6 +229,39 @@ impl RouteConfig {
             })
         })
     }
+}
+
+/// Full logical and physical location of one order.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ConsistentRoute {
+    pub virtual_db: u32,
+    pub virtual_table: u32,
+    pub physical: ShardRoute,
+}
+
+/// SplitMix64 finalizer: deterministic, fast and sufficiently avalanche-like
+/// for distributing sequential Leaf order ids before consistent hashing.
+#[inline]
+pub fn mix64(mut value: u64) -> u64 {
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+/// Google's jump consistent hash, expressed without floating point so every
+/// architecture produces exactly the same route.
+#[inline]
+pub fn jump_consistent_hash(key: u64, buckets: u32) -> u32 {
+    assert!(buckets > 0, "consistent hash needs at least one bucket");
+    let mut key = key;
+    let mut current: i64 = -1;
+    let mut next: i64 = 0;
+    while next < buckets as i64 {
+        current = next;
+        key = key.wrapping_mul(2_862_933_555_777_941_757).wrapping_add(1);
+        next = (((current + 1) as u128 * (1u128 << 31)) / (((key >> 33) + 1) as u128)) as i64;
+    }
+    current as u32
 }
 
 fn env_u64(name: &str) -> Option<u64> {
@@ -302,8 +430,14 @@ mod tests {
             let slot = route.table as usize * cfg.db_count as usize + route.db as usize;
             slots[slot] += 1;
         }
-        assert!(slots.iter().all(|count| *count == 100));
-        assert_eq!(cfg.route_order_id(42), cfg.route_order_id(1_042));
+        let min = *slots.iter().min().unwrap();
+        let max = *slots.iter().max().unwrap();
+        assert!(min > 50, "minimum physical slot load {min}");
+        assert!(max < 170, "maximum physical slot load {max}");
+        assert_eq!(cfg.route_order_id(42), cfg.route_order_id(42));
+        let full = cfg.route_order_id_full(42);
+        assert!(full.virtual_db < VIRTUAL_DB_COUNT as u32);
+        assert!(full.virtual_table < VIRTUAL_TABLE_COUNT as u32);
     }
 
     #[test]
@@ -323,14 +457,37 @@ mod tests {
 
     #[test]
     fn different_db_count_reshards_slots_as_expected() {
-        // 100-database record spreads the first 100 categories one-per-db.
-        let cfg = RouteConfig::new(100, 100, 2);
-        let mut seen = std::collections::HashSet::new();
-        for category in 0..100u32 {
-            assert!(seen.insert(cfg.route_category(category).db));
+        let before = RouteConfig::new(10, 100, 1);
+        let after = RouteConfig::new(11, 100, 2);
+        let moved = (1..=100_000u64)
+            .filter(|order_id| {
+                before.route_order_id(*order_id).db != after.route_order_id(*order_id).db
+            })
+            .count();
+        // Adding one physical DB should move roughly 1/11 of virtual buckets,
+        // not remap nearly every order as modulo routing would.
+        assert!((7_000..=12_000).contains(&moved), "moved={moved}");
+    }
+
+    #[test]
+    fn default_virtual_space_is_1000_databases_and_10000_tables() {
+        let cfg = RouteConfig::default();
+        assert_eq!(cfg.virtual_db_count, 1_000);
+        assert_eq!(cfg.virtual_table_count, 10_000);
+        assert_eq!(cfg.db_count, 10);
+        assert_eq!(cfg.tables_per_db, 100);
+    }
+
+    #[test]
+    fn execution_partitions_are_stable_and_owned_by_one_database() {
+        let cfg = RouteConfig::default();
+        for order_id in 1..100_000u64 {
+            let partition = cfg.execution_partition(order_id, 40);
+            assert_eq!(
+                partition % cfg.db_count as u32,
+                cfg.route_order_id(order_id).db
+            );
+            assert_eq!(partition, cfg.execution_partition(order_id, 40));
         }
-        assert_eq!(seen.len(), 100);
-        assert_eq!(cfg.route_category(0), ShardRoute { db: 0, table: 0 });
-        assert_eq!(cfg.route_category(100), ShardRoute { db: 0, table: 1 });
     }
 }
