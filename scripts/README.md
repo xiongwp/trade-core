@@ -1,5 +1,24 @@
 # scripts
 
+## bench/staged.sh — two-axis staged performance test
+
+Runs the local staged benchmark: horizontal scale-out
+(`cluster_throughput` over a node-count list) and vertical offered-load ramp
+(`latency` over a target-rate list), printing markdown tables. A single peak
+number hides the SLO knee; staging exposes it.
+
+```sh
+scripts/bench/staged.sh                                   # defaults
+NODES="1 2 4 6 8" scripts/bench/staged.sh                 # scale-out axis
+RATES="200000 1000000 2000000" scripts/bench/staged.sh    # load axis
+ORDERS_PER_NODE=1000000 JOURNAL=1 scripts/bench/staged.sh # add durable stage
+```
+
+Stop the docker stack and confirm a low `load1` first — contention depresses
+the numbers (the script warns). Absolute peaks and durable/fsync numbers need
+a dedicated idle NVMe machine; use `scripts/acceptance/run-ladder.py` there.
+A recorded local baseline lives in `docs/stage-performance-local-baseline.md`.
+
 ## gen-deploy.py — deployment manifest generator
 
 Generates the sharded docker-compose deployment described in
