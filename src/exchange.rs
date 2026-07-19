@@ -244,6 +244,32 @@ pub enum ExecReport {
     },
 }
 
+impl ExecReport {
+    /// The order(s) this report is *about*. Every variant targets exactly one
+    /// order except `Trade`, which touches two (taker and maker) — callers that
+    /// project reports per-order (outbox/Kafka delivery, DB projection) must
+    /// deliver it once for each returned id, not just the first.
+    pub fn targets(&self) -> (OrderId, Option<OrderId>) {
+        match *self {
+            ExecReport::Trade { taker, maker, .. } => (taker, Some(maker)),
+            ExecReport::Accepted { order_id, .. }
+            | ExecReport::Filled { order_id, .. }
+            | ExecReport::PartiallyFilled { order_id, .. }
+            | ExecReport::Resting { order_id, .. }
+            | ExecReport::Cancelled { order_id, .. }
+            | ExecReport::Rejected { order_id, .. }
+            | ExecReport::Modified { order_id, .. }
+            | ExecReport::NotFound { order_id, .. } => (order_id, None),
+            ExecReport::DepthLevel { .. }
+            | ExecReport::DepthEnd { .. }
+            | ExecReport::Halted { .. }
+            | ExecReport::Resumed { .. }
+            | ExecReport::UserHalted { .. }
+            | ExecReport::UserResumed { .. } => (OrderId(0), None),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionReportEvent {
     pub raft_index: Option<u64>,
@@ -1687,9 +1713,22 @@ impl Shard {
                 // committed-batch path is fail-fast via match_and_record_batch;
                 // this single-command path is reachable only for non-batch Raft
                 // commands, and it too must halt rather than lose a fill.
-                if let Err(error) = outbox.append(raft_group_id, index, *ordinal, &report) {
+                let (primary, secondary) = report.targets();
+                if let Err(error) = outbox.append(raft_group_id, index, *ordinal, primary, &report)
+                {
                     metrics.asset_wal_errors.fetch_add(1, Ordering::Relaxed);
                     panic!("append execution report to durable outbox: {error}");
+                }
+                // A Trade touches two orders (taker and maker); deliver a
+                // second copy targeted at the maker so both sides' per-order
+                // Kafka partition/DB projection see it, not just the taker's.
+                if let Some(secondary) = secondary {
+                    if let Err(error) =
+                        outbox.append(raft_group_id, index, *ordinal, secondary, &report)
+                    {
+                        metrics.asset_wal_errors.fetch_add(1, Ordering::Relaxed);
+                        panic!("append execution report to durable outbox: {error}");
+                    }
                 }
             }
             metrics.record(&report);
@@ -1933,11 +1972,29 @@ impl Shard {
                 // batch before the watermark advances.
                 if let Some(outbox) = outbox.as_mut() {
                     if append_error.is_none() {
-                        if let Err(error) =
-                            outbox.append_deferred(raft_group_id, raft_index, ordinal, &report)
-                        {
+                        let (primary, secondary) = report.targets();
+                        if let Err(error) = outbox.append_deferred(
+                            raft_group_id,
+                            raft_index,
+                            ordinal,
+                            primary,
+                            &report,
+                        ) {
                             metrics.asset_wal_errors.fetch_add(1, Ordering::Relaxed);
                             append_error = Some(error);
+                        } else if let Some(secondary) = secondary {
+                            // See the single-command path above: a Trade needs
+                            // a second, maker-targeted copy.
+                            if let Err(error) = outbox.append_deferred(
+                                raft_group_id,
+                                raft_index,
+                                ordinal,
+                                secondary,
+                                &report,
+                            ) {
+                                metrics.asset_wal_errors.fetch_add(1, Ordering::Relaxed);
+                                append_error = Some(error);
+                            }
                         }
                     }
                 }

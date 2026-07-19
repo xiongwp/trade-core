@@ -5,10 +5,14 @@ use std::time::{Duration, Instant};
 
 use crate::exchange::ExecReport;
 use crate::journal::fnv1a;
+use crate::types::OrderId;
 use crate::wire::{self, EXECUTION_EVENT_LEN, REPORT_LEN};
 
 pub const OUTBOX_HEADER: [u8; 8] = *b"TCEX\x01\0\0\0";
-pub const OUTBOX_RECORD_LEN: usize = 4 + 8 + 4 + REPORT_LEN + 8;
+/// `target_order_id` (8 bytes) makes a Trade's two per-side copies
+/// distinguishable on disk and in the DB idempotency key — see
+/// [`wire::ExecutionEvent::target_order_id`].
+pub const OUTBOX_RECORD_LEN: usize = 4 + 8 + 4 + 8 + REPORT_LEN + 8;
 const CURSOR_HEADER: [u8; 8] = *b"TCEC\x01\0\0\0";
 const CURSOR_LEN: usize = CURSOR_HEADER.len() + 8 + 8;
 
@@ -17,24 +21,29 @@ pub struct OutboxRecord {
     pub raft_group: u32,
     pub raft_index: u64,
     pub ordinal: u32,
+    /// The order this record is about (see [`ExecReport::targets`]). A `Trade`
+    /// produces two records sharing `(raft_group, raft_index, ordinal)` but
+    /// with different `target_order_id`s — one per side.
+    pub target_order_id: OrderId,
     pub report_frame: [u8; REPORT_LEN],
 }
 
 impl OutboxRecord {
     pub fn kafka_key(&self, _category_size: u32) -> [u8; 8] {
-        let report = wire::decode_report(&self.report_frame).expect("valid outbox report");
-        report.order_id.0.to_be_bytes()
+        self.target_order_id.0.to_be_bytes()
     }
 
     pub fn kafka_payload(&self) -> [u8; EXECUTION_EVENT_LEN] {
         let report = wire::decode_report(&self.report_frame).expect("valid outbox report");
         let mut payload = [0u8; EXECUTION_EVENT_LEN];
         payload[..4].copy_from_slice(b"EX01");
-        payload[4..8].copy_from_slice(&1u32.to_le_bytes());
+        payload[4..8].copy_from_slice(&2u32.to_le_bytes());
         payload[8..12].copy_from_slice(&self.raft_group.to_le_bytes());
         payload[16..24].copy_from_slice(&self.raft_index.to_le_bytes());
         payload[24..28].copy_from_slice(&self.ordinal.to_le_bytes());
         payload[32..32 + REPORT_LEN].copy_from_slice(&self.report_frame);
+        payload[32 + REPORT_LEN..32 + REPORT_LEN + 8]
+            .copy_from_slice(&self.target_order_id.0.to_le_bytes());
         debug_assert_eq!(
             wire::decode_execution_event(&payload).unwrap().report,
             report
@@ -277,6 +286,7 @@ impl ExecutionOutboxWriter {
         raft_group: u32,
         raft_index: u64,
         ordinal: u32,
+        target_order_id: OrderId,
         report: &ExecReport,
     ) -> io::Result<()> {
         let mut frame = [0u8; REPORT_LEN];
@@ -285,6 +295,7 @@ impl ExecutionOutboxWriter {
             raft_group,
             raft_index,
             ordinal,
+            target_order_id,
             report_frame: frame,
         };
         write_record(&mut self.writer, &record)?;
@@ -310,6 +321,7 @@ impl ExecutionOutboxWriter {
         raft_group: u32,
         raft_index: u64,
         ordinal: u32,
+        target_order_id: OrderId,
         report: &ExecReport,
     ) -> io::Result<()> {
         let mut frame = [0u8; REPORT_LEN];
@@ -318,6 +330,7 @@ impl ExecutionOutboxWriter {
             raft_group,
             raft_index,
             ordinal,
+            target_order_id,
             report_frame: frame,
         };
         write_record(&mut self.writer, &record)?;
@@ -417,7 +430,8 @@ fn write_record(mut writer: impl Write, record: &OutboxRecord) -> io::Result<()>
     bytes[0..4].copy_from_slice(&record.raft_group.to_le_bytes());
     bytes[4..12].copy_from_slice(&record.raft_index.to_le_bytes());
     bytes[12..16].copy_from_slice(&record.ordinal.to_le_bytes());
-    bytes[16..16 + REPORT_LEN].copy_from_slice(&record.report_frame);
+    bytes[16..24].copy_from_slice(&record.target_order_id.0.to_le_bytes());
+    bytes[24..24 + REPORT_LEN].copy_from_slice(&record.report_frame);
     let checksum = fnv1a(&bytes[..OUTBOX_RECORD_LEN - 8]);
     bytes[OUTBOX_RECORD_LEN - 8..].copy_from_slice(&checksum.to_le_bytes());
     writer.write_all(&bytes)
@@ -498,11 +512,14 @@ impl ExecutionOutboxReader {
                 break;
             }
             let mut frame = [0u8; REPORT_LEN];
-            frame.copy_from_slice(&bytes[16..16 + REPORT_LEN]);
+            frame.copy_from_slice(&bytes[24..24 + REPORT_LEN]);
             records.push(OutboxRecord {
                 raft_group: u32::from_le_bytes(bytes[0..4].try_into().expect("group")),
                 raft_index: u64::from_le_bytes(bytes[4..12].try_into().expect("index")),
                 ordinal: u32::from_le_bytes(bytes[12..16].try_into().expect("ordinal")),
+                target_order_id: OrderId(u64::from_le_bytes(
+                    bytes[16..24].try_into().expect("target_order_id"),
+                )),
                 report_frame: frame,
             });
         }
@@ -655,6 +672,7 @@ mod tests {
                     3,
                     9,
                     2,
+                    OrderId(7),
                     &ExecReport::Accepted {
                         instrument: InstrumentId(42),
                         order_id: OrderId(7),
@@ -695,6 +713,7 @@ mod tests {
                         7,
                         index,
                         ordinal,
+                        OrderId(ordinal as u64),
                         &ExecReport::Accepted {
                             instrument: InstrumentId(index as u32),
                             order_id: OrderId(ordinal as u64),
@@ -733,8 +752,8 @@ mod tests {
             .with_rotate_bytes(Some(rotate));
         // Batch 1 (two records) fills the base segment; after its (simulated)
         // watermark advance the writer rotates to a fresh segment.
-        writer.append_deferred(1, 1, 0, &report(1)).unwrap();
-        writer.append_deferred(1, 1, 1, &report(1)).unwrap();
+        writer.append_deferred(1, 1, 0, OrderId(1), &report(1)).unwrap();
+        writer.append_deferred(1, 1, 1, OrderId(1), &report(1)).unwrap();
         writer.sync_data().unwrap();
         assert!(writer.maybe_rotate().unwrap());
         let seg1 = writer.current_segment().to_path_buf();
@@ -746,8 +765,8 @@ mod tests {
         assert_eq!(seg1.extension().unwrap(), "bin");
 
         // Not-yet-published sealed segments survive rotation.
-        writer.append_deferred(1, 2, 0, &report(2)).unwrap();
-        writer.append_deferred(1, 2, 1, &report(2)).unwrap();
+        writer.append_deferred(1, 2, 0, OrderId(2), &report(2)).unwrap();
+        writer.append_deferred(1, 2, 1, OrderId(2), &report(2)).unwrap();
         writer.sync_data().unwrap();
         assert!(writer.maybe_rotate().unwrap());
         assert!(base.exists(), "unpublished sealed segment must be retained");
@@ -762,8 +781,8 @@ mod tests {
             .read_available(|record| published.push((record.raft_index, record.ordinal)))
             .unwrap();
         assert_eq!(published, vec![(1, 0), (1, 1)]);
-        writer.append_deferred(1, 3, 0, &report(3)).unwrap();
-        writer.append_deferred(1, 3, 1, &report(3)).unwrap();
+        writer.append_deferred(1, 3, 0, OrderId(3), &report(3)).unwrap();
+        writer.append_deferred(1, 3, 1, OrderId(3), &report(3)).unwrap();
         writer.sync_data().unwrap();
         assert!(writer.maybe_rotate().unwrap());
         assert!(!base.exists(), "fully published segment must be reclaimed");
@@ -877,6 +896,7 @@ mod tests {
                         2,
                         index,
                         0,
+                        OrderId(index),
                         &ExecReport::Accepted {
                             instrument: InstrumentId(5),
                             order_id: OrderId(index),

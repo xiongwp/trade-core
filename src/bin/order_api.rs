@@ -661,7 +661,12 @@ fn bootstrap(store: &OrderStore) -> mysql::Result<()> {
         conn.query_drop(format!("CREATE DATABASE IF NOT EXISTS {db_name}"))?;
         conn.query_drop(format!("CREATE TABLE IF NOT EXISTS {db_name}.processed_commands (category_id INT UNSIGNED NOT NULL, kafka_partition INT NOT NULL, kafka_offset BIGINT UNSIGNED NOT NULL, command_id BIGINT UNSIGNED NOT NULL UNIQUE, user_id BIGINT UNSIGNED NOT NULL, shard_table INT UNSIGNED NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(category_id,kafka_offset), KEY idx_partition_offset (kafka_partition,kafka_offset)) ENGINE=InnoDB"))?;
         conn.query_drop(format!("CREATE TABLE IF NOT EXISTS {db_name}.processed_executions (kafka_partition INT NOT NULL, kafka_offset BIGINT UNSIGNED NOT NULL, instrument INT UNSIGNED NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(kafka_partition,kafka_offset), KEY idx_instrument_offset (instrument,kafka_offset)) ENGINE=InnoDB"))?;
-        conn.query_drop(format!("CREATE TABLE IF NOT EXISTS {db_name}.processed_execution_events (raft_group INT UNSIGNED NOT NULL, raft_index BIGINT UNSIGNED NOT NULL, report_ordinal INT UNSIGNED NOT NULL, instrument INT UNSIGNED NOT NULL, order_id BIGINT UNSIGNED NOT NULL, report_type TINYINT UNSIGNED NOT NULL, kafka_partition INT NOT NULL, kafka_offset BIGINT UNSIGNED NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(raft_group,raft_index,report_ordinal), KEY idx_instrument_index (instrument,raft_index), KEY idx_order_event (order_id,raft_index)) ENGINE=InnoDB"))?;
+        // PRIMARY KEY includes order_id: a Trade is delivered as two records
+        // sharing one (raft_group,raft_index,report_ordinal) — one per side
+        // (see wire::ExecutionEvent::target_order_id). Without order_id in the
+        // key, INSERT IGNORE silently dropped whichever side's copy landed
+        // second in the same shard DB, and its UPDATE never ran.
+        conn.query_drop(format!("CREATE TABLE IF NOT EXISTS {db_name}.processed_execution_events (raft_group INT UNSIGNED NOT NULL, raft_index BIGINT UNSIGNED NOT NULL, report_ordinal INT UNSIGNED NOT NULL, instrument INT UNSIGNED NOT NULL, order_id BIGINT UNSIGNED NOT NULL, report_type TINYINT UNSIGNED NOT NULL, kafka_partition INT NOT NULL, kafka_offset BIGINT UNSIGNED NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(raft_group,raft_index,report_ordinal,order_id), KEY idx_instrument_index (instrument,raft_index), KEY idx_order_event (order_id,raft_index)) ENGINE=InnoDB"))?;
         for table in 0..store.routing.tables_per_db {
             conn.query_drop(format!("CREATE TABLE IF NOT EXISTS {db_name}.asset_orders_{table:03} (row_seq BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, order_id BIGINT UNSIGNED NOT NULL UNIQUE, category_id INT UNSIGNED NOT NULL, user_id BIGINT UNSIGNED NOT NULL, instrument INT UNSIGNED NOT NULL, side TINYINT NOT NULL, price BIGINT UNSIGNED NOT NULL, qty BIGINT UNSIGNED NOT NULL, filled_qty BIGINT UNSIGNED NOT NULL DEFAULT 0, status VARCHAR(16) NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, KEY idx_category_row (category_id,row_seq), KEY idx_user_created (user_id,created_at)) ENGINE=InnoDB"))?;
         }
@@ -1832,9 +1837,17 @@ impl ExecutionDbForwarder {
     }
 
     fn submit(&self, records: &[ExecutionKafkaRecord]) -> Result<(), String> {
+        // Each Kafka record already targets exactly one order: `target_order_id`
+        // (wire v2) is set explicitly by the outbox, which delivers a `Trade` as
+        // two separate records — one per side — rather than leaving this layer
+        // to reconstruct the maker's copy from `aux_id`. Re-deriving it here
+        // used to produce two rows sharing one `(raft_group, raft_index,
+        // ordinal)` key with no way to route them independently when both
+        // sides landed in the same shard DB; see `processed_execution_events`'s
+        // primary key below for the other half of that fix.
         let mut by_db = HashMap::<u32, ExecutionShardTables>::new();
         for record in records {
-            let order_id = record.event.report.order_id.0;
+            let order_id = record.event.target_order_id.0;
             let route = self.routing.route_order_id(order_id);
             by_db
                 .entry(route.db)
@@ -1842,18 +1855,6 @@ impl ExecutionDbForwarder {
                 .entry(route.table)
                 .or_default()
                 .push((record.clone(), order_id));
-            if record.event.report.type_code == wire::RT_TRADE
-                && record.event.report.aux_id != order_id
-            {
-                let maker_id = record.event.report.aux_id;
-                let maker_route = self.routing.route_order_id(maker_id);
-                by_db
-                    .entry(maker_route.db)
-                    .or_default()
-                    .entry(maker_route.table)
-                    .or_default()
-                    .push((record.clone(), maker_id));
-            }
         }
         let mut replies = Vec::with_capacity(by_db.len());
         for (db, tables) in by_db {
@@ -1966,7 +1967,7 @@ fn apply_execution_report(
                 format!(
                     "UPDATE {db}.{table} SET status='FILLED',filled_qty=qty WHERE order_id=:id"
                 ),
-                params! {"id" => report.order_id.0},
+                params! {"id" => target_order_id},
             )
             .map_err(|error| error.to_string())?;
         }
@@ -1974,21 +1975,21 @@ fn apply_execution_report(
             tx,
             db,
             table,
-            report.order_id.0,
+            target_order_id,
             "PARTIAL",
             Some(report.qty),
         )?,
         wire::RT_RESTING | wire::RT_ACCEPTED => {
-            update_execution_status(tx, db, table, report.order_id.0, "OPEN", None)?
+            update_execution_status(tx, db, table, target_order_id, "OPEN", None)?
         }
         wire::RT_CANCELLED => {
-            update_execution_status(tx, db, table, report.order_id.0, "CANCELLED", None)?
+            update_execution_status(tx, db, table, target_order_id, "CANCELLED", None)?
         }
         wire::RT_REJECTED => {
-            update_execution_status(tx, db, table, report.order_id.0, "REJECTED", None)?
+            update_execution_status(tx, db, table, target_order_id, "REJECTED", None)?
         }
         wire::RT_MODIFIED => {
-            update_execution_status(tx, db, table, report.order_id.0, "OPEN", None)?
+            update_execution_status(tx, db, table, target_order_id, "OPEN", None)?
         }
         _ => {}
     }

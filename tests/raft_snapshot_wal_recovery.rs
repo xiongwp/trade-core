@@ -151,6 +151,7 @@ fn outbox_tail_without_durable_application_proof_is_trimmed_then_regenerated() {
                 3,
                 55,
                 0,
+                OrderId(55),
                 &ExecReport::Accepted {
                     instrument: InstrumentId(0),
                     order_id: OrderId(55),

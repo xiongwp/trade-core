@@ -177,12 +177,12 @@ pub fn diff_journals(a_path: &Path, b_path: &Path) -> io::Result<JournalDiff> {
 pub fn format_outbox_record(record: &OutboxRecord) -> String {
     match wire::decode_report(&record.report_frame) {
         Some(report) => format!(
-            "raft_group={} raft_index={} ordinal={} {}",
-            record.raft_group, record.raft_index, record.ordinal, report
+            "raft_group={} raft_index={} ordinal={} target_order_id={} {}",
+            record.raft_group, record.raft_index, record.ordinal, record.target_order_id.0, report
         ),
         None => format!(
-            "raft_group={} raft_index={} ordinal={} <undecodable report>",
-            record.raft_group, record.raft_index, record.ordinal
+            "raft_group={} raft_index={} ordinal={} target_order_id={} <undecodable report>",
+            record.raft_group, record.raft_index, record.ordinal, record.target_order_id.0
         ),
     }
 }

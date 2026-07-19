@@ -91,7 +91,12 @@ pub fn decode_raft_entry(payload: &[u8]) -> Option<Vec<Command>> {
 
 /// Fixed execution-report frame length in bytes (v2: 56 — adds fee fields).
 pub const REPORT_LEN: usize = 56;
-pub const EXECUTION_EVENT_LEN: usize = 88;
+/// v2: adds an explicit `target_order_id` trailer (see [`encode_execution_event`]).
+/// A `Trade` touches two orders (taker and maker); each is delivered as its own
+/// envelope carrying the *same* report but a different `target_order_id`, so a
+/// downstream consumer keying/partitioning by order id sees a self-consistent
+/// per-order event stream on both sides instead of only the taker's.
+pub const EXECUTION_EVENT_LEN: usize = 96;
 const EXECUTION_EVENT_MAGIC: [u8; 4] = *b"EX01";
 
 const MT_NEW: u8 = 1;
@@ -542,6 +547,11 @@ pub struct ExecutionEvent {
     pub raft_group: u32,
     pub raft_index: u64,
     pub ordinal: u32,
+    /// The order this particular envelope is *about*. Equal to `report.order_id`
+    /// for every report type except `Trade`, which is delivered as two envelopes
+    /// (one per side) sharing the same `(raft_index, ordinal)` but differing
+    /// `target_order_id`.
+    pub target_order_id: OrderId,
     pub report: DecodedReport,
 }
 
@@ -549,34 +559,40 @@ pub fn encode_execution_event(
     raft_group: u32,
     raft_index: u64,
     ordinal: u32,
+    target_order_id: OrderId,
     report: &ExecReport,
     out: &mut [u8; EXECUTION_EVENT_LEN],
 ) {
     out.fill(0);
     out[..4].copy_from_slice(&EXECUTION_EVENT_MAGIC);
-    out[4..8].copy_from_slice(&1u32.to_le_bytes());
+    out[4..8].copy_from_slice(&2u32.to_le_bytes());
     out[8..12].copy_from_slice(&raft_group.to_le_bytes());
     out[16..24].copy_from_slice(&raft_index.to_le_bytes());
     out[24..28].copy_from_slice(&ordinal.to_le_bytes());
     let mut frame = [0u8; REPORT_LEN];
     encode_report(report, &mut frame);
-    out[24 + 8..].copy_from_slice(&frame);
+    out[32..32 + REPORT_LEN].copy_from_slice(&frame);
+    out[32 + REPORT_LEN..32 + REPORT_LEN + 8].copy_from_slice(&target_order_id.0.to_le_bytes());
 }
 
 pub fn decode_execution_event(buf: &[u8]) -> Option<ExecutionEvent> {
     if buf.len() >= EXECUTION_EVENT_LEN && buf[..4] == EXECUTION_EVENT_MAGIC {
         let version = u32::from_le_bytes(buf[4..8].try_into().ok()?);
-        if version != 1 {
+        if version != 2 {
             return None;
         }
         let raft_group = u32::from_le_bytes(buf[8..12].try_into().ok()?);
         let raft_index = u64::from_le_bytes(buf[16..24].try_into().ok()?);
         let ordinal = u32::from_le_bytes(buf[24..28].try_into().ok()?);
         let report = decode_report(&buf[32..32 + REPORT_LEN])?;
+        let target_order_id = OrderId(u64::from_le_bytes(
+            buf[32 + REPORT_LEN..32 + REPORT_LEN + 8].try_into().ok()?,
+        ));
         return Some(ExecutionEvent {
             raft_group,
             raft_index,
             ordinal,
+            target_order_id,
             report,
         });
     }
@@ -585,6 +601,7 @@ pub fn decode_execution_event(buf: &[u8]) -> Option<ExecutionEvent> {
         raft_group: 0,
         raft_index: 0,
         ordinal: 0,
+        target_order_id: report.order_id,
         report,
     })
 }
@@ -670,11 +687,12 @@ mod tests {
             order_id: OrderId(99),
         };
         let mut payload = [0u8; EXECUTION_EVENT_LEN];
-        encode_execution_event(7, 1234, 5, &r, &mut payload);
+        encode_execution_event(7, 1234, 5, OrderId(99), &r, &mut payload);
         let event = decode_execution_event(&payload).unwrap();
         assert_eq!(event.raft_group, 7);
         assert_eq!(event.raft_index, 1234);
         assert_eq!(event.ordinal, 5);
+        assert_eq!(event.target_order_id, OrderId(99));
         assert_eq!(event.report.type_code, RT_RESTING);
         assert_eq!(event.report.instrument, InstrumentId(42));
         assert_eq!(event.report.order_id, OrderId(99));
@@ -685,6 +703,7 @@ mod tests {
         assert_eq!(legacy_event.raft_group, 0);
         assert_eq!(legacy_event.raft_index, 0);
         assert_eq!(legacy_event.ordinal, 0);
+        assert_eq!(legacy_event.target_order_id, OrderId(99));
         assert_eq!(legacy_event.report, event.report);
     }
 

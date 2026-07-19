@@ -21,6 +21,18 @@ fn read_outbox_ids(path: &PathBuf) -> Vec<(u64, u32)> {
     ids
 }
 
+/// Same as [`read_outbox_ids`] but including the per-record target order id.
+fn read_outbox_targets(path: &PathBuf) -> Vec<(u64, u32, u64)> {
+    let mut reader = ExecutionOutboxReader::open(path.clone()).unwrap();
+    let mut ids = Vec::new();
+    reader
+        .read_available(|record| {
+            ids.push((record.raft_index, record.ordinal, record.target_order_id.0))
+        })
+        .unwrap();
+    ids
+}
+
 fn collect_events(sink: &trade_core::ResultSink, want: usize) -> Vec<ExecutionReportEvent> {
     let mut got = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -81,11 +93,24 @@ fn committed_batch_is_durable_in_outbox_before_watermark_and_survives_restart() 
 
     // ...and because the outbox fsync precedes the watermark, all five events
     // are already durable with their deterministic (raft_index, ordinal) ids.
+    // The Trade at ordinal 3 touches two orders, so it is delivered as two
+    // outbox records sharing (88, 3) — one per side (see
+    // `wire::ExecutionEvent::target_order_id`) — for six records total.
     let durable = read_outbox_ids(&outbox_path);
     assert_eq!(
         durable,
-        vec![(88, 0), (88, 1), (88, 2), (88, 3), (88, 4)],
-        "every committed fill is durable, in deterministic order"
+        vec![(88, 0), (88, 1), (88, 2), (88, 3), (88, 3), (88, 4)],
+        "every committed fill is durable, in deterministic order, Trade delivered once per side"
+    );
+    let targets: Vec<u64> = read_outbox_targets(&outbox_path)
+        .into_iter()
+        .filter(|&(index, ordinal, _)| (index, ordinal) == (88, 3))
+        .map(|(_, _, target)| target)
+        .collect();
+    assert_eq!(
+        targets,
+        vec![2, 1],
+        "the Trade's two copies target the taker (order 2) then the maker (order 1), not the same id twice"
     );
 
     // Recovery trims the outbox to the last durable batch. Batch 88 is
@@ -93,7 +118,7 @@ fn committed_batch_is_durable_in_outbox_before_watermark_and_survives_restart() 
     // fills.
     let max_applied = applied.iter().max().copied();
     truncate_after_applied(&outbox_path, max_applied).unwrap();
-    assert_eq!(read_outbox_ids(&outbox_path).len(), 5);
+    assert_eq!(read_outbox_ids(&outbox_path).len(), 6);
 
     // Restarting the exchange runs the same recovery trim during build(); the
     // committed fills remain intact and the outbox stays appendable.
@@ -106,7 +131,7 @@ fn committed_batch_is_durable_in_outbox_before_watermark_and_survives_restart() 
         });
         handle.shutdown();
     }
-    assert_eq!(read_outbox_ids(&outbox_path).len(), 5);
+    assert_eq!(read_outbox_ids(&outbox_path).len(), 6);
 
     std::fs::remove_dir_all(root).ok();
 }
