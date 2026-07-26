@@ -1454,8 +1454,23 @@ fn persist_mysql_shard(
     // Results may have reached this database before the command projection.
     // Once the order rows exist, drain their durable pending events in the same
     // transaction so no external scheduler is required for the common race.
+    //
+    // The drain is three heavy set-based queries (a window-function UPDATE JOIN,
+    // an INSERT..SELECT and a DELETE JOIN). On the common path — a fresh order
+    // that rests without any execution event yet in this table — they match
+    // nothing. Guard with a single cheap probe so the pure-resting path pays one
+    // indexed `LIMIT 1` lookup instead of three empty joins. This is strictly a
+    // no-op skip: when a row exists the drain runs exactly as before, so the
+    // projection's behaviour (and its 1064-sensitive SQL) is untouched.
     for table in pending_tables {
-        apply_pending_execution_table(&mut tx, &db, table)?;
+        let has_pending: Option<u8> = tx
+            .query_first(format!(
+                "SELECT 1 FROM {db}.pending_execution_events WHERE shard_table={table} LIMIT 1"
+            ))
+            .map_err(|error| error.to_string())?;
+        if has_pending.is_some() {
+            apply_pending_execution_table(&mut tx, &db, table)?;
+        }
     }
     tx.commit().map_err(|error| error.to_string())?;
     store.metrics.record_mysql(started.elapsed());
