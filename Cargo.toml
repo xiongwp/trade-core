@@ -62,6 +62,11 @@ path = "benches/order_e2e.rs"
 harness = false
 
 [[bench]]
+name = "transport_hop"
+path = "benches/transport_hop.rs"
+harness = false
+
+[[bench]]
 name = "order_batch_e2e"
 path = "benches/order_batch_e2e.rs"
 harness = false
