@@ -26,7 +26,7 @@
 //! * **Cancel/modify/force-close priority**: the high-priority queue is fully
 //!   drained before, and between, new orders.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -775,6 +775,9 @@ fn build_inner(
             default_pool: (config.pool_orders_per_book, config.prefault),
             pin_core: config.pin_cpus.then_some(shard_id),
             last_depth: Instant::now(),
+            dirty: HashSet::new(),
+            depth_buf: Vec::new(),
+            idle_streak: 0,
         };
         threads.push(
             thread::Builder::new()
@@ -1365,11 +1368,34 @@ struct Shard {
     default_pool: (usize, bool),
     pin_core: Option<usize>,
     last_depth: Instant,
+    /// Instruments whose book changed since the last depth publish. Depth is
+    /// only recomputed for these, so a shard hosting thousands of mostly-idle
+    /// books doesn't rescan every ladder every cadence tick.
+    dirty: HashSet<InstrumentId>,
+    /// Reusable scratch for the per-tick depth batch (no periodic allocation).
+    depth_buf: Vec<ExecReport>,
+    /// Consecutive idle loop iterations, used to back off the poll interval.
+    idle_streak: u32,
 }
 
 /// Depth-of-market publish cadence and ladder size.
 const DEPTH_EVERY: Duration = Duration::from_millis(200);
 const DEPTH_LEVELS: usize = 5;
+
+/// Idle poll interval as a function of how many consecutive idle iterations the
+/// shard has seen. Tight (50µs) through short gaps between bursts, then two
+/// steps out to 500µs once the shard has been quiet long enough that latency no
+/// longer matters (nothing is arriving anyway).
+#[inline]
+fn idle_backoff(idle_streak: u32) -> Duration {
+    // At 50µs/iter, ~128 iters ≈ 6ms of continuous silence before the first
+    // step; ~1024 ≈ tens of ms before the widest interval.
+    match idle_streak {
+        0..=128 => Duration::from_micros(50),
+        129..=1024 => Duration::from_micros(200),
+        _ => Duration::from_micros(500),
+    }
+}
 
 impl Shard {
     fn run(&mut self) {
@@ -1417,7 +1443,9 @@ impl Shard {
             }
 
             if worked {
-                // Under sustained load, still publish depth on cadence.
+                // Busy: reset the idle backoff so the first quiet tick polls
+                // tightly again, and publish depth on cadence.
+                self.idle_streak = 0;
                 self.maybe_publish_depth();
             } else {
                 if !self.running.load(Ordering::Acquire)
@@ -1438,7 +1466,15 @@ impl Shard {
                     self.take_snapshot();
                 }
                 self.maybe_publish_depth();
-                thread::park_timeout(Duration::from_micros(50));
+                // Adaptive backoff: bursty traffic with micro-gaps keeps polling
+                // tightly (50µs) so the first order after a lull is picked up
+                // fast; only *sustained* silence widens the interval, so a truly
+                // idle shard stops spinning a pinned core down to a 500µs poll.
+                // There is no producer-side unpark, so the cap also bounds the
+                // worst-case wake latency after quiet: 500µs.
+                self.idle_streak = self.idle_streak.saturating_add(1);
+                let backoff = idle_backoff(self.idle_streak);
+                thread::park_timeout(backoff);
             }
         }
         // Final snapshot on clean shutdown makes the next start instant — but
@@ -1470,10 +1506,18 @@ impl Shard {
         if self.last_depth.elapsed() < DEPTH_EVERY {
             return;
         }
+        if self.dirty.is_empty() {
+            return; // nothing changed since the last publish
+        }
         self.last_depth = Instant::now();
-        // Collect first (immutable borrow), then emit.
-        let mut out: Vec<ExecReport> = Vec::new();
-        for (&instrument, engine) in self.processor.engines.iter() {
+        // Collect first (immutable borrow of the engines), then emit. The buffer
+        // is a reusable member, so a steady publish cadence allocates nothing.
+        let mut out = std::mem::take(&mut self.depth_buf);
+        out.clear();
+        for &instrument in self.dirty.iter() {
+            let Some(engine) = self.processor.engines.get(&instrument) else {
+                continue; // command touched no book (e.g. rejected admin action)
+            };
             let book = engine.book();
             if book.is_empty() {
                 continue;
@@ -1504,26 +1548,23 @@ impl Shard {
                 ask_levels: asks.len() as u8,
             });
         }
-        for r in out {
+        self.dirty.clear();
+        for r in out.drain(..) {
             self.emit_report(r);
         }
+        self.depth_buf = out; // hand the buffer (and its capacity) back
     }
 
     fn emit_report(&self, report: ExecReport) {
-        let mut pending = ExecutionReportEvent {
-            raft_index: None,
-            ordinal: 0,
-            report,
-        };
-        loop {
-            match self.result_tx.push(pending) {
-                Ok(()) => return,
-                Err(returned) => {
-                    pending = returned;
-                    thread::yield_now();
-                }
-            }
-        }
+        push_result_event(
+            &self.result_tx,
+            &self.metrics,
+            ExecutionReportEvent {
+                raft_index: None,
+                ordinal: 0,
+                report,
+            },
+        );
     }
 
     fn snapshot_due(&mut self) -> bool {
@@ -1673,6 +1714,10 @@ impl Shard {
                 .fetch_max(self.rep_seq, Ordering::Relaxed);
         }
         let mut ordinal = 0;
+        // Mark the touched book so the next cadence republishes just this
+        // instrument's depth (admin commands rarely move the book, but the
+        // resulting single redundant publish is cheaper than tracking intent).
+        self.dirty.insert(cmd.instrument());
         self.process_and_emit(cmd, raft_index, &mut ordinal);
         if let Some(index) = raft_index {
             self.metrics.set_raft_applied_index(index);
@@ -1708,17 +1753,9 @@ impl Shard {
                 report,
             };
             *ordinal = ordinal.saturating_add(1);
-            // Backpressure: spin+yield until the order system drains.
-            let mut pending = event;
-            loop {
-                match result_tx.push(pending) {
-                    Ok(()) => return,
-                    Err(returned) => {
-                        pending = returned;
-                        thread::yield_now();
-                    }
-                }
-            }
+            // Backpressure: spin briefly, then park (and count) until the order
+            // system drains — see `push_result_event`.
+            push_result_event(result_tx, metrics, event);
         });
         let match_ns = started.elapsed().as_nanos() as u64;
         self.metrics.record_match_latency(match_ns);
@@ -1743,6 +1780,7 @@ impl Shard {
             );
             let mut reports = Vec::new();
             for command in commands {
+                self.dirty.insert(command.instrument());
                 self.processor
                     .process(command, &mut |report| reports.push(report));
             }
@@ -1806,6 +1844,9 @@ impl Shard {
         // watermarked-but-unwritten batch would be skipped on recovery and its
         // execution events lost forever. Reports are held back and delivered to
         // the order system only after the batch is durable (see below).
+        for command in &commands {
+            self.dirty.insert(command.instrument());
+        }
         let emitted = self
             .match_and_record_batch(commands, raft_index)
             .expect("append committed batch execution reports to durable outbox");
@@ -1972,13 +2013,40 @@ impl Shard {
     /// Deliver one already-durable execution report event to the order system,
     /// applying backpressure (spin+yield) until the consumer drains.
     fn emit_report_event(&self, event: ExecutionReportEvent) {
-        let mut pending = event;
-        loop {
-            match self.result_tx.push(pending) {
-                Ok(()) => return,
-                Err(returned) => {
-                    pending = returned;
-                    thread::yield_now();
+        push_result_event(&self.result_tx, &self.metrics, event);
+    }
+}
+
+/// Push one execution event onto the result stream, applying backpressure when
+/// the order system can't keep up.
+///
+/// A short spin absorbs the common case (the consumer drains within a few
+/// hundred nanoseconds) without a syscall. Past the spin budget the thread
+/// **parks** instead of spinning forever: a matching thread is CPU-pinned, so
+/// burning the core while a downstream stall persists steals cycles from every
+/// other shard sharing the socket and inflates tail latency. Each park bumps
+/// `result_backpressure`, turning an otherwise invisible downstream stall into
+/// an observable, alertable signal.
+fn push_result_event(
+    result_tx: &Producer<ExecutionReportEvent>,
+    metrics: &crate::metrics::Metrics,
+    mut event: ExecutionReportEvent,
+) {
+    // Enough spins to ride out a consumer that is scheduled on another core and
+    // draining continuously; short enough that a genuine stall parks quickly.
+    const SPIN_LIMIT: u32 = 128;
+    let mut spins: u32 = 0;
+    loop {
+        match result_tx.push(event) {
+            Ok(()) => return,
+            Err(returned) => {
+                event = returned;
+                if spins < SPIN_LIMIT {
+                    spins += 1;
+                    std::hint::spin_loop();
+                } else {
+                    metrics.result_backpressure.fetch_add(1, Ordering::Relaxed);
+                    thread::park_timeout(Duration::from_micros(20));
                 }
             }
         }

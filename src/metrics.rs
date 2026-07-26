@@ -82,6 +82,11 @@ pub struct Metrics {
     pub execution_kafka_publish_ns_total: AtomicU64,
     pub execution_kafka_publish_ns_max: AtomicU64,
     pub execution_kafka_publish_samples: AtomicU64,
+    /// Times a shard's matching thread had to park because the result queue was
+    /// full — i.e. the order system could not drain execution reports fast
+    /// enough and applied backpressure onto matching. Sustained growth means the
+    /// downstream consumer, not the engine, is the throughput bottleneck.
+    pub result_backpressure: AtomicU64,
     /// Log-bucketed latency distributions running in parallel with the
     /// `*_ns_total`/`*_ns_max`/`*_samples` triples above. The triples are kept
     /// for backward compatibility; these back the p50/p90/p99 SLO gauges.
@@ -171,6 +176,7 @@ impl Metrics {
             c("execution_kafka_publish_ns_total", "Total execution Kafka publish acknowledgement latency in nanoseconds", self.execution_kafka_publish_ns_total.load(Ordering::Relaxed)),
             c("execution_kafka_publish_samples", "Execution Kafka publish batches acknowledged", self.execution_kafka_publish_samples.load(Ordering::Relaxed)),
             format!("# HELP tc_execution_kafka_publish_ns_max Maximum execution Kafka publish acknowledgement latency in nanoseconds\n# TYPE tc_execution_kafka_publish_ns_max gauge\ntc_execution_kafka_publish_ns_max {}\n", self.execution_kafka_publish_ns_max.load(Ordering::Relaxed)),
+            c("result_backpressure", "Times a matching thread parked on a full result queue (downstream backpressure)", self.result_backpressure.load(Ordering::Relaxed)),
         ]
         .concat();
         // Append the parallel latency histograms and their derived quantile
