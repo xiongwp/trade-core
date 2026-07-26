@@ -87,6 +87,12 @@ struct OrderPipelineMetrics {
     observed_mysql_lag: AtomicU64,
     observed_match_lag: AtomicU64,
     dlq_total: AtomicU64,
+    /// Consumer-group lag reads that failed (Kafka metadata/coordinator errors).
+    /// While these persist the observed-lag gauges would otherwise freeze at a
+    /// stale value and drive backpressure off phantom backlog; the monitor
+    /// clears the lag after a short staleness window, and this counter makes the
+    /// condition observable instead of silent.
+    lag_read_failures: AtomicU64,
 }
 
 impl OrderPipelineMetrics {
@@ -240,10 +246,12 @@ impl OrderPipelineMetrics {
         ) + &format!(
             "# TYPE tc_order_mysql_consumer_lag gauge\ntc_order_mysql_consumer_lag {}\n\
 # TYPE tc_order_match_consumer_lag gauge\ntc_order_match_consumer_lag {}\n\
-# TYPE tc_order_dlq_total counter\ntc_order_dlq_total {}\n",
+# TYPE tc_order_dlq_total counter\ntc_order_dlq_total {}\n\
+# TYPE tc_order_lag_read_failures counter\ntc_order_lag_read_failures {}\n",
             self.observed_mysql_lag.load(AtomicOrdering::Relaxed),
             self.observed_match_lag.load(AtomicOrdering::Relaxed),
             self.dlq_total.load(AtomicOrdering::Relaxed),
+            self.lag_read_failures.load(AtomicOrdering::Relaxed),
         ) + &self.mysql_commit_hist.render_standalone(
             "order_mysql_commit_ns",
             "Order API MySQL commit latency (nanoseconds)",
@@ -1988,21 +1996,47 @@ fn run_consumer_lag_monitor(kafka: KafkaIngress, group_id: String, stage: &'stat
         .set("group.id", &group_id)
         .create()
         .expect("create Kafka lag monitor");
+    // Partitions this stage watches; used to zero the per-partition breakdown
+    // when the reading goes stale.
+    let partition_count = kafka.router.topics().len() * kafka.partitions_per_topic as usize;
+    // After this many consecutive failed reads (~STALE_AFTER * 500ms) the last
+    // lag is treated as stale and cleared. Otherwise a Kafka coordinator/leader
+    // hiccup freezes the gauge at its last value, and because try_reserve gates
+    // on `inflight + observed_lag`, a frozen-high lag silently 429s every new
+    // order off phantom backlog. Falling back to local inflight admission is
+    // safe: if Kafka is genuinely down the publish path back-pressures at the
+    // source, so no unbounded backlog can hide behind the cleared gauge.
+    const STALE_AFTER: u32 = 6; // ~3s
+    let mut consecutive_failures: u32 = 0;
     let mut last_error_log = std::time::Instant::now() - Duration::from_secs(30);
     loop {
         match read_consumer_group_lag(&consumer, &kafka) {
             Ok(lags) => {
+                consecutive_failures = 0;
                 let total: u64 = lags.iter().sum();
                 // Global backlog master switch keeps the summed view; the
                 // per-category tier machine keeps the per-partition breakdown.
                 kafka.metrics.set_observed_lag(stage, total);
                 kafka.backpressure.set_partition_lags(stage, &lags);
             }
-            Err(error) if last_error_log.elapsed() >= Duration::from_secs(30) => {
-                log_warn!("order-kafka", format_args!("{stage}-lag"); "event=lag_read_failed group={group_id} error={error}");
-                last_error_log = std::time::Instant::now();
+            Err(error) => {
+                kafka
+                    .metrics
+                    .lag_read_failures
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                if consecutive_failures == STALE_AFTER {
+                    // Drop the now-stale reading once, exactly as it goes stale.
+                    kafka.metrics.set_observed_lag(stage, 0);
+                    kafka
+                        .backpressure
+                        .set_partition_lags(stage, &vec![0u64; partition_count]);
+                }
+                if last_error_log.elapsed() >= Duration::from_secs(30) {
+                    log_warn!("order-kafka", format_args!("{stage}-lag"); "event=lag_read_failed group={group_id} error={error} consecutive={consecutive_failures}");
+                    last_error_log = std::time::Instant::now();
+                }
             }
-            Err(_) => {}
         }
         std::thread::sleep(Duration::from_millis(500));
     }
