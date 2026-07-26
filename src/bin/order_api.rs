@@ -1953,10 +1953,9 @@ fn kafka_consumer_config(brokers: &str, group_id: &str) -> ClientConfig {
 /// keys off this; the caller also sums it for the market-wide backlog switch.
 fn read_consumer_group_lag(
     consumer: &BaseConsumer,
-    kafka: &KafkaIngress,
+    topics: &[String],
+    per_topic: i32,
 ) -> Result<Vec<u64>, String> {
-    let topics = kafka.router.topics();
-    let per_topic = kafka.partitions_per_topic as i32;
     let mut requested = TopicPartitionList::new();
     for topic in topics {
         for partition in 0..per_topic {
@@ -1990,7 +1989,13 @@ fn read_consumer_group_lag(
     Ok(lags)
 }
 
-fn run_consumer_lag_monitor(kafka: KafkaIngress, group_id: String, stage: &'static str) {
+fn run_consumer_lag_monitor(
+    kafka: KafkaIngress,
+    group_id: String,
+    stage: &'static str,
+    topics: Vec<String>,
+    per_topic: i32,
+) {
     let consumer: BaseConsumer = ClientConfig::new()
         .set("bootstrap.servers", &kafka.brokers)
         .set("group.id", &group_id)
@@ -1998,7 +2003,7 @@ fn run_consumer_lag_monitor(kafka: KafkaIngress, group_id: String, stage: &'stat
         .expect("create Kafka lag monitor");
     // Partitions this stage watches; used to zero the per-partition breakdown
     // when the reading goes stale.
-    let partition_count = kafka.router.topics().len() * kafka.partitions_per_topic as usize;
+    let partition_count = topics.len() * per_topic as usize;
     // After this many consecutive failed reads (~STALE_AFTER * 500ms) the last
     // lag is treated as stale and cleared. Otherwise a Kafka coordinator/leader
     // hiccup freezes the gauge at its last value, and because try_reserve gates
@@ -2010,7 +2015,7 @@ fn run_consumer_lag_monitor(kafka: KafkaIngress, group_id: String, stage: &'stat
     let mut consecutive_failures: u32 = 0;
     let mut last_error_log = std::time::Instant::now() - Duration::from_secs(30);
     loop {
-        match read_consumer_group_lag(&consumer, &kafka) {
+        match read_consumer_group_lag(&consumer, &topics, per_topic) {
             Ok(lags) => {
                 consecutive_failures = 0;
                 let total: u64 = lags.iter().sum();
@@ -3129,14 +3134,34 @@ fn main() {
         kafka.execution_group,
     );
     if ingress_enabled {
-        for (stage, group_id) in [
-            ("mysql", kafka.db_group.clone()),
-            ("match", kafka.matcher_group.clone()),
-        ] {
+        // Each stage's consumers commit offsets on DIFFERENT topics: the match
+        // group consumes the ingress order topics, the DB-projection group
+        // consumes the routed DB topic. The monitor must read each group's lag
+        // on the topic that group actually consumes. Reading the persist group
+        // against the ingress topics (its committed offset there is always 0)
+        // reports the whole ingress high-watermark as phantom MySQL lag, which
+        // wedges backpressure permanently once it exceeds max_pipeline_backlog.
+        let stages: [(&'static str, String, Vec<String>, i32); 2] = [
+            (
+                "mysql",
+                kafka.db_group.clone(),
+                vec![kafka.db_route_topic.clone()],
+                kafka.db_route_partitions as i32,
+            ),
+            (
+                "match",
+                kafka.matcher_group.clone(),
+                kafka.router.topics().to_vec(),
+                kafka.partitions_per_topic as i32,
+            ),
+        ];
+        for (stage, group_id, topics, per_topic) in stages {
             let monitor_kafka = kafka.clone();
             std::thread::Builder::new()
                 .name(format!("order-kafka-{stage}-lag"))
-                .spawn(move || run_consumer_lag_monitor(monitor_kafka, group_id, stage))
+                .spawn(move || {
+                    run_consumer_lag_monitor(monitor_kafka, group_id, stage, topics, per_topic)
+                })
                 .expect("spawn Kafka lag monitor");
         }
     }
