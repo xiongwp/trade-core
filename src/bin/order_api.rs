@@ -2421,8 +2421,19 @@ fn persist_execution_shard(
             "DELETE p FROM {db}.pending_execution_events p INNER JOIN {db}.processed_execution_events e ON e.raft_group=p.raft_group AND e.raft_index=p.raft_index AND e.report_ordinal=p.report_ordinal AND e.target_order_id=p.target_order_id"
         ))
         .map_err(|error| error.to_string())?;
+        // When every inserted event for a table was an already-processed retry
+        // (ignored above, then deleted), that table has no pending rows and the
+        // three-query drain would match nothing. Same behaviour-preserving skip
+        // as the command-projection path: probe once, drain only if non-empty.
         for table in touched {
-            apply_pending_execution_table(&mut tx, &db, table)?;
+            let has_pending: Option<u8> = tx
+                .query_first(format!(
+                    "SELECT 1 FROM {db}.pending_execution_events WHERE shard_table={table} LIMIT 1"
+                ))
+                .map_err(|error| error.to_string())?;
+            if has_pending.is_some() {
+                apply_pending_execution_table(&mut tx, &db, table)?;
+            }
         }
         tx.commit().map_err(|error| error.to_string())?;
     }
