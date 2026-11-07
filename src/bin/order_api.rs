@@ -1203,7 +1203,9 @@ fn decode_batch(body: &[u8], category_size: u32) -> Result<Vec<BatchRecord>, Str
         let command = wire::WireView::parse(&frame)
             .and_then(|view| view.to_command())
             .ok_or_else(|| "batch contains an invalid command frame".to_string())?;
-        if let trade_core::Command::New(order) = &command {
+        if let trade_core::Command::New(order) | trade_core::Command::NewConditional(order, _) =
+            &command
+        {
             if order.user != user {
                 return Err(format!(
                     "batch user {user} does not match order {} user {}",
@@ -1258,7 +1260,9 @@ struct KafkaRecord {
 
 fn command_id(command: &trade_core::Command) -> u64 {
     match command {
-        trade_core::Command::New(order) => order.id.0,
+        trade_core::Command::New(order) | trade_core::Command::NewConditional(order, _) => {
+            order.id.0
+        }
         trade_core::Command::Cancel { cmd_id, .. }
         | trade_core::Command::Modify { cmd_id, .. }
         | trade_core::Command::Halt { cmd_id, .. }
@@ -1272,7 +1276,9 @@ fn command_id(command: &trade_core::Command) -> u64 {
 
 fn database_order_id(command: &trade_core::Command) -> u64 {
     match command {
-        trade_core::Command::New(order) => order.id.0,
+        trade_core::Command::New(order) | trade_core::Command::NewConditional(order, _) => {
+            order.id.0
+        }
         trade_core::Command::Cancel { order_id, .. }
         | trade_core::Command::Modify { order_id, .. } => order_id.0,
         trade_core::Command::ForceClose { close_order_id, .. } => close_order_id.0,
@@ -1425,7 +1431,9 @@ fn persist_mysql_shard(
         ]);
 
         match command {
-            trade_core::Command::New(order) => {
+            // A conditional order gets its row at placement like any other;
+            // the execution projection moves it on when it triggers.
+            trade_core::Command::New(order) | trade_core::Command::NewConditional(order, _) => {
                 orders_by_table.entry(route.table).or_default().extend([
                     Value::from(order.id.0),
                     Value::from(record.category_id),

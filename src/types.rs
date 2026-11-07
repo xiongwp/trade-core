@@ -81,6 +81,37 @@ pub enum OrderType {
     Market,
 }
 
+/// Which way a conditional order is armed (Binance spot `STOP_LOSS[_LIMIT]` /
+/// `TAKE_PROFIT[_LIMIT]`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TriggerKind {
+    /// Fires when the market moves *against* the order's side: a sell when a
+    /// trade prints at or below the trigger, a buy at or above it.
+    StopLoss,
+    /// Fires when the market moves *in favour of* the order's side: a sell at
+    /// or above the trigger, a buy at or below it.
+    TakeProfit,
+}
+
+/// The arming condition of a conditional order. It sits outside the book
+/// until a trade prints at or through `price`, then enters as an ordinary order.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Trigger {
+    pub price: Price,
+    pub kind: TriggerKind,
+}
+
+impl Trigger {
+    /// `true` if an order on `side` fires when the trade price rises to (or
+    /// above) the trigger; `false` if it fires when it falls to (or below).
+    pub fn fires_on_rise(&self, side: Side) -> bool {
+        matches!(
+            (side, self.kind),
+            (Side::Buy, TriggerKind::StopLoss) | (Side::Sell, TriggerKind::TakeProfit)
+        )
+    }
+}
+
 /// How long an order remains active.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TimeInForce {

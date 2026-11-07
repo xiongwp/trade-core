@@ -20,7 +20,7 @@
 //! |-----|------|----------------------------------------------------------|
 //! | 0   | 1    | msg type (1=New, 2=Cancel, 3=Modify, 4=ForceClose)       |
 //! | 1   | 1    | side (0=Buy, 1=Sell) — close side for ForceClose         |
-//! | 2   | 1    | order type (0=Limit, 1=Market)                           |
+//! | 2   | 1    | order type (0=Limit, 1=Market); New only: bit 7 = conditional, bit 6 = take-profit |
 //! | 3   | 1    | time-in-force (0=GTC, 1=IOC, 2=FOK)                      |
 //! | 4   | 4    | instrument id (u32)                                      |
 //! | 8   | 8    | order id (u64) — close-order id for ForceClose           |
@@ -164,6 +164,10 @@ pub const RT_DEPTH_END: u8 = 11;
 /// order_id slot = the command's id, aux = reject reason code. (12..=15 are
 /// the halt / resume / user-halt / user-resume acks.)
 pub const RT_CMD_REJECTED: u8 = 16;
+/// A conditional order accepted into the trigger book (not on the book yet).
+pub const RT_STOP_ACCEPTED: u8 = 17;
+/// A conditional order fired; its ordinary-order reports follow.
+pub const RT_TRIGGERED: u8 = 18;
 
 /// A borrowed view over one wire frame. Reads fields in place; copies nothing.
 #[derive(Clone, Copy)]
@@ -221,10 +225,25 @@ impl<'a> WireView<'a> {
         }
     }
     fn order_type(&self) -> OrderType {
-        match self.buf[2] {
+        match self.buf[2] & ORDER_TYPE_MASK {
             1 => OrderType::Market,
             _ => OrderType::Limit,
         }
+    }
+    #[inline]
+    pub fn trigger_price(&self) -> Price {
+        self.u64_at(40)
+    }
+    /// The trigger of a conditional `New` (bit 7 of the order-type byte).
+    fn trigger(&self) -> Option<Trigger> {
+        (self.buf[2] & FLAG_CONDITIONAL != 0).then(|| Trigger {
+            price: self.trigger_price(),
+            kind: if self.buf[2] & FLAG_TAKE_PROFIT != 0 {
+                TriggerKind::TakeProfit
+            } else {
+                TriggerKind::StopLoss
+            },
+        })
     }
     fn tif(&self) -> TimeInForce {
         match self.buf[3] {
@@ -250,7 +269,10 @@ impl<'a> WireView<'a> {
                 order.instrument = self.instrument();
                 order.user = self.user();
                 order.tif = self.tif();
-                Some(Command::New(order))
+                Some(match self.trigger() {
+                    Some(trigger) => Command::NewConditional(order, trigger),
+                    None => Command::New(order),
+                })
             }
             MT_CANCEL => Some(Command::Cancel {
                 instrument: self.instrument(),
@@ -300,6 +322,23 @@ pub fn encode_admin(halt: bool, instrument: InstrumentId, cmd_id: u64, out: &mut
     out[0] = if halt { MT_HALT } else { MT_RESUME };
     out[4..8].copy_from_slice(&instrument.0.to_le_bytes());
     out[8..16].copy_from_slice(&cmd_id.to_le_bytes());
+}
+
+/// Order-type byte: low bits carry the type, high bits the conditional flags.
+const ORDER_TYPE_MASK: u8 = 0x0F;
+const FLAG_CONDITIONAL: u8 = 0x80;
+const FLAG_TAKE_PROFIT: u8 = 0x40;
+
+/// Encode a conditional (stop-loss / take-profit) `New` into a frame: the
+/// order as [`encode_new`] writes it, flagged, with the trigger price in the
+/// frame's tail.
+pub fn encode_new_conditional(order: &Order, trigger: &Trigger, out: &mut [u8; MSG_LEN]) {
+    encode_new(order, out);
+    out[2] |= FLAG_CONDITIONAL;
+    if trigger.kind == TriggerKind::TakeProfit {
+        out[2] |= FLAG_TAKE_PROFIT;
+    }
+    out[40..48].copy_from_slice(&trigger.price.to_le_bytes());
 }
 
 /// Encode a `New` order into a frame.
@@ -390,6 +429,7 @@ pub fn encode_force_close(
 pub fn encode_command(cmd: &Command, out: &mut [u8; MSG_LEN]) {
     match cmd {
         Command::New(order) => encode_new(order, out),
+        Command::NewConditional(order, trigger) => encode_new_conditional(order, trigger, out),
         Command::Cancel {
             instrument,
             order_id,
@@ -526,6 +566,14 @@ pub fn encode_report(r: &ExecReport, out: &mut [u8; REPORT_LEN]) {
             0,
             0,
         ),
+        ExecReport::StopAccepted {
+            instrument,
+            order_id,
+        } => put(RT_STOP_ACCEPTED, instrument, order_id, 0, 0, 0, 0),
+        ExecReport::Triggered {
+            instrument,
+            order_id,
+        } => put(RT_TRIGGERED, instrument, order_id, 0, 0, 0, 0),
         ExecReport::CommandRejected {
             instrument,
             command_id,
@@ -624,6 +672,8 @@ pub const REJECT_REASONS: &[&str] = &[
     "min-qty",
     "price-range",
     "min-notional",
+    "invalid-stop",
+    "stop-not-amendable",
 ];
 
 /// Wire code of a reject reason (0 if it is not in [`REJECT_REASONS`]).
@@ -774,6 +824,8 @@ impl fmt::Display for DecodedReport {
                 self.order_id,
                 reject_reason_name(self.aux_id)
             ),
+            RT_STOP_ACCEPTED => write!(f, "STOP       {} {}", self.instrument, self.order_id),
+            RT_TRIGGERED => write!(f, "TRIGGERED  {} {}", self.instrument, self.order_id),
             RT_CMD_REJECTED => write!(
                 f,
                 "CMDREJECT  {} command {} ({})",

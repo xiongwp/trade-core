@@ -41,7 +41,7 @@ use crate::journal::{self, JournalReader, JournalWriter};
 use crate::lockfree::{self, Consumer, Producer};
 use crate::order::Order;
 use crate::risk::{InstrumentSpecs, PriceGuard, RiskLimits};
-use crate::snapshot::{self, EngineState, Snapshot};
+use crate::snapshot::{self, EngineState, Snapshot, StopOrder};
 use crate::strategy::MatchingStrategy;
 use crate::trade::{ModifyOutcome, OrderStatus};
 use crate::types::*;
@@ -52,6 +52,10 @@ use crate::wire;
 pub enum Command {
     /// Submit a new order (low-priority queue).
     New(Order),
+    /// Submit a conditional (stop-loss / take-profit) order (low-priority
+    /// queue). It is held outside the book until a trade prints at or through
+    /// the trigger price, then enters as the given ordinary order.
+    NewConditional(Order, Trigger),
     /// Cancel a resting order (high-priority queue). `cmd_id` is the
     /// order-system-assigned **unique increasing command id** (Leaf-style, the
     /// same series as new-order ids): cancels and modifies are first-class
@@ -128,7 +132,7 @@ impl Command {
     /// Globally unique id used for exact retry suppression and replay repair.
     pub fn id(&self) -> u64 {
         match self {
-            Command::New(order) => order.id.0,
+            Command::New(order) | Command::NewConditional(order, _) => order.id.0,
             Command::Cancel { cmd_id, .. }
             | Command::Modify { cmd_id, .. }
             | Command::Halt { cmd_id, .. }
@@ -143,7 +147,7 @@ impl Command {
     /// The instrument this command targets (used for shard routing).
     pub fn instrument(&self) -> InstrumentId {
         match self {
-            Command::New(o) => o.instrument,
+            Command::New(o) | Command::NewConditional(o, _) => o.instrument,
             Command::Cancel { instrument, .. } => *instrument,
             Command::Modify { instrument, .. } => *instrument,
             Command::ForceClose { instrument, .. } => *instrument,
@@ -157,7 +161,7 @@ impl Command {
 
     /// Whether this command belongs on the high-priority queue.
     fn is_high_priority(&self) -> bool {
-        !matches!(self, Command::New(_))
+        !matches!(self, Command::New(_) | Command::NewConditional(..))
     }
 }
 
@@ -200,6 +204,18 @@ pub enum ExecReport {
         instrument: InstrumentId,
         order_id: OrderId,
         reason: &'static str,
+    },
+    /// A conditional order was accepted and is waiting for its trigger (it is
+    /// not on the book yet).
+    StopAccepted {
+        instrument: InstrumentId,
+        order_id: OrderId,
+    },
+    /// A conditional order's trigger printed: it now enters as an ordinary
+    /// order, and the usual Accepted / Trade / Filled ... reports follow.
+    Triggered {
+        instrument: InstrumentId,
+        order_id: OrderId,
     },
     /// A command was refused without changing any order: a re-sent duplicate,
     /// or an amend that breaks the instrument's trading rules. `command_id` is
@@ -861,6 +877,107 @@ pub struct Processor {
     positions: HashMap<(u64, InstrumentId), i64>,
     /// Reusable trade buffer: the New-order hot path allocates nothing.
     trades_buf: Vec<crate::trade::Trade>,
+    /// Untriggered conditional orders per instrument.
+    stops: HashMap<InstrumentId, TriggerBook>,
+    /// Total untriggered conditional orders: when 0 (the common case) the
+    /// trigger check after a trade costs one comparison.
+    pending_stops: usize,
+    /// Arrival counter ordering stops that share a trigger price. Only its
+    /// relative order matters, so it is not persisted (restore renumbers).
+    stop_seq: u64,
+}
+
+/// Untriggered conditional orders of one instrument, in firing priority:
+/// rising triggers lowest-first, falling triggers highest-first, ties by
+/// arrival. Determinism: the order in which a single trade print fires
+/// several stops is a pure function of this state.
+#[derive(Default)]
+struct TriggerBook {
+    /// Fire when a trade prints at or above the price.
+    rises: std::collections::BTreeMap<(Price, u64), StopOrder>,
+    /// Fire when a trade prints at or below the price.
+    falls: std::collections::BTreeMap<(Price, u64), StopOrder>,
+    /// order id -> (rises?, key) for cancel lookups.
+    index: HashMap<OrderId, (bool, (Price, u64))>,
+}
+
+impl TriggerBook {
+    fn insert(&mut self, stop: StopOrder, seq: u64) {
+        let rises = stop.trigger.fires_on_rise(stop.order.side);
+        let key = (stop.trigger.price, seq);
+        self.index.insert(stop.order.id, (rises, key));
+        if rises {
+            self.rises.insert(key, stop);
+        } else {
+            self.falls.insert(key, stop);
+        }
+    }
+
+    fn remove(&mut self, id: OrderId) -> Option<StopOrder> {
+        let (rises, key) = self.index.remove(&id)?;
+        if rises {
+            self.rises.remove(&key)
+        } else {
+            self.falls.remove(&key)
+        }
+    }
+
+    fn contains(&self, id: OrderId) -> bool {
+        self.index.contains_key(&id)
+    }
+
+    /// Remove and return the next stop armed by a trade at `price`: rising
+    /// triggers first (lowest price, earliest arrival), then falling ones
+    /// (highest price, earliest arrival).
+    fn pop_triggered(&mut self, price: Price) -> Option<StopOrder> {
+        let key = match self.rises.first_key_value() {
+            Some((&key, _)) if key.0 <= price => Some((true, key)),
+            _ => self
+                .falls
+                .iter()
+                .rev()
+                .find(|(key, _)| key.0 >= price)
+                .and_then(|(_, stop)| {
+                    // Highest price first; among equal prices, earliest arrival.
+                    self.falls
+                        .range((stop.trigger.price, 0)..=(stop.trigger.price, u64::MAX))
+                        .next()
+                        .map(|(&key, _)| (false, key))
+                }),
+        }?;
+        let (rises, key) = key;
+        let stop = if rises {
+            self.rises.remove(&key)
+        } else {
+            self.falls.remove(&key)
+        }?;
+        self.index.remove(&stop.order.id);
+        Some(stop)
+    }
+
+    fn remove_user(&mut self, user: u64) -> Vec<OrderId> {
+        let mut ids: Vec<(Price, u64, OrderId)> = self
+            .rises
+            .iter()
+            .chain(self.falls.iter())
+            .filter(|(_, stop)| stop.order.user == user)
+            .map(|(&(price, seq), stop)| (price, seq, stop.order.id))
+            .collect();
+        ids.sort_by_key(|&(_, seq, _)| seq); // arrival order: deterministic
+        ids.into_iter()
+            .filter_map(|(_, _, id)| self.remove(id).map(|stop| stop.order.id))
+            .collect()
+    }
+
+    /// Canonical export order: rising book, then falling book, each in key
+    /// order (so restore can renumber arrivals and keep tie order).
+    fn export(&self) -> Vec<StopOrder> {
+        self.rises.values().chain(self.falls.values()).copied().collect()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.index.is_empty()
+    }
 }
 
 impl Processor {
@@ -882,6 +999,9 @@ impl Processor {
             suspended: std::collections::HashSet::new(),
             positions: HashMap::new(),
             trades_buf: Vec::new(),
+            stops: HashMap::new(),
+            pending_stops: 0,
+            stop_seq: 0,
         }
     }
 
@@ -959,6 +1079,11 @@ impl Processor {
                 instrument,
                 engine_seq: e.seq(),
                 orders: e.export_orders(),
+                stops: self
+                    .stops
+                    .get(&instrument)
+                    .map(TriggerBook::export)
+                    .unwrap_or_default(),
             })
             .collect();
         states.sort_by_key(|s| s.instrument);
@@ -983,8 +1108,18 @@ impl Processor {
             // insert the same resting order twice during recovery.
             self.seen_command_ids
                 .extend(e.orders.iter().map(|order| order.id.0));
+            self.seen_command_ids
+                .extend(e.stops.iter().map(|stop| stop.order.id.0));
             let engine = self.engine_for(e.instrument);
             engine.restore(e.engine_seq, &e.orders);
+            for stop in &e.stops {
+                self.stop_seq += 1;
+                self.stops
+                    .entry(e.instrument)
+                    .or_default()
+                    .insert(*stop, self.stop_seq);
+                self.pending_stops += 1;
+            }
         }
     }
 
@@ -1040,7 +1175,9 @@ impl Processor {
         if self.dedup {
             // (id, instrument, is_admin_stream)
             let (id, inst, admin) = match &cmd {
-                Command::New(o) => (o.id.0, o.instrument, false),
+                Command::New(o) | Command::NewConditional(o, _) => {
+                    (o.id.0, o.instrument, false)
+                }
                 Command::Cancel {
                     cmd_id, instrument, ..
                 } => (*cmd_id, *instrument, true),
@@ -1108,13 +1245,32 @@ impl Processor {
                 self.halted.remove(&instrument);
                 emit(ExecReport::Resumed { instrument });
             }
-            Command::New(order) => self.process_new(order, emit),
+            Command::New(order) => {
+                let instrument = order.instrument;
+                let last_price = self.process_new(order, emit);
+                if self.pending_stops > 0 {
+                    self.fire_stops(instrument, last_price, emit);
+                }
+            }
+            Command::NewConditional(order, trigger) => self.place_stop(order, trigger, emit),
             Command::Cancel {
                 instrument,
                 order_id,
                 ..
             } => {
                 if self.engine_for(instrument).cancel(order_id) {
+                    emit(ExecReport::Cancelled {
+                        instrument,
+                        order_id,
+                    });
+                } else if self.pending_stops > 0
+                    && self
+                        .stops
+                        .get_mut(&instrument)
+                        .and_then(|book| book.remove(order_id))
+                        .is_some()
+                {
+                    self.pending_stops -= 1;
                     emit(ExecReport::Cancelled {
                         instrument,
                         order_id,
@@ -1133,6 +1289,21 @@ impl Processor {
                 new_qty,
                 cmd_id,
             } => {
+                // An untriggered conditional order is not amendable (cancel
+                // and re-place it); refusing leaves it untouched.
+                if self.pending_stops > 0
+                    && self
+                        .stops
+                        .get(&instrument)
+                        .is_some_and(|book| book.contains(order_id))
+                {
+                    emit(ExecReport::CommandRejected {
+                        instrument,
+                        command_id: cmd_id,
+                        reason: "stop-not-amendable",
+                    });
+                    return;
+                }
                 // Trading rules apply to the amended price/size too. A refused
                 // amend leaves the order untouched: a command-level rejection.
                 if !self.specs.is_empty() {
@@ -1168,6 +1339,7 @@ impl Processor {
                         order_id,
                     }),
                     ModifyOutcome::Requoted(report) => {
+                        let last_price = report.trades.last().map(|t| t.price);
                         for t in &report.trades {
                             let (maker_fee, taker_fee) = self.fees.fees(t.price, t.quantity);
                             emit(ExecReport::Trade {
@@ -1199,6 +1371,9 @@ impl Processor {
                                 order_id,
                             }),
                         }
+                        if self.pending_stops > 0 {
+                            self.fire_stops(instrument, last_price, emit);
+                        }
                     }
                 }
             }
@@ -1209,8 +1384,16 @@ impl Processor {
                 close_side,
                 close_qty,
             } => {
-                // 1. Pull every resting order of the user.
-                let cancelled = self.engine_for(instrument).cancel_all_for_user(user);
+                // 1. Pull every resting order of the user, and every
+                //    untriggered conditional one (it would re-open exposure).
+                let mut cancelled = self.engine_for(instrument).cancel_all_for_user(user);
+                if self.pending_stops > 0 {
+                    if let Some(book) = self.stops.get_mut(&instrument) {
+                        let pulled = book.remove_user(user);
+                        self.pending_stops -= pulled.len();
+                        cancelled.extend(pulled);
+                    }
+                }
                 for order_id in cancelled {
                     emit(ExecReport::Cancelled {
                         instrument,
@@ -1223,13 +1406,18 @@ impl Processor {
                         .on(instrument)
                         .by(user);
                     close.tif = TimeInForce::Ioc;
-                    self.process_new(close, emit);
+                    let last_price = self.process_new(close, emit);
+                    if self.pending_stops > 0 {
+                        self.fire_stops(instrument, last_price, emit);
+                    }
                 }
             }
         }
     }
 
-    fn process_new(&mut self, mut order: Order, emit: &mut dyn FnMut(ExecReport)) {
+    /// Admit and match one ordinary order. Returns the price of the last trade
+    /// it printed (the input to [`Self::fire_stops`]), if any.
+    fn process_new(&mut self, mut order: Order, emit: &mut dyn FnMut(ExecReport)) -> Option<Price> {
         let instrument = order.instrument;
         let id = order.id;
 
@@ -1241,7 +1429,7 @@ impl Processor {
                 order_id: id,
                 reason: "halted",
             });
-            return;
+            return None;
         }
         if order.user != 0 && self.suspended.contains(&order.user) {
             emit(ExecReport::Rejected {
@@ -1249,7 +1437,7 @@ impl Processor {
                 order_id: id,
                 reason: "user-suspended",
             });
-            return;
+            return None;
         }
 
         // Order-shape checks, cheapest first:
@@ -1262,7 +1450,7 @@ impl Processor {
                 order_id: id,
                 reason: "post-only",
             });
-            return;
+            return None;
         }
         if !self.specs.is_empty() {
             if let Some(spec) = self.specs.get(instrument) {
@@ -1272,7 +1460,7 @@ impl Processor {
                         order_id: id,
                         reason,
                     });
-                    return;
+                    return None;
                 }
             }
         }
@@ -1285,7 +1473,7 @@ impl Processor {
                     order_id: id,
                     reason,
                 });
-                return;
+                return None;
             }
         }
         // 2. anti-spike price banding (may convert market orders into
@@ -1297,7 +1485,7 @@ impl Processor {
                     order_id: id,
                     reason,
                 });
-                return;
+                return None;
             }
         }
         // 3. per-user open-order cap (needs book state).
@@ -1313,7 +1501,7 @@ impl Processor {
                         order_id: id,
                         reason: "max-user-orders",
                     });
-                    return;
+                    return None;
                 }
             }
         }
@@ -1362,6 +1550,7 @@ impl Processor {
                 taker_fee,
             });
         }
+        let last_price = trades.last().map(|t| t.price);
         self.trades_buf = trades;
         match status {
             OrderStatus::Filled => emit(ExecReport::Filled {
@@ -1388,6 +1577,105 @@ impl Processor {
                 // and a FOK that cannot fill whole.
                 reason: if post_only { "post-only" } else { "unfillable" },
             }),
+        }
+        last_price
+    }
+
+    /// Admit a conditional order into the instrument's trigger book. Static
+    /// checks run now (halt, suspension, trading rules, limits) so a bad
+    /// order fails at placement; the dynamic ones (price band, book state)
+    /// run again when it fires and enters through [`Self::process_new`].
+    // Kept out of line: conditional orders are rare next to plain orders, and
+    // their code must not grow the hot `process` / `process_new` paths.
+    #[cold]
+    #[inline(never)]
+    fn place_stop(&mut self, order: Order, trigger: Trigger, emit: &mut dyn FnMut(ExecReport)) {
+        let instrument = order.instrument;
+        let id = order.id;
+        let reject = |reason, emit: &mut dyn FnMut(ExecReport)| {
+            emit(ExecReport::Rejected {
+                instrument,
+                order_id: id,
+                reason,
+            })
+        };
+        if self.halted.contains(&instrument) {
+            return reject("halted", emit);
+        }
+        if order.user != 0 && self.suspended.contains(&order.user) {
+            return reject("user-suspended", emit);
+        }
+        // Budget orders carry a total in `price` and post-only must rest on
+        // arrival; neither is meaningful as a triggered order.
+        if trigger.price == 0
+            || matches!(
+                order.tif,
+                TimeInForce::IocBudget | TimeInForce::FokBudget | TimeInForce::PostOnly
+            )
+        {
+            return reject("invalid-stop", emit);
+        }
+        if !self.specs.is_empty() {
+            if let Some(spec) = self.specs.get(instrument) {
+                let checked = spec
+                    .check(&order)
+                    .and_then(|()| spec.check_amend(trigger.price, order.quantity));
+                if let Err(reason) = checked {
+                    return reject(reason, emit);
+                }
+            }
+        }
+        if let Some(limits) = &self.limits {
+            if let Err(reason) = limits.check_static(&order) {
+                return reject(reason, emit);
+            }
+        }
+        self.engine_for(instrument); // the instrument now has state to snapshot
+        self.stop_seq += 1;
+        self.stops
+            .entry(instrument)
+            .or_default()
+            .insert(StopOrder { order, trigger }, self.stop_seq);
+        self.pending_stops += 1;
+        emit(ExecReport::StopAccepted {
+            instrument,
+            order_id: id,
+        });
+    }
+
+    /// Fire every conditional order armed by trades on `instrument`, starting
+    /// from the price of the trade that just printed. A fired order that
+    /// itself trades moves the price on, so cascades resolve here, in one
+    /// command, in the trigger book's deterministic priority order. Callers
+    /// check `pending_stops > 0` first, so a venue with no stops never calls it.
+    #[cold]
+    #[inline(never)]
+    fn fire_stops(
+        &mut self,
+        instrument: InstrumentId,
+        mut last_price: Option<Price>,
+        emit: &mut dyn FnMut(ExecReport),
+    ) {
+        while self.pending_stops > 0 {
+            let Some(price) = last_price else { return };
+            let Some(stop) = self
+                .stops
+                .get_mut(&instrument)
+                .and_then(|book| book.pop_triggered(price))
+            else {
+                return;
+            };
+            self.pending_stops -= 1;
+            if self.stops.get(&instrument).is_some_and(TriggerBook::is_empty) {
+                self.stops.remove(&instrument);
+            }
+            emit(ExecReport::Triggered {
+                instrument,
+                order_id: stop.order.id,
+            });
+            if let Some(price) = self.process_new(stop.order, emit) {
+                last_price = Some(price);
+            }
         }
     }
 }
@@ -2352,6 +2640,16 @@ pub fn fingerprint_engine_states(
             mix(o.remaining);
             mix(o.timestamp);
             mix(o.user);
+        }
+        // Only mixed in when present, so state without conditional orders
+        // fingerprints exactly as it did before they existed.
+        for stop in &s.stops {
+            mix(stop.order.id.0);
+            mix(stop.order.price);
+            mix(stop.order.quantity);
+            mix(stop.order.user);
+            mix(stop.trigger.price);
+            mix(stop.trigger.fires_on_rise(stop.order.side) as u64);
         }
     }
     h

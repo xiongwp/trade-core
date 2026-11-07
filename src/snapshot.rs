@@ -40,8 +40,14 @@ use crate::types::*;
 
 const MAGIC: &[u8; 4] = b"TCS1";
 const VERSION: u32 = 4; // v4: + last durably applied Raft index
+/// v5: + per-engine untriggered conditional orders. Written only when some
+/// exist, so a node holding none keeps producing v4 snapshots that a previous
+/// build can still install during a rolling upgrade.
+const VERSION_STOPS: u32 = 5;
 const LEGACY_VERSION: u32 = 3;
 const ORDER_ENC: usize = 56;
+/// Encoded stop: the order, then trigger price (u64) and kind (u8).
+const STOP_ENC: usize = ORDER_ENC + 8 + 1;
 
 fn encode_order(o: &Order, out: &mut [u8; ORDER_ENC]) {
     out[0..8].copy_from_slice(&o.id.0.to_le_bytes());
@@ -102,6 +108,42 @@ pub struct EngineState {
     pub engine_seq: Timestamp,
     /// Resting orders in time-priority order.
     pub orders: Vec<Order>,
+    /// Untriggered conditional orders, in firing-priority order within each
+    /// direction (see `Processor`'s trigger book).
+    pub stops: Vec<StopOrder>,
+}
+
+/// An untriggered conditional order: held outside the book until a trade
+/// prints at or through its trigger.
+#[derive(Clone, Copy, Debug)]
+pub struct StopOrder {
+    pub order: Order,
+    pub trigger: Trigger,
+}
+
+fn encode_stop(stop: &StopOrder, out: &mut [u8; STOP_ENC]) {
+    let mut order = [0u8; ORDER_ENC];
+    encode_order(&stop.order, &mut order);
+    out[..ORDER_ENC].copy_from_slice(&order);
+    out[ORDER_ENC..ORDER_ENC + 8].copy_from_slice(&stop.trigger.price.to_le_bytes());
+    out[ORDER_ENC + 8] = match stop.trigger.kind {
+        TriggerKind::StopLoss => 0,
+        TriggerKind::TakeProfit => 1,
+    };
+}
+
+fn decode_stop(b: &[u8; STOP_ENC]) -> StopOrder {
+    StopOrder {
+        order: decode_order(b[..ORDER_ENC].try_into().unwrap()),
+        trigger: Trigger {
+            price: u64::from_le_bytes(b[ORDER_ENC..ORDER_ENC + 8].try_into().unwrap()),
+            kind: if b[ORDER_ENC + 8] == 1 {
+                TriggerKind::TakeProfit
+            } else {
+                TriggerKind::StopLoss
+            },
+        },
+    }
 }
 
 /// A decoded shard snapshot.
@@ -141,9 +183,14 @@ pub struct SnapshotData<'a> {
 
 /// Write a snapshot **atomically**: temp file, fsync, rename over `path`.
 pub fn write(path: &Path, data: SnapshotData<'_>) -> io::Result<()> {
+    let version = if data.engines.iter().any(|e| !e.stops.is_empty()) {
+        VERSION_STOPS
+    } else {
+        VERSION
+    };
     let mut buf: Vec<u8> = Vec::with_capacity(4096);
     buf.extend_from_slice(MAGIC);
-    buf.extend_from_slice(&VERSION.to_le_bytes());
+    buf.extend_from_slice(&version.to_le_bytes());
     buf.extend_from_slice(&data.journal_seq.to_le_bytes());
     buf.extend_from_slice(&data.raft_applied_index.to_le_bytes());
     buf.extend_from_slice(&data.max_cmd_id.to_le_bytes());
@@ -171,6 +218,14 @@ pub fn write(path: &Path, data: SnapshotData<'_>) -> io::Result<()> {
         for o in &e.orders {
             encode_order(o, &mut rec);
             buf.extend_from_slice(&rec);
+        }
+        if version >= VERSION_STOPS {
+            buf.extend_from_slice(&(e.stops.len() as u32).to_le_bytes());
+            let mut stop_rec = [0u8; STOP_ENC];
+            for stop in &e.stops {
+                encode_stop(stop, &mut stop_rec);
+                buf.extend_from_slice(&stop_rec);
+            }
         }
     }
     let h = fnv1a(&buf);
@@ -254,7 +309,7 @@ pub fn load(path: &Path) -> io::Result<Snapshot> {
         return Err(corrupt("checksum mismatch"));
     }
     let version = u32::from_le_bytes(buf[4..8].try_into().unwrap());
-    if version != VERSION && version != LEGACY_VERSION {
+    if version != VERSION && version != VERSION_STOPS && version != LEGACY_VERSION {
         return Err(corrupt("unsupported version"));
     }
     let journal_seq = u64::from_le_bytes(buf[8..16].try_into().unwrap());
@@ -312,10 +367,26 @@ pub fn load(path: &Path) -> io::Result<Snapshot> {
             orders.push(decode_order(rec));
             pos += ORDER_ENC;
         }
+        let mut stops = Vec::new();
+        if version >= VERSION_STOPS {
+            if pos + 4 > body_len {
+                return Err(corrupt("truncated stop count"));
+            }
+            let n = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+            pos += 4;
+            if pos + n * STOP_ENC > body_len {
+                return Err(corrupt("truncated stops"));
+            }
+            for _ in 0..n {
+                stops.push(decode_stop(buf[pos..pos + STOP_ENC].try_into().unwrap()));
+                pos += STOP_ENC;
+            }
+        }
         engines.push(EngineState {
             instrument,
             engine_seq,
             orders,
+            stops,
         });
     }
     Ok(Snapshot {
@@ -352,6 +423,7 @@ mod tests {
                     .on(InstrumentId(7))
                     .by(22),
             ],
+            stops: Vec::new(),
         }];
         write(
             &path,
