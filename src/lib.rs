@@ -62,6 +62,7 @@ pub mod snapshot;
 pub mod strategy;
 pub mod trade;
 pub mod types;
+pub mod websocket;
 pub mod wire;
 
 pub use book::{OrderBook, OrderPool};

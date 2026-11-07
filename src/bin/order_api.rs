@@ -762,6 +762,65 @@ fn verify_caught_up_inner(
         })
 }
 
+/// Most orders accepted per WebSocket message (`TC_WS_MAX_BATCH`).
+fn ws_max_batch() -> usize {
+    static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| env_number("TC_WS_MAX_BATCH", 5_000usize).max(1))
+}
+
+/// Serve one `/ws/orders` connection. Each binary message is a batch of up
+/// to `max_batch` records in the `/commands/batch` layout (user `u64` LE +
+/// one wire frame); `submit` admits and publishes it exactly like the HTTP
+/// batch path. Every message gets one JSON text acknowledgement, in order,
+/// carrying its 1-based `seq` on this connection so clients may pipeline:
+/// `{"seq":N,"accepted":true,"status":"PENDING","count":C}` or
+/// `{"seq":N,"accepted":false,"code":429,"error":"..."}` (codes as HTTP).
+/// A message above the size limit closes the connection (1009).
+fn ws_order_session(
+    r: &mut impl Read,
+    w: &mut impl Write,
+    max_batch: usize,
+    mut submit: impl FnMut(&[u8]) -> Result<usize, (&'static str, String)>,
+) -> std::io::Result<()> {
+    use trade_core::websocket::{self, Message};
+    let max_len = max_batch * BATCH_RECORD_LEN;
+    let mut seq = 0u64;
+    loop {
+        let message = match websocket::read_message(r, w, max_len) {
+            Ok(Some(message)) => message,
+            Ok(None) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                let code: u16 = if error.to_string().contains("too large") { 1009 } else { 1002 };
+                let _ = websocket::write_frame(w, websocket::OP_CLOSE, &code.to_be_bytes());
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+        seq += 1;
+        let result = match message {
+            Message::Binary(body) => submit(&body),
+            Message::Text(_) => Err((
+                "400 Bad Request",
+                format!("binary batches only: up to {max_batch} records of {BATCH_RECORD_LEN} bytes"),
+            )),
+        };
+        let ack = match result {
+            Ok(count) => format!(
+                "{{\"seq\":{seq},\"accepted\":true,\"status\":\"PENDING\",\"count\":{count}}}"
+            ),
+            Err((status, error)) => {
+                let code = status.split_whitespace().next().unwrap_or("500");
+                format!(
+                    "{{\"seq\":{seq},\"accepted\":false,\"code\":{code},\"error\":\"{}\"}}",
+                    error.replace('"', "'")
+                )
+            }
+        };
+        websocket::write_frame(w, websocket::OP_TEXT, ack.as_bytes())?;
+        w.flush()?;
+    }
+}
+
 /// Prefix for request errors that retrying cannot fix (malformed parameters,
 /// instrument-rule violations): answered `400`, not the retryable `503`.
 const INVALID_REQUEST: &str = "invalid-request: ";
@@ -2997,6 +3056,8 @@ fn handle(
         let mut authorized = false;
         let mut keep_alive = version == "HTTP/1.1";
         let mut content_length = 0usize;
+        let mut upgrade_websocket = false;
+        let mut websocket_key: Option<String> = None;
         loop {
             let mut header = String::new();
             match reader.read_line(&mut header) {
@@ -3013,6 +3074,12 @@ fn handle(
                 }
                 if key.eq_ignore_ascii_case("content-length") {
                     content_length = value.parse().unwrap_or(usize::MAX);
+                }
+                if key.eq_ignore_ascii_case("upgrade") {
+                    upgrade_websocket = value.eq_ignore_ascii_case("websocket");
+                }
+                if key.eq_ignore_ascii_case("sec-websocket-key") {
+                    websocket_key = Some(value.to_string());
                 }
             }
         }
@@ -3098,6 +3165,42 @@ fn handle(
                 return;
             }
             continue;
+        }
+        if method == "GET" && path == "/ws/orders" {
+            let key = websocket_key.take().filter(|_| upgrade_websocket);
+            let (Some(key), true) = (key, ingress_enabled) else {
+                let (status, error) = if ingress_enabled {
+                    ("400 Bad Request", "websocket upgrade required")
+                } else {
+                    ("503 Service Unavailable", "ingress disabled for this worker role")
+                };
+                respond(reader.get_mut(), status, &format!("{{\"error\":\"{error}\"}}"), false);
+                return;
+            };
+            let Ok(mut writer) = reader.get_ref().try_clone() else {
+                return;
+            };
+            if writer
+                .write_all(trade_core::websocket::handshake_response(&key).as_bytes())
+                .is_err()
+            {
+                return;
+            }
+            // `reader` may already hold frames the client pipelined behind
+            // the handshake, so it stays the read side.
+            let result = ws_order_session(&mut reader, &mut writer, ws_max_batch(), |body| {
+                match decode_batch(body, category_size) {
+                    Ok(records) => match kafka.publish_batch(&records) {
+                        Ok(()) => Ok(records.len()),
+                        Err(error) => Err((ingress_error_status(&error), error)),
+                    },
+                    Err(error) => Err(("400 Bad Request", error)),
+                }
+            });
+            if let Err(error) = result {
+                log_warn!("order-api", "event=ws_session_closed error={error}");
+            }
+            return;
         }
         if !ingress_enabled && method == "POST" {
             respond(
@@ -3488,6 +3591,81 @@ mod tests {
         pack.iter()
             .map(|frame| u64::from_le_bytes(frame[8..16].try_into().unwrap()))
             .collect()
+    }
+
+    fn ws_batch(count: u64) -> Vec<u8> {
+        (0..count)
+            .flat_map(|i| batch_order_with_id(100_000 + i, 42_001, 1 + i))
+            .collect()
+    }
+
+    fn ws_acks(out: &[u8]) -> Vec<(u8, String)> {
+        let mut r = out;
+        let mut frames = Vec::new();
+        while !r.is_empty() {
+            let (op, payload) = trade_core::websocket::read_server_frame(&mut r).unwrap();
+            frames.push((op, String::from_utf8_lossy(&payload).into_owned()));
+        }
+        frames
+    }
+
+    #[test]
+    fn websocket_session_acknowledges_each_batch_in_order() {
+        use trade_core::websocket::{write_client_frame, OP_BINARY, OP_CLOSE, OP_TEXT};
+        let mut wire = Vec::new();
+        write_client_frame(&mut wire, OP_BINARY, &ws_batch(3), [1, 2, 3, 4]).unwrap();
+        write_client_frame(&mut wire, OP_BINARY, &ws_batch(5), [5, 6, 7, 8]).unwrap(); // backpressured
+        write_client_frame(&mut wire, 0x9, b"hi", [0, 0, 0, 0]).unwrap(); // ping
+        write_client_frame(&mut wire, OP_TEXT, b"{}", [9, 9, 9, 9]).unwrap();
+        write_client_frame(&mut wire, OP_BINARY, &ws_batch(5), [1, 1, 1, 1]).unwrap();
+        write_client_frame(&mut wire, OP_CLOSE, &1000u16.to_be_bytes(), [0, 0, 0, 0]).unwrap();
+
+        let mut submitted = Vec::new();
+        let mut out = Vec::new();
+        let mut calls = 0;
+        ws_order_session(&mut &wire[..], &mut out, 5, |body| {
+            calls += 1;
+            let records = decode_batch(body, 1_000).map_err(|e| ("400 Bad Request", e))?;
+            if calls == 2 {
+                return Err(("429 Too Many Requests", "backpressure: hard".into()));
+            }
+            submitted.push(records.len());
+            Ok(records.len())
+        })
+        .unwrap();
+
+        assert_eq!(submitted, vec![3, 5]);
+        let acks = ws_acks(&out);
+        let texts: Vec<&str> = acks
+            .iter()
+            .filter(|(op, _)| *op == OP_TEXT)
+            .map(|(_, t)| t.as_str())
+            .collect();
+        assert_eq!(texts[0], r#"{"seq":1,"accepted":true,"status":"PENDING","count":3}"#);
+        assert_eq!(
+            texts[1],
+            r#"{"seq":2,"accepted":false,"code":429,"error":"backpressure: hard"}"#
+        );
+        assert!(texts[2].starts_with(r#"{"seq":3,"accepted":false,"code":400,"#), "{}", texts[2]);
+        assert_eq!(texts[3], r#"{"seq":4,"accepted":true,"status":"PENDING","count":5}"#);
+        assert!(acks.iter().any(|(op, t)| *op == 0xA && t == "hi"), "ping answered");
+        assert_eq!(acks.last().unwrap().0, OP_CLOSE);
+    }
+
+    #[test]
+    fn websocket_session_closes_on_a_batch_above_the_limit() {
+        use trade_core::websocket::{write_client_frame, OP_BINARY, OP_CLOSE};
+        let mut wire = Vec::new();
+        write_client_frame(&mut wire, OP_BINARY, &ws_batch(6), [1, 2, 3, 4]).unwrap();
+        let mut out = Vec::new();
+        let result = ws_order_session(&mut &wire[..], &mut out, 5, |_| {
+            panic!("an oversized batch must not be submitted")
+        });
+        assert!(result.is_err());
+        let mut r = &out[..];
+        let (op, payload) = trade_core::websocket::read_server_frame(&mut r).unwrap();
+        assert_eq!((op, payload), (OP_CLOSE, 1009u16.to_be_bytes().to_vec()));
+        assert!(r.is_empty(), "nothing else was sent");
     }
 
     #[test]

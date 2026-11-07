@@ -18,6 +18,11 @@
 //! STRIDE: gap between instrument ids (default 1000 = one asset category, so the
 //! instruments land in distinct categories and spread over every Raft group;
 //! 1 packs them all into category 0 / one group).
+//!
+//! TC_SIM_TRANSPORT=ws sends each batch as one binary message over a
+//! persistent `/ws/orders` WebSocket per worker (acknowledged per message)
+//! instead of `POST /commands/batch`; e.g. BATCH=5000 for 5000 orders per
+//! message.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -88,6 +93,64 @@ fn read_response(reader: &mut BufReader<TcpStream>) -> std::io::Result<(u16, Vec
     let mut body = vec![0; content_length];
     reader.read_exact(&mut body)?;
     Ok((status, body))
+}
+
+/// Open `/ws/orders`: HTTP upgrade, then expect `101 Switching Protocols`.
+fn ws_connect(
+    stream: &mut TcpStream,
+    reader: &mut BufReader<TcpStream>,
+    token: &str,
+) -> std::io::Result<()> {
+    stream.write_all(
+        format!(
+            "GET /ws/orders HTTP/1.1\r\nHost: order-api\r\nAuthorization: Bearer {token}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        )
+        .as_bytes(),
+    )?;
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    if !line.contains(" 101 ") {
+        return Err(std::io::Error::other(format!("websocket upgrade refused: {line}")));
+    }
+    loop {
+        line.clear();
+        reader.read_line(&mut line)?;
+        if line == "\r\n" || line == "\n" {
+            return Ok(());
+        }
+    }
+}
+
+/// Send one batch as a WebSocket message and map its JSON ack onto an HTTP
+/// status (202 accepted, else the ack's `code`).
+fn ws_send_batch(
+    stream: &mut TcpStream,
+    reader: &mut BufReader<TcpStream>,
+    body: &[u8],
+    mask: [u8; 4],
+) -> std::io::Result<(u16, Vec<u8>)> {
+    use trade_core::websocket::{read_server_frame, write_client_frame, OP_BINARY, OP_TEXT};
+    write_client_frame(stream, OP_BINARY, body, mask)?;
+    loop {
+        let (opcode, payload) = read_server_frame(reader)?;
+        if opcode != OP_TEXT {
+            if opcode == trade_core::websocket::OP_CLOSE {
+                return Err(std::io::Error::other("websocket closed by server"));
+            }
+            continue; // pong etc.
+        }
+        let ack = String::from_utf8_lossy(&payload);
+        if ack.contains("\"accepted\":true") {
+            return Ok((202, payload));
+        }
+        let code = ack
+            .split("\"code\":")
+            .nth(1)
+            .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+            .and_then(|digits| digits.parse().ok())
+            .unwrap_or(0);
+        return Ok((code, payload));
+    }
 }
 
 /// Scrape a Prometheus text endpoint, summing samples that share a name
@@ -254,6 +317,10 @@ fn main() {
             let mut stream = TcpStream::connect(&addr).expect("connect order API");
             stream.set_nodelay(true).ok();
             let mut reader = BufReader::new(stream.try_clone().expect("clone socket"));
+            let websocket = std::env::var("TC_SIM_TRANSPORT").is_ok_and(|t| t == "ws");
+            if websocket {
+                ws_connect(&mut stream, &mut reader, &token).expect("open /ws/orders");
+            }
             // Recent orders of this worker: (order id, instrument, user).
             let mut recent: Vec<(u64, u32, u64)> = Vec::with_capacity(RECENT);
             let mut mix = Mix::default();
@@ -323,10 +390,15 @@ fn main() {
                 let started = Instant::now();
                 let mut backoff_ms: u64 = 10;
                 loop {
-                    let result = stream
-                        .write_all(header.as_bytes())
-                        .and_then(|()| stream.write_all(&body))
-                        .and_then(|()| read_response(&mut reader));
+                    let result = if websocket {
+                        let mask = (rng.next() as u32).to_le_bytes();
+                        ws_send_batch(&mut stream, &mut reader, &body, mask)
+                    } else {
+                        stream
+                            .write_all(header.as_bytes())
+                            .and_then(|()| stream.write_all(&body))
+                            .and_then(|()| read_response(&mut reader))
+                    };
                     match result {
                         Ok((202, _)) => {
                             submitted.fetch_add(count, Ordering::Relaxed);
@@ -450,7 +522,8 @@ fn main() {
     println!();
     println!("== workload ==");
     println!(
-        "users={users} instruments={instruments} (id stride {stride}) concurrency={concurrency} batch={batch} commands={commands}"
+        "transport={} users={users} instruments={instruments} (id stride {stride}) concurrency={concurrency} batch={batch} commands={commands}",
+        std::env::var("TC_SIM_TRANSPORT").unwrap_or_else(|_| "http".into())
     );
     println!(
         "new orders={new_orders} (limit {} / post-only {} / market IOC {}), cancels={}",

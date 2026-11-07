@@ -301,85 +301,6 @@ fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
 // WebSocket (RFC 6455, server side, text frames) — dependency-free
 // ---------------------------------------------------------------------------
 
-/// SHA-1 (needed only for the WS handshake accept key — not for security).
-fn sha1(data: &[u8]) -> [u8; 20] {
-    let (mut h0, mut h1, mut h2, mut h3, mut h4) = (
-        0x67452301u32,
-        0xEFCDAB89u32,
-        0x98BADCFEu32,
-        0x10325476u32,
-        0xC3D2E1F0u32,
-    );
-    let ml = (data.len() as u64) * 8;
-    let mut msg = data.to_vec();
-    msg.push(0x80);
-    while msg.len() % 64 != 56 {
-        msg.push(0);
-    }
-    msg.extend_from_slice(&ml.to_be_bytes());
-    for chunk in msg.chunks(64) {
-        let mut w = [0u32; 80];
-        for (i, word) in chunk.chunks(4).enumerate() {
-            w[i] = u32::from_be_bytes(word.try_into().unwrap());
-        }
-        for i in 16..80 {
-            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
-        }
-        let (mut a, mut b, mut c, mut d, mut e) = (h0, h1, h2, h3, h4);
-        for (i, &wi) in w.iter().enumerate() {
-            let (f, k) = match i {
-                0..=19 => ((b & c) | (!b & d), 0x5A827999),
-                20..=39 => (b ^ c ^ d, 0x6ED9EBA1),
-                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDC),
-                _ => (b ^ c ^ d, 0xCA62C1D6),
-            };
-            let t = a
-                .rotate_left(5)
-                .wrapping_add(f)
-                .wrapping_add(e)
-                .wrapping_add(k)
-                .wrapping_add(wi);
-            e = d;
-            d = c;
-            c = b.rotate_left(30);
-            b = a;
-            a = t;
-        }
-        h0 = h0.wrapping_add(a);
-        h1 = h1.wrapping_add(b);
-        h2 = h2.wrapping_add(c);
-        h3 = h3.wrapping_add(d);
-        h4 = h4.wrapping_add(e);
-    }
-    let mut out = [0u8; 20];
-    for (i, h) in [h0, h1, h2, h3, h4].iter().enumerate() {
-        out[i * 4..i * 4 + 4].copy_from_slice(&h.to_be_bytes());
-    }
-    out
-}
-
-fn base64(data: &[u8]) -> String {
-    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut s = String::new();
-    for c in data.chunks(3) {
-        let b = [c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)];
-        let n = u32::from_be_bytes([0, b[0], b[1], b[2]]);
-        s.push(T[(n >> 18 & 63) as usize] as char);
-        s.push(T[(n >> 12 & 63) as usize] as char);
-        s.push(if c.len() > 1 {
-            T[(n >> 6 & 63) as usize] as char
-        } else {
-            '='
-        });
-        s.push(if c.len() > 2 {
-            T[(n & 63) as usize] as char
-        } else {
-            '='
-        });
-    }
-    s
-}
-
 /// Write one unmasked text frame (server -> client).
 fn ws_send_text(stream: &mut TcpStream, payload: &str) -> std::io::Result<()> {
     let p = payload.as_bytes();
@@ -439,16 +360,7 @@ fn ws_session(
     query: &str,
     state: &Arc<Mutex<State>>,
 ) -> std::io::Result<()> {
-    let accept = base64(&sha1(
-        format!("{key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11").as_bytes(),
-    ));
-    stream.write_all(
-        format!(
-            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
-             Connection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
-        )
-        .as_bytes(),
-    )?;
+    stream.write_all(trade_core::websocket::handshake_response(key).as_bytes())?;
 
     let symbol = query_param(query, "symbol")
         .and_then(|v| v.parse().ok())
