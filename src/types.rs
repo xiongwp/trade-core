@@ -98,4 +98,9 @@ pub enum TimeInForce {
     /// FOK with a total-notional budget (`FOK_BUDGET`): fill the entire
     /// quantity only if total cost <= budget (buy) / proceeds >= budget (sell).
     FokBudget,
+    /// Post-only / maker-only (Binance `LIMIT_MAKER`, OKX `post_only`): a
+    /// limit order that must add liquidity. If it would trade on arrival it is
+    /// rejected whole instead of taking; otherwise it rests like GTC. Market
+    /// orders cannot be post-only.
+    PostOnly,
 }

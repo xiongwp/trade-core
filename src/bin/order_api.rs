@@ -23,7 +23,7 @@ use trade_core::metrics::LatencyHistogram;
 use trade_core::order::Order;
 use trade_core::order_queue::{encode_envelope, QueueEnvelope, QueueRouter};
 use trade_core::sharding::{self, DEFAULT_ASSET_CATEGORY_SIZE};
-use trade_core::types::{InstrumentId, OrderId, Side};
+use trade_core::types::{InstrumentId, OrderId, OrderType, Side, TimeInForce};
 use trade_core::wire;
 use trade_core::{log_error, log_info, log_warn};
 
@@ -762,8 +762,14 @@ fn verify_caught_up_inner(
         })
 }
 
+/// Prefix for request errors that retrying cannot fix (malformed parameters,
+/// instrument-rule violations): answered `400`, not the retryable `503`.
+const INVALID_REQUEST: &str = "invalid-request: ";
+
 fn ingress_error_status(error: &str) -> &'static str {
-    if error.starts_with("backpressure-emergency:") {
+    if error.starts_with(INVALID_REQUEST) {
+        "400 Bad Request"
+    } else if error.starts_with("backpressure-emergency:") {
         // Emergency tier / lost quorum: stop writes for this category.
         "503 Service Unavailable"
     } else if error.starts_with("backpressure:") {
@@ -774,20 +780,54 @@ fn ingress_error_status(error: &str) -> &'static str {
     }
 }
 
+/// Parse `POST /orders`. `type` is `limit` (default) or `market` (no `price`);
+/// `tif` is `gtc` (default), `ioc`, `fok` or `post_only`.
 fn order_from_query(query: &str) -> Result<Order, String> {
     let side = match query_param(query, "side") {
         Some("buy") => Side::Buy,
         Some("sell") => Side::Sell,
         _ => return Err("side must be buy or sell".into()),
     };
-    Ok(Order::limit(
-        OrderId(required(query, "order_id")?),
-        side,
-        required(query, "price")?,
-        required(query, "qty")?,
-    )
-    .on(InstrumentId(required(query, "instrument")?))
-    .by(required(query, "user")?))
+    let order_id = OrderId(required(query, "order_id")?);
+    let qty = required(query, "qty")?;
+    let mut order = match query_param(query, "type") {
+        None | Some("limit") => Order::limit(order_id, side, required(query, "price")?, qty),
+        Some("market") => Order::market(order_id, side, qty),
+        Some(_) => return Err("type must be limit or market".into()),
+    };
+    order.tif = match query_param(query, "tif") {
+        None | Some("gtc") => TimeInForce::Gtc,
+        Some("ioc") => TimeInForce::Ioc,
+        Some("fok") => TimeInForce::Fok,
+        Some("post_only") => TimeInForce::PostOnly,
+        Some(_) => return Err("tif must be gtc, ioc, fok or post_only".into()),
+    };
+    if order.tif == TimeInForce::PostOnly && order.order_type == OrderType::Market {
+        return Err("post_only requires a limit order".into());
+    }
+    let order = order
+        .on(InstrumentId(required(query, "instrument")?))
+        .by(required(query, "user")?);
+    // Fail fast on instrument-rule violations, like Binance/OKX answer
+    // synchronously. The matching engine enforces the same table
+    // authoritatively; this only spares the round trip through Kafka/Raft.
+    if let Some(spec) = instrument_specs().get(order.instrument) {
+        spec.check(&order)?;
+    }
+    Ok(order)
+}
+
+/// `TC_INSTRUMENT_SPECS` (same format and value as the matching nodes').
+fn instrument_specs() -> &'static trade_core::InstrumentSpecs {
+    static SPECS: std::sync::OnceLock<trade_core::InstrumentSpecs> = std::sync::OnceLock::new();
+    SPECS.get_or_init(|| {
+        std::env::var("TC_INSTRUMENT_SPECS")
+            .ok()
+            .map(|text| {
+                trade_core::InstrumentSpecs::parse(&text).expect("valid TC_INSTRUMENT_SPECS")
+            })
+            .unwrap_or_default()
+    })
 }
 
 fn cancel_from_query(query: &str) -> Result<(InstrumentId, OrderId, u64, u64), String> {
@@ -2999,20 +3039,24 @@ fn handle(
         // (order_id, category) of the request, for correlating a rejection.
         let mut req_ctx: Option<(u64, u32)> = None;
         let persisted = match (method.as_str(), path) {
-            ("POST", "/orders") => order_from_query(query).and_then(|order| {
-                let mut frame = [0u8; wire::MSG_LEN];
-                wire::encode_new(&order, &mut frame);
-                let category = sharding::asset_category(order.instrument, category_size);
-                req_ctx = Some((order.id.0, category));
-                kafka.publish(category, order.user, &frame)
-            }),
-            ("POST", "/cancels") => cancel_from_query(query).and_then(|(i, o, c, u)| {
-                let mut frame = [0u8; wire::MSG_LEN];
-                wire::encode_cancel(i, o, c, &mut frame);
-                let category = sharding::asset_category(i, category_size);
-                req_ctx = Some((o.0, category));
-                kafka.publish(category, u, &frame)
-            }),
+            ("POST", "/orders") => order_from_query(query)
+                .map_err(|error| format!("{INVALID_REQUEST}{error}"))
+                .and_then(|order| {
+                    let mut frame = [0u8; wire::MSG_LEN];
+                    wire::encode_new(&order, &mut frame);
+                    let category = sharding::asset_category(order.instrument, category_size);
+                    req_ctx = Some((order.id.0, category));
+                    kafka.publish(category, order.user, &frame)
+                }),
+            ("POST", "/cancels") => cancel_from_query(query)
+                .map_err(|error| format!("{INVALID_REQUEST}{error}"))
+                .and_then(|(i, o, c, u)| {
+                    let mut frame = [0u8; wire::MSG_LEN];
+                    wire::encode_cancel(i, o, c, &mut frame);
+                    let category = sharding::asset_category(i, category_size);
+                    req_ctx = Some((o.0, category));
+                    kafka.publish(category, u, &frame)
+                }),
             _ => {
                 respond(
                     reader.get_mut(),
@@ -3069,6 +3113,9 @@ fn main() {
 
     let routing = sharding::RouteConfig::from_env();
     let category_size = category_size();
+    // Parse the instrument-rule table now: a bad value fails startup, not the
+    // first order.
+    let _ = instrument_specs();
     let metrics = Arc::new(OrderPipelineMetrics::default());
     let matcher_groups = parse_matcher_groups();
     let token = std::env::var("TC_ORDER_API_TOKEN").expect("TC_ORDER_API_TOKEN");
@@ -3294,6 +3341,41 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn order_query_parses_type_and_tif() {
+        let base = "order_id=1&side=buy&qty=10&instrument=3&user=9";
+        let gtc = order_from_query(&format!("{base}&price=100")).unwrap();
+        assert_eq!(
+            (gtc.order_type, gtc.tif, gtc.price),
+            (OrderType::Limit, TimeInForce::Gtc, 100)
+        );
+        let maker = order_from_query(&format!("{base}&price=100&tif=post_only")).unwrap();
+        assert_eq!(maker.tif, TimeInForce::PostOnly);
+        let ioc = order_from_query(&format!("{base}&type=market&tif=ioc")).unwrap();
+        assert_eq!((ioc.order_type, ioc.tif), (OrderType::Market, TimeInForce::Ioc));
+
+        assert!(order_from_query(base).is_err(), "limit needs a price");
+        assert!(order_from_query(&format!("{base}&type=market&tif=post_only")).is_err());
+        assert!(order_from_query(&format!("{base}&price=100&tif=gtd")).is_err());
+        assert!(order_from_query(&format!("{base}&price=100&type=stop")).is_err());
+    }
+
+    #[test]
+    fn unfixable_request_errors_are_400_not_retryable_503() {
+        assert_eq!(
+            ingress_error_status(&format!("{INVALID_REQUEST}tick-size")),
+            "400 Bad Request"
+        );
+        assert_eq!(
+            ingress_error_status("backpressure: soft"),
+            "429 Too Many Requests"
+        );
+        assert_eq!(
+            ingress_error_status("kafka unavailable"),
+            "503 Service Unavailable"
+        );
+    }
 
     fn mysql_test_store() -> Option<OrderStore> {
         let url = std::env::var("TC_TEST_MYSQL_URL").ok()?;

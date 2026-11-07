@@ -171,6 +171,13 @@ fn main() {
             max_notional: 10_000_000_000,
             max_user_orders: 10_000,
         }),
+        // Per-instrument trading rules, same format as the Raft node's.
+        instrument_specs: std::env::var("TC_INSTRUMENT_SPECS")
+            .ok()
+            .map(|text| {
+                trade_core::InstrumentSpecs::parse(&text).expect("valid TC_INSTRUMENT_SPECS")
+            })
+            .unwrap_or_default(),
         execution_outbox_dir: None,
         raft_group_id: 0,
         execution_outbox_sync_every: 1,

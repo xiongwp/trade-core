@@ -166,7 +166,13 @@ impl MatchingEngine {
         order.price = new_price;
         order.quantity = new_qty;
         order.remaining = new_qty;
-        order.tif = TimeInForce::Gtc;
+        // Only GTC and post-only orders rest. A post-only amend stays
+        // post-only: if the new price would take, the re-entry is rejected and
+        // the order ends cancelled (it already left the book above) rather
+        // than silently turning into a taker.
+        if order.tif != TimeInForce::PostOnly {
+            order.tif = TimeInForce::Gtc;
+        }
         ModifyOutcome::Requoted(self.submit(order))
     }
 
@@ -226,6 +232,14 @@ impl MatchingEngine {
                     }
                 }
             }
+        }
+
+        // Post-only: must add liquidity — reject whole if it would trade now.
+        if order.tif == TimeInForce::PostOnly
+            && (order.order_type == OrderType::Market
+                || self.book.would_cross(order.side, order.price))
+        {
+            return (order.id, OrderStatus::Rejected, 0, false);
         }
 
         // Fill-or-kill: reject up front unless the whole quantity can fill now.
@@ -404,8 +418,10 @@ impl MatchingEngine {
                     };
                     (status, false)
                 }
-                // GTC limit remainder rests on the book.
-                (OrderType::Limit, TimeInForce::Gtc) => {
+                // GTC / post-only limit remainder rests on the book (a
+                // post-only that reached here never crossed, so filled == 0).
+                (OrderType::Limit, TimeInForce::Gtc)
+                | (OrderType::Limit, TimeInForce::PostOnly) => {
                     self.book.insert(order);
                     let status = if filled > 0 {
                         OrderStatus::PartiallyFilled

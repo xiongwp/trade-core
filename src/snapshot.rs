@@ -61,6 +61,7 @@ fn encode_order(o: &Order, out: &mut [u8; ORDER_ENC]) {
         TimeInForce::Fok => 2,
         TimeInForce::IocBudget => 3,
         TimeInForce::FokBudget => 4,
+        TimeInForce::PostOnly => 5,
     };
     out[23] = 0; // pad
     out[24..32].copy_from_slice(&o.price.to_le_bytes());
@@ -85,6 +86,7 @@ fn decode_order(b: &[u8; ORDER_ENC]) -> Order {
             2 => TimeInForce::Fok,
             3 => TimeInForce::IocBudget,
             4 => TimeInForce::FokBudget,
+            5 => TimeInForce::PostOnly,
             _ => TimeInForce::Gtc,
         },
         price: u64::from_le_bytes(b[24..32].try_into().unwrap()),

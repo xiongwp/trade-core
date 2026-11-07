@@ -675,6 +675,32 @@ impl OrderBook {
         (qty - left, cost)
     }
 
+    /// Would an aggressor with limit `limit` trade immediately? Levels holding
+    /// only tombstones (aggregate qty 0) are skipped, so a lazily-reclaimed
+    /// cancel never makes a post-only order look marketable. Stops at the
+    /// first live level or the first level beyond the limit — O(1) normally.
+    pub fn would_cross(&self, aggressor: Side, limit: Price) -> bool {
+        let levels = self.side(aggressor.opposite());
+        let mut crosses = false;
+        match aggressor {
+            Side::Buy => levels.walk_asc(|px, lv| {
+                if px > limit {
+                    return false;
+                }
+                crosses = lv.qty > 0;
+                !crosses
+            }),
+            Side::Sell => levels.walk_desc(|px, lv| {
+                if px < limit {
+                    return false;
+                }
+                crosses = lv.qty > 0;
+                !crosses
+            }),
+        }
+        crosses
+    }
+
     /// Total resting quantity reachable by an aggressor with limit `limit`
     /// (pass `Price::MAX`/`MIN` for market orders).
     pub fn crossable_qty(&self, aggressor: Side, limit: Price) -> Qty {

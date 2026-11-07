@@ -188,6 +188,7 @@ impl<'a> WireView<'a> {
             2 => TimeInForce::Fok,
             3 => TimeInForce::IocBudget,
             4 => TimeInForce::FokBudget,
+            5 => TimeInForce::PostOnly,
             _ => TimeInForce::Gtc,
         }
     }
@@ -275,6 +276,7 @@ pub fn encode_new(order: &Order, out: &mut [u8; MSG_LEN]) {
         TimeInForce::Fok => 2,
         TimeInForce::IocBudget => 3,
         TimeInForce::FokBudget => 4,
+        TimeInForce::PostOnly => 5,
     };
     out[4..8].copy_from_slice(&order.instrument.0.to_le_bytes());
     out[8..16].copy_from_slice(&order.id.0.to_le_bytes());
@@ -470,8 +472,16 @@ pub fn encode_report(r: &ExecReport, out: &mut [u8; REPORT_LEN]) {
         ExecReport::Rejected {
             instrument,
             order_id,
-            ..
-        } => put(RT_REJECTED, instrument, order_id, 0, 0, 0, 0),
+            reason,
+        } => put(
+            RT_REJECTED,
+            instrument,
+            order_id,
+            reject_reason_code(reason),
+            0,
+            0,
+            0,
+        ),
         ExecReport::Modified {
             instrument,
             order_id,
@@ -535,6 +545,44 @@ pub struct DecodedReport {
     pub price: Price,
     pub qty: Qty,
     pub side: Side,
+}
+
+/// Reject reasons as carried on the wire: a `Rejected` report puts the index
+/// of its reason in the frame's `aux` slot (unused by that type), so clients
+/// see *why* — the Binance/OKX error-code role. Append only: the index is the
+/// wire code. 0 = unknown (a reason missing from this table).
+pub const REJECT_REASONS: &[&str] = &[
+    "unknown",
+    "duplicate",
+    "halted",
+    "user-suspended",
+    "max-qty",
+    "max-notional",
+    "price-band",
+    "max-user-orders",
+    "unfillable",
+    "post-only",
+    "tick-size",
+    "lot-size",
+    "min-qty",
+    "price-range",
+    "min-notional",
+];
+
+/// Wire code of a reject reason (0 if it is not in [`REJECT_REASONS`]).
+pub fn reject_reason_code(reason: &str) -> u64 {
+    REJECT_REASONS
+        .iter()
+        .position(|known| *known == reason)
+        .unwrap_or(0) as u64
+}
+
+/// Reject reason for a wire code (`"unknown"` if out of range).
+pub fn reject_reason_name(code: u64) -> &'static str {
+    REJECT_REASONS
+        .get(code as usize)
+        .copied()
+        .unwrap_or(REJECT_REASONS[0])
 }
 
 /// A durable execution event envelope. The report remains the old fixed frame;
@@ -662,7 +710,13 @@ impl fmt::Display for DecodedReport {
             ),
             RT_RESTING => write!(f, "RESTING    {} {}", self.instrument, self.order_id),
             RT_CANCELLED => write!(f, "CANCELLED  {} {}", self.instrument, self.order_id),
-            RT_REJECTED => write!(f, "REJECTED   {} {}", self.instrument, self.order_id),
+            RT_REJECTED => write!(
+                f,
+                "REJECTED   {} {} ({})",
+                self.instrument,
+                self.order_id,
+                reject_reason_name(self.aux_id)
+            ),
             RT_MODIFIED => write!(
                 f,
                 "MODIFIED   {} {} remaining {}",

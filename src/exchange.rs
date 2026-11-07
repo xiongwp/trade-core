@@ -40,7 +40,7 @@ use crate::engine::{MatchingEngine, SelfTradePolicy};
 use crate::journal::{self, JournalReader, JournalWriter};
 use crate::lockfree::{self, Consumer, Producer};
 use crate::order::Order;
-use crate::risk::{PriceGuard, RiskLimits};
+use crate::risk::{InstrumentSpecs, PriceGuard, RiskLimits};
 use crate::snapshot::{self, EngineState, Snapshot};
 use crate::strategy::MatchingStrategy;
 use crate::trade::{ModifyOutcome, OrderStatus};
@@ -295,6 +295,9 @@ pub struct ExchangeConfig {
     pub stp: SelfTradePolicy,
     /// Static pre-trade limits (max qty / notional / per-user open orders).
     pub risk_limits: Option<RiskLimits>,
+    /// Per-instrument trading rules (tick / lot / min-max qty / price range /
+    /// min notional). Empty = unrestricted, and the hot path skips the check.
+    pub instrument_specs: InstrumentSpecs,
     /// Maker/taker fee schedule (default = zero fees).
     pub fees: crate::fees::FeeSchedule,
     /// Idempotent command dedup: reject any command whose id is <= the
@@ -329,6 +332,7 @@ impl Default for ExchangeConfig {
             snapshot_every: None,
             stp: SelfTradePolicy::Allow,
             risk_limits: None,
+            instrument_specs: InstrumentSpecs::default(),
             fees: crate::fees::FeeSchedule::default(),
             dedup_commands: false,
             execution_outbox_dir: None,
@@ -645,6 +649,7 @@ fn build_inner(
         let mut processor = Processor::new(config.strategy, config.price_guard.clone())
             .with_stp(config.stp)
             .with_limits(config.risk_limits)
+            .with_specs(config.instrument_specs.clone())
             .with_dedup(config.dedup_commands)
             .with_fees(config.fees);
         for &inst in &config.instruments {
@@ -822,6 +827,7 @@ pub struct Processor {
     default_pool: (usize, bool),
     stp: SelfTradePolicy,
     limits: Option<RiskLimits>,
+    specs: InstrumentSpecs,
     /// Idempotency: highest command id applied; duplicates are rejected.
     /// 0-ids bypass (legacy/tests). Persisted in snapshots (exactly-once
     /// across crash + order-system re-send).
@@ -856,6 +862,7 @@ impl Processor {
             default_pool: (4096, false),
             stp: SelfTradePolicy::Allow,
             limits: None,
+            specs: InstrumentSpecs::default(),
             dedup: false,
             seen_command_ids: std::collections::HashSet::new(),
             max_new_id: 0,
@@ -877,6 +884,12 @@ impl Processor {
     /// Set static pre-trade limits (builder style).
     pub fn with_limits(mut self, limits: Option<RiskLimits>) -> Self {
         self.limits = limits;
+        self
+    }
+
+    /// Set per-instrument trading rules (builder style).
+    pub fn with_specs(mut self, specs: InstrumentSpecs) -> Self {
+        self.specs = specs;
         self
     }
 
@@ -1108,8 +1121,23 @@ impl Processor {
                 order_id,
                 new_price,
                 new_qty,
-                ..
+                cmd_id,
             } => {
+                // Trading rules apply to the amended price/size too. A refused
+                // amend leaves the order untouched, so the rejection is keyed by
+                // the command id (as duplicate commands are), never the order's.
+                if !self.specs.is_empty() {
+                    if let Some(spec) = self.specs.get(instrument) {
+                        if let Err(reason) = spec.check_amend(new_price, new_qty) {
+                            emit(ExecReport::Rejected {
+                                instrument,
+                                order_id: OrderId(cmd_id),
+                                reason,
+                            });
+                            return;
+                        }
+                    }
+                }
                 match self
                     .engine_for(instrument)
                     .modify(order_id, new_price, new_qty)
@@ -1215,7 +1243,31 @@ impl Processor {
             return;
         }
 
-        // Synchronous pre-trade risk, cheapest checks first:
+        // Order-shape checks, cheapest first:
+        // 0. post-only must be a limit (a market order always takes), and the
+        //    instrument's trading rules (tick / lot / qty / price / notional);
+        let post_only = order.tif == TimeInForce::PostOnly;
+        if post_only && order.order_type == OrderType::Market {
+            emit(ExecReport::Rejected {
+                instrument,
+                order_id: id,
+                reason: "post-only",
+            });
+            return;
+        }
+        if !self.specs.is_empty() {
+            if let Some(spec) = self.specs.get(instrument) {
+                if let Err(reason) = spec.check(&order) {
+                    emit(ExecReport::Rejected {
+                        instrument,
+                        order_id: id,
+                        reason,
+                    });
+                    return;
+                }
+            }
+        }
+        // Synchronous pre-trade risk:
         // 1. static limits (order shape);
         if let Some(limits) = &self.limits {
             if let Err(reason) = limits.check_static(&order) {
@@ -1323,7 +1375,9 @@ impl Processor {
             OrderStatus::Rejected => emit(ExecReport::Rejected {
                 instrument,
                 order_id: id,
-                reason: "unfillable",
+                // The engine rejects a post-only that would take liquidity,
+                // and a FOK that cannot fill whole.
+                reason: if post_only { "post-only" } else { "unfillable" },
             }),
         }
     }

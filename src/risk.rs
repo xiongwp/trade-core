@@ -154,6 +154,149 @@ impl RiskLimits {
     }
 }
 
+/// Per-instrument trading rules — the exchange-info filters every major venue
+/// enforces (Binance `PRICE_FILTER` / `LOT_SIZE` / `NOTIONAL`, OKX `tickSz` /
+/// `lotSz` / `minSz`). Prices and quantities are already integer ticks/lots;
+/// these constrain them further. A field of `0` means "unrestricted".
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct InstrumentSpec {
+    /// Limit prices must be a multiple of this.
+    pub tick_size: Price,
+    /// Quantities must be a multiple of this.
+    pub lot_size: Qty,
+    pub min_qty: Qty,
+    pub max_qty: Qty,
+    /// Inclusive limit-price range.
+    pub min_price: Price,
+    pub max_price: Price,
+    /// Minimum `price * qty` for a limit order (total budget for budget
+    /// orders). Market orders have no price yet and are not notional-checked.
+    pub min_notional: u128,
+}
+
+impl InstrumentSpec {
+    /// Validate a new order. `Err(reason)` rejects.
+    pub fn check(&self, order: &Order) -> Result<(), &'static str> {
+        self.check_qty(order.quantity)?;
+        if self.min_qty > 0 && order.quantity < self.min_qty {
+            return Err("min-qty");
+        }
+        if order.order_type == OrderType::Market {
+            return Ok(());
+        }
+        // Budget orders: `price` is the TOTAL budget, not a per-unit price.
+        if matches!(order.tif, TimeInForce::IocBudget | TimeInForce::FokBudget) {
+            if (order.price as u128) < self.min_notional {
+                return Err("min-notional");
+            }
+            return Ok(());
+        }
+        self.check_price(order.price)?;
+        if self.min_notional > 0
+            && (order.price as u128) * (order.quantity as u128) < self.min_notional
+        {
+            return Err("min-notional");
+        }
+        Ok(())
+    }
+
+    /// Validate an amend's new price/remaining. `min_qty`/`min_notional` are
+    /// deliberately not applied: a partially filled order's remainder may
+    /// legitimately sit below them. `new_qty == 0` is a cancel and always ok.
+    pub fn check_amend(&self, new_price: Price, new_qty: Qty) -> Result<(), &'static str> {
+        if new_qty == 0 {
+            return Ok(());
+        }
+        self.check_qty(new_qty)?;
+        self.check_price(new_price)
+    }
+
+    fn check_qty(&self, qty: Qty) -> Result<(), &'static str> {
+        if self.lot_size > 0 && qty % self.lot_size != 0 {
+            return Err("lot-size");
+        }
+        if self.max_qty > 0 && qty > self.max_qty {
+            return Err("max-qty");
+        }
+        Ok(())
+    }
+
+    fn check_price(&self, price: Price) -> Result<(), &'static str> {
+        if self.tick_size > 0 && price % self.tick_size != 0 {
+            return Err("tick-size");
+        }
+        if price < self.min_price || (self.max_price > 0 && price > self.max_price) {
+            return Err("price-range");
+        }
+        Ok(())
+    }
+}
+
+/// The venue's instrument rule table: explicit per-instrument specs plus an
+/// optional default for every other instrument (deployments with thousands of
+/// sparse assets configure one default instead of listing each).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InstrumentSpecs {
+    pub default: Option<InstrumentSpec>,
+    pub per_instrument: HashMap<InstrumentId, InstrumentSpec>,
+}
+
+impl InstrumentSpecs {
+    /// True when no rule is configured (the hot path then skips the lookup).
+    pub fn is_empty(&self) -> bool {
+        self.default.is_none() && self.per_instrument.is_empty()
+    }
+
+    pub fn get(&self, instrument: InstrumentId) -> Option<&InstrumentSpec> {
+        self.per_instrument
+            .get(&instrument)
+            .or(self.default.as_ref())
+    }
+
+    /// Parse the `TC_INSTRUMENT_SPECS` format: `;`-separated entries of
+    /// `<instrument id | *>:<key>=<value>,...`, keys `tick`, `lot`, `min_qty`,
+    /// `max_qty`, `min_price`, `max_price`, `min_notional`. `*` is the default.
+    ///
+    /// Example: `*:tick=1,lot=1,min_notional=1000;7:tick=5,lot=10,min_qty=10`
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let mut specs = InstrumentSpecs::default();
+        for entry in text.split(';').map(str::trim).filter(|e| !e.is_empty()) {
+            let (target, fields) = entry
+                .split_once(':')
+                .ok_or_else(|| format!("instrument spec `{entry}` lacks `<id>:`"))?;
+            let mut spec = InstrumentSpec::default();
+            for field in fields.split(',').map(str::trim).filter(|f| !f.is_empty()) {
+                let (key, value) = field
+                    .split_once('=')
+                    .ok_or_else(|| format!("instrument spec field `{field}` lacks `=`"))?;
+                let bad = || format!("instrument spec field `{field}` has a bad value");
+                match key.trim() {
+                    "tick" => spec.tick_size = value.trim().parse().map_err(|_| bad())?,
+                    "lot" => spec.lot_size = value.trim().parse().map_err(|_| bad())?,
+                    "min_qty" => spec.min_qty = value.trim().parse().map_err(|_| bad())?,
+                    "max_qty" => spec.max_qty = value.trim().parse().map_err(|_| bad())?,
+                    "min_price" => spec.min_price = value.trim().parse().map_err(|_| bad())?,
+                    "max_price" => spec.max_price = value.trim().parse().map_err(|_| bad())?,
+                    "min_notional" => {
+                        spec.min_notional = value.trim().parse().map_err(|_| bad())?
+                    }
+                    other => return Err(format!("unknown instrument spec key `{other}`")),
+                }
+            }
+            match target.trim() {
+                "*" => specs.default = Some(spec),
+                id => {
+                    let id = id
+                        .parse::<u32>()
+                        .map_err(|_| format!("bad instrument id `{id}` in instrument spec"))?;
+                    specs.per_instrument.insert(InstrumentId(id), spec);
+                }
+            }
+        }
+        Ok(specs)
+    }
+}
+
 /// An asynchronous risk strategy: evaluated periodically off the matching path,
 /// emitting commands (typically force-closes) to inject via the gateway.
 pub trait AsyncRiskStrategy: Send {

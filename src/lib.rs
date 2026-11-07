@@ -71,7 +71,7 @@ pub use exchange::{
     ExecReport, ExecutionReportEvent, OrderGateway, ResultSink,
 };
 pub use order::Order;
-pub use risk::{PriceGuard, RiskLimits};
+pub use risk::{InstrumentSpec, InstrumentSpecs, PriceGuard, RiskLimits};
 pub use strategy::{
     Allocation, MatchingStrategy, PriceTimePriority, ProRata, RestingOrder, SizePriority,
 };

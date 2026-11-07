@@ -152,8 +152,17 @@ fn main() {
         .unwrap_or(30);
     let snapshot_every =
         (snapshot_every_secs > 0).then(|| Duration::from_secs(snapshot_every_secs));
+    // Per-instrument trading rules (tick / lot / qty / price / min notional),
+    // e.g. `*:tick=1,lot=1;7:tick=5,lot=10,min_notional=1000`. Every node of a
+    // group must run the same table: rejections are part of the replicated,
+    // deterministic report stream.
+    let instrument_specs = std::env::var("TC_INSTRUMENT_SPECS")
+        .ok()
+        .map(|text| trade_core::InstrumentSpecs::parse(&text).expect("valid TC_INSTRUMENT_SPECS"))
+        .unwrap_or_default();
     let (gateway, sink, handle) = build(ExchangeConfig {
         journal_dir: Some(data_dir.join("journal")),
+        instrument_specs,
         raft_wal_authoritative: true,
         snapshot_every,
         // Exact duplicate suppression lives at the Raft ingress. The old
