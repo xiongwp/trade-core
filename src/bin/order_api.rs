@@ -23,7 +23,7 @@ use trade_core::metrics::LatencyHistogram;
 use trade_core::order::Order;
 use trade_core::order_queue::{encode_envelope, QueueEnvelope, QueueRouter};
 use trade_core::sharding::{self, DEFAULT_ASSET_CATEGORY_SIZE};
-use trade_core::types::{InstrumentId, OrderId, OrderType, Side, TimeInForce};
+use trade_core::types::{InstrumentId, OrderId, OrderType, Side, TimeInForce, Trigger, TriggerKind};
 use trade_core::wire;
 use trade_core::{log_error, log_info, log_warn};
 
@@ -815,6 +815,45 @@ fn order_from_query(query: &str) -> Result<Order, String> {
         spec.check(&order)?;
     }
     Ok(order)
+}
+
+/// Parse `POST /orders` into the command to publish. With `stop_price` it is
+/// a conditional order: `trigger` is `sl` (stop-loss, default) or `tp`
+/// (take-profit), held by the matching engine until a trade prints at or
+/// through `stop_price`, then entered as the `type`/`tif` order described.
+fn order_command_from_query(query: &str) -> Result<trade_core::Command, String> {
+    let order = order_from_query(query)?;
+    let stop_price: Option<u64> = match query_param(query, "stop_price") {
+        None => None,
+        Some(_) => Some(required(query, "stop_price")?),
+    };
+    let Some(stop_price) = stop_price else {
+        if query_param(query, "trigger").is_some() {
+            return Err("trigger requires stop_price".into());
+        }
+        return Ok(trade_core::Command::New(order));
+    };
+    let kind = match query_param(query, "trigger") {
+        None | Some("sl") => TriggerKind::StopLoss,
+        Some("tp") => TriggerKind::TakeProfit,
+        Some(_) => return Err("trigger must be sl or tp".into()),
+    };
+    if stop_price == 0 {
+        return Err("stop_price must be positive".into());
+    }
+    if order.tif == TimeInForce::PostOnly {
+        return Err("post_only cannot be combined with stop_price".into());
+    }
+    if let Some(spec) = instrument_specs().get(order.instrument) {
+        spec.check_amend(stop_price, order.quantity)?;
+    }
+    Ok(trade_core::Command::NewConditional(
+        order,
+        Trigger {
+            price: stop_price,
+            kind,
+        },
+    ))
 }
 
 /// `TC_INSTRUMENT_SPECS` (same format and value as the matching nodes').
@@ -2454,6 +2493,7 @@ fn projects_order_state(type_code: u8) -> bool {
             | wire::RT_CANCELLED
             | wire::RT_REJECTED
             | wire::RT_MODIFIED
+            | wire::RT_STOP_ACCEPTED
     )
 }
 
@@ -2596,6 +2636,7 @@ fn apply_pending_execution_table(
                WHEN e.has_filled=1 OR GREATEST(o.filled_qty+e.trade_qty,e.partial_qty)>=o.qty THEN 'FILLED' \
                WHEN e.latest_type={cancelled} THEN 'CANCELLED' \
                WHEN e.latest_type={rejected} THEN 'REJECTED' \
+               WHEN e.latest_type={stop_accepted} THEN 'UNTRIGGERED' \
                WHEN GREATEST(o.filled_qty+e.trade_qty,e.partial_qty)>0 THEN 'PARTIAL' \
                ELSE 'OPEN' END, \
              o.filled_qty=LEAST(o.qty,GREATEST(o.filled_qty+e.trade_qty,e.partial_qty,IF(e.has_filled=1,o.qty,0)))",
@@ -2604,6 +2645,7 @@ fn apply_pending_execution_table(
         filled = wire::RT_FILLED,
         cancelled = wire::RT_CANCELLED,
         rejected = wire::RT_REJECTED,
+        stop_accepted = wire::RT_STOP_ACCEPTED,
     ))
     .map_err(|error| error.to_string())?;
     tx.query_drop(format!(
@@ -3088,12 +3130,17 @@ fn handle(
         // (order_id, category) of the request, for correlating a rejection.
         let mut req_ctx: Option<(u64, u32)> = None;
         let persisted = match (method.as_str(), path) {
-            ("POST", "/orders") => order_from_query(query)
+            ("POST", "/orders") => order_command_from_query(query)
                 .map_err(|error| format!("{INVALID_REQUEST}{error}"))
-                .and_then(|order| {
+                .and_then(|command| {
                     let mut frame = [0u8; wire::MSG_LEN];
-                    wire::encode_new(&order, &mut frame);
-                    let category = sharding::asset_category(order.instrument, category_size);
+                    wire::encode_command(&command, &mut frame);
+                    let category = sharding::asset_category(command.instrument(), category_size);
+                    let (trade_core::Command::New(order)
+                    | trade_core::Command::NewConditional(order, _)) = &command
+                    else {
+                        unreachable!("order_command_from_query yields orders");
+                    };
                     req_ctx = Some((order.id.0, category));
                     kafka.publish(category, order.user, &frame)
                 }),
@@ -3411,6 +3458,46 @@ mod tests {
     }
 
     #[test]
+    fn order_query_with_stop_price_is_a_conditional_order() {
+        let base = "order_id=1&side=sell&qty=10&instrument=3&user=9";
+        match order_command_from_query(&format!("{base}&type=market&stop_price=95")).unwrap() {
+            trade_core::Command::NewConditional(order, trigger) => {
+                assert_eq!(order.order_type, OrderType::Market);
+                assert_eq!(
+                    trigger,
+                    Trigger {
+                        price: 95,
+                        kind: TriggerKind::StopLoss
+                    }
+                );
+            }
+            other => panic!("expected a conditional order, got {other:?}"),
+        }
+        match order_command_from_query(&format!("{base}&price=120&stop_price=118&trigger=tp"))
+            .unwrap()
+        {
+            trade_core::Command::NewConditional(order, trigger) => {
+                assert_eq!((order.price, trigger.price), (120, 118));
+                assert_eq!(trigger.kind, TriggerKind::TakeProfit);
+            }
+            other => panic!("expected a conditional order, got {other:?}"),
+        }
+        assert!(matches!(
+            order_command_from_query(&format!("{base}&price=100")).unwrap(),
+            trade_core::Command::New(_)
+        ));
+        for bad in [
+            "&price=100&trigger=tp",               // trigger without stop_price
+            "&price=100&stop_price=0",             // zero trigger
+            "&price=100&stop_price=x",             // malformed
+            "&price=100&stop_price=95&trigger=x",  // unknown kind
+            "&price=100&stop_price=95&tif=post_only",
+        ] {
+            assert!(order_command_from_query(&format!("{base}{bad}")).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn only_order_state_reports_are_staged_for_projection() {
         for code in [
             wire::RT_ACCEPTED,
@@ -3424,11 +3511,16 @@ mod tests {
         ] {
             assert!(projects_order_state(code), "type {code}");
         }
-        // NotFound, depth, halt/resume acks (12..=15), command rejects.
-        for code in [wire::RT_NOTFOUND, wire::RT_DEPTH_LEVEL, wire::RT_DEPTH_END, 12, 13, 14, 15, wire::RT_CMD_REJECTED] {
+        // NotFound, depth, halt/resume acks (12..=15), command rejects,
+        // stop-fired markers.
+        for code in [wire::RT_NOTFOUND, wire::RT_DEPTH_LEVEL, wire::RT_DEPTH_END, 12, 13, 14, 15, wire::RT_CMD_REJECTED, wire::RT_TRIGGERED] {
             assert!(!projects_order_state(code), "type {code}");
         }
-        assert_eq!(projected_report_types_sql(), "1,2,3,4,5,6,7,8");
+        assert_eq!(projected_report_types_sql(), "1,2,3,4,5,6,7,8,17");
+        // A stop firing is followed by the fired order's own reports; the
+        // Triggered marker itself changes no row.
+        assert!(projects_order_state(wire::RT_STOP_ACCEPTED));
+        assert!(!projects_order_state(wire::RT_TRIGGERED));
     }
 
     #[test]
@@ -3724,6 +3816,56 @@ mod tests {
         assert_eq!(pending(&mut conn), 1);
         bootstrap(&store).unwrap();
         assert_eq!(pending(&mut conn), 0);
+    }
+
+    /// Same disposable MySQL 8 as above.
+    #[test]
+    #[ignore = "requires disposable MySQL 8 via TC_TEST_MYSQL_URL"]
+    fn mysql8_projection_tracks_a_conditional_order_from_untriggered_to_filled() {
+        let store = mysql_test_store().expect("TC_TEST_MYSQL_URL must be set");
+        let seed = (std::process::id() as u64) << 32 | journal::now_nanos() as u64 & 0xffff_ffff;
+        let order = seed | 1;
+        let instrument = 42_003;
+        let row = |conn: &mut mysql::PooledConn| -> Option<(u64, String)> {
+            let route = store.routing.route_order_id(order);
+            conn.exec_first(
+                format!(
+                    "SELECT filled_qty,status FROM order_db_0.{} WHERE order_id=:id",
+                    route.table_name()
+                ),
+                params! {"id" => order},
+            )
+            .unwrap()
+        };
+        persist_mysql_shard(&store, 0, &[kafka_new(order, 66_002, instrument, 4, 1)]).unwrap();
+        persist_events(
+            &store,
+            vec![report_event(wire::RT_STOP_ACCEPTED, order, instrument, seed, 1)],
+        )
+        .unwrap();
+        let mut conn = store.shard(0).get_conn().unwrap();
+        assert_eq!(row(&mut conn), Some((0, "UNTRIGGERED".into())));
+
+        // The trigger prints: Triggered (not staged), then the fired order's
+        // ordinary lifecycle in the same command.
+        persist_events(
+            &store,
+            vec![
+                // Distinct raft indices: (group, index, ordinal, target) is
+                // the idempotency key, and report_event uses ordinal 0.
+                report_event(wire::RT_TRIGGERED, order, instrument, seed + 1, 2),
+                report_event(wire::RT_ACCEPTED, order, instrument, seed + 2, 3),
+                trade_event(order, seed | 2, instrument, 4, seed + 3, 0, 4),
+                report_event(wire::RT_FILLED, order, instrument, seed + 4, 5),
+            ],
+        )
+        .unwrap();
+        assert_eq!(row(&mut conn), Some((4, "FILLED".into())));
+        let pending: u64 = conn
+            .query_first("SELECT COUNT(*) FROM order_db_0.pending_execution_events")
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending, 0);
     }
 
     #[test]
