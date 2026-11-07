@@ -756,6 +756,8 @@ fn spawn_execution_outbox_publisher(
             );
             while running.load(Ordering::Acquire) {
                 let mut published_any = false;
+                // Any publish, checkpoint or cursor failure in this pass.
+                let mut pass_failed = false;
                 while let Some(message) = checkpoint_consumer.poll(Duration::ZERO) {
                     match message {
                         Ok(message) => {
@@ -774,6 +776,7 @@ fn spawn_execution_outbox_publisher(
                             metrics
                                 .execution_outbox_publish_healthy
                                 .store(0, Ordering::Release);
+                            pass_failed = true;
                             log_warn!("execution-outbox", "event=cursor_poll_failed error={error}");
                         }
                     }
@@ -797,6 +800,7 @@ fn spawn_execution_outbox_publisher(
                         metrics
                             .execution_outbox_publish_healthy
                             .store(0, Ordering::Release);
+                        pass_failed = true;
                     }
                 }
                 if let Ok(entries) = std::fs::read_dir(&root) {
@@ -935,6 +939,7 @@ fn spawn_execution_outbox_publisher(
                                     metrics
                                         .execution_outbox_publish_healthy
                                         .store(0, Ordering::Release);
+                                    pass_failed = true;
                                     log_error!(
                                         "execution-outbox",
                                         "event=cursor_failed error={error}"
@@ -955,6 +960,7 @@ fn spawn_execution_outbox_publisher(
                                 metrics
                                     .execution_outbox_publish_healthy
                                     .store(0, Ordering::Release);
+                                pass_failed = true;
                                 log_warn!(
                                     "execution-kafka",
                                     "event=batch_not_acknowledged records={}",
@@ -974,6 +980,7 @@ fn spawn_execution_outbox_publisher(
                             metrics
                                 .execution_outbox_publish_healthy
                                 .store(0, Ordering::Release);
+                            pass_failed = true;
                             log_error!("execution-outbox", "event=read_failed error={error}");
                         }
                     }
@@ -985,6 +992,16 @@ fn spawn_execution_outbox_publisher(
                 metrics
                     .execution_outbox_pending
                     .store(pending, Ordering::Release);
+                // Refresh health once per pass. It used to be refreshed only
+                // while a segment was being read; with drained segments now
+                // skipped, an idle leader would otherwise keep the 0 written
+                // while its last checkpoint was still in flight — and stay
+                // not-ready forever.
+                if leadership.load(Ordering::Acquire) && !pass_failed {
+                    metrics
+                        .execution_outbox_publish_healthy
+                        .store(pending_checkpoints.is_empty() as u64, Ordering::Release);
+                }
                 if !published_any && !idle_sleep.is_zero() {
                     thread::sleep(idle_sleep);
                 }
