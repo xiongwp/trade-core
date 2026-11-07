@@ -1654,9 +1654,10 @@ fn rewind_kafka_batch(consumer: &BaseConsumer, records: &[KafkaRecord]) {
 }
 
 struct RaftForwardJob {
-    /// One entry per asset category: that category's frames, already split
-    /// into Raft-batch-sized chunks that must commit in order.
-    categories: Vec<Vec<Vec<[u8; wire::MSG_LEN]>>>,
+    /// This group's frames from one Kafka batch, each category's run in Kafka
+    /// order (categories are independent books, so their relative order is
+    /// free).
+    frames: Vec<[u8; wire::MSG_LEN]>,
     reply: std::sync::mpsc::SyncSender<Result<(), String>>,
 }
 
@@ -1668,12 +1669,12 @@ struct RaftForwarder {
 impl RaftForwarder {
     fn spawn(target_groups: Vec<Vec<MatcherTarget>>, backpressure: Arc<Backpressure>) -> Self {
         let queue_capacity = env_number("TC_RAFT_FORWARD_QUEUE", 64usize).max(1);
-        // Each request blocks until its Raft entry commits, so one connection
-        // means one entry — one WAL fsync plus a replication round trip — at
-        // a time, however many categories are waiting. Several connections
-        // let the leader's runtime collect concurrent requests into one
-        // Ready, so a single fsync covers many categories' batches.
-        let lanes = env_number("TC_RAFT_FORWARD_CONNECTIONS", 8usize).max(1);
+        // Each request blocks until its Raft entry commits — one WAL fsync
+        // plus a replication round trip — so the entry is the unit of cost.
+        // Pack up to this many commands per entry, across categories and
+        // across the jobs queued behind each other.
+        let pack_size = env_number("TC_RAFT_PACK_SIZE", 5_000usize)
+            .clamp(1, wire::RAFT_BATCH_MAX_COMMANDS);
         let mut groups = Vec::with_capacity(target_groups.len());
         for (group, targets) in target_groups.into_iter().enumerate() {
             let (tx, rx) = std::sync::mpsc::sync_channel::<RaftForwardJob>(queue_capacity);
@@ -1681,13 +1682,18 @@ impl RaftForwarder {
             std::thread::Builder::new()
                 .name(format!("raft-forward-{group}"))
                 .spawn(move || {
-                    let mut matchers = (0..lanes)
-                        .map(|_| MatcherConnection::new(targets.clone()))
-                        .collect::<Vec<_>>();
-                    while let Ok(job) = rx.recv() {
-                        let result = forward_categories(group, &mut matchers, &job.categories);
+                    let mut matcher = MatcherConnection::new(targets);
+                    while let Ok(first) = rx.recv() {
+                        let jobs = drain_queued_jobs(first, &rx, pack_size);
+                        let result = packs(&jobs, pack_size).try_for_each(|pack| {
+                            matcher.send_frames(&pack).map_err(|error| {
+                                format!("Raft group {group} batch commit failed: {error}")
+                            })
+                        });
                         worker_backpressure.set_group_health(group, result.is_ok());
-                        let _ = job.reply.send(result);
+                        for job in jobs {
+                            let _ = job.reply.send(result.clone());
+                        }
                     }
                 })
                 .expect("spawn Raft forwarding worker");
@@ -1728,18 +1734,10 @@ impl RaftForwarder {
             if categories.is_empty() {
                 continue;
             }
-            let categories = categories
-                .into_values()
-                .map(|frames| {
-                    frames
-                        .chunks(wire::RAFT_BATCH_MAX_COMMANDS)
-                        .map(|chunk| chunk.to_vec())
-                        .collect::<Vec<_>>()
-                })
-                .collect();
+            let frames = categories.into_values().flatten().collect();
             let (reply, result) = std::sync::mpsc::sync_channel(1);
             self.groups[group]
-                .send(RaftForwardJob { categories, reply })
+                .send(RaftForwardJob { frames, reply })
                 .map_err(|_| format!("Raft group {group} forwarding worker stopped"))?;
             replies.push(result);
         }
@@ -1752,54 +1750,36 @@ impl RaftForwarder {
     }
 }
 
-/// Spread a job's categories over the connection lanes: category `i` goes to
-/// lane `i % lanes`. A category's chunks stay on one lane, in order, so its
-/// commands commit in Kafka order; categories are independent books, so their
-/// relative order across lanes is free (as it already is across consumers).
-fn assign_lanes(categories: usize, lanes: usize) -> Vec<Vec<usize>> {
-    let lanes = lanes.max(1).min(categories.max(1));
-    let mut assigned = vec![Vec::new(); lanes];
-    for category in 0..categories {
-        assigned[category % lanes].push(category);
+/// Take `first` plus whatever jobs are already queued behind it, while they
+/// fit in one pack — no waiting, so an idle pipeline adds no latency. The
+/// channel is FIFO and each job keeps its categories' Kafka order, so
+/// concatenating jobs in arrival order keeps every category in order.
+fn drain_queued_jobs(
+    first: RaftForwardJob,
+    rx: &std::sync::mpsc::Receiver<RaftForwardJob>,
+    pack_size: usize,
+) -> Vec<RaftForwardJob> {
+    let mut total = first.frames.len();
+    let mut jobs = vec![first];
+    while total < pack_size {
+        let Ok(job) = rx.try_recv() else { break };
+        total += job.frames.len();
+        jobs.push(job);
     }
-    assigned
+    jobs
 }
 
-/// Commit every category of one job, lanes in parallel. Returns after all
-/// lanes finish (the next job must not overtake this one within a category);
-/// any lane's failure fails the job, and the caller's retry is safe because
-/// Raft suppresses already-committed command ids.
-fn forward_categories(
-    group: usize,
-    matchers: &mut [MatcherConnection],
-    categories: &[Vec<Vec<[u8; wire::MSG_LEN]>>],
-) -> Result<(), String> {
-    let send_lane = |matcher: &mut MatcherConnection, lane: &[usize]| {
-        lane.iter()
-            .flat_map(|&category| categories[category].iter())
-            .try_for_each(|frames| {
-                matcher.send_frames(frames).map_err(|error| {
-                    format!("Raft group {group} batch commit failed: {error}")
-                })
-            })
-    };
-    let lanes = assign_lanes(categories.len(), matchers.len());
-    if lanes.len() <= 1 {
-        return lanes
-            .first()
-            .map_or(Ok(()), |lane| send_lane(&mut matchers[0], lane));
-    }
-    std::thread::scope(|scope| {
-        let handles = matchers
-            .iter_mut()
-            .zip(&lanes)
-            .map(|(matcher, lane)| scope.spawn(move || send_lane(matcher, lane)))
-            .collect::<Vec<_>>();
-        handles
-            .into_iter()
-            .map(|handle| handle.join().expect("Raft forwarding lane panicked"))
-            .collect::<Result<Vec<()>, String>>()
-            .map(|_| ())
+/// Cut the merged jobs into Raft entries of at most `pack_size` commands,
+/// in order. Each pack is committed before the next is sent, so a category
+/// spanning two packs still applies in order.
+fn packs(
+    jobs: &[RaftForwardJob],
+    pack_size: usize,
+) -> impl Iterator<Item = Vec<[u8; wire::MSG_LEN]>> + '_ {
+    let mut frames = jobs.iter().flat_map(|job| job.frames.iter().copied()).peekable();
+    std::iter::from_fn(move || {
+        frames.peek()?;
+        Some(frames.by_ref().take(pack_size).collect())
     })
 }
 
@@ -3490,21 +3470,49 @@ fn main() {
 mod tests {
     use super::*;
 
-    #[test]
-    fn forwarding_lanes_keep_each_category_on_one_lane_in_order() {
-        assert_eq!(assign_lanes(0, 8), vec![Vec::<usize>::new()]);
-        assert_eq!(assign_lanes(1, 8), vec![vec![0]]);
-        assert_eq!(assign_lanes(5, 2), vec![vec![0, 2, 4], vec![1, 3]]);
-        // Never more lanes than categories, every category exactly once.
-        let lanes = assign_lanes(25, 8);
-        assert_eq!(lanes.len(), 8);
-        let mut seen = lanes.concat();
-        seen.sort_unstable();
-        assert_eq!(seen, (0..25).collect::<Vec<_>>());
-        for lane in &lanes {
-            assert!(lane.windows(2).all(|w| w[0] < w[1]), "lane order is stable");
+    fn forward_job(frames: std::ops::Range<u64>) -> RaftForwardJob {
+        let (reply, _) = std::sync::mpsc::sync_channel(1);
+        RaftForwardJob {
+            frames: frames
+                .map(|id| {
+                    let mut frame = [0u8; wire::MSG_LEN];
+                    frame[8..16].copy_from_slice(&id.to_le_bytes());
+                    frame
+                })
+                .collect(),
+            reply,
         }
-        assert_eq!(assign_lanes(3, 0), vec![vec![0, 1, 2]], "0 lanes means 1");
+    }
+
+    fn ids(pack: &[[u8; wire::MSG_LEN]]) -> Vec<u64> {
+        pack.iter()
+            .map(|frame| u64::from_le_bytes(frame[8..16].try_into().unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn queued_jobs_are_packed_in_order_up_to_the_pack_size() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(8);
+        tx.send(forward_job(3..6)).unwrap();
+        tx.send(forward_job(6..9)).unwrap();
+        tx.send(forward_job(9..20)).unwrap();
+        // The first job has 3; a queued job is taken while the total is
+        // still under the pack size (3 < 5), which brings it to 6 and stops.
+        let jobs = drain_queued_jobs(forward_job(0..3), &rx, 5);
+        assert_eq!(jobs.len(), 2);
+        let packed: Vec<Vec<u64>> = packs(&jobs, 5).map(|pack| ids(&pack)).collect();
+        assert_eq!(packed, vec![vec![0, 1, 2, 3, 4], vec![5]]);
+        // The rest stays queued, in order, for the next round.
+        let rest = drain_queued_jobs(rx.recv().unwrap(), &rx, 5);
+        assert_eq!(rest.len(), 2);
+        let packed: Vec<Vec<u64>> = packs(&rest, 5).map(|pack| ids(&pack)).collect();
+        assert_eq!(
+            packed,
+            vec![vec![6, 7, 8, 9, 10], vec![11, 12, 13, 14, 15], vec![16, 17, 18, 19]]
+        );
+        // A full first job takes nothing else; an empty one yields no pack.
+        assert_eq!(drain_queued_jobs(forward_job(0..5), &rx, 5).len(), 1);
+        assert_eq!(packs(&[forward_job(0..0)], 5).count(), 0);
     }
 
     #[test]
