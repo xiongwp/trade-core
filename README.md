@@ -63,6 +63,7 @@ scheduler noise — Linux with isolated, pinned cores trims them.)
 | O(1) under stress | 20M-order test exposed three O(level) hot spots — full-level view copies, O(level) cancels, O(level) depth sums — fixed via capped FIFO views, **tombstone cancels**, and per-level aggregate counters | E2E: 20M orders in 2.18 s (9.16M/s) with chart live |
 | Order system sharded 10 DB × 100 tables by user id | `sharding::route(user_id)` (splitmix64 → 1000 slots); DDL name enumeration | uniformity test (<5% skew) |
 | TCP long-connection intake | binary 48-byte frames (40 before the trigger-price tail; old WAL/journal/Kafka data still replays), parse-in-place over a reusable buffer; reports streamed back async | [tcp_roundtrip.rs](tests/tcp_roundtrip.rs) |
+| WebSocket order intake | `GET /ws/orders` (Bearer token): each binary message = up to `TC_WS_MAX_BATCH` (default 5000) orders in the `/commands/batch` record layout, same admission/Kafka path; one JSON ack per message with its `seq` (pipelining), HTTP-equivalent error codes, 1009 close above the limit. Raft forwarding packs up to `TC_RAFT_PACK_SIZE` (default 5000) commands per entry/fsync | `websocket_session_*`, [websocket.rs](src/websocket.rs) |
 
 ## Architecture
 
