@@ -851,20 +851,13 @@ fn spawn_execution_outbox_publisher(
                 metrics
                     .execution_outbox_pending
                     .store(pending_before_publish, Ordering::Release);
-                let mut publish_paths = readers.keys().cloned().collect::<Vec<_>>();
-                publish_paths
-                    .sort_by_key(|path| outbox_segment_order(path).unwrap_or((u32::MAX, u64::MAX)));
-                let mut visited_shards = HashSet::new();
-                for path in publish_paths {
-                    let Some((shard, _)) = outbox_segment_order(&path) else {
-                        continue;
-                    };
-                    // Advancing more than one segment of the same engine shard
-                    // in a pass could publish a newer segment while the older
-                    // one still has records after the current batch.
-                    if !visited_shards.insert(shard) {
-                        continue;
-                    }
+                let segments = readers
+                    .iter()
+                    .map(|(path, reader)| {
+                        (path.clone(), reader.pending_records().unwrap_or(u64::MAX))
+                    })
+                    .collect::<Vec<_>>();
+                for path in select_publish_segments(segments) {
                     let Some(reader) = readers.get_mut(&path) else {
                         continue;
                     };
@@ -1010,6 +1003,30 @@ fn is_execution_outbox_file(path: &std::path::Path) -> bool {
 
 fn outbox_checkpoint_name(path: &std::path::Path) -> Option<String> {
     path.file_name()?.to_str().map(str::to_owned)
+}
+
+/// Which outbox segment each engine shard publishes from this pass: its
+/// oldest segment that still has unpublished records (an unreadable pending
+/// count counts as pending). One per shard, so a newer segment is never
+/// published while an older one still has records.
+///
+/// Fully drained segments must be skipped, not stopped at: a sealed segment is
+/// only deleted when the writer next rotates, which needs new commands — and
+/// a group whose outbox backlog exceeds the readiness limit receives none.
+/// Stopping at the drained segment wedged the group permanently (the 25,630
+/// records in the next segment could never publish, so readiness never
+/// returned, so nothing rotated).
+fn select_publish_segments(mut segments: Vec<(std::path::PathBuf, u64)>) -> Vec<std::path::PathBuf> {
+    segments.sort_by_key(|(path, _)| outbox_segment_order(path).unwrap_or((u32::MAX, u64::MAX)));
+    let mut chosen_shards = HashSet::new();
+    segments
+        .into_iter()
+        .filter(|(_, pending)| *pending > 0)
+        .filter_map(|(path, _)| {
+            let (shard, _) = outbox_segment_order(&path)?;
+            chosen_shards.insert(shard).then_some(path)
+        })
+        .collect()
 }
 
 fn outbox_segment_order(path: &std::path::Path) -> Option<(u32, u64)> {
@@ -1211,6 +1228,38 @@ mod tests {
     fn execution_reports_partition_by_category_not_instrument() {
         assert_eq!(category_key(1), category_key(1_000));
         assert_ne!(category_key(1_000), category_key(1_001));
+    }
+
+    #[test]
+    fn publisher_moves_past_drained_segments_but_never_ahead_of_pending_ones() {
+        let path = |name: &str| std::path::PathBuf::from(format!("/o/{name}"));
+        // The wedge: base segment fully published, newer one holds the backlog.
+        assert_eq!(
+            select_publish_segments(vec![
+                (path("outbox-shard-0-seg-0000000001.bin"), 25_630),
+                (path("outbox-shard-0.bin"), 0),
+            ]),
+            vec![path("outbox-shard-0-seg-0000000001.bin")]
+        );
+        // Ordering: while the older segment has records, the newer one waits.
+        assert_eq!(
+            select_publish_segments(vec![
+                (path("outbox-shard-0-seg-0000000002.bin"), 9),
+                (path("outbox-shard-0-seg-0000000001.bin"), 3),
+                (path("outbox-shard-0.bin"), 0),
+            ]),
+            vec![path("outbox-shard-0-seg-0000000001.bin")]
+        );
+        // One segment per shard, shards independent; unreadable = pending.
+        assert_eq!(
+            select_publish_segments(vec![
+                (path("outbox-shard-1.bin"), u64::MAX),
+                (path("outbox-shard-0.bin"), 0),
+                (path("outbox-shard-1-seg-0000000001.bin"), 4),
+                (path("outbox-shard-0-seg-0000000001.bin"), 0),
+            ]),
+            vec![path("outbox-shard-1.bin")]
+        );
     }
 
     #[test]
