@@ -1560,7 +1560,7 @@ fn decode_kafka_record(
         offset: message.offset(),
         category_id,
         user: envelope.user,
-        frame: *envelope.frame,
+        frame: envelope.frame,
     })
 }
 
@@ -1767,7 +1767,7 @@ fn decode_db_kafka_record(
             envelope.route_version, routing.route_version
         ));
     }
-    let command = wire::WireView::parse(envelope.frame)
+    let command = wire::WireView::parse(&envelope.frame)
         .and_then(|view| view.to_command())
         .ok_or("invalid DB command frame")?;
     let expected = routing.execution_partition(
@@ -1786,7 +1786,7 @@ fn decode_db_kafka_record(
         offset: message.offset(),
         category_id: sharding::asset_category(command.instrument(), category_size),
         user: envelope.user,
-        frame: *envelope.frame,
+        frame: envelope.frame,
     })
 }
 

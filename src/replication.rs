@@ -20,7 +20,7 @@
 //! books are byte-identical to the primary's at every seq (fingerprint-verified
 //! by test). Failover = promote the standby: it already holds the state.
 //!
-//! Record: `[shard_id u32][seq u64][frame MSG_LEN]` = 52 bytes, little-endian.
+//! Record: `[shard_id u32][seq u64][frame MSG_LEN]` = 60 bytes, little-endian.
 //!
 //! Honest scope: a standby must start **empty and attach from seq 1** (or be
 //! bootstrapped by copying the primary's snapshot directory first — the

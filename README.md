@@ -61,7 +61,7 @@ scheduler noise — Linux with isolated, pinned cores trims them.)
 | Market data & chart frontend | fanout port → `market-data` service: **K-lines (1s…1mo)** + **depth ladder (top-5 bid/ask)** + canvas UI, **WebSocket push** (poll fallback), **candle history persisted** (atomic 10 s snapshots, loaded on restart) | kline tests incl. persistence; chart+depth+WS verified live in browser |
 | O(1) under stress | 20M-order test exposed three O(level) hot spots — full-level view copies, O(level) cancels, O(level) depth sums — fixed via capped FIFO views, **tombstone cancels**, and per-level aggregate counters | E2E: 20M orders in 2.18 s (9.16M/s) with chart live |
 | Order system sharded 10 DB × 100 tables by user id | `sharding::route(user_id)` (splitmix64 → 1000 slots); DDL name enumeration | uniformity test (<5% skew) |
-| TCP long-connection intake | binary 40-byte frames, parse-in-place over a reusable buffer; reports streamed back async | [tcp_roundtrip.rs](tests/tcp_roundtrip.rs) |
+| TCP long-connection intake | binary 48-byte frames (40 before the trigger-price tail; old WAL/journal/Kafka data still replays), parse-in-place over a reusable buffer; reports streamed back async | [tcp_roundtrip.rs](tests/tcp_roundtrip.rs) |
 
 ## Architecture
 
@@ -80,7 +80,7 @@ not duplicate commands into per-shard or per-asset WALs.
            (sharding::route by user_id)     │ Shard 0 (thread, CPU-pinned) │
  ids   ──▶ LeafIdGen (segment buffer)       │  1. WAL journal (ordered)    │
                                             │  2. PriceGuard vet (sync)    │
- client ──TCP 40B frames──▶ Gateway ─┬────▶ │  3. match in slab memory     │
+ client ──TCP 48B frames──▶ Gateway ─┬────▶ │  3. match in slab memory     │
                                      │      │  4. emit reports (async)     │
         [high: cancel/modify/close]──┤      └──────────────────────────────┘
         [normal: new orders       ]──┘        ... Shard N
@@ -202,7 +202,7 @@ assert_eq!(summary.fingerprint, live_fingerprint);
 | [`exchange`](src/exchange.rs) | shards, dual-priority intake, journal/snapshot hooks, replay & recovery |
 | [`journal`](src/journal.rs) | WAL: ordered, checksummed, time-stamped, replayable, truncatable |
 | [`snapshot`](src/snapshot.rs) | atomic point-in-time state capture; snapshot + tail recovery |
-| [`wire`](src/wire.rs) / [`gateway`](src/gateway.rs) | 40-byte binary protocol, parse-in-place; TCP long connection + market-data fanout |
+| [`wire`](src/wire.rs) / [`gateway`](src/gateway.rs) | 48-byte binary protocol, parse-in-place; TCP long connection + market-data fanout |
 | [`kline`](src/kline.rs) | OHLCV candle aggregation, 1s→calendar-month buckets |
 | [`risk`](src/risk.rs) | price banding (sync), margin monitor + force-close (async) |
 | [`idgen`](src/idgen.rs) | Leaf-segment id generator |

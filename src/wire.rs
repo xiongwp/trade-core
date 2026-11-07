@@ -14,7 +14,7 @@
 //! buffers. A bypass driver plugs in by handing its RX slices to
 //! [`WireView::parse`]; the decode path does not change.
 //!
-//! ## Frame layout (little-endian, 40 bytes)
+//! ## Frame layout (little-endian, 48 bytes)
 //!
 //! | off | size | field                                                    |
 //! |-----|------|----------------------------------------------------------|
@@ -27,6 +27,13 @@
 //! | 16  | 8    | price (u64) — new price for Modify; **cmd_id for Cancel** |
 //! | 24  | 8    | quantity (u64) — new qty for Modify, close qty for FC    |
 //! | 32  | 8    | user id (u64) — **cmd_id for Modify**                    |
+//! | 40  | 8    | trigger price (u64) for conditional orders; 0 = none      |
+//!
+//! Frames were 40 bytes before the trigger-price tail existed. Every persisted
+//! or queued copy of an older frame (Raft batch v1, journal v2, Kafka
+//! envelopes) decodes through [`widen_v1_frame`]: the first 40 bytes are
+//! unchanged and a zero tail means "ordinary order", so old data replays
+//! exactly as before.
 //!
 //! Every command carries a unique increasing id: New = order id; Cancel/Modify
 //! = `cmd_id` from the same Leaf-style series. Combined with the journal seq
@@ -39,10 +46,12 @@ use crate::types::*;
 use std::fmt;
 
 /// Fixed wire frame length in bytes.
-pub const MSG_LEN: usize = 40;
+pub const MSG_LEN: usize = 48;
+/// Length of a frame written before the trigger-price tail (bytes 40..48).
+pub const MSG_LEN_V1: usize = 40;
 pub const RAFT_BATCH_HEADER_LEN: usize = 12;
-/// High-throughput Raft application batch.  At 40 bytes per command the
-/// maximum entry is about 400 KiB, small enough for replication while
+/// High-throughput Raft application batch.  At 48 bytes per command the
+/// maximum entry is about 480 KiB, small enough for replication while
 /// amortizing quorum WAL and application durability barriers over 10x more
 /// commands than the original 1,000-command limit.
 pub const RAFT_BATCH_MAX_COMMANDS: usize = 10_000;
@@ -51,13 +60,16 @@ const RAFT_BATCH_MAGIC: [u8; 4] = *b"RB01";
 /// Encode multiple command frames into one Raft application entry. Consensus
 /// persists and replicates this byte string atomically, so a batch consumes one
 /// log index and one Ready fsync rather than one of each per command.
+///
+/// Version 2 carries [`MSG_LEN`]-byte frames; version 1 entries (40-byte
+/// frames) already in a WAL still decode via [`decode_raft_entry`].
 pub fn encode_raft_batch(frames: &[[u8; MSG_LEN]]) -> Option<Vec<u8>> {
     if frames.is_empty() || frames.len() > RAFT_BATCH_MAX_COMMANDS {
         return None;
     }
     let mut out = Vec::with_capacity(RAFT_BATCH_HEADER_LEN + frames.len() * MSG_LEN);
     out.extend_from_slice(&RAFT_BATCH_MAGIC);
-    out.extend_from_slice(&1u32.to_le_bytes());
+    out.extend_from_slice(&2u32.to_le_bytes());
     out.extend_from_slice(&(frames.len() as u32).to_le_bytes());
     for frame in frames {
         WireView::parse(frame)?;
@@ -66,27 +78,55 @@ pub fn encode_raft_batch(frames: &[[u8; MSG_LEN]]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Decode either a new batch entry or a legacy one-command Raft entry.
+/// Decode a batch entry (version 1 with 40-byte frames, or version 2) or a
+/// legacy one-command Raft entry (a bare 40- or 48-byte frame).
 pub fn decode_raft_entry(payload: &[u8]) -> Option<Vec<Command>> {
     if payload.len() == MSG_LEN {
         return Some(vec![WireView::parse(payload)?.to_command()?]);
+    }
+    if payload.len() == MSG_LEN_V1 {
+        let frame = widen_v1_frame(payload)?;
+        return Some(vec![WireView::parse(&frame)?.to_command()?]);
     }
     if payload.len() < RAFT_BATCH_HEADER_LEN || payload[..4] != RAFT_BATCH_MAGIC {
         return None;
     }
     let version = u32::from_le_bytes(payload[4..8].try_into().ok()?);
     let count = u32::from_le_bytes(payload[8..12].try_into().ok()?) as usize;
-    if version != 1
-        || count == 0
+    let frame_len = match version {
+        1 => MSG_LEN_V1,
+        2 => MSG_LEN,
+        _ => return None,
+    };
+    if count == 0
         || count > RAFT_BATCH_MAX_COMMANDS
-        || payload.len() != RAFT_BATCH_HEADER_LEN + count * MSG_LEN
+        || payload.len() != RAFT_BATCH_HEADER_LEN + count * frame_len
     {
         return None;
     }
     payload[RAFT_BATCH_HEADER_LEN..]
-        .chunks_exact(MSG_LEN)
-        .map(|frame| WireView::parse(frame)?.to_command())
+        .chunks_exact(frame_len)
+        .map(|frame| WireView::parse(&widen_frame(frame)?)?.to_command())
         .collect()
+}
+
+/// Widen a 40-byte frame written before the trigger-price tail existed. The
+/// tail is zero: an ordinary order, decoded exactly as the old build did.
+pub fn widen_v1_frame(old: &[u8]) -> Option<[u8; MSG_LEN]> {
+    let old: &[u8; MSG_LEN_V1] = old.try_into().ok()?;
+    let mut frame = [0u8; MSG_LEN];
+    frame[..MSG_LEN_V1].copy_from_slice(old);
+    Some(frame)
+}
+
+/// A frame of either width as a current-width frame (`None` for any other
+/// length).
+pub fn widen_frame(bytes: &[u8]) -> Option<[u8; MSG_LEN]> {
+    match bytes.len() {
+        MSG_LEN => bytes.try_into().ok(),
+        MSG_LEN_V1 => widen_v1_frame(bytes),
+        _ => None,
+    }
 }
 
 /// Fixed execution-report frame length in bytes (v2: 56 — adds fee fields).
