@@ -1654,7 +1654,9 @@ fn rewind_kafka_batch(consumer: &BaseConsumer, records: &[KafkaRecord]) {
 }
 
 struct RaftForwardJob {
-    batches: Vec<Vec<[u8; wire::MSG_LEN]>>,
+    /// One entry per asset category: that category's frames, already split
+    /// into Raft-batch-sized chunks that must commit in order.
+    categories: Vec<Vec<Vec<[u8; wire::MSG_LEN]>>>,
     reply: std::sync::mpsc::SyncSender<Result<(), String>>,
 }
 
@@ -1666,6 +1668,12 @@ struct RaftForwarder {
 impl RaftForwarder {
     fn spawn(target_groups: Vec<Vec<MatcherTarget>>, backpressure: Arc<Backpressure>) -> Self {
         let queue_capacity = env_number("TC_RAFT_FORWARD_QUEUE", 64usize).max(1);
+        // Each request blocks until its Raft entry commits, so one connection
+        // means one entry — one WAL fsync plus a replication round trip — at
+        // a time, however many categories are waiting. Several connections
+        // let the leader's runtime collect concurrent requests into one
+        // Ready, so a single fsync covers many categories' batches.
+        let lanes = env_number("TC_RAFT_FORWARD_CONNECTIONS", 8usize).max(1);
         let mut groups = Vec::with_capacity(target_groups.len());
         for (group, targets) in target_groups.into_iter().enumerate() {
             let (tx, rx) = std::sync::mpsc::sync_channel::<RaftForwardJob>(queue_capacity);
@@ -1673,13 +1681,11 @@ impl RaftForwarder {
             std::thread::Builder::new()
                 .name(format!("raft-forward-{group}"))
                 .spawn(move || {
-                    let mut matcher = MatcherConnection::new(targets);
+                    let mut matchers = (0..lanes)
+                        .map(|_| MatcherConnection::new(targets.clone()))
+                        .collect::<Vec<_>>();
                     while let Ok(job) = rx.recv() {
-                        let result = job.batches.iter().try_for_each(|frames| {
-                            matcher.send_frames(frames).map_err(|error| {
-                                format!("Raft group {group} batch commit failed: {error}")
-                            })
-                        });
+                        let result = forward_categories(group, &mut matchers, &job.categories);
                         worker_backpressure.set_group_health(group, result.is_ok());
                         let _ = job.reply.send(result);
                     }
@@ -1722,9 +1728,9 @@ impl RaftForwarder {
             if categories.is_empty() {
                 continue;
             }
-            let batches = categories
+            let categories = categories
                 .into_values()
-                .flat_map(|frames| {
+                .map(|frames| {
                     frames
                         .chunks(wire::RAFT_BATCH_MAX_COMMANDS)
                         .map(|chunk| chunk.to_vec())
@@ -1733,7 +1739,7 @@ impl RaftForwarder {
                 .collect();
             let (reply, result) = std::sync::mpsc::sync_channel(1);
             self.groups[group]
-                .send(RaftForwardJob { batches, reply })
+                .send(RaftForwardJob { categories, reply })
                 .map_err(|_| format!("Raft group {group} forwarding worker stopped"))?;
             replies.push(result);
         }
@@ -1744,6 +1750,57 @@ impl RaftForwarder {
         }
         Ok(())
     }
+}
+
+/// Spread a job's categories over the connection lanes: category `i` goes to
+/// lane `i % lanes`. A category's chunks stay on one lane, in order, so its
+/// commands commit in Kafka order; categories are independent books, so their
+/// relative order across lanes is free (as it already is across consumers).
+fn assign_lanes(categories: usize, lanes: usize) -> Vec<Vec<usize>> {
+    let lanes = lanes.max(1).min(categories.max(1));
+    let mut assigned = vec![Vec::new(); lanes];
+    for category in 0..categories {
+        assigned[category % lanes].push(category);
+    }
+    assigned
+}
+
+/// Commit every category of one job, lanes in parallel. Returns after all
+/// lanes finish (the next job must not overtake this one within a category);
+/// any lane's failure fails the job, and the caller's retry is safe because
+/// Raft suppresses already-committed command ids.
+fn forward_categories(
+    group: usize,
+    matchers: &mut [MatcherConnection],
+    categories: &[Vec<Vec<[u8; wire::MSG_LEN]>>],
+) -> Result<(), String> {
+    let send_lane = |matcher: &mut MatcherConnection, lane: &[usize]| {
+        lane.iter()
+            .flat_map(|&category| categories[category].iter())
+            .try_for_each(|frames| {
+                matcher.send_frames(frames).map_err(|error| {
+                    format!("Raft group {group} batch commit failed: {error}")
+                })
+            })
+    };
+    let lanes = assign_lanes(categories.len(), matchers.len());
+    if lanes.len() <= 1 {
+        return lanes
+            .first()
+            .map_or(Ok(()), |lane| send_lane(&mut matchers[0], lane));
+    }
+    std::thread::scope(|scope| {
+        let handles = matchers
+            .iter_mut()
+            .zip(&lanes)
+            .map(|(matcher, lane)| scope.spawn(move || send_lane(matcher, lane)))
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("Raft forwarding lane panicked"))
+            .collect::<Result<Vec<()>, String>>()
+            .map(|_| ())
+    })
 }
 
 fn forward_kafka_batch(
@@ -3432,6 +3489,23 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forwarding_lanes_keep_each_category_on_one_lane_in_order() {
+        assert_eq!(assign_lanes(0, 8), vec![Vec::<usize>::new()]);
+        assert_eq!(assign_lanes(1, 8), vec![vec![0]]);
+        assert_eq!(assign_lanes(5, 2), vec![vec![0, 2, 4], vec![1, 3]]);
+        // Never more lanes than categories, every category exactly once.
+        let lanes = assign_lanes(25, 8);
+        assert_eq!(lanes.len(), 8);
+        let mut seen = lanes.concat();
+        seen.sort_unstable();
+        assert_eq!(seen, (0..25).collect::<Vec<_>>());
+        for lane in &lanes {
+            assert!(lane.windows(2).all(|w| w[0] < w[1]), "lane order is stable");
+        }
+        assert_eq!(assign_lanes(3, 0), vec![vec![0, 1, 2]], "0 lanes means 1");
+    }
 
     #[test]
     fn order_query_parses_type_and_tif() {
