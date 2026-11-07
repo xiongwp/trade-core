@@ -321,6 +321,7 @@ fn main() {
                     body.len()
                 );
                 let started = Instant::now();
+                let mut backoff_ms: u64 = 10;
                 loop {
                     let result = stream
                         .write_all(header.as_bytes())
@@ -332,9 +333,14 @@ fn main() {
                             break;
                         }
                         Ok((429 | 503, _)) => {
-                            // Backpressure: the stack is protecting itself; retry.
+                            // Backpressure: the stack is protecting itself. Back
+                            // off exponentially with jitter, like a real client —
+                            // a fixed 5 ms retry turned into a storm of ~1.5k
+                            // rejected 28 KB batches/s that starved the drain.
                             throttled.fetch_add(1, Ordering::Relaxed);
-                            std::thread::sleep(Duration::from_millis(5));
+                            let jitter = rng.below(backoff_ms / 2 + 1);
+                            std::thread::sleep(Duration::from_millis(backoff_ms + jitter));
+                            backoff_ms = (backoff_ms * 2).min(500);
                         }
                         other => {
                             failed.fetch_add(count, Ordering::Relaxed);

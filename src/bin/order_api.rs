@@ -1451,7 +1451,6 @@ fn persist_mysql_shard(
 
     let mut processed = Vec::with_capacity(records.len() * 6);
     let mut orders_by_table: BTreeMap<u32, Vec<Value>> = BTreeMap::new();
-    let mut cancels = Vec::new();
     let mut modifies = Vec::new();
 
     for record in records {
@@ -1484,9 +1483,12 @@ fn persist_mysql_shard(
                     Value::from("PENDING"),
                 ]);
             }
-            trade_core::Command::Cancel { order_id, .. } => {
-                cancels.push((route.table_name(), order_id.0, record.user));
-            }
+            // A cancel request changes no status: only the engine's answer
+            // does (`Cancelled` -> CANCELLED; `NotFound` -> nothing). Marking
+            // the row CANCEL_PENDING here overwrote orders that had already
+            // FILLED/CANCELLED, and a late cancel's NotFound then left them
+            // stuck (Binance spot likewise never uses PENDING_CANCEL).
+            trade_core::Command::Cancel { .. } => {}
             trade_core::Command::Modify {
                 order_id,
                 new_price,
@@ -1535,13 +1537,6 @@ fn persist_mysql_shard(
                 &format!("INSERT IGNORE INTO {db}.asset_orders_{table:03} (order_id,category_id,user_id,instrument,side,price,qty,status)"),
                 8,
                 values,
-            )
-            .map_err(|error| error.to_string())?;
-    }
-    for (table, order_id, user) in cancels {
-        tx.exec_drop(
-                format!("UPDATE {db}.{table} SET status='CANCEL_PENDING' WHERE order_id=:id AND user_id=:user"),
-                params! {"id" => order_id, "user" => user},
             )
             .map_err(|error| error.to_string())?;
     }
@@ -3571,6 +3566,19 @@ mod tests {
         }
     }
 
+    fn kafka_cancel(order_id: u64, cmd_id: u64, user: u64, instrument: u32, offset: i64) -> KafkaRecord {
+        let mut frame = [0u8; wire::MSG_LEN];
+        wire::encode_cancel(InstrumentId(instrument), OrderId(order_id), cmd_id, &mut frame);
+        KafkaRecord {
+            topic: "mysql-it".into(),
+            partition: 0,
+            offset,
+            category_id: sharding::asset_category(InstrumentId(instrument), 1_000),
+            user,
+            frame,
+        }
+    }
+
     fn report_event(
         type_code: u8,
         target_order_id: u64,
@@ -3866,6 +3874,74 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(pending, 0);
+    }
+
+    /// Same disposable MySQL 8 as above. Found by the 10k-user stress run:
+    /// 129 orders were stuck in CANCEL_PENDING.
+    #[test]
+    #[ignore = "requires disposable MySQL 8 via TC_TEST_MYSQL_URL"]
+    fn mysql8_cancel_request_never_overwrites_order_status() {
+        let store = mysql_test_store().expect("TC_TEST_MYSQL_URL must be set");
+        let seed = (std::process::id() as u64) << 32 | journal::now_nanos() as u64 & 0xffff_ffff;
+        let (filled, open) = (seed | 1, seed | 2);
+        let (user, instrument) = (77_001, 42_003);
+        let status = |order: u64| -> Option<String> {
+            let route = store.routing.route_order_id(order);
+            store
+                .shard(0)
+                .get_conn()
+                .unwrap()
+                .exec_first(
+                    format!("SELECT status FROM order_db_0.{} WHERE order_id=:id", route.table_name()),
+                    params! {"id" => order},
+                )
+                .unwrap()
+        };
+
+        persist_mysql_shard(
+            &store,
+            0,
+            &[kafka_new(filled, user, instrument, 3, 1), kafka_new(open, user, instrument, 3, 2)],
+        )
+        .unwrap();
+        persist_events(
+            &store,
+            vec![
+                trade_event(filled, open ^ 0xff, instrument, 3, seed, 0, 1),
+                report_event(wire::RT_FILLED, filled, instrument, seed + 1, 2),
+                report_event(wire::RT_RESTING, open, instrument, seed + 2, 3),
+            ],
+        )
+        .unwrap();
+        assert_eq!(status(filled).as_deref(), Some("FILLED"));
+        assert_eq!(status(open).as_deref(), Some("OPEN"));
+
+        // A late cancel of the filled order (the engine answers NotFound) and a
+        // cancel of the open one: neither request changes a status by itself.
+        persist_mysql_shard(
+            &store,
+            0,
+            &[
+                kafka_cancel(filled, seed + 10, user, instrument, 3),
+                kafka_cancel(open, seed + 11, user, instrument, 4),
+            ],
+        )
+        .unwrap();
+        persist_events(
+            &store,
+            vec![report_event(wire::RT_NOTFOUND, filled, instrument, seed + 3, 4)],
+        )
+        .unwrap();
+        assert_eq!(status(filled).as_deref(), Some("FILLED"));
+        assert_eq!(status(open).as_deref(), Some("OPEN"));
+
+        // Only the engine's confirmation cancels.
+        persist_events(
+            &store,
+            vec![report_event(wire::RT_CANCELLED, open, instrument, seed + 4, 5)],
+        )
+        .unwrap();
+        assert_eq!(status(open).as_deref(), Some("CANCELLED"));
     }
 
     #[test]
