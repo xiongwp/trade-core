@@ -120,6 +120,10 @@ pub const RT_NOTFOUND: u8 = 9;
 pub const RT_DEPTH_LEVEL: u8 = 10;
 /// Depth snapshot terminator: aux = bid_levels | ask_levels << 8.
 pub const RT_DEPTH_END: u8 = 11;
+/// A refused command that changed no order ([`ExecReport::CommandRejected`]):
+/// order_id slot = the command's id, aux = reject reason code. (12..=15 are
+/// the halt / resume / user-halt / user-resume acks.)
+pub const RT_CMD_REJECTED: u8 = 16;
 
 /// A borrowed view over one wire frame. Reads fields in place; copies nothing.
 #[derive(Clone, Copy)]
@@ -482,6 +486,19 @@ pub fn encode_report(r: &ExecReport, out: &mut [u8; REPORT_LEN]) {
             0,
             0,
         ),
+        ExecReport::CommandRejected {
+            instrument,
+            command_id,
+            reason,
+        } => put(
+            RT_CMD_REJECTED,
+            instrument,
+            OrderId(command_id),
+            reject_reason_code(reason),
+            0,
+            0,
+            0,
+        ),
         ExecReport::Modified {
             instrument,
             order_id,
@@ -715,6 +732,13 @@ impl fmt::Display for DecodedReport {
                 "REJECTED   {} {} ({})",
                 self.instrument,
                 self.order_id,
+                reject_reason_name(self.aux_id)
+            ),
+            RT_CMD_REJECTED => write!(
+                f,
+                "CMDREJECT  {} command {} ({})",
+                self.instrument,
+                self.order_id.0,
                 reject_reason_name(self.aux_id)
             ),
             RT_MODIFIED => write!(

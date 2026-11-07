@@ -114,7 +114,7 @@ impl Metrics {
             ExecReport::Cancelled { .. } => {
                 self.cancels.fetch_add(1, Ordering::Relaxed);
             }
-            ExecReport::Rejected { .. } => {
+            ExecReport::Rejected { .. } | ExecReport::CommandRejected { .. } => {
                 self.rejects.fetch_add(1, Ordering::Relaxed);
             }
             ExecReport::Modified { .. } => {

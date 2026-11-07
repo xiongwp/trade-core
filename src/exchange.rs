@@ -201,6 +201,16 @@ pub enum ExecReport {
         order_id: OrderId,
         reason: &'static str,
     },
+    /// A command was refused without changing any order: a re-sent duplicate,
+    /// or an amend that breaks the instrument's trading rules. `command_id` is
+    /// the refused command's own id — for a duplicate `New` that is also the
+    /// original order's id, whose state must NOT change. Consumers projecting
+    /// order state ignore this report; it exists so the sender learns why.
+    CommandRejected {
+        instrument: InstrumentId,
+        command_id: u64,
+        reason: &'static str,
+    },
     Modified {
         instrument: InstrumentId,
         order_id: OrderId,
@@ -1015,9 +1025,9 @@ impl Processor {
     pub fn process(&mut self, cmd: Command, emit: &mut dyn FnMut(ExecReport)) {
         let exact_id = cmd.id();
         if exact_id != 0 && !self.seen_command_ids.insert(exact_id) {
-            emit(ExecReport::Rejected {
+            emit(ExecReport::CommandRejected {
                 instrument: cmd.instrument(),
-                order_id: OrderId(exact_id),
+                command_id: exact_id,
                 reason: "duplicate",
             });
             return;
@@ -1060,9 +1070,9 @@ impl Processor {
                     &mut self.max_new_id
                 };
                 if id <= *cursor {
-                    emit(ExecReport::Rejected {
+                    emit(ExecReport::CommandRejected {
                         instrument: inst,
-                        order_id: OrderId(id),
+                        command_id: id,
                         reason: "duplicate",
                     });
                     return;
@@ -1124,14 +1134,13 @@ impl Processor {
                 cmd_id,
             } => {
                 // Trading rules apply to the amended price/size too. A refused
-                // amend leaves the order untouched, so the rejection is keyed by
-                // the command id (as duplicate commands are), never the order's.
+                // amend leaves the order untouched: a command-level rejection.
                 if !self.specs.is_empty() {
                     if let Some(spec) = self.specs.get(instrument) {
                         if let Err(reason) = spec.check_amend(new_price, new_qty) {
-                            emit(ExecReport::Rejected {
+                            emit(ExecReport::CommandRejected {
                                 instrument,
-                                order_id: OrderId(cmd_id),
+                                command_id: cmd_id,
                                 reason,
                             });
                             return;
@@ -2350,11 +2359,21 @@ pub fn fingerprint_engine_states(
 
 /// FNV-1a fingerprint of a report stream (order-sensitive). Two runs with equal
 /// fingerprints produced identical trades, fills, rests and cancels.
+///
+/// Reject frames are hashed in their original layout — type `RT_REJECTED`,
+/// zero `aux` — even though the wire now carries a reason code there and
+/// splits off `RT_CMD_REJECTED`. Raft application proofs persist this value,
+/// so a node replaying a WAL tail proved by an older build must reach the same
+/// fingerprint or it refuses to start.
 pub fn fingerprint_reports(reports: &[ExecReport]) -> u64 {
     let mut frame = [0u8; wire::REPORT_LEN];
     let mut h: u64 = 0xcbf29ce484222325;
     for r in reports {
         wire::encode_report(r, &mut frame);
+        if frame[0] == wire::RT_REJECTED || frame[0] == wire::RT_CMD_REJECTED {
+            frame[0] = wire::RT_REJECTED;
+            frame[16..24].fill(0);
+        }
         for &b in &frame {
             h ^= b as u64;
             h = h.wrapping_mul(0x100000001b3);

@@ -851,6 +851,12 @@ fn bootstrap(store: &OrderStore) -> mysql::Result<()> {
         conn.query_drop(format!("CREATE TABLE IF NOT EXISTS {db_name}.processed_executions (kafka_partition INT NOT NULL, kafka_offset BIGINT UNSIGNED NOT NULL, instrument INT UNSIGNED NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(kafka_partition,kafka_offset), KEY idx_instrument_offset (instrument,kafka_offset)) ENGINE=InnoDB"))?;
         conn.query_drop(format!("CREATE TABLE IF NOT EXISTS {db_name}.processed_execution_events (raft_group INT UNSIGNED NOT NULL, raft_index BIGINT UNSIGNED NOT NULL, report_ordinal INT UNSIGNED NOT NULL, target_order_id BIGINT UNSIGNED NOT NULL, shard_table INT UNSIGNED NOT NULL, instrument INT UNSIGNED NOT NULL, report_type TINYINT UNSIGNED NOT NULL, kafka_partition INT NOT NULL, kafka_offset BIGINT UNSIGNED NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(raft_group,raft_index,report_ordinal,target_order_id), KEY idx_instrument_index (instrument,raft_index), KEY idx_order_event (target_order_id,raft_index)) ENGINE=InnoDB"))?;
         conn.query_drop(format!("CREATE TABLE IF NOT EXISTS {db_name}.pending_execution_events (raft_group INT UNSIGNED NOT NULL, raft_index BIGINT UNSIGNED NOT NULL, report_ordinal INT UNSIGNED NOT NULL, target_order_id BIGINT UNSIGNED NOT NULL, shard_table INT UNSIGNED NOT NULL, instrument INT UNSIGNED NOT NULL, report_type TINYINT UNSIGNED NOT NULL, event_qty BIGINT UNSIGNED NOT NULL, kafka_partition INT NOT NULL, kafka_offset BIGINT UNSIGNED NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(raft_group,raft_index,report_ordinal,target_order_id), KEY idx_pending_table_order (shard_table,target_order_id,raft_index,report_ordinal)) ENGINE=InnoDB"))?;
+        // Rows staged before `projects_order_state` existed (NotFound, halt
+        // acks) can never be promoted; drop them once at startup.
+        conn.query_drop(format!(
+            "DELETE FROM {db_name}.pending_execution_events WHERE report_type NOT IN ({})",
+            projected_report_types_sql()
+        ))?;
         for table in 0..store.routing.tables_per_db {
             conn.query_drop(format!("CREATE TABLE IF NOT EXISTS {db_name}.asset_orders_{table:03} (row_seq BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, order_id BIGINT UNSIGNED NOT NULL UNIQUE, category_id INT UNSIGNED NOT NULL, user_id BIGINT UNSIGNED NOT NULL, instrument INT UNSIGNED NOT NULL, side TINYINT NOT NULL, price BIGINT UNSIGNED NOT NULL, qty BIGINT UNSIGNED NOT NULL, filled_qty BIGINT UNSIGNED NOT NULL DEFAULT 0, status VARCHAR(16) NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, KEY idx_category_row (category_id,row_seq), KEY idx_user_created (user_id,created_at)) ENGINE=InnoDB"))?;
         }
@@ -2421,6 +2427,37 @@ impl ExecutionDbForwarder {
     }
 }
 
+/// Report types that change an order row. Everything else on the execution
+/// topic — `NotFound`, the halt/resume acks (order id 0), command-level
+/// rejects (keyed by a command id, see `ExecReport::CommandRejected`) — must
+/// not be staged: no order row ever matches some of them, so they would sit in
+/// `pending_execution_events` forever, and for the rest the status `CASE` in
+/// `apply_pending_execution_table` reads an unrecognised latest event as "no
+/// terminal state", flipping e.g. a CANCELLED order back to OPEN on a repeated
+/// cancel's `NotFound`.
+fn projects_order_state(type_code: u8) -> bool {
+    matches!(
+        type_code,
+        wire::RT_ACCEPTED
+            | wire::RT_TRADE
+            | wire::RT_FILLED
+            | wire::RT_PARTIAL
+            | wire::RT_RESTING
+            | wire::RT_CANCELLED
+            | wire::RT_REJECTED
+            | wire::RT_MODIFIED
+    )
+}
+
+/// SQL list of the report types [`projects_order_state`] accepts.
+fn projected_report_types_sql() -> String {
+    (0..=u8::MAX)
+        .filter(|&code| projects_order_state(code))
+        .map(|code| code.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn sweep_pending_execution_shard(store: &OrderStore, shard_db: u32) -> Result<(), String> {
     let db = format!("order_db_{shard_db}");
     let mut conn = store
@@ -2457,8 +2494,12 @@ fn persist_execution_shard(
         .map_err(|error| error.to_string())?;
     let mut updates = Vec::new();
     for (shard_table, records) in tables {
+        // Reports that change no order are consumed (their Kafka offsets still
+        // commit with the batch) but never staged; see `projects_order_state`.
         for (record, target_order_id) in records {
-            updates.push((shard_table, record, target_order_id));
+            if projects_order_state(record.event.report.type_code) {
+                updates.push((shard_table, record, target_order_id));
+            }
         }
     }
     // Coalescing several consumer jobs is useful for queue efficiency, but it
@@ -3362,6 +3403,27 @@ mod tests {
     }
 
     #[test]
+    fn only_order_state_reports_are_staged_for_projection() {
+        for code in [
+            wire::RT_ACCEPTED,
+            wire::RT_TRADE,
+            wire::RT_FILLED,
+            wire::RT_PARTIAL,
+            wire::RT_RESTING,
+            wire::RT_CANCELLED,
+            wire::RT_REJECTED,
+            wire::RT_MODIFIED,
+        ] {
+            assert!(projects_order_state(code), "type {code}");
+        }
+        // NotFound, depth, halt/resume acks (12..=15), command rejects.
+        for code in [wire::RT_NOTFOUND, wire::RT_DEPTH_LEVEL, wire::RT_DEPTH_END, 12, 13, 14, 15, wire::RT_CMD_REJECTED] {
+            assert!(!projects_order_state(code), "type {code}");
+        }
+        assert_eq!(projected_report_types_sql(), "1,2,3,4,5,6,7,8");
+    }
+
+    #[test]
     fn unfixable_request_errors_are_400_not_retryable_503() {
         assert_eq!(
             ingress_error_status(&format!("{INVALID_REQUEST}tick-size")),
@@ -3407,6 +3469,18 @@ mod tests {
             user,
             frame,
         }
+    }
+
+    fn report_event(
+        type_code: u8,
+        target_order_id: u64,
+        instrument: u32,
+        raft_index: u64,
+        offset: i64,
+    ) -> ExecutionKafkaRecord {
+        let mut record = trade_event(target_order_id, 0, instrument, 0, raft_index, 0, offset);
+        record.event.report.type_code = type_code;
+        record
     }
 
     fn trade_event(
@@ -3571,6 +3645,77 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(pending, 0);
+    }
+
+    /// Same disposable MySQL 8 as above.
+    #[test]
+    #[ignore = "requires disposable MySQL 8 via TC_TEST_MYSQL_URL"]
+    fn mysql8_projection_ignores_reports_that_change_no_order() {
+        let store = mysql_test_store().expect("TC_TEST_MYSQL_URL must be set");
+        let seed = (std::process::id() as u64) << 32 | journal::now_nanos() as u64 & 0xffff_ffff;
+        let order = seed | 1;
+        let instrument = 42_002;
+        let status = |conn: &mut mysql::PooledConn| -> Option<String> {
+            let route = store.routing.route_order_id(order);
+            conn.exec_first(
+                format!(
+                    "SELECT status FROM order_db_0.{} WHERE order_id=:id",
+                    route.table_name()
+                ),
+                params! {"id" => order},
+            )
+            .unwrap()
+        };
+        let pending = |conn: &mut mysql::PooledConn| -> u64 {
+            conn.query_first("SELECT COUNT(*) FROM order_db_0.pending_execution_events")
+                .unwrap()
+                .unwrap()
+        };
+
+        persist_mysql_shard(&store, 0, &[kafka_new(order, 66_001, instrument, 10, 1)]).unwrap();
+        persist_events(
+            &store,
+            vec![
+                report_event(wire::RT_ACCEPTED, order, instrument, seed, 1),
+                report_event(wire::RT_CANCELLED, order, instrument, seed + 1, 2),
+            ],
+        )
+        .unwrap();
+        let mut conn = store.shard(0).get_conn().unwrap();
+        assert_eq!(status(&mut conn).as_deref(), Some("CANCELLED"));
+
+        // A repeated cancel answers NotFound; it must not reopen the order.
+        persist_events(
+            &store,
+            vec![report_event(wire::RT_NOTFOUND, order, instrument, seed + 2, 3)],
+        )
+        .unwrap();
+        assert_eq!(status(&mut conn).as_deref(), Some("CANCELLED"));
+
+        // A duplicate New's command reject carries the original order's id and
+        // must not mark it REJECTED; halt acks carry order id 0 and command
+        // rejects of cancels a command id — neither may linger in pending.
+        persist_events(
+            &store,
+            vec![
+                report_event(wire::RT_CMD_REJECTED, order, instrument, seed + 3, 4),
+                report_event(12, 0, instrument, seed + 4, 5),
+                report_event(wire::RT_CMD_REJECTED, seed | 0xffff, instrument, seed + 5, 6),
+            ],
+        )
+        .unwrap();
+        assert_eq!(status(&mut conn).as_deref(), Some("CANCELLED"));
+        assert_eq!(pending(&mut conn), 0);
+
+        // Rows staged by an older build are dropped when bootstrap runs.
+        conn.exec_drop(
+            "INSERT INTO order_db_0.pending_execution_events (raft_group,raft_index,report_ordinal,target_order_id,shard_table,instrument,report_type,event_qty,kafka_partition,kafka_offset) VALUES (7,:idx,0,0,0,:inst,12,0,0,7)",
+            params! {"idx" => seed + 6, "inst" => instrument},
+        )
+        .unwrap();
+        assert_eq!(pending(&mut conn), 1);
+        bootstrap(&store).unwrap();
+        assert_eq!(pending(&mut conn), 0);
     }
 
     #[test]

@@ -47,7 +47,7 @@ fn snapshot_restores_exact_ids_before_replaying_a_duplicate_tail() {
     assert_eq!(processor.engine(instrument).unwrap().book().len(), 1);
     assert!(matches!(
         reports.as_slice(),
-        [ExecReport::Rejected {
+        [ExecReport::CommandRejected {
             reason: "duplicate",
             ..
         }]

@@ -2,7 +2,7 @@
 //! price range / min notional), end to end through the deterministic
 //! `Processor`, the wire format and snapshots.
 
-use trade_core::exchange::{ExecReport, Processor};
+use trade_core::exchange::{fingerprint_reports, ExecReport, Processor};
 use trade_core::prelude::*;
 use trade_core::snapshot::{self, SnapshotData};
 use trade_core::wire;
@@ -264,9 +264,10 @@ fn amend_breaking_a_rule_is_refused_and_leaves_the_order_untouched() {
         (amend(600, 20, 902), "price-range"),
     ] {
         let reports = run(&mut p, cmd);
-        // Keyed by the command id: the order itself was not rejected.
+        // A command-level reject keyed by the amend's id: the order itself
+        // was not rejected.
         assert!(
-            matches!(reports[..], [ExecReport::Rejected { order_id, reason: r, .. }] if r == reason && order_id.0 >= 900),
+            matches!(reports[..], [ExecReport::CommandRejected { command_id, reason: r, .. }] if r == reason && command_id >= 900),
             "{reports:?}"
         );
         let resting = *p.engine(SYM).unwrap().book().get(OrderId(1)).unwrap();
@@ -383,4 +384,73 @@ fn resting_post_only_survives_snapshot_and_replay_is_deterministic() {
     assert_eq!(book.get(OrderId(2)).unwrap().tif, TimeInForce::PostOnly);
     assert_eq!(book.get(OrderId(4)).unwrap().tif, TimeInForce::PostOnly);
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn duplicate_new_is_a_command_reject_that_leaves_the_original_order_alone() {
+    let mut p = processor();
+    run(&mut p, new(1, Side::Buy, 100, 10));
+    let reports = run(&mut p, new(1, Side::Buy, 100, 10));
+    assert!(
+        matches!(
+            reports[..],
+            [ExecReport::CommandRejected {
+                command_id: 1,
+                reason: "duplicate",
+                ..
+            }]
+        ),
+        "{reports:?}"
+    );
+    assert_eq!(
+        p.engine(SYM)
+            .unwrap()
+            .book()
+            .get(OrderId(1))
+            .unwrap()
+            .remaining,
+        10
+    );
+
+    let mut frame = [0u8; wire::REPORT_LEN];
+    wire::encode_report(&reports[0], &mut frame);
+    let decoded = wire::decode_report(&frame).unwrap();
+    assert_eq!(decoded.type_code, wire::RT_CMD_REJECTED);
+    assert_eq!(decoded.order_id, OrderId(1));
+    assert_eq!(wire::reject_reason_name(decoded.aux_id), "duplicate");
+}
+
+#[test]
+fn report_fingerprint_matches_proofs_written_before_reason_codes() {
+    // An older build encoded every reject as RT_REJECTED with a zero aux slot
+    // and persisted that fingerprint in Raft application proofs. Replaying a
+    // proved WAL tail on this build must reproduce it, or the node refuses to
+    // start. Reason code 0 ("unknown") is exactly the legacy frame.
+    let legacy = |id| ExecReport::Rejected {
+        instrument: SYM,
+        order_id: OrderId(id),
+        reason: "unknown",
+    };
+    assert_eq!(wire::reject_reason_code("unknown"), 0);
+    assert_eq!(
+        fingerprint_reports(&[ExecReport::Rejected {
+            instrument: SYM,
+            order_id: OrderId(5),
+            reason: "post-only",
+        }]),
+        fingerprint_reports(&[legacy(5)])
+    );
+    assert_eq!(
+        fingerprint_reports(&[ExecReport::CommandRejected {
+            instrument: SYM,
+            command_id: 5,
+            reason: "duplicate",
+        }]),
+        fingerprint_reports(&[legacy(5)])
+    );
+    // Everything else still separates.
+    assert_ne!(
+        fingerprint_reports(&[legacy(5)]),
+        fingerprint_reports(&[legacy(6)])
+    );
 }

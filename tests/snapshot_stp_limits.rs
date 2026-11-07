@@ -286,7 +286,7 @@ fn duplicate_commands_are_rejected_and_cursor_persists() {
         &mut |r| reports.push(r),
     );
     assert!(reports.iter().any(|r| matches!(r,
-        ExecReport::Rejected { reason, .. } if *reason == "duplicate")));
+        ExecReport::CommandRejected { reason, .. } if *reason == "duplicate")));
     assert_eq!(
         p.engine(InstrumentId(0)).unwrap().book().len(),
         1,
@@ -314,7 +314,7 @@ fn duplicate_commands_are_rejected_and_cursor_persists() {
     assert!(matches!(reports[0], ExecReport::Cancelled { .. }));
     assert!(matches!(
         reports[1],
-        ExecReport::Rejected {
+        ExecReport::CommandRejected {
             reason: "duplicate",
             ..
         }
@@ -349,7 +349,7 @@ fn duplicate_commands_are_rejected_and_cursor_persists() {
     assert!(
         matches!(
             reports[0],
-            ExecReport::Rejected {
+            ExecReport::CommandRejected {
                 reason: "duplicate",
                 ..
             }
@@ -373,7 +373,7 @@ fn exact_duplicate_is_safe_even_without_monotonic_cursor_dedup() {
     );
     assert!(matches!(
         reports.as_slice(),
-        [ExecReport::Rejected {
+        [ExecReport::CommandRejected {
             reason: "duplicate",
             ..
         }]
