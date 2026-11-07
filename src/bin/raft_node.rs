@@ -245,6 +245,12 @@ fn main() {
             let mut committed_ids = CommittedIdWindow::new(dedup_max_ids);
             let mut was_leader = false;
             let mut last_tick = Instant::now();
+            // Compaction probe: the matching snapshot's applied index, cached
+            // against the file's (mtime, len) and re-checked at most once a
+            // second. Decoding the snapshot (every resting order) on each 2 ms
+            // loop pass cost ~40% of a core per group under load.
+            let mut compaction_probe: Option<(std::time::SystemTime, u64, u64)> = None;
+            let mut last_compaction_check = Instant::now();
             // Fencing: committed terms are monotonic within a member's stream.
             // A regression would mean a stale leader's entry reached apply, so
             // refuse to matching it. route_version is reserved for the future
@@ -497,9 +503,27 @@ fn main() {
                         .execution_outbox_publish_healthy
                         .load(Ordering::Acquire)
                         == 1
+                    && last_compaction_check.elapsed() >= Duration::from_secs(1)
                 {
-                    if let Ok(snapshot) = trade_core::snapshot::load(&runtime_snapshot_path) {
-                        let index = snapshot.raft_applied_index;
+                    last_compaction_check = Instant::now();
+                    let snapshot_index = std::fs::metadata(&runtime_snapshot_path)
+                        .and_then(|meta| Ok((meta.modified()?, meta.len())))
+                        .ok()
+                        .and_then(|(modified, len)| match compaction_probe {
+                            Some((cached_modified, cached_len, index))
+                                if cached_modified == modified && cached_len == len =>
+                            {
+                                Some(index)
+                            }
+                            _ => {
+                                let index = trade_core::snapshot::load(&runtime_snapshot_path)
+                                    .ok()?
+                                    .raft_applied_index;
+                                compaction_probe = Some((modified, len, index));
+                                Some(index)
+                            }
+                        });
+                    if let Some(index) = snapshot_index {
                         if index <= node.applied_index()
                             && index
                                 >= node

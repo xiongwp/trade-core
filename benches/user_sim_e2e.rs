@@ -12,9 +12,12 @@
 //! stage's completed count to reach the submitted count of an earlier instant).
 //!
 //! Run: cargo bench --bench user_sim_e2e --
-//!      [ADDR TOKEN COMMANDS USERS INSTRUMENTS CONCURRENCY BATCH ENGINE_METRICS]
+//!      [ADDR TOKEN COMMANDS USERS INSTRUMENTS CONCURRENCY BATCH ENGINE_METRICS STRIDE]
 //! ENGINE_METRICS: comma-separated metrics endpoints, one replica per Raft group
 //! (default: the local compose stack's node 1 of groups 0..3).
+//! STRIDE: gap between instrument ids (default 1000 = one asset category, so the
+//! instruments land in distinct categories and spread over every Raft group;
+//! 1 packs them all into category 0 / one group).
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -204,6 +207,7 @@ fn main() {
         .split(',')
         .map(str::to_string)
         .collect();
+    let stride: u32 = args.next().and_then(|v| v.parse().ok()).unwrap_or(1000).max(1);
     let metrics_addr = addr.clone();
 
     // Ids: one globally unique increasing space for orders and cancel cmd_ids.
@@ -279,11 +283,12 @@ fn main() {
                     let user = 1_000_000 + rng.below(users);
                     // Hot set: half the flow on the first 10% of instruments.
                     let hot = (instruments / 10).max(1);
-                    let instrument = 1 + if rng.below(2) == 0 {
-                        rng.below(hot as u64) as u32
-                    } else {
-                        rng.below(instruments as u64) as u32
-                    };
+                    let instrument = 1 + stride
+                        * if rng.below(2) == 0 {
+                            rng.below(hot as u64) as u32
+                        } else {
+                            rng.below(instruments as u64) as u32
+                        };
                     let side = if rng.below(2) == 0 { Side::Buy } else { Side::Sell };
                     let qty = 1 + rng.below(20);
                     let order = if roll < 15 {
@@ -439,7 +444,7 @@ fn main() {
     println!();
     println!("== workload ==");
     println!(
-        "users={users} instruments={instruments} concurrency={concurrency} batch={batch} commands={commands}"
+        "users={users} instruments={instruments} (id stride {stride}) concurrency={concurrency} batch={batch} commands={commands}"
     );
     println!(
         "new orders={new_orders} (limit {} / post-only {} / market IOC {}), cancels={}",
