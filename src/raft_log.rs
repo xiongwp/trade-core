@@ -183,11 +183,17 @@ impl DurableRaftLog {
                 break;
             }
             let length = u32::from_le_bytes(length_bytes) as usize;
-            if length > 16 * 1024 * 1024 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "raft state record is too large",
-                ));
+            // Bound the allocation by what the file can still hold, not by a
+            // fixed cap: a snapshot record embeds the whole matching-engine
+            // state and outgrows any fixed size as books grow (a 16 MiB cap
+            // made a node with a ~17 MiB book unable to restart). A record
+            // longer than the remaining bytes cannot be complete — the same
+            // torn tail that reading it would hit.
+            let remaining = read.metadata()?.len().saturating_sub(read.stream_position()?);
+            if length as u64 + 8 > remaining {
+                read.set_len(record_start)?;
+                read.sync_all()?;
+                break;
             }
             let mut payload = vec![0; length];
             if !read_or_truncate_torn_tail(&mut read, &mut payload, record_start)? {
@@ -1260,6 +1266,48 @@ mod tests {
         let tail = restored.take_committed();
         assert!(tail.iter().all(|c| c.index > compact_at));
         assert_eq!(tail.len(), 2, "only entries above the snapshot re-deliver");
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn snapshot_record_larger_than_16_mib_survives_restart() {
+        // The embedded matching snapshot grows with the books; recovery must
+        // not cap record size (a 16 MiB cap kept such nodes from restarting).
+        let path = std::env::temp_dir().join(format!(
+            "tc-raft-big-snapshot-{}-{:?}.bin",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let config = ClusterConfig::new(1, voters()).unwrap();
+        let mut leader = RaftNode::open(config.clone(), &path).unwrap();
+        let mut followers = (2..=5).map(node).collect::<Vec<_>>();
+        leader.campaign().unwrap();
+        drive_open_leader(&mut leader, &mut followers);
+        for i in 0..3u8 {
+            leader.propose(vec![b'a' + i]).unwrap();
+            drive_open_leader(&mut leader, &mut followers);
+        }
+        let all = leader.take_committed();
+        let blob: Vec<u8> = (0..17 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        assert!(leader.compact(all[1].index, blob.clone()).unwrap());
+        drop(leader);
+        assert!(std::fs::metadata(&path).unwrap().len() > 16 * 1024 * 1024);
+
+        let mut restored = RaftNode::open(config.clone(), &path).unwrap();
+        assert_eq!(restored.take_installed_snapshot(), Some(blob));
+        drop(restored);
+
+        // A record whose declared length runs past the end of the file is a
+        // torn tail: dropped, and the earlier records still recover.
+        let len = std::fs::metadata(&path).unwrap().len();
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&[ENTRY_RECORD]).unwrap();
+        file.write_all(&(u32::MAX).to_le_bytes()).unwrap();
+        drop(file);
+        let mut again = RaftNode::open(config, &path).unwrap();
+        assert!(again.take_installed_snapshot().is_some());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), len, "torn record trimmed");
         std::fs::remove_file(path).ok();
     }
 
