@@ -20,11 +20,23 @@ struct GroupPlacement {
     raft_port: u16,
 }
 
-/// Default Raft port of `node` in `group` (implicit placements). Groups 0-9
-/// keep the original `7000 + 10g + n`; from group 10 on that layout ran into
-/// the service ports (group 200 node 1 = 9001 = group 0's order port), so
-/// larger groups use `40000 + 10g + n`. `None` when it would not fit a u16.
+/// Default Raft port of `node` in `group` (implicit placements):
+///
+/// | groups     | port              | example          |
+/// |------------|-------------------|------------------|
+/// | 0-9        | `7000 + 10g + n`  | G0 N1 = 7001     |
+/// | 10-2552    | `40000 + 10g + n` | G10 N1 = 40101   |
+///
+/// Groups 0-9 keep the original layout; from group 10 on it ran into the
+/// service ports (group 200 node 1 = 9001 = group 0's order port). Each
+/// group owns ten ports, so `node` must be 1-9: node 10 would be the next
+/// group's node 0. `None` for such a node, and when the port would not fit
+/// a u16 (every node of a group fits only up to group 2552: G2552 N9 =
+/// 65529, while G2553 N9 would be 65539).
 fn raft_port(group: u16, node: u16) -> Option<u16> {
+    if !(1..=9).contains(&node) {
+        return None;
+    }
     let base: u32 = if group < 10 { 7_000 } else { 40_000 };
     u16::try_from(base + 10 * group as u32 + node as u32).ok()
 }
@@ -427,8 +439,8 @@ mod tests {
     }
 
     #[test]
-    fn ports_never_collide_up_to_two_thousand_groups() {
-        let placements: Vec<GroupPlacement> = (0..2_000)
+    fn ports_never_collide_for_every_group_that_fits() {
+        let placements: Vec<GroupPlacement> = (0..2_553)
             .map(|group| GroupPlacement {
                 group,
                 local_node: 9,
@@ -440,13 +452,22 @@ mod tests {
         // Every node id of a group shares the service ports but not the Raft
         // one, and other nodes' Raft ports must not hit this node's services.
         let mut all = std::collections::HashSet::new();
-        for group in 0..2_000u16 {
+        for group in 0..2_553u16 {
             let (order, md, metrics) = service_ports(group).unwrap();
             assert!(all.insert(order) && all.insert(md) && all.insert(metrics), "group {group}");
             for node in 1..=9 {
                 assert!(all.insert(raft_port(group, node).unwrap()), "group {group} node {node}");
             }
         }
+    }
+
+    #[test]
+    fn raft_ports_reject_node_ids_outside_one_to_nine_and_oversized_groups() {
+        assert_eq!(raft_port(0, 0), None);
+        assert_eq!(raft_port(0, 10), None, "node 10 would be group 1 node 0");
+        assert_eq!(raft_port(10, 1), Some(40_101));
+        assert_eq!(raft_port(2_552, 9), Some(65_529));
+        assert_eq!(raft_port(2_553, 9), None, "65539 does not fit a u16");
     }
 
     #[test]
