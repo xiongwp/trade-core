@@ -327,10 +327,9 @@ services:
       # Commands packed into one Raft entry (= one WAL fsync), across categories
       # and queued Kafka batches; capped at the Raft entry limit of 10000.
       TC_RAFT_PACK_SIZE: ${TC_RAFT_PACK_SIZE:-5000}
-      # Applied-event dedupe rows older than this are purged (0 = keep all);
-      # must exceed the longest execution-event redelivery (seconds).
-      TC_ORDER_DEDUPE_RETENTION_SECS: ${TC_ORDER_DEDUPE_RETENTION_SECS:-86400}
-      TC_ORDER_DEDUPE_PURGE_INTERVAL_SECS: ${TC_ORDER_DEDUPE_PURGE_INTERVAL_SECS:-}
+      # Hours of applied-event dedupe history (1-45); older hourly partitions
+      # are truncated. Must exceed the longest execution-event redelivery.
+      TC_ORDER_DEDUPE_RETENTION_HOURS: ${TC_ORDER_DEDUPE_RETENTION_HOURS:-24}
       # 1 = also write the processed_commands audit table (nothing reads it).
       TC_ORDER_COMMAND_LOG: ${TC_ORDER_COMMAND_LOG:-0}
       TC_ORDER_KAFKA_ROUTE_VERSION: ${TC_ORDER_KAFKA_ROUTE_VERSION:-1}

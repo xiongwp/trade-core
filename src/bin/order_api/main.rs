@@ -174,11 +174,6 @@ fn main() {
             drain_handoff.clone(),
         )
     });
-    if kafka.db_consumers > 0 || kafka.execution_consumers > 0 {
-        if let Some(store) = &store {
-            spawn_dedupe_retention(store.clone());
-        }
-    }
     let matcher_group_count = matcher_groups.len();
     let ingress_enabled = env_enabled("TC_ORDER_HTTP_INGRESS_ENABLED", true);
     let raft_forwarder = (kafka.matcher_consumers > 0)

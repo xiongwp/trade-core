@@ -329,7 +329,20 @@ impl ExecutionDbForwarder {
                 .name(format!("execution-db-shard-{shard_db}"))
                 .spawn(move || {
                     let mut last_sweep = std::time::Instant::now();
+                    let mut ring = DedupeRing::new();
                     loop {
+                        match ring.maintain(&shard_store, shard_db) {
+                            Ok(0) => {}
+                            Ok(truncated) => {
+                                shard_store
+                                    .metrics
+                                    .dedupe_truncated_partitions
+                                    .fetch_add(truncated, AtomicOrdering::Relaxed);
+                            }
+                            Err(error) => {
+                                log_warn!("execution-db", shard_db; "event=dedupe_ring_failed error={error}");
+                            }
+                        }
                         // Tables the command writer filled since the last pass.
                         if let Some(handoff) = &handoff {
                             let tables = handoff.take(shard_db);
@@ -574,10 +587,7 @@ pub(crate) fn persist_execution_shard(
         .map_err(|error| error.to_string())?;
         // A Kafka retry can reinsert an already-processed event into pending;
         // discard it before applying any mutations.
-        tx.query_drop(format!(
-            "DELETE p FROM {db}.pending_execution_events p INNER JOIN {db}.processed_execution_events e ON e.raft_group=p.raft_group AND e.raft_index=p.raft_index AND e.report_ordinal=p.report_ordinal AND e.target_order_id=p.target_order_id"
-        ))
-        .map_err(|error| error.to_string())?;
+        discard_redelivered_events(&mut tx, &db, shard_db)?;
         // When every inserted event for a table was an already-processed retry
         // (ignored above, then deleted), that table has no pending rows and the
         // three-query drain would match nothing. Same behaviour-preserving skip
@@ -593,6 +603,26 @@ pub(crate) fn persist_execution_shard(
             }
         }
         tx.commit().map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+/// Drop pending events that were already applied (a Kafka or outbox
+/// redelivery), checking the pre-ring table too while it still exists.
+pub(crate) fn discard_redelivered_events(
+    tx: &mut Transaction<'_>,
+    db: &str,
+    shard_db: u32,
+) -> Result<(), String> {
+    let mut tables = vec!["processed_execution_events"];
+    if has_legacy_dedupe(shard_db) {
+        tables.push("processed_execution_events_legacy");
+    }
+    for table in tables {
+        tx.query_drop(format!(
+            "DELETE p FROM {db}.pending_execution_events p INNER JOIN {db}.{table} e ON e.raft_group=p.raft_group AND e.raft_index=p.raft_index AND e.report_ordinal=p.report_ordinal AND e.target_order_id=p.target_order_id"
+        ))
+        .map_err(|error| error.to_string())?;
     }
     Ok(())
 }
@@ -640,8 +670,8 @@ pub(crate) fn apply_pending_execution_table(
     ))
     .map_err(|error| error.to_string())?;
     tx.query_drop(format!(
-        "INSERT IGNORE INTO {db}.processed_execution_events (raft_group,raft_index,report_ordinal,target_order_id,shard_table,instrument,report_type,kafka_partition,kafka_offset) \
-         SELECT p.raft_group,p.raft_index,p.report_ordinal,p.target_order_id,p.shard_table,p.instrument,p.report_type,p.kafka_partition,p.kafka_offset \
+        "INSERT IGNORE INTO {db}.processed_execution_events (raft_group,raft_index,report_ordinal,target_order_id,shard_table,instrument,report_type,kafka_partition,kafka_offset,bucket) \
+         SELECT p.raft_group,p.raft_index,p.report_ordinal,p.target_order_id,p.shard_table,p.instrument,p.report_type,p.kafka_partition,p.kafka_offset,{DEDUPE_BUCKET_SQL} \
          FROM {db}.pending_execution_events p INNER JOIN {db}.{table} o ON o.order_id=p.target_order_id WHERE p.shard_table={shard_table}"
     ))
     .map_err(|error| error.to_string())?;

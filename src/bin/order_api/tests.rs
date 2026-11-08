@@ -444,49 +444,108 @@ fn mysql8_projection_is_race_safe_and_idempotent() {
     assert_eq!(pending, 0);
 }
 
-/// Same disposable MySQL 8 as above.
+#[test]
+fn dedupe_ring_keeps_the_retention_window_and_the_next_hour() {
+    let retention = 24;
+    for hour in [0u64, 7, 47, 48, 1_000_000] {
+        let expired = expired_buckets(hour, retention);
+        assert_eq!(expired.len() as u64, DEDUPE_BUCKETS - retention - 2);
+        for age in 0..=retention {
+            let bucket = (hour + DEDUPE_BUCKETS - age) % DEDUPE_BUCKETS;
+            assert!(!expired.contains(&bucket), "hour {hour}: live bucket {bucket} (age {age}) expired");
+        }
+        assert!(!expired.contains(&((hour + 1) % DEDUPE_BUCKETS)), "next hour's bucket");
+        assert!(expired.contains(&((hour + DEDUPE_BUCKETS - retention - 1) % DEDUPE_BUCKETS)));
+    }
+    // The largest retention still leaves one bucket to clear.
+    assert_eq!(expired_buckets(5, DEDUPE_BUCKETS - 3).len(), 1);
+}
+
+/// Same disposable MySQL 8 as above. Rows land in the current hour's
+/// partition; truncation clears expired hours and nothing in the window.
 #[test]
 #[ignore = "requires disposable MySQL 8 via TC_TEST_MYSQL_URL"]
-fn mysql8_dedupe_retention_purges_below_an_expired_high_water_mark() {
+fn mysql8_dedupe_ring_truncates_only_expired_hour_partitions() {
     let store = mysql_test_store().expect("TC_TEST_MYSQL_URL must be set");
     // A raft group no other test uses, so concurrent tests keep their rows.
     let group = 1_000_000 + (std::process::id() % 1_000_000);
     let mut conn = store.shard(0).get_conn().unwrap();
-    conn.exec_drop("DELETE FROM order_db_0.processed_execution_events WHERE raft_group=?", (group,))
-        .unwrap();
-    for index in 1..=12u64 {
+    let hour: u64 = conn.query_first("SELECT UNIX_TIMESTAMP() DIV 3600").unwrap().unwrap();
+    let bucket_of = |age: i64| ((hour as i64 - age).rem_euclid(DEDUPE_BUCKETS as i64)) as u64;
+    // (raft_index, age in hours): the next hour, live hours, then expired ones.
+    let rows = [(1u64, -1i64), (2, 0), (3, 5), (4, 24), (5, 25), (6, 30), (7, 46)];
+    for (index, age) in rows {
         conn.exec_drop(
-            "INSERT INTO order_db_0.processed_execution_events (raft_group,raft_index,report_ordinal,target_order_id,shard_table,instrument,report_type,kafka_partition,kafka_offset) VALUES (?,?,0,1,0,0,12,0,0)",
-            (group, index),
+            "INSERT INTO order_db_0.processed_execution_events (raft_group,raft_index,report_ordinal,target_order_id,shard_table,instrument,report_type,kafka_partition,kafka_offset,bucket) VALUES (?,?,0,1,0,0,12,0,0,?)",
+            (group, index, bucket_of(age)),
         )
         .unwrap();
     }
-    let count = |conn: &mut mysql::PooledConn| -> u64 {
-        conn.exec_first(
-            "SELECT COUNT(*) FROM order_db_0.processed_execution_events WHERE raft_group=?",
-            (group,),
-        )
-        .unwrap()
-        .unwrap()
-    };
-    let retention = Duration::from_secs(1);
-    let mut history = std::collections::VecDeque::new();
+    // The bucket the projection computes is the current hour's.
+    let computed: u64 = conn.query_first(format!("SELECT {DEDUPE_BUCKET_SQL}")).unwrap().unwrap();
+    assert_eq!(computed, bucket_of(0));
 
-    // A fresh sample is younger than the retention: nothing goes.
-    let purged = purge_dedupe_table(&store, 0, "processed_execution_events", "raft_group", "raft_index", retention, &mut history).unwrap();
-    assert_eq!(count(&mut conn), 12, "purged {purged} rows too early");
-    assert_eq!(history.len(), 1);
-
-    // An expired mark of 11 for this group: rows 1..=10 go, 11 and 12 stay.
-    history.clear();
-    let old = std::time::Instant::now() - Duration::from_secs(2);
-    history.push_back((old, vec![(group as u64, 11)]));
-    let purged = purge_dedupe_table(&store, 0, "processed_execution_events", "raft_group", "raft_index", retention, &mut history).unwrap();
-    assert_eq!(purged, 10);
-    assert_eq!(count(&mut conn), 2);
-    assert_eq!(history.len(), 1, "the fresh sample waits for its turn");
+    let mut ring = DedupeRing::new();
+    let truncated = ring.advance(&mut conn, 0, hour).unwrap();
+    assert_eq!(truncated, DEDUPE_BUCKETS - 24 - 2);
+    let left: Vec<u64> = conn
+        .exec("SELECT raft_index FROM order_db_0.processed_execution_events WHERE raft_group=? ORDER BY raft_index", (group,))
+        .unwrap();
+    assert_eq!(left, vec![1, 2, 3, 4], "rows aged 25, 30 and 46 hours go");
+    // Same hour again: nothing to do. Next hour: exactly the bucket aged out.
+    assert_eq!(ring.advance(&mut conn, 0, hour).unwrap(), 0);
+    assert_eq!(ring.advance(&mut conn, 0, hour + 1).unwrap(), 1);
+    let left: Vec<u64> = conn
+        .exec("SELECT raft_index FROM order_db_0.processed_execution_events WHERE raft_group=? ORDER BY raft_index", (group,))
+        .unwrap();
+    assert_eq!(left, vec![1, 2, 3], "the 24-hour-old row is now 25 hours old");
     conn.exec_drop("DELETE FROM order_db_0.processed_execution_events WHERE raft_group=?", (group,))
         .unwrap();
+}
+
+/// Same disposable MySQL 8 as above. A pre-ring dedupe table is renamed,
+/// not rebuilt, and still stops a redelivery of an event it recorded.
+#[test]
+#[ignore = "requires disposable MySQL 8 via TC_TEST_MYSQL_URL"]
+fn mysql8_legacy_dedupe_table_is_renamed_and_still_consulted() {
+    let store = mysql_test_store().expect("TC_TEST_MYSQL_URL must be set");
+    let group = 2_000_000 + (std::process::id() % 1_000_000);
+    let mut conn = store.shard(0).get_conn().unwrap();
+    conn.query_drop("DROP TABLE IF EXISTS order_db_0.processed_execution_events_legacy").unwrap();
+    conn.query_drop("DROP TABLE order_db_0.processed_execution_events").unwrap();
+    conn.query_drop("CREATE TABLE order_db_0.processed_execution_events (raft_group INT UNSIGNED NOT NULL, raft_index BIGINT UNSIGNED NOT NULL, report_ordinal INT UNSIGNED NOT NULL, target_order_id BIGINT UNSIGNED NOT NULL, shard_table INT UNSIGNED NOT NULL, instrument INT UNSIGNED NOT NULL, report_type TINYINT UNSIGNED NOT NULL, kafka_partition INT NOT NULL, kafka_offset BIGINT UNSIGNED NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(raft_group,raft_index,report_ordinal,target_order_id)) ENGINE=InnoDB")
+        .unwrap();
+    conn.exec_drop(
+        "INSERT INTO order_db_0.processed_execution_events (raft_group,raft_index,report_ordinal,target_order_id,shard_table,instrument,report_type,kafka_partition,kafka_offset) VALUES (?,1,0,9,0,0,12,0,0)",
+        (group,),
+    )
+    .unwrap();
+
+    bootstrap(&store).unwrap();
+    assert!(has_legacy_dedupe(0));
+    let partitions: u64 = conn
+        .query_first("SELECT COUNT(*) FROM information_schema.partitions WHERE table_schema='order_db_0' AND table_name='processed_execution_events'")
+        .unwrap()
+        .unwrap();
+    assert_eq!(partitions, DEDUPE_BUCKETS);
+
+    // The same event arrives again: it is recognised through the legacy table.
+    conn.exec_drop(
+        "INSERT INTO order_db_0.pending_execution_events (raft_group,raft_index,report_ordinal,target_order_id,shard_table,instrument,report_type,event_qty,kafka_partition,kafka_offset) VALUES (?,1,0,9,0,0,12,0,0,0)",
+        (group,),
+    )
+    .unwrap();
+    let mut tx = conn.start_transaction(TxOpts::default()).unwrap();
+    discard_redelivered_events(&mut tx, "order_db_0", 0).unwrap();
+    tx.commit().unwrap();
+    let pending: u64 = conn
+        .exec_first("SELECT COUNT(*) FROM order_db_0.pending_execution_events WHERE raft_group=?", (group,))
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending, 0);
+
+    conn.query_drop("DROP TABLE order_db_0.processed_execution_events_legacy").unwrap();
+    legacy_dedupe_dbs().lock().unwrap().remove(&0);
 }
 
 #[test]

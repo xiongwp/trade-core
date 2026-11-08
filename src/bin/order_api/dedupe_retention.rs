@@ -1,4 +1,5 @@
-//! Retention purge of the dedupe tables and the optional command audit log.
+//! Retention of the execution-event dedupe table (an hourly ring of
+//! partitions) and the optional command audit log.
 
 use super::*;
 
@@ -9,125 +10,136 @@ use super::*;
 /// (`INSERT IGNORE` on the order's unique `order_id`, modifies are plain
 /// `SET`s) — so by default the row, its primary key and its `UNIQUE
 /// (command_id)` index are no longer written on the hot path. Set
-/// `TC_ORDER_COMMAND_LOG=1` to keep it as an audit trail; the dedupe
-/// retention below then bounds it.
+/// `TC_ORDER_COMMAND_LOG=1` to keep it as an audit trail; it is then never
+/// purged (operators own its retention).
 pub(crate) fn command_log_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| env_enabled("TC_ORDER_COMMAND_LOG", false))
 }
 
-/// Dedupe tables that only grow, with the primary-key prefix the purge walks:
-/// `(group column, monotonically increasing position within the group)`.
-pub(crate) const DEDUPE_TABLES: [(&str, &str, &str); 2] = [
-    // Execution events already applied to their order: only consulted to
-    // drop a Kafka/outbox redelivery of the same event.
-    ("processed_execution_events", "raft_group", "raft_index"),
-    ("processed_commands", "category_id", "kafka_offset"),
-];
-pub(crate) const DEDUPE_PURGE_CHUNK: usize = 5_000;
+/// `processed_execution_events` only answers "was this event already
+/// applied?" for Kafka/outbox redeliveries, so it only needs recent history.
+/// Deleting old rows one by one costs as much as inserting them (measured:
+/// MySQL p99 4 s -> 8 s while purging). Instead every row carries
+/// `bucket = hour number mod DEDUPE_BUCKETS`, the table is `PARTITION BY
+/// HASH(bucket)` (partition `p<n>` holds bucket n), and expired hours are
+/// dropped with `TRUNCATE PARTITION` — a metadata operation, one per hour.
+pub(crate) const DEDUPE_BUCKETS: u64 = 48;
 
-/// Keep the dedupe tables to a retention window so the projection does not
-/// slow down as history accumulates (measured: ~20% lower end-to-end TPS
-/// with 10x the data, MySQL backlog the largest factor).
-///
-/// `TC_ORDER_DEDUPE_RETENTION_SECS` (default 86400, 0 = keep forever) must
-/// exceed the longest time an execution event can be redelivered — consumer
-/// restarts and outbox replays are seconds — since an event replayed after
-/// its row is purged would be applied twice. There is no index on
-/// `created_at` (it would cost a write per event), so the purge samples the
-/// per-group high-water mark of the primary key every interval and, once a
-/// sample is older than the retention, deletes everything below it in short
-/// chunked transactions. Samples live in memory: after a restart nothing is
-/// purged until a full retention has passed again, which only errs towards
-/// keeping more.
-pub(crate) fn spawn_dedupe_retention(store: OrderStore) {
-    let retention = Duration::from_secs(env_number("TC_ORDER_DEDUPE_RETENTION_SECS", 86_400u64));
-    if retention.is_zero() {
-        return;
-    }
-    let interval = Duration::from_secs(env_number(
-        "TC_ORDER_DEDUPE_PURGE_INTERVAL_SECS",
-        (retention.as_secs() / 8).clamp(1, 300),
-    ))
-    .max(Duration::from_secs(1));
-    let _ = std::thread::Builder::new()
-        .name("dedupe-retention".into())
-        .spawn(move || {
-            let mut dbs: Vec<u32> = store.owned_dbs.iter().copied().collect();
-            dbs.sort_unstable();
-            let mut samples: HashMap<(u32, &str), std::collections::VecDeque<(std::time::Instant, Vec<(u64, u64)>)>> =
-                HashMap::new();
-            while !SHUTDOWN.load(AtomicOrdering::Acquire) {
-                for &db in &dbs {
-                    for (table, group, position) in DEDUPE_TABLES {
-                        let history = samples.entry((db, table)).or_default();
-                        match purge_dedupe_table(&store, db, table, group, position, retention, history) {
-                            Ok(rows) if rows > 0 => {
-                                store.metrics.dedupe_purged_rows.fetch_add(rows, AtomicOrdering::Relaxed);
-                                log_info!("dedupe-retention", db; "event=purged table={table} rows={rows}");
-                            }
-                            Ok(_) => {}
-                            Err(error) => {
-                                log_warn!("dedupe-retention", db; "event=purge_failed table={table} error={error}");
-                            }
-                        }
-                    }
-                }
-                let deadline = std::time::Instant::now() + interval;
-                while std::time::Instant::now() < deadline && !SHUTDOWN.load(AtomicOrdering::Acquire) {
-                    std::thread::sleep(Duration::from_millis(200));
-                }
-            }
-        });
+/// The bucket of a row inserted now, by the MySQL server's clock (the same
+/// clock [`DedupeRing`] reads, so no host clock skew is involved).
+pub(crate) const DEDUPE_BUCKET_SQL: &str = "MOD(UNIX_TIMESTAMP() DIV 3600, 48)";
+
+/// Hours of dedupe history kept: `TC_ORDER_DEDUPE_RETENTION_HOURS`, default
+/// 24, at most 45. It must exceed the longest time an execution event can
+/// be redelivered (consumer restarts and outbox replays take seconds); an
+/// event replayed after its row is gone would be applied twice.
+pub(crate) fn dedupe_retention_hours() -> u64 {
+    env_number("TC_ORDER_DEDUPE_RETENTION_HOURS", 24u64).clamp(1, DEDUPE_BUCKETS - 3)
 }
 
-/// One retention step for one table: record the current per-group
-/// high-water mark, then delete rows below the newest mark that is older
-/// than `retention`. Returns the rows deleted.
-pub(crate) fn purge_dedupe_table(
-    store: &OrderStore,
-    db: u32,
-    table: &str,
-    group: &str,
-    position: &str,
-    retention: Duration,
-    history: &mut std::collections::VecDeque<(std::time::Instant, Vec<(u64, u64)>)>,
-) -> Result<u64, String> {
-    let mut conn = store.shard(db).get_conn().map_err(|error| error.to_string())?;
-    // Loose index scan over the primary key: one probe per group.
-    let marks: Vec<(u64, u64)> = conn
-        .query(format!(
-            "SELECT {group}, MAX({position}) FROM order_db_{db}.{table} GROUP BY {group}"
-        ))
-        .map_err(|error| error.to_string())?;
-    let now = std::time::Instant::now();
-    history.push_back((now, marks));
-    let mut cutoff = None;
-    while history
-        .front()
-        .is_some_and(|(taken, _)| now.duration_since(*taken) >= retention)
-    {
-        cutoff = history.pop_front().map(|(_, marks)| marks);
-    }
-    let Some(cutoff) = cutoff else {
-        return Ok(0);
-    };
-    let mut deleted = 0;
-    for (group_value, below) in cutoff {
-        loop {
-            conn.exec_drop(
-                format!(
-                    "DELETE FROM order_db_{db}.{table} WHERE {group}=? AND {position}<? LIMIT {DEDUPE_PURGE_CHUNK}"
-                ),
-                (group_value, below),
-            )
-            .map_err(|error| error.to_string())?;
-            let rows = conn.affected_rows();
-            deleted += rows;
-            if rows < DEDUPE_PURGE_CHUNK as u64 || SHUTDOWN.load(AtomicOrdering::Acquire) {
-                break;
-            }
+/// Buckets that are safe to truncate at `hour`: all but the live window,
+/// which is the last `retention` hours, the current one, and the next one
+/// (the hour can roll over between reading the clock and a concurrent
+/// insert computing its bucket).
+pub(crate) fn expired_buckets(hour: u64, retention: u64) -> Vec<u64> {
+    let live: Vec<u64> = (0..=retention + 1)
+        .map(|k| (hour + DEDUPE_BUCKETS - retention + k) % DEDUPE_BUCKETS)
+        .collect();
+    (0..DEDUPE_BUCKETS).filter(|bucket| !live.contains(bucket)).collect()
+}
+
+/// Databases whose pre-ring dedupe table was renamed to
+/// `processed_execution_events_legacy` at bootstrap. Redeliveries are
+/// checked against it too until one retention has passed, then it is dropped.
+pub(crate) fn legacy_dedupe_dbs() -> &'static Mutex<std::collections::BTreeSet<u32>> {
+    static DBS: std::sync::OnceLock<Mutex<std::collections::BTreeSet<u32>>> =
+        std::sync::OnceLock::new();
+    DBS.get_or_init(Default::default)
+}
+
+pub(crate) fn has_legacy_dedupe(db: u32) -> bool {
+    legacy_dedupe_dbs()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains(&db)
+}
+
+/// Hourly maintenance of one database's dedupe ring, run by that database's
+/// execution writer between batches — the writer that inserts into the
+/// table, so the truncate never waits on its own transactions.
+pub(crate) struct DedupeRing {
+    retention: u64,
+    /// Hour whose expired buckets were truncated last (None: not yet in
+    /// this process, so everything outside the live window is cleared once).
+    last_hour: Option<u64>,
+    next_check: std::time::Instant,
+    started: std::time::Instant,
+}
+
+impl DedupeRing {
+    pub(crate) fn new() -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            retention: dedupe_retention_hours(),
+            last_hour: None,
+            next_check: now,
+            started: now,
         }
     }
-    Ok(deleted)
+
+    /// Cheap unless due: one clock read every 10 s; partitions are only
+    /// touched when the hour changes. Returns the partitions truncated.
+    pub(crate) fn maintain(&mut self, store: &OrderStore, db: u32) -> Result<u64, String> {
+        let now = std::time::Instant::now();
+        if now < self.next_check {
+            return Ok(0);
+        }
+        self.next_check = now + Duration::from_secs(10);
+        let mut conn = store.shard(db).get_conn().map_err(|error| error.to_string())?;
+        let hour: u64 = conn
+            .query_first("SELECT UNIX_TIMESTAMP() DIV 3600")
+            .map_err(|error| error.to_string())?
+            .ok_or("no clock row")?;
+        let truncated = self.advance(&mut conn, db, hour)?;
+        if has_legacy_dedupe(db) && self.started.elapsed() >= Duration::from_secs(self.retention * 3600) {
+            conn.query_drop(format!("DROP TABLE IF EXISTS order_db_{db}.processed_execution_events_legacy"))
+                .map_err(|error| error.to_string())?;
+            legacy_dedupe_dbs()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&db);
+            log_info!("dedupe-retention", db; "event=legacy_dedupe_table_dropped");
+        }
+        Ok(truncated)
+    }
+
+    /// Truncate the buckets that expired between the last handled hour and
+    /// `hour` (all expired buckets on the first call).
+    pub(crate) fn advance(
+        &mut self,
+        conn: &mut mysql::PooledConn,
+        db: u32,
+        hour: u64,
+    ) -> Result<u64, String> {
+        let buckets: Vec<u64> = match self.last_hour {
+            Some(last) if hour == last => return Ok(0),
+            Some(last) if hour > last && hour - last < DEDUPE_BUCKETS => {
+                let expired = expired_buckets(hour, self.retention);
+                (last + 1..=hour)
+                    .map(|h| (h + DEDUPE_BUCKETS - self.retention - 1) % DEDUPE_BUCKETS)
+                    .filter(|bucket| expired.contains(bucket))
+                    .collect()
+            }
+            _ => expired_buckets(hour, self.retention),
+        };
+        for &bucket in &buckets {
+            conn.query_drop(format!(
+                "ALTER TABLE order_db_{db}.processed_execution_events TRUNCATE PARTITION p{bucket}"
+            ))
+            .map_err(|error| error.to_string())?;
+        }
+        self.last_hour = Some(hour);
+        Ok(buckets.len() as u64)
+    }
 }

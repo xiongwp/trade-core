@@ -34,8 +34,8 @@ pub(crate) struct OrderPipelineMetrics {
     /// clears the lag after a short staleness window, and this counter makes the
     /// condition observable instead of silent.
     pub(crate) lag_read_failures: AtomicU64,
-    /// Rows the dedupe retention has deleted (see `spawn_dedupe_retention`).
-    pub(crate) dedupe_purged_rows: AtomicU64,
+    /// Expired dedupe partitions truncated (see `DedupeRing`).
+    pub(crate) dedupe_truncated_partitions: AtomicU64,
 }
 
 impl OrderPipelineMetrics {
@@ -191,12 +191,12 @@ impl OrderPipelineMetrics {
 # TYPE tc_order_match_consumer_lag gauge\ntc_order_match_consumer_lag {}\n\
 # TYPE tc_order_dlq_total counter\ntc_order_dlq_total {}\n\
 # TYPE tc_order_lag_read_failures counter\ntc_order_lag_read_failures {}\n\
-# TYPE tc_order_dedupe_purged_rows counter\ntc_order_dedupe_purged_rows {}\n",
+# TYPE tc_order_dedupe_truncated_partitions counter\ntc_order_dedupe_truncated_partitions {}\n",
             self.observed_mysql_lag.load(AtomicOrdering::Relaxed),
             self.observed_match_lag.load(AtomicOrdering::Relaxed),
             self.dlq_total.load(AtomicOrdering::Relaxed),
             self.lag_read_failures.load(AtomicOrdering::Relaxed),
-            self.dedupe_purged_rows.load(AtomicOrdering::Relaxed),
+            self.dedupe_truncated_partitions.load(AtomicOrdering::Relaxed),
         ) + &self.mysql_commit_hist.render_standalone(
             "order_mysql_commit_ns",
             "Order API MySQL commit latency (nanoseconds)",
