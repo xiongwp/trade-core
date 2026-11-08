@@ -87,6 +87,16 @@ pub struct Metrics {
     /// enough and applied backpressure onto matching. Sustained growth means the
     /// downstream consumer, not the engine, is the throughput bottleneck.
     pub result_backpressure: AtomicU64,
+    /// Engine snapshots taken, and the time the matching thread spent on the
+    /// last / slowest one (export + write + fsync, during which this shard
+    /// matches nothing) and the last snapshot's size in bytes.
+    pub snapshots: AtomicU64,
+    pub snapshot_ns_last: AtomicU64,
+    pub snapshot_ns_max: AtomicU64,
+    pub snapshot_bytes: AtomicU64,
+    /// Time the last snapshot spent being written and fsynced off the
+    /// matching thread (Raft mode writes in the background).
+    pub snapshot_write_ns_last: AtomicU64,
     /// Log-bucketed latency distributions running in parallel with the
     /// `*_ns_total`/`*_ns_max`/`*_samples` triples above. The triples are kept
     /// for backward compatibility; these back the p50/p90/p99 SLO gauges.
@@ -177,6 +187,11 @@ impl Metrics {
             c("execution_kafka_publish_samples", "Execution Kafka publish batches acknowledged", self.execution_kafka_publish_samples.load(Ordering::Relaxed)),
             format!("# HELP tc_execution_kafka_publish_ns_max Maximum execution Kafka publish acknowledgement latency in nanoseconds\n# TYPE tc_execution_kafka_publish_ns_max gauge\ntc_execution_kafka_publish_ns_max {}\n", self.execution_kafka_publish_ns_max.load(Ordering::Relaxed)),
             c("result_backpressure", "Times a matching thread parked on a full result queue (downstream backpressure)", self.result_backpressure.load(Ordering::Relaxed)),
+            c("snapshots", "Engine snapshots taken", self.snapshots.load(Ordering::Relaxed)),
+            format!("# HELP tc_snapshot_ns_last Matching-thread time spent on the last engine snapshot\n# TYPE tc_snapshot_ns_last gauge\ntc_snapshot_ns_last {}\n", self.snapshot_ns_last.load(Ordering::Relaxed)),
+            format!("# HELP tc_snapshot_ns_max Slowest engine snapshot (matching paused meanwhile)\n# TYPE tc_snapshot_ns_max gauge\ntc_snapshot_ns_max {}\n", self.snapshot_ns_max.load(Ordering::Relaxed)),
+            format!("# HELP tc_snapshot_bytes Size of the last engine snapshot\n# TYPE tc_snapshot_bytes gauge\ntc_snapshot_bytes {}\n", self.snapshot_bytes.load(Ordering::Relaxed)),
+            format!("# HELP tc_snapshot_write_ns_last Background write+fsync time of the last engine snapshot\n# TYPE tc_snapshot_write_ns_last gauge\ntc_snapshot_write_ns_last {}\n", self.snapshot_write_ns_last.load(Ordering::Relaxed)),
         ]
         .concat();
         // Append the parallel latency histograms and their derived quantile

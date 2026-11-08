@@ -851,6 +851,7 @@ fn build_inner(
             snapshot_path,
             snapshot_every: config.snapshot_every,
             last_snapshot: Instant::now(),
+            snapshot_writer: None,
             snap_request,
             running: running.clone(),
             started: started.clone(),
@@ -1806,6 +1807,8 @@ struct Shard {
     snapshot_path: Option<PathBuf>,
     snapshot_every: Option<Duration>,
     last_snapshot: Instant,
+    /// In-flight background snapshot write (Raft mode), at most one.
+    snapshot_writer: Option<thread::JoinHandle<()>>,
     snap_request: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
     started: Arc<AtomicBool>,
@@ -1925,8 +1928,11 @@ impl Shard {
         // Final snapshot on clean shutdown makes the next start instant — but
         // only when periodic snapshotting is enabled: journal-only deployments
         // keep their full journal (e.g. for audit/time replay).
+        if let Some(writer) = self.snapshot_writer.take() {
+            let _ = writer.join();
+        }
         if self.snapshot_every.is_some() {
-            self.take_snapshot();
+            self.take_snapshot_sync();
         }
         // Shutdown flush failures must be visible: an operator relying on a
         // clean stop for durability needs to know the tail didn't make it.
@@ -2025,10 +2031,66 @@ impl Shard {
         }
     }
 
-    /// Capture state and persist it atomically. Standalone mode then truncates
-    /// its covered journal; authoritative-Raft mode retains the consensus WAL
-    /// and stores its applied index in the snapshot.
+    /// Periodic snapshot. In authoritative-Raft mode the matching thread only
+    /// copies its state; writing and fsyncing the file happen on a background
+    /// thread, so matching no longer pauses for the disk (measured up to
+    /// ~0.9 s per group under load with ~9 MB books). At most one write is in
+    /// flight; a snapshot that comes due while one is running is skipped and
+    /// retried on the next idle tick. Standalone mode stays synchronous: it
+    /// truncates its command journal after the snapshot, which is only safe
+    /// when nothing was appended in between.
     fn take_snapshot(&mut self) {
+        if !(self.raft_wal_authoritative && self.journal.is_none()) {
+            self.take_snapshot_sync();
+            return;
+        }
+        let Some(path) = self.snapshot_path.clone() else {
+            return;
+        };
+        if self
+            .snapshot_writer
+            .as_ref()
+            .is_some_and(|writer| !writer.is_finished())
+        {
+            return; // previous write still running; try again later
+        }
+        if let Some(writer) = self.snapshot_writer.take() {
+            let _ = writer.join();
+        }
+        let started = Instant::now();
+        let captured = capture_processor_snapshot(&self.processor, 0, self.last_raft_index);
+        let paused_ns = started.elapsed().as_nanos() as u64;
+        self.metrics.snapshots.fetch_add(1, Ordering::Relaxed);
+        self.metrics.snapshot_ns_last.store(paused_ns, Ordering::Relaxed);
+        self.metrics.snapshot_ns_max.fetch_max(paused_ns, Ordering::Relaxed);
+        self.last_snapshot = Instant::now();
+        let metrics = self.metrics.clone();
+        self.snapshot_writer = Some(
+            thread::Builder::new()
+                .name(format!("snapshot-{}", self.shard_id))
+                .spawn(move || {
+                    let started = Instant::now();
+                    if let Err(error) = captured.write(&path) {
+                        crate::log_error!("snapshot", "event=snapshot_write_failed error={error}");
+                        return;
+                    }
+                    let took = started.elapsed();
+                    metrics
+                        .snapshot_write_ns_last
+                        .store(took.as_nanos() as u64, Ordering::Relaxed);
+                    if let Ok(meta) = std::fs::metadata(&path) {
+                        metrics.snapshot_bytes.store(meta.len(), Ordering::Relaxed);
+                    }
+                })
+                .expect("spawn snapshot writer"),
+        );
+    }
+
+    /// Capture state and persist it atomically on the matching thread.
+    /// Standalone mode then truncates its covered journal; authoritative-Raft
+    /// mode retains the consensus WAL and stores its applied index in the
+    /// snapshot.
+    fn take_snapshot_sync(&mut self) {
         let Some(path) = self.snapshot_path.as_ref() else {
             return;
         };
@@ -2041,9 +2103,28 @@ impl Shard {
             }
             None => 0,
         };
-        if persist_processor_snapshot(&self.processor, path, journal_seq, self.last_raft_index)
-            .is_ok()
-        {
+        let started = Instant::now();
+        let persisted =
+            persist_processor_snapshot(&self.processor, path, journal_seq, self.last_raft_index);
+        // The shard matches nothing while it snapshots, so this is a pause in
+        // matching that grows with the books.
+        let took = started.elapsed();
+        let took_ns = took.as_nanos() as u64;
+        self.metrics.snapshots.fetch_add(1, Ordering::Relaxed);
+        self.metrics.snapshot_ns_last.store(took_ns, Ordering::Relaxed);
+        self.metrics.snapshot_ns_max.fetch_max(took_ns, Ordering::Relaxed);
+        if let Ok(meta) = std::fs::metadata(path) {
+            self.metrics.snapshot_bytes.store(meta.len(), Ordering::Relaxed);
+        }
+        if took > Duration::from_millis(100) {
+            crate::log_warn!(
+                "snapshot",
+                "event=slow_snapshot took_ms={} bytes={}",
+                took.as_millis(),
+                self.metrics.snapshot_bytes.load(Ordering::Relaxed)
+            );
+        }
+        if persisted.is_ok() {
             if let Some(journal) = self.journal.as_mut() {
                 let _ = journal.truncate();
             }
@@ -2503,38 +2584,66 @@ fn push_result_event(
 // Journal replay
 // ---------------------------------------------------------------------------
 
+/// A snapshot's state copied out of the processor, so it can be written
+/// after matching has moved on.
+struct CapturedSnapshot {
+    journal_seq: u64,
+    raft_applied_index: u64,
+    max_cmd_id: u64,
+    max_admin_id: u64,
+    halted: Vec<u32>,
+    suspended: Vec<u64>,
+    positions: Vec<(u64, u32, i64)>,
+    engines: Vec<EngineState>,
+}
+
+impl CapturedSnapshot {
+    fn write(&self, path: &Path) -> std::io::Result<()> {
+        snapshot::write(
+            path,
+            snapshot::SnapshotData {
+                journal_seq: self.journal_seq,
+                raft_applied_index: self.raft_applied_index,
+                max_cmd_id: self.max_cmd_id,
+                max_admin_id: self.max_admin_id,
+                halted: &self.halted,
+                suspended: &self.suspended,
+                positions: &self.positions,
+                engines: &self.engines,
+            },
+        )
+    }
+}
+
+fn capture_processor_snapshot(
+    processor: &Processor,
+    journal_seq: u64,
+    raft_applied_index: u64,
+) -> CapturedSnapshot {
+    CapturedSnapshot {
+        journal_seq,
+        raft_applied_index,
+        max_cmd_id: processor.max_new_id,
+        max_admin_id: processor.max_admin_id,
+        halted: processor.halted.iter().map(|instrument| instrument.0).collect(),
+        suspended: processor.suspended.iter().copied().collect(),
+        positions: processor
+            .positions
+            .iter()
+            .filter(|(_, &quantity)| quantity != 0)
+            .map(|(&(user, instrument), &quantity)| (user, instrument.0, quantity))
+            .collect(),
+        engines: processor.export_state(),
+    }
+}
+
 fn persist_processor_snapshot(
     processor: &Processor,
     path: &Path,
     journal_seq: u64,
     raft_applied_index: u64,
 ) -> std::io::Result<()> {
-    let states = processor.export_state();
-    let halted: Vec<u32> = processor
-        .halted
-        .iter()
-        .map(|instrument| instrument.0)
-        .collect();
-    let suspended: Vec<u64> = processor.suspended.iter().copied().collect();
-    let positions: Vec<(u64, u32, i64)> = processor
-        .positions
-        .iter()
-        .filter(|(_, &quantity)| quantity != 0)
-        .map(|(&(user, instrument), &quantity)| (user, instrument.0, quantity))
-        .collect();
-    snapshot::write(
-        path,
-        snapshot::SnapshotData {
-            journal_seq,
-            raft_applied_index,
-            max_cmd_id: processor.max_new_id,
-            max_admin_id: processor.max_admin_id,
-            halted: &halted,
-            suspended: &suspended,
-            positions: &positions,
-            engines: &states,
-        },
-    )
+    capture_processor_snapshot(processor, journal_seq, raft_applied_index).write(path)
 }
 
 /// Restore a version-4 matching snapshot whose Raft index is explicit. Legacy
