@@ -135,13 +135,27 @@ impl DedupeRing {
             }
             _ => expired_buckets(hour, self.retention),
         };
+        // Only partitions that hold rows. A truncate recreates the partition's
+        // tablespace (seconds on slow storage) and this runs on the execution
+        // writer, so clearing all ~22 empty buckets of a fresh table at start
+        // stalled the projection for over a minute.
+        let mut truncated = 0;
         for &bucket in &buckets {
+            let occupied: Option<u8> = conn
+                .query_first(format!(
+                    "SELECT 1 FROM order_db_{db}.processed_execution_events PARTITION (p{bucket}) LIMIT 1"
+                ))
+                .map_err(|error| error.to_string())?;
+            if occupied.is_none() {
+                continue;
+            }
             conn.query_drop(format!(
                 "ALTER TABLE order_db_{db}.processed_execution_events TRUNCATE PARTITION p{bucket}"
             ))
             .map_err(|error| error.to_string())?;
+            truncated += 1;
         }
         self.last_hour = Some(hour);
-        Ok(buckets.len() as u64)
+        Ok(truncated)
     }
 }

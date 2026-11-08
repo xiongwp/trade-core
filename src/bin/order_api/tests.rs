@@ -486,8 +486,9 @@ fn mysql8_dedupe_ring_truncates_only_expired_hour_partitions() {
     assert_eq!(computed, bucket_of(0));
 
     let mut ring = DedupeRing::new();
+    // Only the expired partitions holding rows (ages 25, 30, 46) are touched.
     let truncated = ring.advance(&mut conn, 0, hour).unwrap();
-    assert_eq!(truncated, DEDUPE_BUCKETS - 24 - 2);
+    assert_eq!(truncated, 3);
     let left: Vec<u64> = conn
         .exec("SELECT raft_index FROM order_db_0.processed_execution_events WHERE raft_group=? ORDER BY raft_index", (group,))
         .unwrap();
