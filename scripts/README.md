@@ -1,5 +1,21 @@
 # scripts
 
+## bench/e2e-clean.sh — end-to-end stress test from clean data
+
+Wipes the local Docker stack (all MySQL, Raft and Kafka volumes), starts it,
+waits for every Raft replica and order-api, then runs `user_sim_e2e`. Data
+left by earlier runs drags end-to-end TPS down run after run, so only runs
+that each start empty are comparable. For A/B, set `IMAGE` and alternate the
+builds, two runs each.
+
+```sh
+scripts/bench/e2e-clean.sh                                   # 300k commands
+scripts/bench/e2e-clean.sh 1000000 10000 100 16 500          # COMMANDS USERS INSTRUMENTS CONCURRENCY BATCH
+IMAGE=trade-core-node:candidate scripts/bench/e2e-clean.sh   # a specific build
+```
+
+Local test stack only: it deletes data by design.
+
 ## bench/staged.sh — two-axis staged performance test
 
 Runs the local staged benchmark: horizontal scale-out
