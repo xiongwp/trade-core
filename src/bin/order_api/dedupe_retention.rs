@@ -123,7 +123,9 @@ impl DedupeRing {
         hour: u64,
     ) -> Result<u64, String> {
         let buckets: Vec<u64> = match self.last_hour {
-            Some(last) if hour == last => return Ok(0),
+            // Same hour, or the server clock stepped back: truncating from an
+            // earlier hour's window would clear the live buckets.
+            Some(last) if hour <= last => return Ok(0),
             Some(last) if hour > last && hour - last < DEDUPE_BUCKETS => {
                 let expired = expired_buckets(hour, self.retention);
                 (last + 1..=hour)

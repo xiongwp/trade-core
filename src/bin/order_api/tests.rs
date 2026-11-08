@@ -499,6 +499,12 @@ fn mysql8_dedupe_ring_truncates_only_expired_hour_partitions() {
         .exec("SELECT raft_index FROM order_db_0.processed_execution_events WHERE raft_group=? ORDER BY raft_index", (group,))
         .unwrap();
     assert_eq!(left, vec![1, 2, 3], "the 24-hour-old row is now 25 hours old");
+    // The server clock steps back an hour: nothing is truncated.
+    assert_eq!(ring.advance(&mut conn, 0, hour).unwrap(), 0);
+    let left: Vec<u64> = conn
+        .exec("SELECT raft_index FROM order_db_0.processed_execution_events WHERE raft_group=? ORDER BY raft_index", (group,))
+        .unwrap();
+    assert_eq!(left, vec![1, 2, 3]);
     conn.exec_drop("DELETE FROM order_db_0.processed_execution_events WHERE raft_group=?", (group,))
         .unwrap();
 }
