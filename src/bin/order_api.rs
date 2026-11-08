@@ -2000,6 +2000,13 @@ fn run_db_kafka_stage(
         .assign(&assignment)
         .expect("assign routed command DB ownership");
     loop {
+        // Between batches only: a batch in hand is finished and its offsets
+        // committed. Returning drops the consumer, which leaves its group so
+        // the partitions move to the replacement at once instead of after the
+        // session timeout (a ~1 min matching stall after every redeploy).
+        if SHUTDOWN.load(AtomicOrdering::SeqCst) {
+            return;
+        }
         let Some(first) = consumer.poll(Duration::from_millis(100)) else {
             continue;
         };
@@ -2088,6 +2095,13 @@ fn run_kafka_stage<F>(
     let mut last_failure_log = std::time::Instant::now() - Duration::from_secs(30);
 
     loop {
+        // Between batches only: a batch in hand is finished and its offsets
+        // committed. Returning drops the consumer, which leaves its group so
+        // the partitions move to the replacement at once instead of after the
+        // session timeout (a ~1 min matching stall after every redeploy).
+        if SHUTDOWN.load(AtomicOrdering::SeqCst) {
+            return;
+        }
         let mut batch = Vec::with_capacity(batch_size);
         let Some(first) = consumer.poll(Duration::from_millis(100)) else {
             continue;
@@ -2320,6 +2334,13 @@ fn run_execution_mysql_consumer(
     );
     let mut last_failure_log = std::time::Instant::now() - Duration::from_secs(30);
     loop {
+        // Between batches only: a batch in hand is finished and its offsets
+        // committed. Returning drops the consumer, which leaves its group so
+        // the partitions move to the replacement at once instead of after the
+        // session timeout (a ~1 min matching stall after every redeploy).
+        if SHUTDOWN.load(AtomicOrdering::SeqCst) {
+            return;
+        }
         let Some(first) = consumer.poll(Duration::from_millis(100)) else {
             continue;
         };
@@ -3860,10 +3881,11 @@ fn main() {
                 .expect("spawn Kafka lag monitor");
         }
     }
+    let mut consumer_threads = Vec::new();
     for worker in 0..kafka.db_router_consumers {
         let router_kafka = kafka.clone();
         let group_id = kafka.db_router_group.clone();
-        std::thread::Builder::new()
+        let handle = std::thread::Builder::new()
             .name(format!("order-kafka-db-route-{worker}"))
             .spawn(move || {
                 let process_kafka = router_kafka.clone();
@@ -3877,6 +3899,7 @@ fn main() {
                 )
             })
             .expect("spawn command DB route consumer");
+        consumer_threads.push(handle);
     }
     for worker in 0..kafka.db_consumers {
         let consumer_forwarder = command_db_forwarder
@@ -3885,12 +3908,13 @@ fn main() {
             .clone();
         let consumer_kafka = kafka.clone();
         let category_size = category_size;
-        std::thread::Builder::new()
+        let handle = std::thread::Builder::new()
             .name(format!("order-kafka-mysql-{worker}"))
             .spawn(move || {
                 run_db_kafka_stage(consumer_kafka, category_size, worker, consumer_forwarder)
             })
             .expect("spawn Kafka MySQL projection consumer");
+        consumer_threads.push(handle);
     }
     for worker in 0..kafka.matcher_consumers {
         let consumer_kafka = kafka.clone();
@@ -3902,7 +3926,7 @@ fn main() {
             .clone();
         let consumer_store_metrics = metrics.clone();
         let route_control = kafka.route_control.clone();
-        std::thread::Builder::new()
+        let handle = std::thread::Builder::new()
             .name(format!("order-kafka-match-{worker}"))
             .spawn(move || {
                 run_kafka_stage(
@@ -3920,6 +3944,7 @@ fn main() {
                 )
             })
             .expect("spawn Kafka matching consumer");
+        consumer_threads.push(handle);
     }
     for worker in 0..kafka.execution_consumers {
         let execution_forwarder = execution_db_forwarder
@@ -3929,7 +3954,7 @@ fn main() {
         let execution_metrics = metrics.clone();
         let execution_kafka = kafka.clone();
         let execution_dlq = dlq.clone();
-        std::thread::Builder::new()
+        let handle = std::thread::Builder::new()
             .name(format!("execution-kafka-mysql-{worker}"))
             .spawn(move || {
                 run_execution_mysql_consumer(
@@ -3941,6 +3966,7 @@ fn main() {
                 )
             })
             .expect("spawn execution MySQL projection consumer");
+        consumer_threads.push(handle);
     }
     let listener = TcpListener::bind("0.0.0.0:9200").expect("bind order API");
     // Non-blocking accept so a SIGTERM/SIGINT (e.g. `docker stop`) stops the API
@@ -3986,6 +4012,13 @@ fn main() {
             Err(_) => std::thread::sleep(Duration::from_millis(100)),
         }
     }
+    // Let every Kafka consumer finish its batch and leave its group before the
+    // process exits (they check SHUTDOWN between batches).
+    let consumers = consumer_threads.len();
+    for handle in consumer_threads {
+        let _ = handle.join();
+    }
+    log_info!("order-api", "stopped {consumers} Kafka consumers cleanly");
 }
 
 #[cfg(test)]
