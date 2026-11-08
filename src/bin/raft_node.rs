@@ -222,6 +222,25 @@ fn main() {
     let config_check = std::env::var("TC_RAFT_CONFIG_CHECK")
         .map(|value| !matches!(value.trim(), "0" | "false" | "no" | "off"))
         .unwrap_or(true);
+    // Set on every replica for a coordinated, whole-group config change: lets
+    // a leader announce a fingerprint that differs from the group's last one.
+    let config_adopt = std::env::var("TC_RAFT_CONFIG_ADOPT")
+        .map(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    let group_config_path = data_dir.join("group-config.fingerprint");
+    // The group's last announced fingerprint, kept on disk: announcements in
+    // the log are compacted away, and without this a misconfigured replica
+    // that restarted could win an election and make every correctly
+    // configured follower stop (observed in a fault test).
+    let mut group_config: Option<u64> = std::fs::read_to_string(&group_config_path)
+        .ok()
+        .and_then(|text| u64::from_str_radix(text.trim(), 16).ok());
+    let announce_every = Duration::from_secs(
+        std::env::var("TC_RAFT_CONFIG_ANNOUNCE_SECS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(30),
+    );
     let (gateway, sink, handle) = build(ExchangeConfig {
         journal_dir: Some(data_dir.join("journal")),
         instrument_specs,
@@ -305,6 +324,7 @@ fn main() {
             let mut commit_started: BTreeMap<u64, Instant> = BTreeMap::new();
             let mut committed_ids = CommittedIdWindow::new(dedup_max_ids);
             let mut was_leader = false;
+            let mut last_announce = Instant::now();
             let mut last_tick = Instant::now();
             // Compaction probe: the matching snapshot's applied index, cached
             // against the file's (mtime, len) and re-checked at most once a
@@ -352,6 +372,7 @@ fn main() {
                 fence_term = committed.term;
                 let payload = committed.data;
                 if let Some((fingerprint, description)) = wire::decode_raft_config_entry(&payload) {
+                    remember_group_config(&group_config_path, &mut group_config, fingerprint);
                     // Replaying history: the group may have been restarted
                     // with a new config since (a coordinated change), so an
                     // old announcement is only reported. Live ones are binding.
@@ -467,6 +488,25 @@ fn main() {
                 // A new leader announces its deterministic config first; every
                 // replica checks it as it applies the entry (see below).
                 if leader && !was_leader && config_check {
+                    // A replica whose config differs from the group's last
+                    // announcement must not lead: announcing its own would make
+                    // every correctly configured follower stop. Step out (exit)
+                    // so a correctly configured replica is elected.
+                    if group_config.is_some_and(|group| group != config_fingerprint) && !config_adopt {
+                        log_error!(
+                            "raft-node",
+                            "event=config_mismatch_refuse_leadership group={:016x} local={config_fingerprint:016x} ({config_description}); set TC_RAFT_CONFIG_ADOPT=1 on every replica for a coordinated change",
+                            group_config.unwrap_or(0)
+                        );
+                        std::process::exit(78);
+                    }
+                    last_announce = Instant::now() - announce_every;
+                }
+                // Announce on election and then periodically, so a replica that
+                // joins (or comes back with a new disk) meets an announcement
+                // in the live log within one period.
+                if leader && config_check && last_announce.elapsed() >= announce_every {
+                    last_announce = Instant::now();
                     let entry = wire::encode_raft_config_entry(config_fingerprint, &config_description);
                     if let Err(error) = node.propose(entry) {
                         log_warn!("raft-node", "event=config_announce_failed error={error:?}");
@@ -556,6 +596,7 @@ fn main() {
                     }
                     let waiters = commit_waiters.remove(&index);
                     if let Some((fingerprint, description)) = wire::decode_raft_config_entry(&payload) {
+                        remember_group_config(&group_config_path, &mut group_config, fingerprint);
                         if fingerprint != config_fingerprint && config_check {
                             // Applying further would compute results that differ
                             // from the leader's: stop instead (EX_CONFIG).
@@ -1249,6 +1290,22 @@ fn deterministic_config(instrument_specs: &str, command_id_window: usize) -> (u6
         trade_core::sharding::RouteConfig::from_env(),
     );
     (trade_core::journal::fnv1a(description.as_bytes()), description)
+}
+
+/// Record the group's latest announced config fingerprint (in memory and,
+/// when it changed, durably on disk).
+fn remember_group_config(path: &std::path::Path, current: &mut Option<u64>, fingerprint: u64) {
+    if *current == Some(fingerprint) {
+        return;
+    }
+    *current = Some(fingerprint);
+    let tmp = path.with_extension("tmp");
+    let written = std::fs::write(&tmp, format!("{fingerprint:016x}\n"))
+        .and_then(|()| std::fs::File::open(&tmp)?.sync_all())
+        .and_then(|()| std::fs::rename(&tmp, path));
+    if let Err(error) = written {
+        log_warn!("raft-node", "event=group_config_persist_failed error={error}");
+    }
 }
 
 /// Take an exclusive, non-blocking `flock` on `<dir>/.raft-node.lock`. The

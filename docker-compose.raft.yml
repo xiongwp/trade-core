@@ -20,6 +20,8 @@ x-raft-environment: &raft-environment
   TC_INSTRUMENT_SPECS: "${TC_INSTRUMENT_SPECS:-}"
   TC_DEDUP_WINDOW_IDS: "${TC_DEDUP_WINDOW_IDS:-500000}"
   TC_RAFT_CONFIG_CHECK: "${TC_RAFT_CONFIG_CHECK:-1}"
+  # 1 on every replica only for a coordinated whole-group config change.
+  TC_RAFT_CONFIG_ADOPT: "${TC_RAFT_CONFIG_ADOPT:-0}"
   # Durable in-memory engine snapshot cadence. Recovery loads this image and
   # deterministically replays the committed Raft tail above its embedded index.
   TC_SNAPSHOT_EVERY_SECS: "${TC_SNAPSHOT_EVERY_SECS:-30}"
