@@ -78,6 +78,35 @@ pub fn encode_raft_batch(frames: &[[u8; MSG_LEN]]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+const RAFT_CONFIG_MAGIC: [u8; 4] = *b"TCCF";
+
+/// A Raft entry announcing the proposing leader's deterministic-config
+/// fingerprint (and a readable description of what was hashed). It carries no
+/// commands: every replica that applies it compares the fingerprint with its
+/// own and refuses to go on applying on a mismatch, instead of silently
+/// computing different results. Builds older than this one cannot decode it.
+pub fn encode_raft_config_entry(fingerprint: u64, description: &str) -> Vec<u8> {
+    let description = &description.as_bytes()[..description.len().min(4096)];
+    let mut out = Vec::with_capacity(20 + description.len());
+    out.extend_from_slice(&RAFT_CONFIG_MAGIC);
+    out.extend_from_slice(&1u32.to_le_bytes());
+    out.extend_from_slice(&fingerprint.to_le_bytes());
+    out.extend_from_slice(&(description.len() as u32).to_le_bytes());
+    out.extend_from_slice(description);
+    out
+}
+
+/// `(fingerprint, description)` of a config entry; `None` for any other entry.
+pub fn decode_raft_config_entry(payload: &[u8]) -> Option<(u64, String)> {
+    if payload.len() < 20 || payload[..4] != RAFT_CONFIG_MAGIC {
+        return None;
+    }
+    let fingerprint = u64::from_le_bytes(payload[8..16].try_into().ok()?);
+    let len = u32::from_le_bytes(payload[16..20].try_into().ok()?) as usize;
+    let description = payload.get(20..20 + len)?;
+    Some((fingerprint, String::from_utf8_lossy(description).into_owned()))
+}
+
 /// Decode a batch entry (version 1 with 40-byte frames, or version 2) or a
 /// legacy one-command Raft entry (a bare 40- or 48-byte frame).
 pub fn decode_raft_entry(payload: &[u8]) -> Option<Vec<Command>> {
@@ -916,6 +945,20 @@ impl fmt::Display for DecodedReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_entry_round_trips_and_is_never_a_command_batch() {
+        let entry = encode_raft_config_entry(0xfeed, "specs=*:tick=1;window=500000");
+        assert_eq!(
+            decode_raft_config_entry(&entry),
+            Some((0xfeed, "specs=*:tick=1;window=500000".to_string()))
+        );
+        assert!(decode_raft_entry(&entry).is_none());
+        let mut frame = [0u8; MSG_LEN];
+        encode_new(&Order::limit(OrderId(1), Side::Buy, 10, 1), &mut frame);
+        let batch = encode_raft_batch(&[frame]).unwrap();
+        assert!(decode_raft_config_entry(&batch).is_none());
+    }
 
     #[test]
     fn report_round_trips() {

@@ -13,6 +13,13 @@ x-raft-environment: &raft-environment
   TC_RAFT_READY_MAX_APPLY_LAG: "${TC_RAFT_READY_MAX_APPLY_LAG:-32}"
   TC_RAFT_READY_MAX_OUTBOX_PENDING: "${TC_RAFT_READY_MAX_OUTBOX_PENDING:-10000}"
   TC_RAFT_DEDUP_MAX_IDS: "${TC_RAFT_DEDUP_MAX_IDS:-1000000}"
+  # Deterministic config: must be identical on every replica of a group. A new
+  # leader announces its fingerprint in the log and a replica that differs
+  # stops applying (exit 78) instead of silently diverging. Set
+  # TC_RAFT_CONFIG_CHECK=0 only while rolling from a build without the check.
+  TC_INSTRUMENT_SPECS: "${TC_INSTRUMENT_SPECS:-}"
+  TC_DEDUP_WINDOW_IDS: "${TC_DEDUP_WINDOW_IDS:-500000}"
+  TC_RAFT_CONFIG_CHECK: "${TC_RAFT_CONFIG_CHECK:-1}"
   # Durable in-memory engine snapshot cadence. Recovery loads this image and
   # deterministically replays the committed Raft tail above its embedded index.
   TC_SNAPSHOT_EVERY_SECS: "${TC_SNAPSHOT_EVERY_SECS:-30}"

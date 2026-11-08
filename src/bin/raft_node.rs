@@ -140,6 +140,13 @@ fn main() {
     // Open consensus before constructing the matching engine. A follower may
     // have durably installed a Raft snapshot immediately before a crash; its
     // embedded matching snapshot must become the engine recovery point first.
+    // Exclusive for the life of this process (released by the kernel on any
+    // exit, including SIGKILL): two processes on one data dir — a duplicated
+    // placement, or a supervisor restarted next to orphaned children — would
+    // interleave WAL writes and snapshot renames.
+    let _data_dir_lock = lock_data_dir(&data_dir).unwrap_or_else(|error| {
+        panic!("cannot lock Raft data directory {}: {error}", data_dir.display())
+    });
     let mut raft_node = RaftNode::open(config, state_path).expect("open durable raft state");
     if let Some((index, bytes)) = raft_node.take_installed_snapshot_with_index() {
         trade_core::snapshot::install_bytes(&engine_snapshot_path, &bytes, index)
@@ -160,10 +167,12 @@ fn main() {
     // e.g. `*:tick=1,lot=1;7:tick=5,lot=10,min_notional=1000`. Every node of a
     // group must run the same table: rejections are part of the replicated,
     // deterministic report stream.
-    let instrument_specs = std::env::var("TC_INSTRUMENT_SPECS")
-        .ok()
-        .map(|text| trade_core::InstrumentSpecs::parse(&text).expect("valid TC_INSTRUMENT_SPECS"))
-        .unwrap_or_default();
+    let instrument_specs_text = std::env::var("TC_INSTRUMENT_SPECS").unwrap_or_default();
+    let instrument_specs = if instrument_specs_text.trim().is_empty() {
+        trade_core::InstrumentSpecs::default()
+    } else {
+        trade_core::InstrumentSpecs::parse(&instrument_specs_text).expect("valid TC_INSTRUMENT_SPECS")
+    };
     // The committed prefix recovered from the WAL. Taken before the engine is
     // built: when the engine snapshot predates the persisted dedupe window
     // (format < 6), the ids of the commands it already covers seed that
@@ -186,6 +195,7 @@ fn main() {
         Some(snapshot) if snapshot.recent_command_ids.is_none() => recovered_committed
             .iter()
             .filter(|committed| committed.index <= engine_snapshot_index)
+            .filter(|committed| wire::decode_raft_config_entry(&committed.data).is_none())
             .flat_map(|committed| {
                 wire::decode_raft_entry(&committed.data)
                     .expect("durable committed Raft entry is not a valid command batch")
@@ -203,6 +213,15 @@ fn main() {
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(trade_core::exchange::DEFAULT_COMMAND_ID_WINDOW)
         .max(1);
+    let (config_fingerprint, config_description) =
+        deterministic_config(&instrument_specs_text, command_id_window);
+    log_info!(
+        "raft-node",
+        "deterministic config fingerprint={config_fingerprint:016x} ({config_description})"
+    );
+    let config_check = std::env::var("TC_RAFT_CONFIG_CHECK")
+        .map(|value| !matches!(value.trim(), "0" | "false" | "no" | "off"))
+        .unwrap_or(true);
     let (gateway, sink, handle) = build(ExchangeConfig {
         journal_dir: Some(data_dir.join("journal")),
         instrument_specs,
@@ -332,6 +351,19 @@ fn main() {
                 );
                 fence_term = committed.term;
                 let payload = committed.data;
+                if let Some((fingerprint, description)) = wire::decode_raft_config_entry(&payload) {
+                    // Replaying history: the group may have been restarted
+                    // with a new config since (a coordinated change), so an
+                    // old announcement is only reported. Live ones are binding.
+                    if fingerprint != config_fingerprint {
+                        log_warn!(
+                            "raft-node",
+                            "event=historic_config_differs index={index} logged={fingerprint:016x} ({description}) local={config_fingerprint:016x}"
+                        );
+                    }
+                    runtime_metrics.set_raft_enqueued_index(index);
+                    continue;
+                }
                 let commands = wire::decode_raft_entry(&payload)
                     .expect("durable committed Raft entry is not a valid command batch");
                 if index <= engine_snapshot_index {
@@ -432,6 +464,14 @@ fn main() {
                 if !leader && !pending.is_empty() {
                     pending.clear();
                 }
+                // A new leader announces its deterministic config first; every
+                // replica checks it as it applies the entry (see below).
+                if leader && !was_leader && config_check {
+                    let entry = wire::encode_raft_config_entry(config_fingerprint, &config_description);
+                    if let Err(error) = node.propose(entry) {
+                        log_warn!("raft-node", "event=config_announce_failed error={error:?}");
+                    }
+                }
                 was_leader = leader;
                 runtime_leadership.store(leader, Ordering::Release);
                 runtime_metrics.set_raft_state(
@@ -515,6 +555,19 @@ fn main() {
                         runtime_metrics.record_raft_commit_latency_group(0, commit_ns);
                     }
                     let waiters = commit_waiters.remove(&index);
+                    if let Some((fingerprint, description)) = wire::decode_raft_config_entry(&payload) {
+                        if fingerprint != config_fingerprint && config_check {
+                            // Applying further would compute results that differ
+                            // from the leader's: stop instead (EX_CONFIG).
+                            log_error!(
+                                "raft-node",
+                                "event=config_mismatch index={index} leader={fingerprint:016x} ({description}) local={config_fingerprint:016x} ({config_description}); refusing to apply"
+                            );
+                            std::process::exit(78);
+                        }
+                        runtime_metrics.set_raft_enqueued_index(index);
+                        continue;
+                    }
                     let commands = wire::decode_raft_entry(&payload)
                         .expect("committed Raft entry is not a valid command batch");
                     // Every committed command goes to the engine, whose
@@ -1179,6 +1232,45 @@ fn execution_category_key(frame: &[u8; wire::REPORT_LEN], category_size: u32) ->
     trade_core::sharding::asset_category(instrument, category_size).to_be_bytes()
 }
 
+/// Bump when a change alters matching results for the same command log (the
+/// replicas of a group must all run builds with the same value).
+const DETERMINISM_VERSION: u32 = 20_261_108;
+
+/// Fingerprint (and readable description) of everything that must be equal
+/// on every replica of a group for them to compute identical results and
+/// publish identically: matching rules, the dedupe window, and the routing
+/// that places execution events on Kafka partitions.
+fn deterministic_config(instrument_specs: &str, command_id_window: usize) -> (u64, String) {
+    let env = |name: &str| std::env::var(name).unwrap_or_default();
+    let description = format!(
+        "determinism={DETERMINISM_VERSION};specs={};dedup_window={command_id_window};exec_partitions={};routing={:?}",
+        instrument_specs.trim(),
+        env("TC_EXECUTION_KAFKA_PARTITIONS").trim(),
+        trade_core::sharding::RouteConfig::from_env(),
+    );
+    (trade_core::journal::fnv1a(description.as_bytes()), description)
+}
+
+/// Take an exclusive, non-blocking `flock` on `<dir>/.raft-node.lock`. The
+/// returned file must be kept open for as long as the directory is used.
+fn lock_data_dir(dir: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    std::fs::create_dir_all(dir)?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(".raft-node.lock"))?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let error = std::io::Error::last_os_error();
+        return Err(std::io::Error::new(
+            error.kind(),
+            format!("held by another process ({error})"),
+        ));
+    }
+    Ok(file)
+}
+
 fn parse_peers(input: &str) -> HashMap<u64, String> {
     input
         .split(',')
@@ -1381,6 +1473,25 @@ mod tests {
         assert!(!is_execution_outbox_file(std::path::Path::new(
             "unrelated.bin"
         )));
+    }
+
+    #[test]
+    fn a_data_dir_can_be_locked_by_only_one_process_handle() {
+        let dir = std::env::temp_dir().join(format!("tc-raft-lock-{}", std::process::id()));
+        let first = lock_data_dir(&dir).expect("first lock");
+        assert!(lock_data_dir(&dir).is_err(), "second lock must fail while held");
+        drop(first);
+        assert!(lock_data_dir(&dir).is_ok(), "released with the handle");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn config_fingerprint_covers_specs_and_the_dedupe_window() {
+        let (base, description) = deterministic_config("*:tick=1", 500_000);
+        assert!(description.contains("dedup_window=500000"), "{description}");
+        assert_ne!(deterministic_config("*:tick=5", 500_000).0, base);
+        assert_ne!(deterministic_config("*:tick=1", 400_000).0, base);
+        assert_eq!(deterministic_config(" *:tick=1 ", 500_000).0, base);
     }
 
     #[test]
