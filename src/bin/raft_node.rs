@@ -816,9 +816,12 @@ fn spawn_execution_outbox_publisher(
             checkpoint_consumer
                 .assign(&assignment)
                 .expect("start execution cursor consumer");
-            let mut shared_offsets = HashMap::<String, u64>::new();
-            let mut pending_checkpoints = HashMap::<String, u64>::new();
-            let mut batches_since_checkpoint = HashMap::<String, usize>::new();
+            // The group's broker-acknowledged publish position: every record
+            // at or before this (raft_index, ordinal) is on Kafka. A logical
+            // position, not a byte offset: replica outboxes differ in layout.
+            let mut shared_position: Option<(u64, u32)> = None;
+            let mut pending_checkpoint: Option<(u64, u32)> = None;
+            let mut batches_since_checkpoint = 0usize;
             let checkpoint_every_batches = std::env::var("TC_EXECUTION_CURSOR_EVERY_BATCHES")
                 .ok()
                 .and_then(|value| value.parse::<usize>().ok())
@@ -847,15 +850,15 @@ fn spawn_execution_outbox_publisher(
                 while let Some(message) = checkpoint_consumer.poll(Duration::ZERO) {
                     match message {
                         Ok(message) => {
-                            if let Some((name, offset)) = decode_outbox_checkpoint(
+                            // Byte-offset checkpoints from older builds are
+                            // ignored: a promoted node then republishes from
+                            // its own cursor (duplicates, deduped downstream).
+                            if let Some(position) = decode_outbox_checkpoint(
                                 raft_group,
                                 message.key(),
                                 message.payload(),
                             ) {
-                                shared_offsets
-                                    .entry(name)
-                                    .and_modify(|current| *current = (*current).max(offset))
-                                    .or_insert(offset);
+                                shared_position = shared_position.max(Some(position));
                             }
                         }
                         Err(error) => {
@@ -867,9 +870,9 @@ fn spawn_execution_outbox_publisher(
                         }
                     }
                 }
-                for (name, offset) in pending_checkpoints.clone() {
-                    let key = outbox_checkpoint_key(raft_group, &name);
-                    let value = offset.to_le_bytes();
+                if let Some(position) = pending_checkpoint {
+                    let key = outbox_checkpoint_key(raft_group);
+                    let value = encode_outbox_checkpoint(position);
                     let delivered = futures::executor::block_on(
                         producer.send(
                             FutureRecord::to(&checkpoint_topic)
@@ -880,8 +883,8 @@ fn spawn_execution_outbox_publisher(
                         ),
                     );
                     if delivered.is_ok() {
-                        pending_checkpoints.remove(&name);
-                        shared_offsets.insert(name, offset);
+                        pending_checkpoint = None;
+                        shared_position = shared_position.max(Some(position));
                     } else {
                         metrics
                             .execution_outbox_publish_healthy
@@ -917,14 +920,11 @@ fn spawn_execution_outbox_publisher(
                 // Every replica follows the broker-acknowledged cursor, so
                 // followers can reclaim sealed segments and a promoted leader
                 // does not replay the full lifetime outbox.
-                for (path, reader) in readers.iter_mut() {
-                    let Some(name) = outbox_checkpoint_name(path) else {
-                        continue;
-                    };
-                    if let Some(offset) = shared_offsets.get(&name).copied() {
-                        // A follower may not have applied up to this offset yet;
-                        // leave it pending and retry after its WAL catches up.
-                        let _ = reader.acknowledge_to(offset);
+                if let Some(position) = shared_position {
+                    for reader in readers.values_mut() {
+                        // Records a follower has not applied yet simply stay
+                        // pending; it catches up on a later pass.
+                        let _ = reader.acknowledge_through(position);
                     }
                 }
                 if !leadership.load(Ordering::Acquire) {
@@ -1002,20 +1002,15 @@ fn spawn_execution_outbox_publisher(
                                 metrics
                                     .execution_kafka_publish_samples
                                     .fetch_add(1, Ordering::Relaxed);
-                                let Some(name) = outbox_checkpoint_name(&path) else {
-                                    continue;
-                                };
-                                let next_offset = reader.offset()
-                                    + records.len() as u64 * reader.record_len() as u64;
-                                let batch_count = batches_since_checkpoint
-                                    .entry(name.clone())
-                                    .and_modify(|count| *count += 1)
-                                    .or_insert(1);
-                                let checkpoint_due = *batch_count >= checkpoint_every_batches
+                                let last = records.last().expect("non-empty batch");
+                                batches_since_checkpoint += 1;
+                                let checkpoint_due = batches_since_checkpoint
+                                    >= checkpoint_every_batches
                                     || pending_in_segment <= records.len() as u64;
                                 if checkpoint_due {
-                                    pending_checkpoints.insert(name.clone(), next_offset);
-                                    *batch_count = 0;
+                                    pending_checkpoint = pending_checkpoint
+                                        .max(Some((last.raft_index, last.ordinal)));
+                                    batches_since_checkpoint = 0;
                                 }
                                 if let Err(error) = reader.acknowledge(records.len()) {
                                     metrics
@@ -1034,7 +1029,7 @@ fn spawn_execution_outbox_publisher(
                                         .execution_outbox_published
                                         .fetch_add(prepared.len() as u64, Ordering::Relaxed);
                                     metrics.execution_outbox_publish_healthy.store(
-                                        pending_checkpoints.is_empty() as u64,
+                                        pending_checkpoint.is_none() as u64,
                                         Ordering::Release,
                                     );
                                 }
@@ -1056,7 +1051,7 @@ fn spawn_execution_outbox_publisher(
                         Ok(_) => {
                             metrics
                                 .execution_outbox_publish_healthy
-                                .store(pending_checkpoints.is_empty() as u64, Ordering::Release);
+                                .store(pending_checkpoint.is_none() as u64, Ordering::Release);
                         }
                         Err(error) => {
                             metrics
@@ -1085,7 +1080,7 @@ fn spawn_execution_outbox_publisher(
                 if leadership.load(Ordering::Acquire) && !pass_failed {
                     metrics
                         .execution_outbox_publish_healthy
-                        .store(pending_checkpoints.is_empty() as u64, Ordering::Release);
+                        .store(pending_checkpoint.is_none() as u64, Ordering::Release);
                 }
                 if !published_any && !idle_sleep.is_zero() {
                     thread::sleep(idle_sleep);
@@ -1103,9 +1098,6 @@ fn is_execution_outbox_file(path: &std::path::Path) -> bool {
             .is_some_and(|name| name.starts_with("outbox-shard-"))
 }
 
-fn outbox_checkpoint_name(path: &std::path::Path) -> Option<String> {
-    path.file_name()?.to_str().map(str::to_owned)
-}
 
 /// Which outbox segment each engine shard publishes from this pass: its
 /// oldest segment that still has unpublished records (an unreadable pending
@@ -1140,30 +1132,43 @@ fn outbox_segment_order(path: &std::path::Path) -> Option<(u32, u64)> {
     }
 }
 
-fn outbox_checkpoint_key(raft_group: u32, name: &str) -> Vec<u8> {
-    let mut key = Vec::with_capacity(4 + name.len());
+/// Shared publish checkpoint, one per Raft group: key = group (big
+/// endian) + `@pos`, value = raft_index (LE u64) + ordinal (LE u32).
+const OUTBOX_POSITION_KEY: &[u8] = b"@pos";
+
+fn outbox_checkpoint_key(raft_group: u32) -> Vec<u8> {
+    let mut key = Vec::with_capacity(4 + OUTBOX_POSITION_KEY.len());
     key.extend_from_slice(&raft_group.to_be_bytes());
-    key.extend_from_slice(name.as_bytes());
+    key.extend_from_slice(OUTBOX_POSITION_KEY);
     key
 }
 
+fn encode_outbox_checkpoint((raft_index, ordinal): (u64, u32)) -> [u8; 12] {
+    let mut value = [0u8; 12];
+    value[..8].copy_from_slice(&raft_index.to_le_bytes());
+    value[8..].copy_from_slice(&ordinal.to_le_bytes());
+    value
+}
+
+/// A logical checkpoint of `expected_group`; `None` for other groups and
+/// for the byte-offset checkpoints older builds wrote (8-byte payload).
 fn decode_outbox_checkpoint(
     expected_group: u32,
     key: Option<&[u8]>,
     payload: Option<&[u8]>,
-) -> Option<(String, u64)> {
-    let key = key?;
-    let payload = payload?;
-    if key.len() <= 4 || payload.len() != 8 {
+) -> Option<(u64, u32)> {
+    let (key, payload) = (key?, payload?);
+    if key.len() != 4 + OUTBOX_POSITION_KEY.len()
+        || &key[4..] != OUTBOX_POSITION_KEY
+        || payload.len() != 12
+        || u32::from_be_bytes(key[..4].try_into().ok()?) != expected_group
+    {
         return None;
     }
-    let group = u32::from_be_bytes(key[..4].try_into().ok()?);
-    if group != expected_group {
-        return None;
-    }
-    let name = std::str::from_utf8(&key[4..]).ok()?.to_owned();
-    let offset = u64::from_le_bytes(payload.try_into().ok()?);
-    Some((name, offset))
+    Some((
+        u64::from_le_bytes(payload[..8].try_into().ok()?),
+        u32::from_le_bytes(payload[8..].try_into().ok()?),
+    ))
 }
 
 #[cfg(test)]
@@ -1379,15 +1384,19 @@ mod tests {
     }
 
     #[test]
-    fn shared_outbox_checkpoint_is_scoped_by_raft_group() {
-        let key = outbox_checkpoint_key(7, "outbox-shard-3.bin");
-        let payload = 12_345u64.to_le_bytes();
+    fn shared_outbox_checkpoint_is_a_logical_position_scoped_by_group() {
+        let key = outbox_checkpoint_key(7);
+        let payload = encode_outbox_checkpoint((12_345, 3));
         assert_eq!(
             decode_outbox_checkpoint(7, Some(&key), Some(&payload)),
-            Some(("outbox-shard-3.bin".into(), 12_345))
+            Some((12_345, 3))
         );
+        assert_eq!(decode_outbox_checkpoint(8, Some(&key), Some(&payload)), None);
+        // An older build's byte-offset checkpoint is ignored, not misread.
+        let mut legacy_key = 7u32.to_be_bytes().to_vec();
+        legacy_key.extend_from_slice(b"outbox-shard-0.bin");
         assert_eq!(
-            decode_outbox_checkpoint(8, Some(&key), Some(&payload)),
+            decode_outbox_checkpoint(7, Some(&legacy_key), Some(&12_345u64.to_le_bytes())),
             None
         );
     }

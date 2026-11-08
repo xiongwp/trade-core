@@ -113,3 +113,59 @@ fn committed_batch_is_durable_in_outbox_before_watermark_and_survives_restart() 
 
     std::fs::remove_dir_all(root).ok();
 }
+
+/// Audit R1: replicas follow the leader's publish progress by logical
+/// position. A replica that installed a Raft snapshot lacks the records it
+/// covers, so the leader's byte offset pointed past records it had never
+/// published; the logical position lands on the same record everywhere.
+#[test]
+fn replicas_follow_the_publish_position_not_the_byte_offset() {
+    use trade_core::execution_outbox::{ExecutionOutboxReader, ExecutionOutboxWriter};
+    use trade_core::exchange::ExecReport;
+    let dir = std::env::temp_dir().join(format!("tc-outbox-logical-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let report = |id: u64| ExecReport::Cancelled {
+        instrument: trade_core::InstrumentId(1),
+        order_id: trade_core::OrderId(id),
+        user: 0,
+    };
+    // Leader: entries 1..=10, two records each. Follower: installed a
+    // snapshot at index 5, so it holds only entries 6..=10.
+    let write = |path: &std::path::Path, from: u64| {
+        let mut writer = ExecutionOutboxWriter::open(path, Duration::from_secs(60), 1_000).unwrap();
+        for index in from..=10 {
+            for ordinal in 0..2 {
+                writer.append(0, index, ordinal, &report(index * 10 + ordinal as u64)).unwrap();
+            }
+        }
+        writer.sync_data().unwrap();
+    };
+    let leader_path = dir.join("leader").join("outbox-shard-0.bin");
+    let follower_path = dir.join("follower").join("outbox-shard-0.bin");
+    write(&leader_path, 1);
+    write(&follower_path, 6);
+
+    // The leader published through entry 7, ordinal 1.
+    let mut leader = ExecutionOutboxReader::open(leader_path).unwrap();
+    let mut follower = ExecutionOutboxReader::open(follower_path).unwrap();
+    leader.acknowledge_through((7, 1)).unwrap();
+    follower.acknowledge_through((7, 1)).unwrap();
+    let next = |reader: &ExecutionOutboxReader| {
+        let record = reader.read_batch(1).unwrap()[0];
+        (record.raft_index, record.ordinal)
+    };
+    assert_eq!(next(&leader), (8, 0));
+    assert_eq!(next(&follower), (8, 0), "follower skipped unpublished records");
+    assert_eq!(leader.pending_records().unwrap(), 6);
+    assert_eq!(follower.pending_records().unwrap(), 6);
+
+    // Mid-entry positions, and positions not reached yet, also land exactly.
+    follower.acknowledge_through((8, 0)).unwrap();
+    assert_eq!(next(&follower), (8, 1));
+    follower.acknowledge_through((3, 0)).unwrap(); // never moves backwards
+    assert_eq!(next(&follower), (8, 1));
+    follower.acknowledge_through((99, 0)).unwrap();
+    assert_eq!(follower.pending_records().unwrap(), 0);
+    std::fs::remove_dir_all(&dir).unwrap();
+}

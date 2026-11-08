@@ -635,6 +635,53 @@ impl ExecutionOutboxReader {
         Ok(())
     }
 
+    /// Advance past every record at or before `through` = (raft_index,
+    /// ordinal) — the logical position the leader has published.
+    ///
+    /// Replica outboxes hold the same records in the same (log) order, but
+    /// not at the same byte offsets: a replica that installed a Raft
+    /// snapshot never wrote the records that snapshot covers, and segment
+    /// boundaries depend on local rotation. Applying the leader's byte
+    /// offset to such a file skipped records that were never published
+    /// (lost after a failover). Records in one file are sorted by position,
+    /// so this binary-searches the first one past `through`.
+    pub fn acknowledge_through(&mut self, through: (u64, u32)) -> io::Result<()> {
+        let mut file = match File::open(&self.path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let header = OUTBOX_HEADER.len() as u64;
+        let record_len = self.record_len as u64;
+        let total = (file.metadata()?.len().saturating_sub(header)) / record_len;
+        let mut lo = (self.offset - header) / record_len;
+        let mut hi = total;
+        let mut buf = [0u8; OUTBOX_RECORD_LEN];
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            file.seek(SeekFrom::Start(header + mid * record_len))?;
+            let bytes = &mut buf[..self.record_len];
+            file.read_exact(bytes)?;
+            // A torn (unsynced) tail record is never "already published".
+            let published = decode_record(bytes)
+                .is_some_and(|record| (record.raft_index, record.ordinal) <= through);
+            if published {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        let next = header + lo * record_len;
+        if next <= self.offset {
+            return Ok(());
+        }
+        if let Some(path) = &self.cursor_path {
+            persist_cursor(path, next)?;
+        }
+        self.offset = next;
+        Ok(())
+    }
+
     pub fn pending_records(&self) -> io::Result<u64> {
         let len = match std::fs::metadata(&self.path) {
             Ok(meta) => meta.len(),
