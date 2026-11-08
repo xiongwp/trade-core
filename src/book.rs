@@ -439,6 +439,14 @@ impl LevelIndex {
     }
 }
 
+/// The resting orders in a [`OrderBook::copy_slots`] copy, sorted by time
+/// priority (ties, which the engine never produces, by id).
+pub fn live_orders_by_time(mut slots: Vec<Order>) -> Vec<Order> {
+    slots.retain(|order| order.remaining > 0);
+    slots.sort_unstable_by_key(|order| (order.timestamp, order.id.0));
+    slots
+}
+
 /// A price-time ordered limit order book over a slab pool.
 ///
 /// Each side maps price -> time-ordered pool slots. Bids are read highest-first,
@@ -508,6 +516,15 @@ impl OrderBook {
     /// [`Self::snapshot_orders`] to preserve each price level's exact queue.
     pub fn iter_orders(&self) -> impl Iterator<Item = &Order> + '_ {
         self.locate.values().map(|loc| self.pool.get(loc.slot))
+    }
+
+    /// Copy the whole slot pool (live, tombstoned and free slots alike) — one
+    /// memcpy, cheap enough to run on the matching thread. A slot holds a live
+    /// order exactly when its `remaining > 0`: tombstones are zeroed, and a
+    /// slot is only released once its order is at zero. Turn the copy into
+    /// resting orders with [`live_orders_by_time`] off the hot path.
+    pub fn copy_slots(&self) -> Vec<Order> {
+        self.pool.slots.clone()
     }
 
     /// Copy live orders in deterministic per-level FIFO order for snapshots.

@@ -2585,7 +2585,10 @@ fn push_result_event(
 // ---------------------------------------------------------------------------
 
 /// A snapshot's state copied out of the processor, so it can be written
-/// after matching has moved on.
+/// after matching has moved on. Capture is kept to flat copies (each book's
+/// slot pool is one memcpy, positions one table clone); filtering live
+/// orders, sorting them into time priority and encoding happen in
+/// [`write`](Self::write), off the matching thread in Raft mode.
 struct CapturedSnapshot {
     journal_seq: u64,
     raft_applied_index: u64,
@@ -2593,12 +2596,36 @@ struct CapturedSnapshot {
     max_admin_id: u64,
     halted: Vec<u32>,
     suspended: Vec<u64>,
-    positions: Vec<(u64, u32, i64)>,
-    engines: Vec<EngineState>,
+    positions: HashMap<(u64, InstrumentId), i64>,
+    engines: Vec<CapturedEngine>,
+}
+
+struct CapturedEngine {
+    instrument: InstrumentId,
+    engine_seq: Timestamp,
+    slots: Vec<Order>,
+    stops: Vec<StopOrder>,
 }
 
 impl CapturedSnapshot {
-    fn write(&self, path: &Path) -> std::io::Result<()> {
+    fn write(self, path: &Path) -> std::io::Result<()> {
+        let positions: Vec<(u64, u32, i64)> = self
+            .positions
+            .iter()
+            .filter(|(_, &quantity)| quantity != 0)
+            .map(|(&(user, instrument), &quantity)| (user, instrument.0, quantity))
+            .collect();
+        let mut engines: Vec<EngineState> = self
+            .engines
+            .into_iter()
+            .map(|engine| EngineState {
+                instrument: engine.instrument,
+                engine_seq: engine.engine_seq,
+                orders: crate::book::live_orders_by_time(engine.slots),
+                stops: engine.stops,
+            })
+            .collect();
+        engines.sort_by_key(|state| state.instrument);
         snapshot::write(
             path,
             snapshot::SnapshotData {
@@ -2608,8 +2635,8 @@ impl CapturedSnapshot {
                 max_admin_id: self.max_admin_id,
                 halted: &self.halted,
                 suspended: &self.suspended,
-                positions: &self.positions,
-                engines: &self.engines,
+                positions: &positions,
+                engines: &engines,
             },
         )
     }
@@ -2627,13 +2654,21 @@ fn capture_processor_snapshot(
         max_admin_id: processor.max_admin_id,
         halted: processor.halted.iter().map(|instrument| instrument.0).collect(),
         suspended: processor.suspended.iter().copied().collect(),
-        positions: processor
-            .positions
+        positions: processor.positions.clone(),
+        engines: processor
+            .engines
             .iter()
-            .filter(|(_, &quantity)| quantity != 0)
-            .map(|(&(user, instrument), &quantity)| (user, instrument.0, quantity))
+            .map(|(&instrument, engine)| CapturedEngine {
+                instrument,
+                engine_seq: engine.seq(),
+                slots: engine.copy_slots(),
+                stops: processor
+                    .stops
+                    .get(&instrument)
+                    .map(TriggerBook::export)
+                    .unwrap_or_default(),
+            })
             .collect(),
-        engines: processor.export_state(),
     }
 }
 

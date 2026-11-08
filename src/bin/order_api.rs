@@ -93,6 +93,8 @@ struct OrderPipelineMetrics {
     /// clears the lag after a short staleness window, and this counter makes the
     /// condition observable instead of silent.
     lag_read_failures: AtomicU64,
+    /// Rows the dedupe retention has deleted (see `spawn_dedupe_retention`).
+    dedupe_purged_rows: AtomicU64,
 }
 
 impl OrderPipelineMetrics {
@@ -247,11 +249,13 @@ impl OrderPipelineMetrics {
             "# TYPE tc_order_mysql_consumer_lag gauge\ntc_order_mysql_consumer_lag {}\n\
 # TYPE tc_order_match_consumer_lag gauge\ntc_order_match_consumer_lag {}\n\
 # TYPE tc_order_dlq_total counter\ntc_order_dlq_total {}\n\
-# TYPE tc_order_lag_read_failures counter\ntc_order_lag_read_failures {}\n",
+# TYPE tc_order_lag_read_failures counter\ntc_order_lag_read_failures {}\n\
+# TYPE tc_order_dedupe_purged_rows counter\ntc_order_dedupe_purged_rows {}\n",
             self.observed_mysql_lag.load(AtomicOrdering::Relaxed),
             self.observed_match_lag.load(AtomicOrdering::Relaxed),
             self.dlq_total.load(AtomicOrdering::Relaxed),
             self.lag_read_failures.load(AtomicOrdering::Relaxed),
+            self.dedupe_purged_rows.load(AtomicOrdering::Relaxed),
         ) + &self.mysql_commit_hist.render_standalone(
             "order_mysql_commit_ns",
             "Order API MySQL commit latency (nanoseconds)",
@@ -1560,6 +1564,136 @@ impl CommandDbForwarder {
     }
 }
 
+/// Whether the command projection also writes `processed_commands` (one row
+/// per command: Kafka position, command id, user, shard table).
+///
+/// Nothing reads that table — redelivered commands are already harmless
+/// (`INSERT IGNORE` on the order's unique `order_id`, modifies are plain
+/// `SET`s) — so by default the row, its primary key and its `UNIQUE
+/// (command_id)` index are no longer written on the hot path. Set
+/// `TC_ORDER_COMMAND_LOG=1` to keep it as an audit trail; the dedupe
+/// retention below then bounds it.
+fn command_log_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| env_enabled("TC_ORDER_COMMAND_LOG", false))
+}
+
+/// Dedupe tables that only grow, with the primary-key prefix the purge walks:
+/// `(group column, monotonically increasing position within the group)`.
+const DEDUPE_TABLES: [(&str, &str, &str); 2] = [
+    // Execution events already applied to their order: only consulted to
+    // drop a Kafka/outbox redelivery of the same event.
+    ("processed_execution_events", "raft_group", "raft_index"),
+    ("processed_commands", "category_id", "kafka_offset"),
+];
+const DEDUPE_PURGE_CHUNK: usize = 5_000;
+
+/// Keep the dedupe tables to a retention window so the projection does not
+/// slow down as history accumulates (measured: ~20% lower end-to-end TPS
+/// with 10x the data, MySQL backlog the largest factor).
+///
+/// `TC_ORDER_DEDUPE_RETENTION_SECS` (default 86400, 0 = keep forever) must
+/// exceed the longest time an execution event can be redelivered — consumer
+/// restarts and outbox replays are seconds — since an event replayed after
+/// its row is purged would be applied twice. There is no index on
+/// `created_at` (it would cost a write per event), so the purge samples the
+/// per-group high-water mark of the primary key every interval and, once a
+/// sample is older than the retention, deletes everything below it in short
+/// chunked transactions. Samples live in memory: after a restart nothing is
+/// purged until a full retention has passed again, which only errs towards
+/// keeping more.
+fn spawn_dedupe_retention(store: OrderStore) {
+    let retention = Duration::from_secs(env_number("TC_ORDER_DEDUPE_RETENTION_SECS", 86_400u64));
+    if retention.is_zero() {
+        return;
+    }
+    let interval = Duration::from_secs(env_number(
+        "TC_ORDER_DEDUPE_PURGE_INTERVAL_SECS",
+        (retention.as_secs() / 8).clamp(1, 300),
+    ))
+    .max(Duration::from_secs(1));
+    let _ = std::thread::Builder::new()
+        .name("dedupe-retention".into())
+        .spawn(move || {
+            let mut dbs: Vec<u32> = store.owned_dbs.iter().copied().collect();
+            dbs.sort_unstable();
+            let mut samples: HashMap<(u32, &str), std::collections::VecDeque<(std::time::Instant, Vec<(u64, u64)>)>> =
+                HashMap::new();
+            while !SHUTDOWN.load(AtomicOrdering::Acquire) {
+                for &db in &dbs {
+                    for (table, group, position) in DEDUPE_TABLES {
+                        let history = samples.entry((db, table)).or_default();
+                        match purge_dedupe_table(&store, db, table, group, position, retention, history) {
+                            Ok(rows) if rows > 0 => {
+                                store.metrics.dedupe_purged_rows.fetch_add(rows, AtomicOrdering::Relaxed);
+                                log_info!("dedupe-retention", db; "event=purged table={table} rows={rows}");
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
+                                log_warn!("dedupe-retention", db; "event=purge_failed table={table} error={error}");
+                            }
+                        }
+                    }
+                }
+                let deadline = std::time::Instant::now() + interval;
+                while std::time::Instant::now() < deadline && !SHUTDOWN.load(AtomicOrdering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            }
+        });
+}
+
+/// One retention step for one table: record the current per-group
+/// high-water mark, then delete rows below the newest mark that is older
+/// than `retention`. Returns the rows deleted.
+fn purge_dedupe_table(
+    store: &OrderStore,
+    db: u32,
+    table: &str,
+    group: &str,
+    position: &str,
+    retention: Duration,
+    history: &mut std::collections::VecDeque<(std::time::Instant, Vec<(u64, u64)>)>,
+) -> Result<u64, String> {
+    let mut conn = store.shard(db).get_conn().map_err(|error| error.to_string())?;
+    // Loose index scan over the primary key: one probe per group.
+    let marks: Vec<(u64, u64)> = conn
+        .query(format!(
+            "SELECT {group}, MAX({position}) FROM order_db_{db}.{table} GROUP BY {group}"
+        ))
+        .map_err(|error| error.to_string())?;
+    let now = std::time::Instant::now();
+    history.push_back((now, marks));
+    let mut cutoff = None;
+    while history
+        .front()
+        .is_some_and(|(taken, _)| now.duration_since(*taken) >= retention)
+    {
+        cutoff = history.pop_front().map(|(_, marks)| marks);
+    }
+    let Some(cutoff) = cutoff else {
+        return Ok(0);
+    };
+    let mut deleted = 0;
+    for (group_value, below) in cutoff {
+        loop {
+            conn.exec_drop(
+                format!(
+                    "DELETE FROM order_db_{db}.{table} WHERE {group}=? AND {position}<? LIMIT {DEDUPE_PURGE_CHUNK}"
+                ),
+                (group_value, below),
+            )
+            .map_err(|error| error.to_string())?;
+            let rows = conn.affected_rows();
+            deleted += rows;
+            if rows < DEDUPE_PURGE_CHUNK as u64 || SHUTDOWN.load(AtomicOrdering::Acquire) {
+                break;
+            }
+        }
+    }
+    Ok(deleted)
+}
+
 /// Persist one routed shard batch with one MySQL commit. Long-lived per-shard
 /// workers call this after coalescing jobs from concurrent Kafka consumers.
 fn persist_mysql_shard(
@@ -1577,7 +1711,7 @@ fn persist_mysql_shard(
         .start_transaction(TxOpts::default())
         .map_err(|error| error.to_string())?;
 
-    let mut processed = Vec::with_capacity(records.len() * 6);
+    let mut processed = Vec::with_capacity(if command_log_enabled() { records.len() * 6 } else { 0 });
     let mut orders_by_table: BTreeMap<u32, Vec<Value>> = BTreeMap::new();
     let mut modifies = Vec::new();
 
@@ -1587,14 +1721,16 @@ fn persist_mysql_shard(
             .ok_or_else(|| "invalid Kafka command frame".to_string())?;
         let id = command_id(&command);
         let route = store.routing.route_order_id(database_order_id(&command));
-        processed.extend([
+        if command_log_enabled() {
+            processed.extend([
             Value::from(record.category_id),
             Value::from(record.partition),
             Value::from((record.offset as u64).saturating_add(1)),
             Value::from(id),
             Value::from(record.user),
             Value::from(route.table),
-        ]);
+            ]);
+        }
 
         match command {
             // A conditional order gets its row at placement like any other;
@@ -1651,13 +1787,15 @@ fn persist_mysql_shard(
         }
     }
 
-    exec_multi_insert(
-            &mut tx,
-            &format!("INSERT IGNORE INTO {db}.processed_commands (category_id,kafka_partition,kafka_offset,command_id,user_id,shard_table)"),
-            6,
-            processed,
-        )
-        .map_err(|error| error.to_string())?;
+    if command_log_enabled() {
+        exec_multi_insert(
+                &mut tx,
+                &format!("INSERT IGNORE INTO {db}.processed_commands (category_id,kafka_partition,kafka_offset,command_id,user_id,shard_table)"),
+                6,
+                processed,
+            )
+            .map_err(|error| error.to_string())?;
+    }
     let pending_tables = orders_by_table.keys().copied().collect::<Vec<_>>();
     for (table, values) in orders_by_table {
         exec_multi_insert(
@@ -3843,6 +3981,11 @@ fn main() {
                 .clone(),
         )
     });
+    if kafka.db_consumers > 0 || kafka.execution_consumers > 0 {
+        if let Some(store) = &store {
+            spawn_dedupe_retention(store.clone());
+        }
+    }
     let matcher_group_count = matcher_groups.len();
     let ingress_enabled = env_enabled("TC_ORDER_HTTP_INGRESS_ENABLED", true);
     let raft_forwarder = (kafka.matcher_consumers > 0)
@@ -4494,6 +4637,50 @@ mod tests {
     }
 
     /// Same disposable MySQL 8 as above.
+    #[test]
+    #[ignore = "requires disposable MySQL 8 via TC_TEST_MYSQL_URL"]
+    fn mysql8_dedupe_retention_purges_below_an_expired_high_water_mark() {
+        let store = mysql_test_store().expect("TC_TEST_MYSQL_URL must be set");
+        // A raft group no other test uses, so concurrent tests keep their rows.
+        let group = 1_000_000 + (std::process::id() % 1_000_000);
+        let mut conn = store.shard(0).get_conn().unwrap();
+        conn.exec_drop("DELETE FROM order_db_0.processed_execution_events WHERE raft_group=?", (group,))
+            .unwrap();
+        for index in 1..=12u64 {
+            conn.exec_drop(
+                "INSERT INTO order_db_0.processed_execution_events (raft_group,raft_index,report_ordinal,target_order_id,shard_table,instrument,report_type,kafka_partition,kafka_offset) VALUES (?,?,0,1,0,0,12,0,0)",
+                (group, index),
+            )
+            .unwrap();
+        }
+        let count = |conn: &mut mysql::PooledConn| -> u64 {
+            conn.exec_first(
+                "SELECT COUNT(*) FROM order_db_0.processed_execution_events WHERE raft_group=?",
+                (group,),
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let retention = Duration::from_secs(1);
+        let mut history = std::collections::VecDeque::new();
+
+        // A fresh sample is younger than the retention: nothing goes.
+        let purged = purge_dedupe_table(&store, 0, "processed_execution_events", "raft_group", "raft_index", retention, &mut history).unwrap();
+        assert_eq!(count(&mut conn), 12, "purged {purged} rows too early");
+        assert_eq!(history.len(), 1);
+
+        // An expired mark of 11 for this group: rows 1..=10 go, 11 and 12 stay.
+        history.clear();
+        let old = std::time::Instant::now() - Duration::from_secs(2);
+        history.push_back((old, vec![(group as u64, 11)]));
+        let purged = purge_dedupe_table(&store, 0, "processed_execution_events", "raft_group", "raft_index", retention, &mut history).unwrap();
+        assert_eq!(purged, 10);
+        assert_eq!(count(&mut conn), 2);
+        assert_eq!(history.len(), 1, "the fresh sample waits for its turn");
+        conn.exec_drop("DELETE FROM order_db_0.processed_execution_events WHERE raft_group=?", (group,))
+            .unwrap();
+    }
+
     #[test]
     #[ignore = "requires disposable MySQL 8 via TC_TEST_MYSQL_URL"]
     fn mysql8_projection_ignores_reports_that_change_no_order() {

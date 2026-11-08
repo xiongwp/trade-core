@@ -89,9 +89,14 @@ impl MatchingEngine {
     /// Export every resting order, sorted by time priority — with [`seq`](Self::seq)
     /// this is the engine's complete state (used by snapshots).
     pub fn export_orders(&self) -> Vec<Order> {
-        let mut orders: Vec<Order> = self.book.iter_orders().copied().collect();
-        orders.sort_by_key(|o| o.timestamp);
-        orders
+        crate::book::live_orders_by_time(self.book.copy_slots())
+    }
+
+    /// The book's raw slot pool (see [`OrderBook::copy_slots`]): the cheap
+    /// half of [`export_orders`](Self::export_orders), for snapshots that
+    /// finish the export on another thread.
+    pub fn copy_slots(&self) -> Vec<Order> {
+        self.book.copy_slots()
     }
 
     /// Restore state exported by [`export_orders`](Self::export_orders): sets the
