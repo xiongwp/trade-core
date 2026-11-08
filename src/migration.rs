@@ -349,6 +349,7 @@ mod tests {
             suspended: &[],
             positions: &[],
             engines: &engines,
+            recent_command_ids: None,
         };
         snapshot::write(path, data).unwrap();
     }

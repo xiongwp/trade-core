@@ -166,6 +166,8 @@ fn main() {
         stp: trade_core::SelfTradePolicy::CancelTaker,
         // Order-system re-sends after reconnect are deduped by the id cursor.
         dedup_commands: true,
+        command_id_window: trade_core::exchange::DEFAULT_COMMAND_ID_WINDOW,
+        legacy_command_ids: Vec::new(),
         risk_limits: Some(trade_core::RiskLimits {
             max_order_qty: 1_000_000,
             max_notional: 10_000_000_000,

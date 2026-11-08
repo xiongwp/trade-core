@@ -44,6 +44,8 @@ const VERSION: u32 = 4; // v4: + last durably applied Raft index
 /// exist, so a node holding none keeps producing v4 snapshots that a previous
 /// build can still install during a rolling upgrade.
 const VERSION_STOPS: u32 = 5;
+/// v6: stops section always present, plus the exact command-id dedupe window.
+const VERSION_DEDUP_WINDOW: u32 = 6;
 const LEGACY_VERSION: u32 = 3;
 const ORDER_ENC: usize = 56;
 /// Encoded stop: the order, then trigger price (u64) and kind (u8).
@@ -167,6 +169,9 @@ pub struct Snapshot {
     /// Position ledger entries (user, instrument, net qty).
     pub positions: Vec<(u64, u32, i64)>,
     pub engines: Vec<EngineState>,
+    /// The exact command-id dedupe window, oldest first (v6+); `None` for
+    /// older snapshots, which did not persist it.
+    pub recent_command_ids: Option<Vec<u64>>,
 }
 
 /// Borrowed state supplied when atomically writing a snapshot.
@@ -179,11 +184,15 @@ pub struct SnapshotData<'a> {
     pub suspended: &'a [u64],
     pub positions: &'a [(u64, u32, i64)],
     pub engines: &'a [EngineState],
+    /// Dedupe window to persist (written as v6); `None` writes v4/v5.
+    pub recent_command_ids: Option<&'a [u64]>,
 }
 
 /// Write a snapshot **atomically**: temp file, fsync, rename over `path`.
 pub fn write(path: &Path, data: SnapshotData<'_>) -> io::Result<()> {
-    let version = if data.engines.iter().any(|e| !e.stops.is_empty()) {
+    let version = if data.recent_command_ids.is_some() {
+        VERSION_DEDUP_WINDOW
+    } else if data.engines.iter().any(|e| !e.stops.is_empty()) {
         VERSION_STOPS
     } else {
         VERSION
@@ -226,6 +235,12 @@ pub fn write(path: &Path, data: SnapshotData<'_>) -> io::Result<()> {
                 encode_stop(stop, &mut stop_rec);
                 buf.extend_from_slice(&stop_rec);
             }
+        }
+    }
+    if let Some(ids) = data.recent_command_ids {
+        buf.extend_from_slice(&(ids.len() as u64).to_le_bytes());
+        for id in ids {
+            buf.extend_from_slice(&id.to_le_bytes());
         }
     }
     let h = fnv1a(&buf);
@@ -309,7 +324,7 @@ pub fn load(path: &Path) -> io::Result<Snapshot> {
         return Err(corrupt("checksum mismatch"));
     }
     let version = u32::from_le_bytes(buf[4..8].try_into().unwrap());
-    if version != VERSION && version != VERSION_STOPS && version != LEGACY_VERSION {
+    if ![LEGACY_VERSION, VERSION, VERSION_STOPS, VERSION_DEDUP_WINDOW].contains(&version) {
         return Err(corrupt("unsupported version"));
     }
     let journal_seq = u64::from_le_bytes(buf[8..16].try_into().unwrap());
@@ -389,7 +404,24 @@ pub fn load(path: &Path) -> io::Result<Snapshot> {
             stops,
         });
     }
+    let recent_command_ids = if version >= VERSION_DEDUP_WINDOW {
+        if pos + 8 > body_len {
+            return Err(corrupt("truncated dedupe window"));
+        }
+        let n = u64::from_le_bytes(buf[pos..pos + 8].try_into().unwrap()) as usize;
+        pos += 8;
+        if n > (body_len - pos) / 8 {
+            return Err(corrupt("truncated dedupe window"));
+        }
+        let ids = (0..n)
+            .map(|k| u64::from_le_bytes(buf[pos + k * 8..pos + k * 8 + 8].try_into().unwrap()))
+            .collect();
+        Some(ids)
+    } else {
+        None
+    };
     Ok(Snapshot {
+        recent_command_ids,
         format_version: version,
         journal_seq,
         raft_applied_index,
@@ -436,6 +468,7 @@ mod tests {
                 suspended: &[42],
                 positions: &[(9, 7, -3)],
                 engines: &engines,
+                recent_command_ids: None,
             },
         )
         .unwrap();

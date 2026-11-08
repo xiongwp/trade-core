@@ -160,6 +160,38 @@ fn main() {
         .ok()
         .map(|text| trade_core::InstrumentSpecs::parse(&text).expect("valid TC_INSTRUMENT_SPECS"))
         .unwrap_or_default();
+    // The committed prefix recovered from the WAL. Taken before the engine is
+    // built: when the engine snapshot predates the persisted dedupe window
+    // (format < 6), the ids of the commands it already covers seed that
+    // window — exactly what the old consensus-side id window held — so the
+    // first restart after an upgrade decides retries as before. From the
+    // next snapshot on, the window is replicated state.
+    let recovered_committed = raft_node.take_committed();
+    let engine_snapshot = trade_core::snapshot::load(&engine_snapshot_path).ok();
+    let engine_snapshot_index = engine_snapshot
+        .as_ref()
+        .map_or(0, |snapshot| snapshot.raft_applied_index);
+    let legacy_command_ids = match &engine_snapshot {
+        Some(snapshot) if snapshot.recent_command_ids.is_none() => recovered_committed
+            .iter()
+            .filter(|committed| committed.index <= engine_snapshot_index)
+            .flat_map(|committed| {
+                wire::decode_raft_entry(&committed.data)
+                    .expect("durable committed Raft entry is not a valid command batch")
+            })
+            .map(|command| command.id())
+            .filter(|&id| id != 0)
+            .collect(),
+        _ => Vec::new(),
+    };
+    drop(engine_snapshot);
+    // Exact command-id dedupe window of the matching state machine. It is
+    // replicated state: every replica of a group must use the same value.
+    let command_id_window = std::env::var("TC_DEDUP_WINDOW_IDS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(trade_core::exchange::DEFAULT_COMMAND_ID_WINDOW)
+        .max(1);
     let (gateway, sink, handle) = build(ExchangeConfig {
         journal_dir: Some(data_dir.join("journal")),
         instrument_specs,
@@ -169,6 +201,8 @@ fn main() {
         // processor high-water cursors reject valid lower ids from independent
         // Kafka partitions, so they must not be enabled here.
         dedup_commands: false,
+        command_id_window,
+        legacy_command_ids,
         // Ten thousand mostly sparse assets must not each reserve the
         // single-market default. Hot dedicated assets can raise this through
         // TC_MATCH_POOL_PER_ASSET; pools still grow dynamically when needed.
@@ -183,9 +217,6 @@ fn main() {
         ..ExchangeConfig::default()
     });
     let metrics = handle.metrics.clone();
-    let engine_snapshot_index = trade_core::snapshot::load(&engine_snapshot_path)
-        .map(|snapshot| snapshot.raft_applied_index)
-        .unwrap_or(0);
     metrics.set_ready(false);
     // Single-group deployment: register one commit-latency series (group 0).
     // A future split-matching topology registers one per group here.
@@ -277,7 +308,6 @@ fn main() {
             runtime_metrics.set_raft_enqueued_index(engine_snapshot_index);
             runtime_metrics.set_raft_applied_index(engine_snapshot_index);
 
-            let recovered_committed = node.take_committed();
             // Rebuild exact idempotency and matching state before this member
             // can campaign or accept a retry. Otherwise a fast election can
             // race the recovered committed prefix and append an old command a
@@ -301,15 +331,13 @@ fn main() {
                     runtime_metrics.set_raft_applied_index(index);
                     continue;
                 }
-                let mut apply = Vec::new();
-                for command in commands {
-                    let id = command.id();
-                    let duplicate = id != 0 && committed_ids.contains(id);
-                    committed_ids.remember(id, index);
-                    if !duplicate {
-                        apply.push(command);
-                    }
+                // Every committed command goes to the engine, whose replicated
+                // dedupe window rejects retries identically on every replica.
+                // `committed_ids` only lets a leader skip re-proposing them.
+                for command in &commands {
+                    committed_ids.remember(command.id(), index);
                 }
+                let apply = commands;
                 if apply.is_empty() {
                     runtime_metrics.set_raft_enqueued_index(index);
                     runtime_metrics.set_raft_applied_index(index);
@@ -463,15 +491,13 @@ fn main() {
                     let waiters = commit_waiters.remove(&index);
                     let commands = wire::decode_raft_entry(&payload)
                         .expect("committed Raft entry is not a valid command batch");
-                    let mut apply = Vec::new();
-                    for command in commands {
-                        let id = command.id();
-                        let duplicate = id != 0 && committed_ids.contains(id);
-                        committed_ids.remember(id, index);
-                        if !duplicate {
-                            apply.push(command);
-                        }
+                    // Every committed command goes to the engine, whose
+                    // replicated dedupe window rejects retries identically on
+                    // every replica (see the recovery loop above).
+                    for command in &commands {
+                        committed_ids.remember(command.id(), index);
                     }
+                    let apply = commands;
                     if apply.is_empty() {
                         runtime_metrics.set_raft_enqueued_index(index);
                         runtime_metrics.set_raft_applied_index(index);

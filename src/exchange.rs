@@ -382,6 +382,12 @@ pub struct ExchangeConfig {
     /// high-water mark (exactly-once under order-system re-send; cursor is
     /// snapshot-persisted). Requires globally increasing ids (Leaf).
     pub dedup_commands: bool,
+    /// Exact command-id dedupe window, in ids (replicated state: every
+    /// replica of a group must use the same value).
+    pub command_id_window: usize,
+    /// Command ids recovered from the consensus log at or below the engine
+    /// snapshot, used only when that snapshot predates the persisted window.
+    pub legacy_command_ids: Vec<u64>,
     /// Durable execution outbox directory. When enabled, every non-depth report
     /// produced from a Raft-committed command is appended before it leaves the
     /// matching shard.
@@ -413,6 +419,8 @@ impl Default for ExchangeConfig {
             instrument_specs: InstrumentSpecs::default(),
             fees: crate::fees::FeeSchedule::default(),
             dedup_commands: false,
+            command_id_window: DEFAULT_COMMAND_ID_WINDOW,
+            legacy_command_ids: Vec::new(),
             execution_outbox_dir: None,
             raft_group_id: 0,
             execution_outbox_sync_every: 1,
@@ -729,6 +737,8 @@ fn build_inner(
             .with_limits(config.risk_limits)
             .with_specs(config.instrument_specs.clone())
             .with_dedup(config.dedup_commands)
+            .with_command_id_window(config.command_id_window)
+            .with_legacy_command_ids(config.legacy_command_ids.clone())
             .with_fees(config.fees);
         for &inst in &config.instruments {
             if inst.0 as usize % config.shards == shard_id {
@@ -913,7 +923,10 @@ pub struct Processor {
     dedup: bool,
     /// Exact retry protection also closes the crash window between replaying
     /// the shard journal and advancing the separate Raft application marker.
-    seen_command_ids: std::collections::HashSet<u64>,
+    seen_command_ids: RecentCommandIds,
+    /// Ids to seed the window with when restoring a pre-v6 snapshot, which
+    /// has no window (see `ExchangeConfig::legacy_command_ids`).
+    legacy_command_ids: Vec<u64>,
     /// Dual dedup cursors — one per intake queue. The high-priority queue
     /// legitimately reorders admin commands ahead of News, so a single cursor
     /// would be poisoned by a jumping cancel and dup-reject every later New.
@@ -938,6 +951,61 @@ pub struct Processor {
     /// Arrival counter ordering stops that share a trigger price. Only its
     /// relative order matters, so it is not persisted (restore renumbers).
     stop_seq: u64,
+}
+
+/// Exact command-id dedupe over the most recent `cap` distinct ids.
+///
+/// Part of the replicated state machine: ids enter in log order and the
+/// oldest is evicted first, and the whole window is written into every
+/// snapshot (format v6). So a replica that restarted, or installed a
+/// snapshot from the leader, makes exactly the same accept/reject decision
+/// as one that never stopped — the previous unbounded set was rebuilt from
+/// resting orders only, so a late Kafka redelivery of a filled order was
+/// rejected on some replicas and matched again on others. Bounded: memory
+/// is `cap` ids no matter how long the node runs. All replicas of a group
+/// must use the same `cap` (`TC_DEDUP_WINDOW_IDS`).
+#[derive(Clone)]
+pub(crate) struct RecentCommandIds {
+    set: std::collections::HashSet<u64>,
+    order: std::collections::VecDeque<u64>,
+    cap: usize,
+}
+
+/// Default exact-dedupe window: 2M ids (~50 MB per group).
+pub const DEFAULT_COMMAND_ID_WINDOW: usize = 2_000_000;
+
+impl RecentCommandIds {
+    fn new(cap: usize) -> Self {
+        Self {
+            set: std::collections::HashSet::new(),
+            order: std::collections::VecDeque::new(),
+            cap: cap.max(1),
+        }
+    }
+
+    /// Record `id`; false when it is already in the window (a duplicate).
+    fn insert(&mut self, id: u64) -> bool {
+        if !self.set.insert(id) {
+            return false;
+        }
+        self.order.push_back(id);
+        while self.order.len() > self.cap {
+            if let Some(expired) = self.order.pop_front() {
+                self.set.remove(&expired);
+            }
+        }
+        true
+    }
+
+    fn clear(&mut self) {
+        self.set.clear();
+        self.order.clear();
+    }
+
+    /// Oldest first: inserting them in this order rebuilds the same window.
+    fn to_vec(&self) -> Vec<u64> {
+        self.order.iter().copied().collect()
+    }
 }
 
 /// Untriggered conditional orders of one instrument, in firing priority:
@@ -1044,7 +1112,8 @@ impl Processor {
             limits: None,
             specs: InstrumentSpecs::default(),
             dedup: false,
-            seen_command_ids: std::collections::HashSet::new(),
+            seen_command_ids: RecentCommandIds::new(DEFAULT_COMMAND_ID_WINDOW),
+            legacy_command_ids: Vec::new(),
             max_new_id: 0,
             max_admin_id: 0,
             fees: crate::fees::FeeSchedule::default(),
@@ -1073,6 +1142,48 @@ impl Processor {
     /// Set per-instrument trading rules (builder style).
     pub fn with_specs(mut self, specs: InstrumentSpecs) -> Self {
         self.specs = specs;
+        self
+    }
+
+    /// A new order whose id is still resting (or waiting as a stop) is a
+    /// retry even after its id has aged out of the bounded window; letting
+    /// it through would insert the id twice (the book asserts on that, on
+    /// every replica alike).
+    fn would_duplicate_live(&self, cmd: &Command) -> bool {
+        let (Command::New(order) | Command::NewConditional(order, _)) = cmd else {
+            return false;
+        };
+        self.engines
+            .get(&order.instrument)
+            .is_some_and(|engine| engine.book().get(order.id).is_some())
+            || (self.pending_stops > 0
+                && self
+                    .stops
+                    .get(&order.instrument)
+                    .is_some_and(|book| book.contains(order.id)))
+    }
+
+    /// Capture and atomically write this processor's snapshot, exactly as a
+    /// matching shard does (format v6, including the dedupe window).
+    pub fn write_snapshot(
+        &self,
+        path: &Path,
+        journal_seq: u64,
+        raft_applied_index: u64,
+    ) -> std::io::Result<()> {
+        persist_processor_snapshot(self, path, journal_seq, raft_applied_index)
+    }
+
+    /// Size of the exact command-id dedupe window (builder style).
+    pub fn with_command_id_window(mut self, cap: usize) -> Self {
+        self.seen_command_ids = RecentCommandIds::new(cap);
+        self
+    }
+
+    /// Ids that seed the dedupe window when a pre-v6 snapshot (without one)
+    /// is restored (builder style).
+    pub fn with_legacy_command_ids(mut self, ids: Vec<u64>) -> Self {
+        self.legacy_command_ids = ids;
         self
     }
 
@@ -1153,16 +1264,30 @@ impl Processor {
         for &(u, i, q) in &snap.positions {
             *self.positions.entry((u, InstrumentId(i))).or_insert(0) += q;
         }
+        // Exact command-id dedupe. A v6 snapshot carries the window itself.
+        // Older ones do not: fall back to what the previous code used (the
+        // ids of every order the snapshot holds, plus the ids the caller
+        // recovered from its uncompacted log), so the first restart after an
+        // upgrade decides retries exactly as before.
+        if let Some(ids) = &snap.recent_command_ids {
+            self.seen_command_ids.clear();
+            for &id in ids {
+                self.seen_command_ids.insert(id);
+            }
+        } else {
+            for id in std::mem::take(&mut self.legacy_command_ids) {
+                self.seen_command_ids.insert(id);
+            }
+            for e in &snap.engines {
+                for id in e.orders.iter().map(|order| order.id.0) {
+                    self.seen_command_ids.insert(id);
+                }
+                for id in e.stops.iter().map(|stop| stop.order.id.0) {
+                    self.seen_command_ids.insert(id);
+                }
+            }
+        }
         for e in &snap.engines {
-            // Exact command-id dedup is independent of the optional monotonic
-            // high-water gate.  Rebuild it for every order represented by the
-            // snapshot before replaying the journal tail; otherwise a durable
-            // retry appended immediately after the snapshot can attempt to
-            // insert the same resting order twice during recovery.
-            self.seen_command_ids
-                .extend(e.orders.iter().map(|order| order.id.0));
-            self.seen_command_ids
-                .extend(e.stops.iter().map(|stop| stop.order.id.0));
             let engine = self.engine_for(e.instrument);
             engine.restore(e.engine_seq, &e.orders);
             for stop in &e.stops {
@@ -1212,7 +1337,7 @@ impl Processor {
     /// Apply one command, emitting every resulting report through `emit`.
     pub fn process(&mut self, cmd: Command, emit: &mut dyn FnMut(ExecReport)) {
         let exact_id = cmd.id();
-        if exact_id != 0 && !self.seen_command_ids.insert(exact_id) {
+        if exact_id != 0 && (!self.seen_command_ids.insert(exact_id) || self.would_duplicate_live(&cmd)) {
             emit(ExecReport::CommandRejected {
                 instrument: cmd.instrument(),
                 command_id: exact_id,
@@ -2598,6 +2723,7 @@ struct CapturedSnapshot {
     suspended: Vec<u64>,
     positions: HashMap<(u64, InstrumentId), i64>,
     engines: Vec<CapturedEngine>,
+    recent_command_ids: Vec<u64>,
 }
 
 struct CapturedEngine {
@@ -2637,6 +2763,7 @@ impl CapturedSnapshot {
                 suspended: &self.suspended,
                 positions: &positions,
                 engines: &engines,
+                recent_command_ids: Some(&self.recent_command_ids),
             },
         )
     }
@@ -2655,6 +2782,7 @@ fn capture_processor_snapshot(
         halted: processor.halted.iter().map(|instrument| instrument.0).collect(),
         suspended: processor.suspended.iter().copied().collect(),
         positions: processor.positions.clone(),
+        recent_command_ids: processor.seen_command_ids.to_vec(),
         engines: processor
             .engines
             .iter()
