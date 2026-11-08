@@ -32,6 +32,11 @@ name = "demo"
 path = "examples/demo.rs"
 
 [[bench]]
+name = "chaos_e2e"
+path = "benches/chaos_e2e.rs"
+harness = false
+
+[[bench]]
 name = "throughput"
 path = "benches/throughput.rs"
 harness = false

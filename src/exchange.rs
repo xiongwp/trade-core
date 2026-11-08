@@ -964,21 +964,46 @@ pub struct Processor {
 /// rejected on some replicas and matched again on others. Bounded: memory
 /// is `cap` ids no matter how long the node runs. All replicas of a group
 /// must use the same `cap` (`TC_DEDUP_WINDOW_IDS`).
+///
+/// A fixed ring (capture is at most two memcpys) with a multiplicative
+/// hash: only membership is ever read, so the hasher cannot affect results.
 #[derive(Clone)]
 pub(crate) struct RecentCommandIds {
-    set: std::collections::HashSet<u64>,
-    order: std::collections::VecDeque<u64>,
+    set: std::collections::HashSet<u64, std::hash::BuildHasherDefault<IdHasher>>,
+    ring: Vec<u64>,
+    /// Slot of the oldest id once the ring is full.
+    head: usize,
     cap: usize,
 }
 
-/// Default exact-dedupe window: 2M ids (~50 MB per group).
-pub const DEFAULT_COMMAND_ID_WINDOW: usize = 2_000_000;
+/// Default exact-dedupe window: 500k ids — 4 MB in every snapshot, which
+/// must also fit a single Raft snapshot message.
+pub const DEFAULT_COMMAND_ID_WINDOW: usize = 500_000;
+
+/// Fx-style hasher for u64 ids (the default SipHash costs ~4x per lookup).
+#[derive(Default, Clone, Copy)]
+pub(crate) struct IdHasher(u64);
+
+impl std::hash::Hasher for IdHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 = (self.0.rotate_left(5) ^ byte as u64).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+        }
+    }
+    fn write_u64(&mut self, value: u64) {
+        self.0 = (self.0.rotate_left(5) ^ value).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+}
 
 impl RecentCommandIds {
     fn new(cap: usize) -> Self {
         Self {
-            set: std::collections::HashSet::new(),
-            order: std::collections::VecDeque::new(),
+            set: Default::default(),
+            ring: Vec::new(),
+            head: 0,
             cap: cap.max(1),
         }
     }
@@ -988,23 +1013,28 @@ impl RecentCommandIds {
         if !self.set.insert(id) {
             return false;
         }
-        self.order.push_back(id);
-        while self.order.len() > self.cap {
-            if let Some(expired) = self.order.pop_front() {
-                self.set.remove(&expired);
-            }
+        if self.ring.len() < self.cap {
+            self.ring.push(id);
+        } else {
+            let expired = std::mem::replace(&mut self.ring[self.head], id);
+            self.set.remove(&expired);
+            self.head = (self.head + 1) % self.cap;
         }
         true
     }
 
     fn clear(&mut self) {
         self.set.clear();
-        self.order.clear();
+        self.ring.clear();
+        self.head = 0;
     }
 
     /// Oldest first: inserting them in this order rebuilds the same window.
     fn to_vec(&self) -> Vec<u64> {
-        self.order.iter().copied().collect()
+        let mut out = Vec::with_capacity(self.ring.len());
+        out.extend_from_slice(&self.ring[self.head..]);
+        out.extend_from_slice(&self.ring[..self.head]);
+        out
     }
 }
 
@@ -1339,7 +1369,12 @@ impl Processor {
 
     /// Apply one command, emitting every resulting report through `emit`.
     pub fn process(&mut self, cmd: Command, emit: &mut dyn FnMut(ExecReport)) {
-        let exact_id = cmd.id();
+        // A Batch is gated per inner command by the recursive calls; gating
+        // it on its first command's id here rejected that command itself.
+        let exact_id = match cmd {
+            Command::Batch(_) => 0,
+            _ => cmd.id(),
+        };
         if exact_id != 0 && (!self.seen_command_ids.insert(exact_id) || self.would_duplicate_live(&cmd)) {
             emit(ExecReport::CommandRejected {
                 instrument: cmd.instrument(),

@@ -28,7 +28,11 @@ use trade_core::wire::{self, MSG_LEN};
 use trade_core::{log_error, log_info, log_warn};
 
 const PROPOSAL_BATCH: usize = 512;
-const MAX_RAFT_MESSAGE_BYTES: usize = 16 << 20;
+/// Largest Raft frame accepted from a peer. A compaction snapshot travels as
+/// one message and carries every resting order plus the dedupe window, so
+/// the old 16 MiB limit left a lagging follower unable to ever catch up once
+/// the books grew (it reset the link on every attempt).
+const MAX_RAFT_MESSAGE_BYTES: usize = 256 << 20;
 
 /// Set by the SIGTERM/SIGINT handler (async-signal-safe: a lone atomic store).
 /// A watcher thread turns it into the normal drain path.
@@ -171,6 +175,13 @@ fn main() {
     let engine_snapshot_index = engine_snapshot
         .as_ref()
         .map_or(0, |snapshot| snapshot.raft_applied_index);
+    // A pre-v6 engine snapshot: its WAL tail was proved under the old rule,
+    // where retries already in the consensus id window were dropped before
+    // the engine. Recovery replays that tail under the same rule, so the
+    // proofs match; live traffic uses the replicated window from here on.
+    let legacy_snapshot = engine_snapshot
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.recent_command_ids.is_none());
     let legacy_command_ids = match &engine_snapshot {
         Some(snapshot) if snapshot.recent_command_ids.is_none() => recovered_committed
             .iter()
@@ -334,10 +345,17 @@ fn main() {
                 // Every committed command goes to the engine, whose replicated
                 // dedupe window rejects retries identically on every replica.
                 // `committed_ids` only lets a leader skip re-proposing them.
-                for command in &commands {
-                    committed_ids.remember(command.id(), index);
+                // Exception: a tail proved by a pre-window build is replayed
+                // under that build's filter (see `legacy_snapshot`).
+                let mut apply = Vec::with_capacity(commands.len());
+                for command in commands {
+                    let id = command.id();
+                    let dropped_by_old_build = legacy_snapshot && id != 0 && committed_ids.contains(id);
+                    committed_ids.remember(id, index);
+                    if !dropped_by_old_build {
+                        apply.push(command);
+                    }
                 }
-                let apply = commands;
                 if apply.is_empty() {
                     runtime_metrics.set_raft_enqueued_index(index);
                     runtime_metrics.set_raft_applied_index(index);
@@ -405,6 +423,14 @@ fn main() {
                     pending.clear();
                     commit_waiters.clear();
                     commit_started.clear();
+                }
+                // A request can still arrive after the step-down pass above
+                // (the intake saw `accepting` just before it flipped). Never
+                // keep it: proposing it in a later term would apply it long
+                // after its caller timed out and resent it to the new leader.
+                // Dropping the reply channel fails the caller, which rewinds.
+                if !leader && !pending.is_empty() {
+                    pending.clear();
                 }
                 was_leader = leader;
                 runtime_leadership.store(leader, Ordering::Release);

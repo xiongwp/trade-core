@@ -198,18 +198,18 @@ pub(crate) fn run_db_kafka_stage(
         };
         let mut batch = Vec::with_capacity(kafka.batch_size);
         if let Ok(message) = first {
-            if let Ok(record) = decode_db_kafka_record(&message, category_size, forwarder.routing) {
-                batch.push(record);
+            match decode_db_kafka_record(&message, category_size, forwarder.routing) {
+                Ok(record) => batch.push(record),
+                Err(error) => dead_letter_command("db", &message, &error),
             }
         }
         let deadline = std::time::Instant::now() + kafka.linger;
         while batch.len() < kafka.batch_size && std::time::Instant::now() < deadline {
             match consumer.poll(deadline.saturating_duration_since(std::time::Instant::now())) {
                 Some(Ok(message)) => {
-                    if let Ok(record) =
-                        decode_db_kafka_record(&message, category_size, forwarder.routing)
-                    {
-                        batch.push(record);
+                    match decode_db_kafka_record(&message, category_size, forwarder.routing) {
+                        Ok(record) => batch.push(record),
+                        Err(error) => dead_letter_command("db", &message, &error),
                     }
                 }
                 _ => break,
@@ -296,7 +296,7 @@ pub(crate) fn run_kafka_stage<F>(
             Ok(message) => match decode_kafka_record(&message, &kafka.router, category_size) {
                 Ok(record) => batch.push(record),
                 Err(error) => {
-                    log_warn!("order-kafka", format_args!("{stage}-{worker}"); "event=rejected_message partition={} offset={} error={error}", message.partition(), message.offset())
+                    dead_letter_command(stage, &message, &error)
                 }
             },
             Err(error) => {
@@ -315,7 +315,7 @@ pub(crate) fn run_kafka_stage<F>(
                     match decode_kafka_record(&message, &kafka.router, category_size) {
                         Ok(record) => batch.push(record),
                         Err(error) => {
-                            log_warn!("order-kafka", format_args!("{stage}-{worker}"); "event=rejected_message partition={} offset={} error={error}", message.partition(), message.offset())
+                            dead_letter_command(stage, &message, &error)
                         }
                     }
                 }

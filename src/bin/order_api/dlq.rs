@@ -141,3 +141,35 @@ where
         }
     }
 }
+
+/// Dead-letter a command-topic message that cannot be decoded or is routed
+/// to the wrong place (e.g. produced under another `route_version` during a
+/// rolling deploy) before its offset is committed past. Skipping it with
+/// only a log line silently lost an order whose client had already been
+/// told ACCEPTED (audit I1); now the raw payload is kept durably
+/// (`TC_ORDER_COMMAND_DLQ_PATH`) for an operator to replay. If even the
+/// dead-letter write fails, the process stops before the offset moves, so
+/// the message is redelivered rather than lost.
+pub(crate) fn dead_letter_command(
+    stage: &str,
+    message: &rdkafka::message::BorrowedMessage<'_>,
+    error: &str,
+) {
+    static DLQ: std::sync::OnceLock<Mutex<DlqWriter>> = std::sync::OnceLock::new();
+    static DEAD_LETTERED: AtomicU64 = AtomicU64::new(0);
+    let dlq = DLQ.get_or_init(|| {
+        let path = std::env::var("TC_ORDER_COMMAND_DLQ_PATH")
+            .unwrap_or_else(|_| "order-command-dlq.wal".into());
+        Mutex::new(DlqWriter::open(Path::new(&path)).expect("open command DLQ file"))
+    });
+    let reason = format!("{stage}: {error}");
+    let payload = rdkafka::message::Message::payload(message).unwrap_or_default();
+    let partition = rdkafka::message::Message::partition(message);
+    let offset = rdkafka::message::Message::offset(message);
+    dlq.lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .append(partition, offset, &reason, payload)
+        .unwrap_or_else(|io| panic!("command DLQ append failed ({io}); refusing to skip offset {offset}"));
+    let total = DEAD_LETTERED.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+    log_error!("order-kafka", stage; "event=command_dead_lettered partition={partition} offset={offset} total={total} error={error}");
+}
