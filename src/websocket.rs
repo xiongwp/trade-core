@@ -57,21 +57,49 @@ pub fn write_frame(w: &mut impl Write, opcode: u8, payload: &[u8]) -> io::Result
     w.write_all(payload)
 }
 
-/// Read the next complete data message from a client. Answers pings with
-/// pongs and a close with a close; returns `Ok(None)` once the client closed
-/// (or the stream ended cleanly between frames).
-///
-/// Rejects (with `InvalidData`) what a server must not accept: unmasked
-/// client frames, fragmented or oversized control frames, a continuation
-/// without a start, a new message inside a fragmented one, reserved bits,
-/// and messages larger than `max_len` bytes (checked before reading them).
-pub fn read_message(
+/// One thing a client sent: a complete data message, or a control frame the
+/// caller must answer itself (when several threads share the socket, only
+/// the writer may write, so control replies cannot be sent from here).
+#[derive(Debug, PartialEq, Eq)]
+pub enum ClientEvent {
+    Message(Message),
+    Ping(Vec<u8>),
+    /// The client closed; carries its status code bytes (if any) to echo.
+    Close(Vec<u8>),
+}
+
+/// Reads [`ClientEvent`]s from one connection. Keeps a fragmented message's
+/// reassembly state between calls, so a ping arriving between fragments is
+/// returned without losing the partial message.
+#[derive(Default)]
+pub struct EventReader {
+    message: Option<(u8, Vec<u8>)>,
+}
+
+impl EventReader {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Read the next [`ClientEvent`]: data messages are reassembled from
+    /// fragments, pongs are skipped. `Ok(None)` = the stream ended cleanly
+    /// between messages.
+    ///
+    /// Rejects (with `InvalidData`) what a server must not accept: unmasked
+    /// client frames, fragmented or oversized control frames, a continuation
+    /// without a start, a new message inside a fragmented one, reserved bits,
+    /// and messages larger than `max_len` bytes (checked before reading them).
+    pub fn next(&mut self, r: &mut impl Read, max_len: usize) -> io::Result<Option<ClientEvent>> {
+        read_event_into(&mut self.message, r, max_len)
+    }
+}
+
+fn read_event_into(
+    message: &mut Option<(u8, Vec<u8>)>,
     r: &mut impl Read,
-    w: &mut impl Write,
     max_len: usize,
-) -> io::Result<Option<Message>> {
+) -> io::Result<Option<ClientEvent>> {
     let invalid = |msg: &str| io::Error::new(io::ErrorKind::InvalidData, msg.to_string());
-    let mut message: Option<(u8, Vec<u8>)> = None;
     loop {
         let mut head = [0u8; 2];
         match r.read_exact(&mut head[..1]) {
@@ -119,18 +147,17 @@ pub fn read_message(
             *byte ^= mask[i % 4];
         }
         match opcode {
-            OP_PING => write_frame(w, OP_PONG, &payload)?,
+            OP_PING => return Ok(Some(ClientEvent::Ping(payload))),
             OP_PONG => {}
             OP_CLOSE => {
-                // Echo the status code (if any) and stop.
-                let _ = write_frame(w, OP_CLOSE, &payload[..payload.len().min(2)]);
-                return Ok(None);
+                payload.truncate(2);
+                return Ok(Some(ClientEvent::Close(payload)));
             }
             OP_TEXT | OP_BINARY => {
                 if message.is_some() {
                     return Err(invalid("new message inside a fragmented one"));
                 }
-                message = Some((opcode, payload));
+                *message = Some((opcode, payload));
             }
             OP_CONTINUATION => match message.as_mut() {
                 Some((_, data)) => data.extend_from_slice(&payload),
@@ -140,12 +167,36 @@ pub fn read_message(
         }
         if fin && !control {
             if let Some((opcode, data)) = message.take() {
-                return Ok(Some(if opcode == OP_TEXT {
+                return Ok(Some(ClientEvent::Message(if opcode == OP_TEXT {
                     Message::Text(data)
                 } else {
                     Message::Binary(data)
-                }));
+                })));
             }
+        }
+    }
+}
+
+/// Read the next complete data message from a client, answering pings with
+/// pongs and a close with a close on `w` (single-threaded sessions). Returns
+/// `Ok(None)` once the client closed or the stream ended between frames.
+/// Validation as for [`read_event`]. A ping inside a fragmented message is
+/// answered after that message completes.
+pub fn read_message(
+    r: &mut impl Read,
+    w: &mut impl Write,
+    max_len: usize,
+) -> io::Result<Option<Message>> {
+    let mut events = EventReader::new();
+    loop {
+        match events.next(r, max_len)? {
+            Some(ClientEvent::Message(message)) => return Ok(Some(message)),
+            Some(ClientEvent::Ping(payload)) => write_frame(w, OP_PONG, &payload)?,
+            Some(ClientEvent::Close(code)) => {
+                let _ = write_frame(w, OP_CLOSE, &code);
+                return Ok(None);
+            }
+            None => return Ok(None),
         }
     }
 }

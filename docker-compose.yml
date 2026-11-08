@@ -124,6 +124,25 @@ services:
           "${TC_EXECUTION_CURSOR_TOPIC:-trade-execution-outbox-cursors-v1}"
     restart: "no"
 
+  # Private real-time push: each user's order results (committed, fills,
+  # cancels, rejects) from the execution topic, no database.
+  #   ws://localhost:9300/ws/user?user=<id>  (Authorization: Bearer <token>)
+  user-stream:
+    image: trade-core-node
+    command: ["exec user-stream"]
+    ports: ["9300:9300"]
+    environment:
+      TC_USER_STREAM_ADDR: 0.0.0.0:9300
+      TC_USER_STREAM_TOKEN: ${TC_USER_STREAM_TOKEN:-local-order-api-token}
+      TC_EXECUTION_KAFKA_BROKERS: ${TC_EXECUTION_KAFKA_BROKERS:-redpanda:9092,redpanda-2:9092,redpanda-3:9092}
+      TC_EXECUTION_KAFKA_TOPIC: ${TC_EXECUTION_KAFKA_TOPIC:-trade-executions-v1}
+      TC_LOG: ${TC_LOG:-info}
+      RUST_BACKTRACE: ${RUST_BACKTRACE:-1}
+    depends_on:
+      redpanda-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
   market-data:
     image: trade-core-node
     command: ["exec market-data raft-1:9101,raft-2:9101,raft-3:9101,raft-4:9101,raft-5:9101,raft-1:9111,raft-2:9111,raft-3:9111,raft-4:9111,raft-5:9111,raft-1:9121,raft-2:9121,raft-3:9121,raft-4:9121,raft-5:9121,raft-1:9131,raft-2:9131,raft-3:9131,raft-4:9131,raft-5:9131 0.0.0.0:8080 /data/md"]

@@ -15,13 +15,14 @@ RUN cargo build --release \
     --bin raft-sim \
     --bin raft-node \
     --bin raft-multi-node \
-    --bin trade-core --bin order --bin order-api --bin market-data --bin order_client --bin order_load \
+    --bin trade-core --bin order --bin order-api --bin user-stream --bin market-data --bin order_client --bin order_load \
     --bin journal-inspect
 
 FROM debian:stable-slim
 COPY --from=build /src/target/release/trade-core /usr/local/bin/trade-core
 COPY --from=build /src/target/release/order /usr/local/bin/order
 COPY --from=build /src/target/release/order-api /usr/local/bin/order-api
+COPY --from=build /src/target/release/user-stream /usr/local/bin/user-stream
 COPY --from=build /src/target/release/market-data /usr/local/bin/market-data
 COPY --from=build /src/target/release/order_client /usr/local/bin/order_client
 COPY --from=build /src/target/release/order_load /usr/local/bin/order_load

@@ -108,5 +108,9 @@ name = "order-api"
 path = "src/bin/order_api.rs"
 
 [[bin]]
+name = "user-stream"
+path = "src/bin/user_stream.rs"
+
+[[bin]]
 name = "journal-inspect"
 path = "src/bin/journal_inspect.rs"
