@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use trade_core::exchange::{fingerprint_reports, ExecReport, Processor};
+use trade_core::exchange::{fingerprint_reports, proof_digest, ExecReport, Processor};
 use trade_core::execution_outbox::{
     segment_paths, ExecutionOutboxReader, ExecutionOutboxWriter, OUTBOX_RECORD_LEN_V1,
 };
@@ -289,4 +289,46 @@ fn v2_execution_events_still_decode_without_an_owner() {
     let decoded = wire::decode_execution_event(&v2).unwrap();
     assert_eq!(decoded, wire::decode_execution_event(&v3).unwrap());
     assert_eq!(wire::execution_event_target_user(&v2), 0);
+}
+
+#[test]
+fn a_maker_filled_completely_is_reported_to_its_owner_but_not_proved() {
+    let mut p = Processor::new(|| Box::new(PriceTimePriority), None);
+    run(&mut p, limit(1, Side::Sell, 100, 5, 601));
+    run(&mut p, limit(2, Side::Sell, 101, 5, 602));
+
+    // Takes all of #1 and part of #2: only #1 is reported filled.
+    let reports = run(&mut p, limit(3, Side::Buy, 101, 7, 603));
+    let maker_filled: Vec<_> = reports
+        .iter()
+        .filter_map(|r| match r {
+            ExecReport::MakerFilled { order_id, user, .. } => Some((order_id.0, *user)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(maker_filled, vec![(1, 601)], "{reports:?}");
+    // It follows the trade that filled the maker.
+    let at = reports
+        .iter()
+        .position(|r| matches!(r, ExecReport::MakerFilled { .. }))
+        .unwrap();
+    assert!(matches!(
+        reports[at - 1],
+        ExecReport::Trade {
+            maker: OrderId(1),
+            ..
+        }
+    ));
+
+    // Raft application proofs written before MakerFilled existed must still
+    // verify: the digest ignores it.
+    let legacy: Vec<ExecReport> = reports
+        .iter()
+        .filter(|r| !matches!(r, ExecReport::MakerFilled { .. }))
+        .cloned()
+        .collect();
+    assert_eq!(
+        proof_digest(&reports),
+        (legacy.len() as u32, fingerprint_reports(&legacy))
+    );
 }

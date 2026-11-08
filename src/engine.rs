@@ -386,6 +386,7 @@ impl MatchingEngine {
                     timestamp: self.seq,
                     maker_user,
                     taker_user: order.user,
+                    maker_remaining: maker.remaining - a.qty,
                 });
                 order.remaining -= a.qty;
                 *budget_left = budget_left.saturating_sub(px as u128 * a.qty as u128);

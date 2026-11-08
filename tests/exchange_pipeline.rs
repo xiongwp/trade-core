@@ -54,18 +54,28 @@ fn committed_batch_reports_carry_stable_event_order() {
     ];
 
     gw.submit_committed(88, Command::Batch(commands)).unwrap();
-    let events = collect_events(&sink, 5);
+    // Accepted, Resting | Accepted, Trade, MakerFilled (order 1 fully
+    // filled), Filled.
+    let events = collect_events(&sink, 6);
     handle.shutdown();
 
-    assert_eq!(events.len(), 5);
+    assert_eq!(events.len(), 6);
     for (ordinal, event) in events.iter().enumerate() {
         assert_eq!(event.raft_index, Some(88));
         assert_eq!(event.ordinal, ordinal as u32);
     }
     assert!(matches!(events[0].report, ExecReport::Accepted { .. }));
-    assert!(events
+    let trade = events
         .iter()
-        .any(|event| matches!(event.report, ExecReport::Trade { .. })));
+        .position(|event| matches!(event.report, ExecReport::Trade { .. }))
+        .expect("a trade");
+    assert!(matches!(
+        events[trade + 1].report,
+        ExecReport::MakerFilled {
+            order_id: OrderId(1),
+            ..
+        }
+    ));
 }
 
 #[test]

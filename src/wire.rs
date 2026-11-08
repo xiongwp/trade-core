@@ -172,6 +172,8 @@ pub const RT_CMD_REJECTED: u8 = 16;
 pub const RT_STOP_ACCEPTED: u8 = 17;
 /// A conditional order fired; its ordinary-order reports follow.
 pub const RT_TRIGGERED: u8 = 18;
+/// A maker order filled completely by the preceding trade (informational).
+pub const RT_MAKER_FILLED: u8 = 19;
 
 /// A borrowed view over one wire frame. Reads fields in place; copies nothing.
 #[derive(Clone, Copy)]
@@ -587,6 +589,11 @@ pub fn encode_report(r: &ExecReport, out: &mut [u8; REPORT_LEN]) {
             order_id,
             ..
         } => put(RT_TRIGGERED, instrument, order_id, 0, 0, 0, 0),
+        ExecReport::MakerFilled {
+            instrument,
+            order_id,
+            ..
+        } => put(RT_MAKER_FILLED, instrument, order_id, 0, 0, 0, 0),
         ExecReport::CommandRejected {
             instrument,
             command_id,
@@ -887,6 +894,7 @@ impl fmt::Display for DecodedReport {
             ),
             RT_STOP_ACCEPTED => write!(f, "STOP       {} {}", self.instrument, self.order_id),
             RT_TRIGGERED => write!(f, "TRIGGERED  {} {}", self.instrument, self.order_id),
+            RT_MAKER_FILLED => write!(f, "MKRFILLED  {} {}", self.instrument, self.order_id),
             RT_CMD_REJECTED => write!(
                 f,
                 "CMDREJECT  {} command {} ({})",

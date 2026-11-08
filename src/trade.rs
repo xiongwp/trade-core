@@ -24,6 +24,9 @@ pub struct Trade {
     /// Owning users (position tracking); 0 = unattributed.
     pub maker_user: u64,
     pub taker_user: u64,
+    /// The maker's unfilled quantity after this trade (0 = it filled
+    /// completely and left the book).
+    pub maker_remaining: Qty,
 }
 
 /// The terminal (or resting) state of a submitted order.

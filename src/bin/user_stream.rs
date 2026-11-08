@@ -167,6 +167,7 @@ fn event_json(payload: &[u8]) -> Option<(u64, String)> {
         }
         wire::RT_PARTIAL => format!("{{\"e\":\"PARTIAL\",{base},\"filled_qty\":{}}}", report.qty),
         wire::RT_FILLED => format!("{{\"e\":\"FILLED\",{base}}}"),
+        wire::RT_MAKER_FILLED => format!("{{\"e\":\"FILLED\",{base},\"role\":\"maker\"}}"),
         wire::RT_RESTING => format!("{{\"e\":\"RESTING\",{base}}}"),
         wire::RT_CANCELLED => format!("{{\"e\":\"CANCELLED\",{base}}}"),
         wire::RT_MODIFIED => format!("{{\"e\":\"MODIFIED\",{base},\"remaining\":{}}}", report.qty),
@@ -514,6 +515,20 @@ mod tests {
             .unwrap()
             .1
             .contains(r#""conditional":true"#));
+
+        let maker_filled = ExecReport::MakerFilled {
+            instrument: sym,
+            order_id: OrderId(1),
+            user: 11,
+        };
+        assert_eq!(
+            event_json(&payload(&maker_filled, 1)).unwrap(),
+            (
+                11,
+                r#"{"e":"FILLED","order_id":1,"user":11,"instrument":5,"event_id":"7:42:3","role":"maker"}"#
+                    .into()
+            )
+        );
 
         // No owner, nothing to push.
         let unowned = ExecReport::NotFound {

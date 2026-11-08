@@ -53,7 +53,8 @@ fn snapshot_plus_raft_tail_replay_is_identical_and_emits_no_duplicate_results() 
                 ]),
             )
             .unwrap();
-        assert_eq!(collect(&sink, 5).len(), 5);
+        // Accepted, Resting, Accepted, Trade, MakerFilled, Filled.
+        assert_eq!(collect(&sink, 6).len(), 6);
 
         handle.snapshot_now();
         let snapshot_path = journal.join("snapshot-shard-0.bin");

@@ -233,6 +233,16 @@ pub enum ExecReport {
         order_id: OrderId,
         user: u64,
     },
+    /// A resting (maker) order was filled completely by the trade just
+    /// reported, so its owner can be told without tracking quantities.
+    /// Informational: it changes no state the projection does not already
+    /// derive from the trade, and it is left out of Raft application proofs
+    /// ([`proof_digest`]) so entries proved before it existed still verify.
+    MakerFilled {
+        instrument: InstrumentId,
+        order_id: OrderId,
+        user: u64,
+    },
     /// A command was refused without changing any order: a re-sent duplicate,
     /// or an amend that breaks the instrument's trading rules. `command_id` is
     /// the refused command's own id — for a duplicate `New` that is also the
@@ -305,6 +315,7 @@ impl ExecReport {
             | ExecReport::Rejected { user, .. }
             | ExecReport::StopAccepted { user, .. }
             | ExecReport::Triggered { user, .. }
+            | ExecReport::MakerFilled { user, .. }
             | ExecReport::Modified { user, .. } => [user, 0],
             _ => [0, 0],
         }
@@ -1396,6 +1407,13 @@ impl Processor {
                                 taker_user: t.taker_user,
                                 maker_user: t.maker_user,
                             });
+                            if t.maker_remaining == 0 {
+                                emit(ExecReport::MakerFilled {
+                                    instrument,
+                                    order_id: t.maker,
+                                    user: t.maker_user,
+                                });
+                            }
                         }
                         let remaining = new_qty.saturating_sub(report.filled);
                         match report.status {
@@ -1609,6 +1627,13 @@ impl Processor {
                 taker_user: t.taker_user,
                 maker_user: t.maker_user,
             });
+            if t.maker_remaining == 0 {
+                emit(ExecReport::MakerFilled {
+                    instrument,
+                    order_id: t.maker,
+                    user: t.maker_user,
+                });
+            }
         }
         let last_price = trades.last().map(|t| t.price);
         self.trades_buf = trades;
@@ -2204,8 +2229,8 @@ impl Shard {
                 self.processor
                     .process(command, &mut |report| reports.push(report));
             }
-            let fingerprint = fingerprint_reports(&reports);
-            crate::asset_log::verify_applied_batch(proof, reports.len() as u32, fingerprint)
+            let (count, fingerprint) = proof_digest(&reports);
+            crate::asset_log::verify_applied_batch(proof, count, fingerprint)
                 .unwrap_or_else(|error| panic!("{error}"));
             self.last_raft_index = raft_index;
             self.metrics.set_raft_applied_index(raft_index);
@@ -2332,13 +2357,14 @@ impl Shard {
                 .iter()
                 .map(|event| event.report.clone())
                 .collect::<Vec<_>>();
+            let (count, fingerprint) = proof_digest(&reports);
             crate::asset_log::mark_applied_batch(
                 self.applied_root
                     .as_deref()
                     .expect("Raft authoritative matching requires an application proof dir"),
                 raft_index,
-                reports.len() as u32,
-                fingerprint_reports(&reports),
+                count,
+                fingerprint,
             )
             .expect("persist exact Raft application result proof");
         } else if let Some(asset_journal) = &self.asset_journal {
@@ -2722,6 +2748,25 @@ pub fn fingerprint_engine_states(
         }
     }
     h
+}
+
+/// `(count, fingerprint)` of a Raft entry's result stream as recorded in and
+/// checked against application proofs. [`ExecReport::MakerFilled`] is left
+/// out: it is derived from the trade before it, and entries proved before it
+/// existed must replay to the same digest.
+pub fn proof_digest(reports: &[ExecReport]) -> (u32, u64) {
+    if !reports
+        .iter()
+        .any(|r| matches!(r, ExecReport::MakerFilled { .. }))
+    {
+        return (reports.len() as u32, fingerprint_reports(reports));
+    }
+    let proved: Vec<ExecReport> = reports
+        .iter()
+        .filter(|r| !matches!(r, ExecReport::MakerFilled { .. }))
+        .cloned()
+        .collect();
+    (proved.len() as u32, fingerprint_reports(&proved))
 }
 
 /// FNV-1a fingerprint of a report stream (order-sensitive). Two runs with equal

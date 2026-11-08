@@ -64,10 +64,14 @@ fn committed_batch_is_durable_in_outbox_before_watermark_and_survives_restart() 
             Command::New(Order::limit(OrderId(2), Side::Buy, 100, 5).on(instrument)),
         ];
         gw.submit_committed(88, Command::Batch(commands)).unwrap();
-        let events = collect_events(&sink, 5);
-        assert_eq!(events.len(), 5, "the crossing batch emits five reports");
+        let events = collect_events(&sink, 6);
+        assert_eq!(
+            events.len(),
+            6,
+            "the crossing batch emits six reports (incl. MakerFilled)"
+        );
         // Reports are delivered to the order system only after the batch is
-        // durable, so seeing all five means the watermark has advanced too.
+        // durable, so seeing all six means the watermark has advanced too.
         handle.shutdown();
     }
 
@@ -78,12 +82,12 @@ fn committed_batch_is_durable_in_outbox_before_watermark_and_survives_restart() 
         "batch 88 must be watermarked as applied"
     );
 
-    // ...and because the outbox fsync precedes the watermark, all five events
+    // ...and because the outbox fsync precedes the watermark, all six events
     // are already durable with their deterministic (raft_index, ordinal) ids.
     let durable = read_outbox_ids(&outbox_path);
     assert_eq!(
         durable,
-        vec![(88, 0), (88, 1), (88, 2), (88, 3), (88, 4)],
+        vec![(88, 0), (88, 1), (88, 2), (88, 3), (88, 4), (88, 5)],
         "every committed fill is durable, in deterministic order"
     );
 
@@ -92,7 +96,7 @@ fn committed_batch_is_durable_in_outbox_before_watermark_and_survives_restart() 
     // fills.
     let max_applied = applied.iter().max().copied();
     truncate_after_applied(&outbox_path, max_applied).unwrap();
-    assert_eq!(read_outbox_ids(&outbox_path).len(), 5);
+    assert_eq!(read_outbox_ids(&outbox_path).len(), 6);
 
     // Restarting the exchange runs the same recovery trim during build(); the
     // committed fills remain intact and the outbox stays appendable.
@@ -105,7 +109,7 @@ fn committed_batch_is_durable_in_outbox_before_watermark_and_survives_restart() 
         });
         handle.shutdown();
     }
-    assert_eq!(read_outbox_ids(&outbox_path).len(), 5);
+    assert_eq!(read_outbox_ids(&outbox_path).len(), 6);
 
     std::fs::remove_dir_all(root).ok();
 }
