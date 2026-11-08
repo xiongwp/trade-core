@@ -948,7 +948,10 @@ fn bootstrap(store: &OrderStore) -> mysql::Result<()> {
         conn.query_drop(format!("CREATE TABLE IF NOT EXISTS {db_name}.processed_commands (category_id INT UNSIGNED NOT NULL, kafka_partition INT NOT NULL, kafka_offset BIGINT UNSIGNED NOT NULL, command_id BIGINT UNSIGNED NOT NULL UNIQUE, user_id BIGINT UNSIGNED NOT NULL, shard_table INT UNSIGNED NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(category_id,kafka_offset), KEY idx_partition_offset (kafka_partition,kafka_offset)) ENGINE=InnoDB"))?;
         conn.query_drop(format!("CREATE TABLE IF NOT EXISTS {db_name}.processed_executions (kafka_partition INT NOT NULL, kafka_offset BIGINT UNSIGNED NOT NULL, instrument INT UNSIGNED NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(kafka_partition,kafka_offset), KEY idx_instrument_offset (instrument,kafka_offset)) ENGINE=InnoDB"))?;
         conn.query_drop(format!("CREATE TABLE IF NOT EXISTS {db_name}.processed_execution_events (raft_group INT UNSIGNED NOT NULL, raft_index BIGINT UNSIGNED NOT NULL, report_ordinal INT UNSIGNED NOT NULL, target_order_id BIGINT UNSIGNED NOT NULL, shard_table INT UNSIGNED NOT NULL, instrument INT UNSIGNED NOT NULL, report_type TINYINT UNSIGNED NOT NULL, kafka_partition INT NOT NULL, kafka_offset BIGINT UNSIGNED NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(raft_group,raft_index,report_ordinal,target_order_id), KEY idx_instrument_index (instrument,raft_index), KEY idx_order_event (target_order_id,raft_index)) ENGINE=InnoDB"))?;
-        conn.query_drop(format!("CREATE TABLE IF NOT EXISTS {db_name}.pending_execution_events (raft_group INT UNSIGNED NOT NULL, raft_index BIGINT UNSIGNED NOT NULL, report_ordinal INT UNSIGNED NOT NULL, target_order_id BIGINT UNSIGNED NOT NULL, shard_table INT UNSIGNED NOT NULL, instrument INT UNSIGNED NOT NULL, report_type TINYINT UNSIGNED NOT NULL, event_qty BIGINT UNSIGNED NOT NULL, kafka_partition INT NOT NULL, kafka_offset BIGINT UNSIGNED NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(raft_group,raft_index,report_ordinal,target_order_id), KEY idx_pending_table_order (shard_table,target_order_id,raft_index,report_ordinal)) ENGINE=InnoDB"))?;
+        conn.query_drop(format!("CREATE TABLE IF NOT EXISTS {db_name}.pending_execution_events (raft_group INT UNSIGNED NOT NULL, raft_index BIGINT UNSIGNED NOT NULL, report_ordinal INT UNSIGNED NOT NULL, target_order_id BIGINT UNSIGNED NOT NULL, shard_table INT UNSIGNED NOT NULL, instrument INT UNSIGNED NOT NULL, report_type TINYINT UNSIGNED NOT NULL, event_qty BIGINT UNSIGNED NOT NULL, event_price BIGINT UNSIGNED NOT NULL DEFAULT 0, event_fee BIGINT UNSIGNED NOT NULL DEFAULT 0, fill_role TINYINT UNSIGNED NOT NULL DEFAULT 0, kafka_partition INT NOT NULL, kafka_offset BIGINT UNSIGNED NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(raft_group,raft_index,report_ordinal,target_order_id), KEY idx_pending_table_order (shard_table,target_order_id,raft_index,report_ordinal)) ENGINE=InnoDB"))?;
+        // One row per (fill, side): a Trade is materialized once for the taker
+        // and once for the maker, keyed exactly like processed_execution_events.
+        conn.query_drop(format!("CREATE TABLE IF NOT EXISTS {db_name}.order_fills (raft_group INT UNSIGNED NOT NULL, raft_index BIGINT UNSIGNED NOT NULL, report_ordinal INT UNSIGNED NOT NULL, order_id BIGINT UNSIGNED NOT NULL, user_id BIGINT UNSIGNED NOT NULL, instrument INT UNSIGNED NOT NULL, side TINYINT NOT NULL, price BIGINT UNSIGNED NOT NULL, qty BIGINT UNSIGNED NOT NULL, fee BIGINT UNSIGNED NOT NULL, fill_role TINYINT UNSIGNED NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(raft_group,raft_index,report_ordinal,order_id), KEY idx_fill_order (order_id,created_at), KEY idx_fill_user_created (user_id,created_at)) ENGINE=InnoDB"))?;
         // Rows staged before `projects_order_state` existed (NotFound, halt
         // acks) can never be promoted; drop them once at startup.
         conn.query_drop(format!(
@@ -956,7 +959,47 @@ fn bootstrap(store: &OrderStore) -> mysql::Result<()> {
             projected_report_types_sql()
         ))?;
         for table in 0..store.routing.tables_per_db {
-            conn.query_drop(format!("CREATE TABLE IF NOT EXISTS {db_name}.asset_orders_{table:03} (row_seq BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, order_id BIGINT UNSIGNED NOT NULL UNIQUE, category_id INT UNSIGNED NOT NULL, user_id BIGINT UNSIGNED NOT NULL, instrument INT UNSIGNED NOT NULL, side TINYINT NOT NULL, price BIGINT UNSIGNED NOT NULL, qty BIGINT UNSIGNED NOT NULL, filled_qty BIGINT UNSIGNED NOT NULL DEFAULT 0, status VARCHAR(16) NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, KEY idx_category_row (category_id,row_seq), KEY idx_user_created (user_id,created_at)) ENGINE=InnoDB"))?;
+            conn.query_drop(format!("CREATE TABLE IF NOT EXISTS {db_name}.asset_orders_{table:03} (row_seq BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, order_id BIGINT UNSIGNED NOT NULL UNIQUE, category_id INT UNSIGNED NOT NULL, user_id BIGINT UNSIGNED NOT NULL, instrument INT UNSIGNED NOT NULL, side TINYINT NOT NULL, price BIGINT UNSIGNED NOT NULL, qty BIGINT UNSIGNED NOT NULL, filled_qty BIGINT UNSIGNED NOT NULL DEFAULT 0, filled_notional DECIMAL(38,0) NOT NULL DEFAULT 0, status VARCHAR(16) NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, KEY idx_category_row (category_id,row_seq), KEY idx_user_created (user_id,created_at)) ENGINE=InnoDB"))?;
+        }
+        add_missing_columns(&mut conn, &db_name, store.routing.tables_per_db)?;
+    }
+    Ok(())
+}
+
+/// Columns added after the first deployments. `CREATE TABLE IF NOT EXISTS`
+/// leaves existing tables alone, and MySQL 8.4 has no `ADD COLUMN IF NOT
+/// EXISTS`, so add whatever information_schema reports missing. Each is
+/// trailing with a constant default, which 8.4 applies as an INSTANT change.
+const PENDING_EVENT_COLUMNS: &[(&str, &str)] = &[
+    ("event_price", "BIGINT UNSIGNED NOT NULL DEFAULT 0"),
+    ("event_fee", "BIGINT UNSIGNED NOT NULL DEFAULT 0"),
+    ("fill_role", "TINYINT UNSIGNED NOT NULL DEFAULT 0"),
+];
+const ASSET_ORDER_COLUMNS: &[(&str, &str)] =
+    &[("filled_notional", "DECIMAL(38,0) NOT NULL DEFAULT 0")];
+
+fn add_missing_columns(
+    conn: &mut mysql::PooledConn,
+    db_name: &str,
+    tables_per_db: u64,
+) -> mysql::Result<()> {
+    let present: std::collections::HashSet<(String, String)> = conn
+        .exec::<(String, String), _, _>(
+            "SELECT TABLE_NAME, COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=?",
+            (db_name,),
+        )?
+        .into_iter()
+        .collect();
+    let mut wanted = vec![("pending_execution_events".to_string(), PENDING_EVENT_COLUMNS)];
+    wanted.extend((0..tables_per_db).map(|table| (format!("asset_orders_{table:03}"), ASSET_ORDER_COLUMNS)));
+    for (table, columns) in wanted {
+        let missing = columns
+            .iter()
+            .filter(|(column, _)| !present.contains(&(table.clone(), column.to_string())))
+            .map(|(column, ddl)| format!("ADD COLUMN {column} {ddl}"))
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            conn.query_drop(format!("ALTER TABLE {db_name}.{table} {}", missing.join(", ")))?;
         }
     }
     Ok(())
@@ -2588,6 +2631,36 @@ fn projects_order_state(type_code: u8) -> bool {
     )
 }
 
+/// `fill_role` values in `pending_execution_events` / `order_fills`.
+const FILL_ROLE_TAKER: u8 = 1;
+const FILL_ROLE_MAKER: u8 = 2;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TradeFill {
+    price: u64,
+    fee: u64,
+    role: u8,
+}
+
+/// The fill a Trade report means for one of its two target orders. A Trade is
+/// materialized once per side: `order_id` is the taker, `aux_id` the maker, and
+/// the event's `target_order_id` says which side this row is for.
+fn trade_fill(report: &wire::DecodedReport, target_order_id: u64) -> Option<TradeFill> {
+    if report.type_code != wire::RT_TRADE {
+        return None;
+    }
+    let (role, fee) = if target_order_id == report.order_id.0 {
+        (FILL_ROLE_TAKER, report.taker_fee)
+    } else {
+        (FILL_ROLE_MAKER, report.maker_fee)
+    };
+    Some(TradeFill {
+        price: report.price,
+        fee,
+        role,
+    })
+}
+
 /// SQL list of the report types [`projects_order_state`] accepts.
 fn projected_report_types_sql() -> String {
     (0..=u8::MAX)
@@ -2649,11 +2722,12 @@ fn persist_execution_shard(
         let mut tx = conn
             .start_transaction(TxOpts::default())
             .map_err(|error| error.to_string())?;
-        let mut values = Vec::with_capacity(chunk.len() * 10);
+        let mut values = Vec::with_capacity(chunk.len() * 13);
         let mut touched = std::collections::BTreeSet::new();
         for (table, record, target_order_id) in chunk {
             touched.insert(*table);
             let event = record.event;
+            let fill = trade_fill(&event.report, *target_order_id);
             values.extend([
                 Value::from(event.raft_group),
                 Value::from(event.raft_index),
@@ -2663,14 +2737,17 @@ fn persist_execution_shard(
                 Value::from(event.report.instrument.0),
                 Value::from(event.report.type_code),
                 Value::from(event.report.qty),
+                Value::from(fill.map_or(0, |fill| fill.price)),
+                Value::from(fill.map_or(0, |fill| fill.fee)),
+                Value::from(fill.map_or(0, |fill| fill.role)),
                 Value::from(record.partition),
                 Value::from(record.offset as u64),
             ]);
         }
         exec_multi_insert(
             &mut tx,
-            &format!("INSERT IGNORE INTO {db}.pending_execution_events (raft_group,raft_index,report_ordinal,target_order_id,shard_table,instrument,report_type,event_qty,kafka_partition,kafka_offset)"),
-            10,
+            &format!("INSERT IGNORE INTO {db}.pending_execution_events (raft_group,raft_index,report_ordinal,target_order_id,shard_table,instrument,report_type,event_qty,event_price,event_fee,fill_role,kafka_partition,kafka_offset)"),
+            13,
             values,
         )
         .map_err(|error| error.to_string())?;
@@ -2717,7 +2794,8 @@ fn apply_pending_execution_table(
                 SUM(IF(report_type={trade},event_qty,0)) trade_qty, \
                 MAX(IF(report_type={partial},event_qty,0)) partial_qty, \
                 MAX(IF(report_type={filled},1,0)) has_filled, \
-                MAX(IF(rn=1,report_type,0)) latest_type \
+                MAX(IF(rn=1,report_type,0)) latest_type, \
+                SUM(IF(report_type={trade},CAST(event_qty AS DECIMAL(38,0))*event_price,0)) trade_notional \
          FROM ( \
            SELECT p.*, ROW_NUMBER() OVER (PARTITION BY target_order_id ORDER BY raft_index DESC,report_ordinal DESC) rn \
            FROM {db}.pending_execution_events p WHERE shard_table={shard_table} \
@@ -2730,7 +2808,8 @@ fn apply_pending_execution_table(
                WHEN e.latest_type={stop_accepted} THEN 'UNTRIGGERED' \
                WHEN GREATEST(o.filled_qty+e.trade_qty,e.partial_qty)>0 THEN 'PARTIAL' \
                ELSE 'OPEN' END, \
-             o.filled_qty=LEAST(o.qty,GREATEST(o.filled_qty+e.trade_qty,e.partial_qty,IF(e.has_filled=1,o.qty,0)))",
+             o.filled_qty=LEAST(o.qty,GREATEST(o.filled_qty+e.trade_qty,e.partial_qty,IF(e.has_filled=1,o.qty,0))), \
+             o.filled_notional=o.filled_notional+e.trade_notional",
         trade = wire::RT_TRADE,
         partial = wire::RT_PARTIAL,
         filled = wire::RT_FILLED,
@@ -2743,6 +2822,17 @@ fn apply_pending_execution_table(
         "INSERT IGNORE INTO {db}.processed_execution_events (raft_group,raft_index,report_ordinal,target_order_id,shard_table,instrument,report_type,kafka_partition,kafka_offset) \
          SELECT p.raft_group,p.raft_index,p.report_ordinal,p.target_order_id,p.shard_table,p.instrument,p.report_type,p.kafka_partition,p.kafka_offset \
          FROM {db}.pending_execution_events p INNER JOIN {db}.{table} o ON o.order_id=p.target_order_id WHERE p.shard_table={shard_table}"
+    ))
+    .map_err(|error| error.to_string())?;
+    // Same join as the promotion above, so a fill lands exactly when its event
+    // is promoted (an event whose order row is not projected yet waits in
+    // pending for both). The order row supplies user_id and side.
+    tx.query_drop(format!(
+        "INSERT IGNORE INTO {db}.order_fills (raft_group,raft_index,report_ordinal,order_id,user_id,instrument,side,price,qty,fee,fill_role,created_at) \
+         SELECT p.raft_group,p.raft_index,p.report_ordinal,p.target_order_id,o.user_id,p.instrument,o.side,p.event_price,p.event_qty,p.event_fee,p.fill_role,p.created_at \
+         FROM {db}.pending_execution_events p INNER JOIN {db}.{table} o ON o.order_id=p.target_order_id \
+         WHERE p.shard_table={shard_table} AND p.report_type={trade}",
+        trade = wire::RT_TRADE,
     ))
     .map_err(|error| error.to_string())?;
     tx.query_drop(format!(
@@ -2791,6 +2881,7 @@ fn open_when_ready(
     routing: sharding::RouteConfig,
     metrics: Arc<OrderPipelineMetrics>,
     owned_dbs: Arc<std::collections::HashSet<u32>>,
+    run_bootstrap: bool,
 ) -> OrderStore {
     loop {
         let opened = (|| -> mysql::Result<OrderStore> {
@@ -2815,7 +2906,7 @@ fn open_when_ready(
                 routing,
                 metrics: metrics.clone(),
             };
-            if env_enabled("TC_MYSQL_BOOTSTRAP_SCHEMA", true) {
+            if run_bootstrap && env_enabled("TC_MYSQL_BOOTSTRAP_SCHEMA", true) {
                 bootstrap(&store)?;
             }
             Ok(store)
@@ -3017,6 +3108,307 @@ fn parse_matcher_groups() -> Vec<Vec<MatcherTarget>> {
     }]]
 }
 
+// ---------------------------------------------------------------------------
+// Order queries: Binance-style reads served purely from the MySQL projection.
+// They lag the engine by the projection delay; real-time state is the user
+// push stream's job, which does not go through MySQL at all.
+// ---------------------------------------------------------------------------
+
+const QUERY_DEFAULT_LIMIT: usize = 100;
+const QUERY_MAX_LIMIT: usize = 1_000;
+/// `status=open`: every non-terminal projection status.
+const OPEN_STATUSES_SQL: &str = "'PENDING','OPEN','PARTIAL','UNTRIGGERED','MODIFY_PENDING'";
+
+#[derive(Debug, PartialEq, Eq)]
+enum OrderQuery {
+    /// `GET /orders/{order_id}`
+    Order(u64),
+    /// `GET /orders?user=U[&status=open|all][&limit=N]`
+    UserOrders { user: u64, open_only: bool, limit: usize },
+    /// `GET /fills?order_id=X[&limit=N]`
+    OrderFills { order_id: u64, limit: usize },
+    /// `GET /fills?user=U[&limit=N]`
+    UserFills { user: u64, limit: usize },
+}
+
+/// `None` when the request is not an order query, so it falls through to the
+/// other routes (`POST /orders` among them).
+fn parse_order_query(method: &str, path: &str, query: &str) -> Option<Result<OrderQuery, String>> {
+    if method != "GET" {
+        return None;
+    }
+    if let Some(id) = path.strip_prefix("/orders/") {
+        return Some(
+            id.parse()
+                .map(OrderQuery::Order)
+                .map_err(|_| "invalid order_id".to_string()),
+        );
+    }
+    let parsed = match path {
+        "/orders" => (|| {
+            let open_only = match query_param(query, "status").unwrap_or("all") {
+                "open" => true,
+                "all" => false,
+                _ => return Err("status must be open or all".to_string()),
+            };
+            Ok(OrderQuery::UserOrders {
+                user: required(query, "user")?,
+                open_only,
+                limit: query_limit(query)?,
+            })
+        })(),
+        "/fills" => (|| {
+            let limit = query_limit(query)?;
+            match (query_param(query, "order_id"), query_param(query, "user")) {
+                (Some(_), None) => Ok(OrderQuery::OrderFills {
+                    order_id: required(query, "order_id")?,
+                    limit,
+                }),
+                (None, Some(_)) => Ok(OrderQuery::UserFills {
+                    user: required(query, "user")?,
+                    limit,
+                }),
+                _ => Err("pass exactly one of order_id or user".to_string()),
+            }
+        })(),
+        _ => return None,
+    };
+    Some(parsed)
+}
+
+fn query_limit(query: &str) -> Result<usize, String> {
+    match query_param(query, "limit") {
+        None => Ok(QUERY_DEFAULT_LIMIT),
+        Some(value) => match value.parse::<usize>() {
+            Ok(limit) if (1..=QUERY_MAX_LIMIT).contains(&limit) => Ok(limit),
+            _ => Err(format!("limit must be 1..={QUERY_MAX_LIMIT}")),
+        },
+    }
+}
+
+/// Columns of an order row, in [`OrderRow`] order. Times are epoch ms (the
+/// projection's TIMESTAMP columns have second precision).
+const ORDER_COLUMNS: &str = "order_id,user_id,instrument,side,price,qty,filled_qty, \
+CAST(filled_notional AS CHAR) filled_notional,status, \
+CAST(UNIX_TIMESTAMP(created_at)*1000 AS UNSIGNED) created_ms, \
+CAST(UNIX_TIMESTAMP(updated_at)*1000 AS UNSIGNED) updated_ms,row_seq";
+
+type OrderRow = (u64, u64, u32, i8, u64, u64, u64, String, String, u64, u64, u64);
+
+/// Columns of an `order_fills` row, in [`FillRow`] order.
+const FILL_COLUMNS: &str = "raft_group,raft_index,report_ordinal,order_id,user_id,instrument, \
+side,price,qty,fee,fill_role,CAST(UNIX_TIMESTAMP(created_at)*1000 AS UNSIGNED) created_ms";
+
+type FillRow = (u32, u64, u32, u64, u64, u32, i8, u64, u64, u64, u8, u64);
+
+/// Newest first; matches `idx_fill_order` / `idx_fill_user_created` plus the
+/// primary key InnoDB appends to them, so `LIMIT` stops early with no filesort.
+const FILL_ORDER_BY: &str =
+    "created_at DESC,raft_group DESC,raft_index DESC,report_ordinal DESC,order_id DESC";
+
+fn side_name(side: i8) -> &'static str {
+    if side == 0 {
+        "BUY"
+    } else {
+        "SELL"
+    }
+}
+
+/// `filled_notional / filled_qty` as a JSON number, truncated to 8 decimals.
+fn average_price(notional: &str, filled_qty: u64) -> String {
+    let notional: u128 = notional.parse().unwrap_or(0);
+    if filled_qty == 0 {
+        return "0".into();
+    }
+    let qty = filled_qty as u128;
+    let whole = notional / qty;
+    // remainder < qty <= u64::MAX, so the scaled remainder fits in u128.
+    let frac = (notional % qty) * 100_000_000 / qty;
+    if frac == 0 {
+        whole.to_string()
+    } else {
+        format!("{whole}.{}", format!("{frac:08}").trim_end_matches('0'))
+    }
+}
+
+fn order_json(row: &OrderRow) -> String {
+    let (order_id, user, instrument, side, price, qty, filled, notional, status, created, updated, _) =
+        row;
+    format!(
+        "{{\"order_id\":{order_id},\"user_id\":{user},\"instrument\":{instrument},\"side\":\"{}\",\"price\":{price},\"qty\":{qty},\"filled_qty\":{filled},\"avg_fill_price\":{},\"status\":\"{status}\",\"created_at\":{created},\"updated_at\":{updated}}}",
+        side_name(*side),
+        average_price(notional, *filled),
+    )
+}
+
+fn fill_json(row: &FillRow) -> String {
+    let (group, index, ordinal, order_id, user, instrument, side, price, qty, fee, role, created) =
+        row;
+    format!(
+        "{{\"order_id\":{order_id},\"user_id\":{user},\"instrument\":{instrument},\"side\":\"{}\",\"price\":{price},\"qty\":{qty},\"fee\":{fee},\"role\":\"{}\",\"time\":{created},\"raft_group\":{group},\"raft_index\":{index},\"report_ordinal\":{ordinal}}}",
+        side_name(*side),
+        if *role == FILL_ROLE_MAKER { "maker" } else { "taker" },
+    )
+}
+
+fn json_array<T>(rows: &[T], render: fn(&T) -> String) -> String {
+    format!("[{}]", rows.iter().map(render).collect::<Vec<_>>().join(","))
+}
+
+fn query_conn(store: &OrderStore, db: u32) -> Result<mysql::PooledConn, String> {
+    store
+        .shards
+        .get(db as usize)
+        .and_then(Option::as_ref)
+        .ok_or_else(|| format!("physical DB {db} is not open on this worker"))?
+        .get_conn()
+        .map_err(|error| error.to_string())
+}
+
+/// Run one statement per physical DB in parallel and concatenate the rows.
+fn fan_out<T: mysql::prelude::FromRow + Send>(
+    store: &OrderStore,
+    sql_for_db: impl Fn(u32) -> String,
+) -> Result<Vec<T>, String> {
+    std::thread::scope(|scope| {
+        let workers = (0..store.routing.db_count as u32)
+            .map(|db| {
+                let sql = sql_for_db(db);
+                scope.spawn(move || query_conn(store, db)?.query::<T, _>(sql).map_err(|e| e.to_string()))
+            })
+            .collect::<Vec<_>>();
+        let mut rows = Vec::new();
+        for worker in workers {
+            rows.extend(worker.join().map_err(|_| "query worker panicked".to_string())??);
+        }
+        Ok(rows)
+    })
+}
+
+/// Where one order's row and fills live: the `route_order_id` placement both
+/// the command projection (asset_orders) and the execution projection
+/// (order_fills, routed by target order id) write with.
+struct OrderLocation {
+    db: u32,
+    orders_table: String,
+    fills_table: String,
+}
+
+fn order_location(routing: &sharding::RouteConfig, order_id: u64) -> OrderLocation {
+    let route = routing.route_order_id(order_id);
+    OrderLocation {
+        db: route.db,
+        orders_table: format!("{}.{}", route.db_name(), route.table_name()),
+        fills_table: format!("{}.order_fills", route.db_name()),
+    }
+}
+
+/// `Ok(None)` means 404 (only `GET /orders/{id}` has one).
+fn serve_order_query(store: &OrderStore, request: &OrderQuery) -> Result<Option<String>, String> {
+    match *request {
+        OrderQuery::Order(order_id) => {
+            let at = order_location(&store.routing, order_id);
+            let row: Option<OrderRow> = query_conn(store, at.db)?
+                .exec_first(
+                    format!("SELECT {ORDER_COLUMNS} FROM {} WHERE order_id=?", at.orders_table),
+                    (order_id,),
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(row.as_ref().map(order_json))
+        }
+        OrderQuery::UserOrders {
+            user,
+            open_only,
+            limit,
+        } => {
+            // Orders are sharded by order id, so one user's orders sit in every
+            // asset_orders table of every DB. Fan-out cost per call: db_count
+            // statements (one per DB, in parallel), each a UNION ALL of
+            // tables_per_db index range scans on idx_user_created — 10 x 100 =
+            // 1000 index dives with the default layout. Each table returns at
+            // most `limit` rows, each DB re-sorts and keeps `limit`, and the
+            // final merge keeps `limit`: bounded, but meant for account-history
+            // reads, not high-rate polling (that is the push stream's job).
+            // `status=open` filters while walking the index, so a user with a
+            // long closed history pays for skipping it.
+            // Per-table order (created_at, row_seq) is the index order, and the
+            // merge key extends it, so per-table top-N merges to the true top-N.
+            let status = if open_only {
+                format!(" AND status IN ({OPEN_STATUSES_SQL})")
+            } else {
+                String::new()
+            };
+            let tables_per_db = store.routing.tables_per_db;
+            let mut rows: Vec<OrderRow> = fan_out(store, |db| {
+                let parts = (0..tables_per_db)
+                    .map(|table| {
+                        format!(
+                            "(SELECT {ORDER_COLUMNS} FROM order_db_{db}.asset_orders_{table:03} WHERE user_id={user}{status} ORDER BY created_at DESC,row_seq DESC LIMIT {limit})"
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" UNION ALL ");
+                format!("SELECT * FROM ({parts}) u ORDER BY created_ms DESC,row_seq DESC,order_id DESC LIMIT {limit}")
+            })?;
+            rows.sort_unstable_by(|a, b| (b.9, b.11, b.0).cmp(&(a.9, a.11, a.0)));
+            rows.truncate(limit);
+            Ok(Some(json_array(&rows, order_json)))
+        }
+        OrderQuery::OrderFills { order_id, limit } => {
+            let at = order_location(&store.routing, order_id);
+            let rows: Vec<FillRow> = query_conn(store, at.db)?
+                .exec(
+                    format!(
+                        "SELECT {FILL_COLUMNS} FROM {} WHERE order_id=? ORDER BY {FILL_ORDER_BY} LIMIT {limit}",
+                        at.fills_table
+                    ),
+                    (order_id,),
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(Some(json_array(&rows, fill_json)))
+        }
+        OrderQuery::UserFills { user, limit } => {
+            // One order_fills table per DB: db_count index range scans on
+            // idx_user_created, `limit` rows each, merged here.
+            let mut rows: Vec<FillRow> = fan_out(store, |db| {
+                format!(
+                    "SELECT {FILL_COLUMNS} FROM order_db_{db}.order_fills WHERE user_id={user} ORDER BY {FILL_ORDER_BY} LIMIT {limit}"
+                )
+            })?;
+            rows.sort_unstable_by(|a, b| {
+                (b.11, b.0, b.1, b.2, b.3).cmp(&(a.11, a.0, a.1, a.2, a.3))
+            });
+            rows.truncate(limit);
+            Ok(Some(json_array(&rows, fill_json)))
+        }
+    }
+}
+
+/// HTTP status and body for an order query.
+fn order_query_response(
+    store: Option<&OrderStore>,
+    request: Result<OrderQuery, String>,
+) -> (&'static str, String) {
+    let request = match request {
+        Ok(request) => request,
+        Err(error) => return ("400 Bad Request", format!("{{\"error\":\"{error}\"}}")),
+    };
+    let Some(store) = store else {
+        return (
+            "503 Service Unavailable",
+            "{\"error\":\"order queries are disabled on this worker (TC_ORDER_QUERY_ENABLED)\"}".into(),
+        );
+    };
+    match serve_order_query(store, &request) {
+        Ok(Some(body)) => ("200 OK", body),
+        Ok(None) => ("404 Not Found", "{\"error\":\"order not found\"}".into()),
+        Err(error) => {
+            log_warn!("order-api", "event=order_query_failed request={request:?} error={error}");
+            ("503 Service Unavailable", "{\"error\":\"order query failed\"}".into())
+        }
+    }
+}
+
 fn respond(stream: &mut TcpStream, status: &str, body: &str, keep_alive: bool) {
     respond_content(stream, status, "application/json", body, keep_alive);
 }
@@ -3039,6 +3431,7 @@ fn handle(
     kafka: Arc<KafkaIngress>,
     token: &str,
     ingress_enabled: bool,
+    query_store: Option<OrderStore>,
 ) {
     stream.set_nodelay(true).ok();
     let mut reader = BufReader::new(stream);
@@ -3122,6 +3515,14 @@ fn handle(
                 "{\"error\":\"unauthorized\"}",
                 keep_alive,
             );
+            if !keep_alive {
+                return;
+            }
+            continue;
+        }
+        if let Some(request) = parse_order_query(&method, path, query) {
+            let (status, body) = order_query_response(query_store.as_ref(), request);
+            respond(reader.get_mut(), status, &body, keep_alive);
             if !keep_alive {
                 return;
             }
@@ -3366,7 +3767,23 @@ fn main() {
         if let Err(error) = validate_shard_urls(&shard_urls, routing.db_count as usize) {
             panic!("shard routing mismatch: {error}");
         }
-        open_when_ready(&shard_urls, routing, metrics.clone(), owned_dbs.clone())
+        open_when_ready(&shard_urls, routing, metrics.clone(), owned_dbs.clone(), true)
+    });
+    // Order queries read every physical DB (one user's orders span all of
+    // them). Reuse the projection pools when this worker owns every DB;
+    // otherwise open read pools to all of them without bootstrap DDL. Off by
+    // default on workers that have no MySQL role, so ingress replicas keep
+    // holding no shard connections.
+    let query_store = env_enabled("TC_ORDER_QUERY_ENABLED", needs_mysql).then(|| match &store {
+        Some(store) if store.owned_dbs.len() as u64 == routing.db_count => store.clone(),
+        _ => {
+            let shard_urls = parse_shard_urls(routing.db_count as usize);
+            if let Err(error) = validate_shard_urls(&shard_urls, routing.db_count as usize) {
+                panic!("shard routing mismatch: {error}");
+            }
+            let all_dbs = Arc::new((0..routing.db_count as u32).collect());
+            open_when_ready(&shard_urls, routing, metrics.clone(), all_dbs, false)
+        }
     });
     let command_db_forwarder = (kafka.db_consumers > 0).then(|| {
         CommandDbForwarder::spawn(store.as_ref().expect("DB consumers require MySQL").clone())
@@ -3550,6 +3967,7 @@ fn main() {
                 let metrics = shared_metrics.clone();
                 let kafka = shared_kafka.clone();
                 let token = token.clone();
+                let query_store = query_store.clone();
                 std::thread::spawn(move || {
                     handle(
                         stream,
@@ -3558,6 +3976,7 @@ fn main() {
                         kafka,
                         &token,
                         ingress_enabled,
+                        query_store,
                     )
                 });
             }
@@ -4670,5 +5089,359 @@ mod tests {
             .expect("legacy path accepts equal caller fingerprints");
         assert!(body.contains("\"verified_by\":\"caller\""));
         assert!(rc.activate(category).is_ok());
+    }
+
+    #[test]
+    fn order_query_parses_routes_filters_and_limits() {
+        let parse = |method: &str, path: &str, query: &str| parse_order_query(method, path, query);
+        assert_eq!(parse("GET", "/orders/42", ""), Some(Ok(OrderQuery::Order(42))));
+        assert!(matches!(parse("GET", "/orders/x", ""), Some(Err(_))));
+        // Not queries: they fall through to ingress / metrics / 404.
+        assert_eq!(parse("POST", "/orders", "user=1"), None);
+        assert_eq!(parse("GET", "/metrics", ""), None);
+        assert_eq!(parse("GET", "/ws/orders", ""), None);
+
+        assert_eq!(
+            parse("GET", "/orders", "user=7"),
+            Some(Ok(OrderQuery::UserOrders { user: 7, open_only: false, limit: 100 }))
+        );
+        assert_eq!(
+            parse("GET", "/orders", "user=7&status=open&limit=1000"),
+            Some(Ok(OrderQuery::UserOrders { user: 7, open_only: true, limit: 1000 }))
+        );
+        assert_eq!(
+            parse("GET", "/orders", "status=all&user=7&limit=1"),
+            Some(Ok(OrderQuery::UserOrders { user: 7, open_only: false, limit: 1 }))
+        );
+        for bad in ["", "user=x", "user=7&status=filled", "user=7&limit=0", "user=7&limit=1001", "user=7&limit=-1"] {
+            assert!(matches!(parse("GET", "/orders", bad), Some(Err(_))), "{bad}");
+        }
+
+        assert_eq!(
+            parse("GET", "/fills", "order_id=3"),
+            Some(Ok(OrderQuery::OrderFills { order_id: 3, limit: 100 }))
+        );
+        assert_eq!(
+            parse("GET", "/fills", "user=4&limit=50"),
+            Some(Ok(OrderQuery::UserFills { user: 4, limit: 50 }))
+        );
+        for bad in ["", "order_id=3&user=4", "order_id=x", "user=4&limit=2000"] {
+            assert!(matches!(parse("GET", "/fills", bad), Some(Err(_))), "{bad}");
+        }
+        // A parse error is a 400 even on a worker without MySQL.
+        let (status, body) = order_query_response(None, Err("invalid order_id".into()));
+        assert_eq!((status, body.as_str()), ("400 Bad Request", "{\"error\":\"invalid order_id\"}"));
+        assert_eq!(order_query_response(None, Ok(OrderQuery::Order(1))).0, "503 Service Unavailable");
+    }
+
+    #[test]
+    fn order_lookups_route_where_the_projections_write() {
+        let routing = sharding::RouteConfig::with_virtual(10, 100, 1_000, 10_000, 1);
+        let mut dbs = std::collections::HashSet::new();
+        for id in (1..2_000u64).map(|n| n.wrapping_mul(0x9e37_79b9_7f4a_7c15)) {
+            // The command projection places the row by database_order_id; the
+            // execution projection places fills by target order id.
+            let order = Order::limit(OrderId(id), Side::Buy, 1_000, 1)
+                .on(InstrumentId(1))
+                .by(9);
+            let written = routing.route_order_id(database_order_id(&trade_core::Command::New(order)));
+            let at = order_location(&routing, id);
+            assert_eq!(at.db, written.db);
+            assert_eq!(at.orders_table, format!("order_db_{}.asset_orders_{:03}", written.db, written.table));
+            assert_eq!(at.fills_table, format!("order_db_{}.order_fills", written.db));
+            dbs.insert(at.db);
+        }
+        // One user's orders land in every DB, hence the per-user fan-out.
+        assert_eq!(dbs.len(), 10);
+    }
+
+    #[test]
+    fn average_fill_price_is_notional_over_filled_qty() {
+        assert_eq!(average_price("0", 0), "0");
+        assert_eq!(average_price("3000", 3), "1000");
+        assert_eq!(average_price("10006", 10), "1000.6");
+        assert_eq!(average_price("10", 3), "3.33333333");
+        // Beyond u64: price * qty products are summed as DECIMAL(38,0).
+        assert_eq!(
+            average_price(&(u64::MAX as u128 * 2).to_string(), 2),
+            u64::MAX.to_string()
+        );
+    }
+
+    #[test]
+    fn trade_fill_takes_role_and_fee_from_the_target_side() {
+        let report = wire::DecodedReport {
+            type_code: wire::RT_TRADE,
+            maker_fee: 3,
+            taker_fee: 7,
+            instrument: InstrumentId(1),
+            order_id: OrderId(10),
+            aux_id: 20,
+            price: 1_001,
+            qty: 6,
+            side: Side::Buy,
+        };
+        assert_eq!(
+            trade_fill(&report, 10),
+            Some(TradeFill { price: 1_001, fee: 7, role: FILL_ROLE_TAKER })
+        );
+        assert_eq!(
+            trade_fill(&report, 20),
+            Some(TradeFill { price: 1_001, fee: 3, role: FILL_ROLE_MAKER })
+        );
+        let filled = wire::DecodedReport { type_code: wire::RT_FILLED, ..report };
+        assert_eq!(trade_fill(&filled, 10), None);
+    }
+
+    fn kafka_order(
+        order_id: u64,
+        user: u64,
+        instrument: u32,
+        side: Side,
+        price: u64,
+        qty: u64,
+        offset: i64,
+    ) -> KafkaRecord {
+        let mut record = kafka_new(order_id, user, instrument, qty, offset);
+        let order = Order::limit(OrderId(order_id), side, price, qty)
+            .on(InstrumentId(instrument))
+            .by(user);
+        wire::encode_new(&order, &mut record.frame);
+        record
+    }
+
+    /// Both per-side events of one Trade, as the engine publishes them.
+    #[allow(clippy::too_many_arguments)]
+    fn trade_pair(
+        taker: u64,
+        maker: u64,
+        instrument: u32,
+        price: u64,
+        qty: u64,
+        fees: (u64, u64),
+        raft_index: u64,
+        ordinal: u32,
+    ) -> Vec<ExecutionKafkaRecord> {
+        [taker, maker]
+            .into_iter()
+            .map(|target| {
+                let mut record = trade_event(target, 0, instrument, qty, raft_index, ordinal, raft_index as i64);
+                record.event.report.order_id = OrderId(taker);
+                record.event.report.aux_id = maker;
+                record.event.report.price = price;
+                (record.event.report.maker_fee, record.event.report.taker_fee) = fees;
+                record
+            })
+            .collect()
+    }
+
+    fn query_ok(store: &OrderStore, method_path: &str, query: &str) -> (&'static str, String) {
+        let request = parse_order_query("GET", method_path, query).expect("an order query route");
+        order_query_response(Some(store), request)
+    }
+
+    /// Same disposable MySQL 8 as above.
+    #[test]
+    #[ignore = "requires disposable MySQL 8 via TC_TEST_MYSQL_URL"]
+    fn mysql8_avg_price_and_fills_after_partial_then_full_fill() {
+        let store = mysql_test_store().expect("TC_TEST_MYSQL_URL must be set");
+        let seed = (std::process::id() as u64) << 32 | journal::now_nanos() as u64 & 0xffff_ffff;
+        let (taker, maker1, maker2) = (seed | 1, seed | 2, seed | 3);
+        let (taker_user, maker_user) = (seed, seed + 1);
+        let instrument = 42_010;
+        persist_mysql_shard(
+            &store,
+            0,
+            &[
+                kafka_order(taker, taker_user, instrument, Side::Buy, 1_005, 10, 1),
+                kafka_order(maker1, maker_user, instrument, Side::Sell, 1_000, 4, 2),
+                kafka_order(maker2, maker_user, instrument, Side::Sell, 1_001, 6, 3),
+            ],
+        )
+        .unwrap();
+
+        // Partial: 4 @ 1000 against maker1 (maker fee 2, taker fee 5).
+        let mut first = trade_pair(taker, maker1, instrument, 1_000, 4, (2, 5), seed, 0);
+        first.push(report_event(wire::RT_FILLED, maker1, instrument, seed, 1));
+        let mut partial = report_event(wire::RT_PARTIAL, taker, instrument, seed, 1);
+        (partial.event.ordinal, partial.event.report.qty) = (2, 4);
+        first.push(partial);
+        persist_events(&store, first).unwrap();
+
+        let (status, body) = query_ok(&store, &format!("/orders/{taker}"), "");
+        assert_eq!(status, "200 OK");
+        assert!(body.contains(&format!("\"order_id\":{taker},\"user_id\":{taker_user},\"instrument\":{instrument},\"side\":\"BUY\",\"price\":1005,\"qty\":10,\"filled_qty\":4,\"avg_fill_price\":1000,\"status\":\"PARTIAL\"")), "{body}");
+        let (_, fills) = query_ok(&store, "/fills", &format!("order_id={taker}"));
+        assert_eq!(fills.matches("\"order_id\"").count(), 1, "{fills}");
+        assert!(fills.contains("\"price\":1000,\"qty\":4,\"fee\":5,\"role\":\"taker\""), "{fills}");
+
+        // Full: 6 @ 1001 against maker2 (maker fee 3, taker fee 7).
+        let mut second = trade_pair(taker, maker2, instrument, 1_001, 6, (3, 7), seed + 1, 0);
+        second.push(report_event(wire::RT_FILLED, maker2, instrument, seed + 1, 1));
+        let mut filled = report_event(wire::RT_FILLED, taker, instrument, seed + 1, 1);
+        filled.event.ordinal = 2;
+        second.push(filled);
+        persist_events(&store, second.clone()).unwrap();
+        persist_events(&store, second).unwrap(); // Kafka replay: no double fill.
+
+        let (_, body) = query_ok(&store, &format!("/orders/{taker}"), "");
+        // (4 * 1000 + 6 * 1001) / 10
+        assert!(body.contains("\"filled_qty\":10,\"avg_fill_price\":1000.6,\"status\":\"FILLED\""), "{body}");
+        let (_, body) = query_ok(&store, &format!("/orders/{maker2}"), "");
+        assert!(body.contains("\"side\":\"SELL\",\"price\":1001,\"qty\":6,\"filled_qty\":6,\"avg_fill_price\":1001,\"status\":\"FILLED\""), "{body}");
+
+        let (_, fills) = query_ok(&store, "/fills", &format!("order_id={taker}"));
+        assert_eq!(fills.matches("\"order_id\"").count(), 2, "{fills}");
+        let fill = |price: u64, qty: u64, fee: u64, role: &str, index: u64| {
+            format!("\"price\":{price},\"qty\":{qty},\"fee\":{fee},\"role\":\"{role}\"")
+                + &format!("|{index}")
+        };
+        // Newest first; the two fills may share a created_at second, so the
+        // tie breaks on raft_index descending.
+        let shape = |fills: &str| -> Vec<String> {
+            fills
+                .split("},{")
+                .map(|row| {
+                    let start = row.find("\"price\"").unwrap();
+                    let end = row.find(",\"time\"").unwrap();
+                    let index = row.split("\"raft_index\":").nth(1).unwrap();
+                    let index: String = index.chars().take_while(char::is_ascii_digit).collect();
+                    format!("{}|{index}", &row[start..end])
+                })
+                .collect()
+        };
+        assert_eq!(
+            shape(&fills),
+            vec![fill(1_001, 6, 7, "taker", seed + 1), fill(1_000, 4, 5, "taker", seed)]
+        );
+        let (_, fills) = query_ok(&store, "/fills", &format!("order_id={maker2}"));
+        assert_eq!(shape(&fills), vec![fill(1_001, 6, 3, "maker", seed + 1)]);
+        assert!(fills.contains(&format!("\"user_id\":{maker_user},\"instrument\":{instrument},\"side\":\"SELL\"")), "{fills}");
+
+        // Per user, across orders: the maker's two fills, newest first.
+        let (_, fills) = query_ok(&store, "/fills", &format!("user={maker_user}"));
+        assert_eq!(
+            shape(&fills),
+            vec![fill(1_001, 6, 3, "maker", seed + 1), fill(1_000, 4, 2, "maker", seed)]
+        );
+        let (_, fills) = query_ok(&store, "/fills", &format!("user={maker_user}&limit=1"));
+        assert_eq!(shape(&fills), vec![fill(1_001, 6, 3, "maker", seed + 1)]);
+        let (_, fills) = query_ok(&store, "/fills", &format!("user={taker_user}"));
+        assert_eq!(fills.matches("\"role\":\"taker\"").count(), 2, "{fills}");
+        assert_eq!(query_ok(&store, "/fills", "user=1&limit=5").1, "[]");
+    }
+
+    /// Same disposable MySQL 8 as above.
+    #[test]
+    #[ignore = "requires disposable MySQL 8 via TC_TEST_MYSQL_URL"]
+    fn mysql8_order_queries_get_list_open_filter_and_404() {
+        let store = mysql_test_store().expect("TC_TEST_MYSQL_URL must be set");
+        let seed = (std::process::id() as u64) << 32 | journal::now_nanos() as u64 & 0xffff_ffff;
+        let user = seed;
+        let instrument = 42_011;
+        // 12 orders spread over the test layout's 8 tables.
+        let orders: Vec<u64> = (1..=12).map(|n| (seed << 4) | n).collect();
+        let records: Vec<KafkaRecord> = orders
+            .iter()
+            .enumerate()
+            .map(|(n, &id)| kafka_order(id, user, instrument, Side::Buy, 1_000 + n as u64, 5, n as i64))
+            .collect();
+        persist_mysql_shard(&store, 0, &records).unwrap();
+        assert!(
+            orders
+                .iter()
+                .map(|&id| store.routing.route_order_id(id).table)
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                > 1,
+            "the list must merge several tables"
+        );
+        // Distinct creation times (order n created at base + n) make
+        // newest-first deterministic.
+        let mut conn = store.shard(0).get_conn().unwrap();
+        for (n, &id) in orders.iter().enumerate() {
+            conn.exec_drop(
+                format!(
+                    "UPDATE order_db_0.{} SET created_at=FROM_UNIXTIME(1700000000+:n) WHERE order_id=:id",
+                    store.routing.route_order_id(id).table_name()
+                ),
+                params! {"n" => n as u64, "id" => id},
+            )
+            .unwrap();
+        }
+        // Terminal states for the 4 newest: two cancelled, one filled, one
+        // rejected; one older order partially filled stays open.
+        persist_events(
+            &store,
+            vec![
+                report_event(wire::RT_CANCELLED, orders[11], instrument, seed, 1),
+                report_event(wire::RT_CANCELLED, orders[10], instrument, seed + 1, 2),
+                report_event(wire::RT_FILLED, orders[9], instrument, seed + 2, 3),
+                report_event(wire::RT_REJECTED, orders[8], instrument, seed + 3, 4),
+                report_event(wire::RT_RESTING, orders[7], instrument, seed + 4, 5),
+                trade_event(orders[6], 0, instrument, 2, seed + 5, 0, 6),
+            ],
+        )
+        .unwrap();
+
+        let ids = |body: &str| -> Vec<u64> {
+            body.split("\"order_id\":")
+                .skip(1)
+                .map(|rest| rest.chars().take_while(char::is_ascii_digit).collect::<String>().parse().unwrap())
+                .collect()
+        };
+        let newest_first: Vec<u64> = orders.iter().rev().copied().collect();
+        let (status, body) = query_ok(&store, "/orders", &format!("user={user}"));
+        assert_eq!(status, "200 OK");
+        assert_eq!(ids(&body), newest_first);
+        let (_, body) = query_ok(&store, "/orders", &format!("user={user}&status=all&limit=3"));
+        assert_eq!(ids(&body), newest_first[..3]);
+        let (_, body) = query_ok(&store, "/orders", &format!("user={user}&status=open"));
+        assert_eq!(ids(&body), newest_first[4..]);
+        assert!(body.contains(&format!("\"order_id\":{},\"user_id\":{user},\"instrument\":{instrument},\"side\":\"BUY\",\"price\":1006,\"qty\":5,\"filled_qty\":2,\"avg_fill_price\":1000,\"status\":\"PARTIAL\",\"created_at\":1700000006000,", orders[6])), "{body}");
+        assert!(body.contains(&format!("\"order_id\":{},", orders[7])) && body.contains("\"status\":\"OPEN\""), "{body}");
+        assert!(body.contains("\"status\":\"PENDING\""), "{body}");
+        let (_, body) = query_ok(&store, "/orders", &format!("user={user}&status=open&limit=2"));
+        assert_eq!(ids(&body), newest_first[4..6]);
+        assert_eq!(query_ok(&store, "/orders", &format!("user={}", user + 1)).1, "[]");
+
+        let (status, body) = query_ok(&store, &format!("/orders/{}", orders[11]), "");
+        assert_eq!(status, "200 OK");
+        assert!(body.contains("\"status\":\"CANCELLED\",\"created_at\":1700000011000,\"updated_at\":"), "{body}");
+        let (status, body) = query_ok(&store, &format!("/orders/{}", seed << 4), "");
+        assert_eq!((status, body.as_str()), ("404 Not Found", "{\"error\":\"order not found\"}"));
+        assert_eq!(query_ok(&store, "/fills", &format!("order_id={}", orders[0])).1, "[]");
+    }
+
+    /// Same disposable MySQL 8 as above.
+    #[test]
+    #[ignore = "requires disposable MySQL 8 via TC_TEST_MYSQL_URL"]
+    fn mysql8_bootstrap_adds_query_columns_to_existing_tables() {
+        let store = mysql_test_store().expect("TC_TEST_MYSQL_URL must be set");
+        let mut conn = store.shard(0).get_conn().unwrap();
+        // A deployment from before the query columns existed.
+        conn.query_drop("ALTER TABLE order_db_0.pending_execution_events DROP COLUMN event_price, DROP COLUMN fill_role")
+            .unwrap();
+        conn.query_drop("ALTER TABLE order_db_0.asset_orders_003 DROP COLUMN filled_notional")
+            .unwrap();
+        bootstrap(&store).unwrap();
+        bootstrap(&store).unwrap(); // idempotent once present
+        let columns: Vec<(String, String)> = conn
+            .query(
+                "SELECT TABLE_NAME, COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='order_db_0' \
+                 AND COLUMN_NAME IN ('event_price','event_fee','fill_role','filled_notional') ORDER BY TABLE_NAME, COLUMN_NAME",
+            )
+            .unwrap();
+        let pending: Vec<&str> = columns
+            .iter()
+            .filter(|(table, _)| table == "pending_execution_events")
+            .map(|(_, column)| column.as_str())
+            .collect();
+        assert_eq!(pending, ["event_fee", "event_price", "fill_role"]);
+        let with_notional = columns
+            .iter()
+            .filter(|(table, column)| table.starts_with("asset_orders_") && column == "filled_notional")
+            .count();
+        assert_eq!(with_notional as u64, store.routing.tables_per_db);
     }
 }
