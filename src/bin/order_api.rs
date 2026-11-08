@@ -1488,7 +1488,7 @@ struct CommandDbForwarder {
 }
 
 impl CommandDbForwarder {
-    fn spawn(store: OrderStore) -> Self {
+    fn spawn(store: OrderStore, handoff: Option<Arc<DrainHandoff>>) -> Self {
         let queue = env_number("TC_MYSQL_SHARD_QUEUE", 64usize).max(1);
         let coalesce_jobs = env_number("TC_MYSQL_SHARD_COALESCE_JOBS", 16usize).max(1);
         let mut shards = Vec::with_capacity(store.routing.db_count as usize);
@@ -1499,6 +1499,7 @@ impl CommandDbForwarder {
             }
             let (tx, rx) = std::sync::mpsc::sync_channel::<CommandShardJob>(queue);
             let shard_store = store.clone();
+            let handoff = handoff.clone();
             std::thread::Builder::new()
                 .name(format!("command-db-shard-{shard_db}"))
                 .spawn(move || {
@@ -1512,7 +1513,12 @@ impl CommandDbForwarder {
                             .iter()
                             .flat_map(|job| job.records.iter().cloned())
                             .collect::<Vec<_>>();
-                        let result = persist_mysql_shard(&shard_store, shard_db, &records);
+                        let result = persist_mysql_shard_with(
+                            &shard_store,
+                            shard_db,
+                            &records,
+                            handoff.as_deref(),
+                        );
                         for job in jobs {
                             let _ = job.reply.send(result.clone());
                         }
@@ -1694,12 +1700,88 @@ fn purge_dedupe_table(
     Ok(deleted)
 }
 
+/// Order tables whose new rows may have execution events waiting in
+/// `pending_execution_events`, per physical database. The command writer
+/// marks them after its commit; the execution writer of the same database
+/// takes them and drains, so it is the only writer that touches pending
+/// rows. In memory only: on start every table is marked once, which covers
+/// marks lost to a crash.
+struct DrainHandoff {
+    dirty: Vec<std::sync::Mutex<std::collections::BTreeSet<u32>>>,
+}
+
+impl DrainHandoff {
+    fn new(routing: sharding::RouteConfig) -> Self {
+        let all: std::collections::BTreeSet<u32> = (0..routing.tables_per_db as u32).collect();
+        Self {
+            dirty: (0..routing.db_count)
+                .map(|_| std::sync::Mutex::new(all.clone()))
+                .collect(),
+        }
+    }
+
+    fn mark(&self, db: u32, tables: impl IntoIterator<Item = u32>) {
+        self.dirty[db as usize]
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .extend(tables);
+    }
+
+    fn take(&self, db: u32) -> std::collections::BTreeSet<u32> {
+        std::mem::take(
+            &mut *self.dirty[db as usize]
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+    }
+}
+
+/// Drain the pending events of `tables` (marked by the command writer) in
+/// one transaction; a table with nothing pending costs one `LIMIT 1` probe.
+fn drain_marked_tables(
+    store: &OrderStore,
+    shard_db: u32,
+    tables: &std::collections::BTreeSet<u32>,
+) -> Result<(), String> {
+    let db = format!("order_db_{shard_db}");
+    let mut conn = store
+        .shard(shard_db)
+        .get_conn()
+        .map_err(|error| error.to_string())?;
+    let mut tx = conn
+        .start_transaction(TxOpts::default())
+        .map_err(|error| error.to_string())?;
+    for &table in tables {
+        let has_pending: Option<u8> = tx
+            .query_first(format!(
+                "SELECT 1 FROM {db}.pending_execution_events WHERE shard_table={table} LIMIT 1"
+            ))
+            .map_err(|error| error.to_string())?;
+        if has_pending.is_some() {
+            apply_pending_execution_table(&mut tx, &db, table)?;
+        }
+    }
+    tx.commit().map_err(|error| error.to_string())
+}
+
 /// Persist one routed shard batch with one MySQL commit. Long-lived per-shard
 /// workers call this after coalescing jobs from concurrent Kafka consumers.
+#[cfg(test)]
 fn persist_mysql_shard(
     store: &OrderStore,
     shard_db: u32,
     records: &[KafkaRecord],
+) -> Result<(), String> {
+    persist_mysql_shard_with(store, shard_db, records, None)
+}
+
+/// [`persist_mysql_shard`], optionally handing the pending-event drain to
+/// the execution writer of the same database instead of running it here.
+fn persist_mysql_shard_with(
+    store: &OrderStore,
+    shard_db: u32,
+    records: &[KafkaRecord],
+    handoff: Option<&DrainHandoff>,
 ) -> Result<(), String> {
     let started = std::time::Instant::now();
     let db = format!("order_db_{shard_db}");
@@ -1824,6 +1906,17 @@ fn persist_mysql_shard(
     // indexed `LIMIT 1` lookup instead of three empty joins. This is strictly a
     // no-op skip: when a row exists the drain runs exactly as before, so the
     // projection's behaviour (and its 1064-sensitive SQL) is untouched.
+    //
+    // With a hand-off (this process also runs the execution writer for this
+    // database) the drain is left to that writer: the order transaction then
+    // never reads or deletes `pending_execution_events`, so the two writers
+    // no longer lock the same pending and order rows against each other.
+    if let Some(handoff) = handoff {
+        tx.commit().map_err(|error| error.to_string())?;
+        handoff.mark(shard_db, pending_tables);
+        store.metrics.record_mysql(started.elapsed());
+        return Ok(());
+    }
     for table in pending_tables {
         let has_pending: Option<u8> = tx
             .query_first(format!(
@@ -2694,7 +2787,7 @@ struct ExecutionDbForwarder {
 }
 
 impl ExecutionDbForwarder {
-    fn spawn(store: OrderStore) -> Self {
+    fn spawn(store: OrderStore, handoff: Option<Arc<DrainHandoff>>) -> Self {
         let queue = env_number("TC_MYSQL_SHARD_QUEUE", 64usize).max(1);
         let coalesce_jobs = env_number("TC_MYSQL_SHARD_COALESCE_JOBS", 16usize).max(1);
         let tx_max_records = env_number("TC_EXECUTION_MYSQL_BATCH_PER_DB", 500usize).max(1);
@@ -2706,18 +2799,36 @@ impl ExecutionDbForwarder {
             }
             let (tx, rx) = std::sync::mpsc::sync_channel::<ExecutionShardJob>(queue);
             let shard_store = store.clone();
+            let handoff = handoff.clone();
             std::thread::Builder::new()
                 .name(format!("execution-db-shard-{shard_db}"))
                 .spawn(move || {
+                    let mut last_sweep = std::time::Instant::now();
                     loop {
-                        let first = match rx.recv_timeout(Duration::from_millis(250)) {
+                        // Tables the command writer filled since the last pass.
+                        if let Some(handoff) = &handoff {
+                            let tables = handoff.take(shard_db);
+                            if !tables.is_empty() {
+                                if let Err(error) =
+                                    drain_marked_tables(&shard_store, shard_db, &tables)
+                                {
+                                    handoff.mark(shard_db, tables);
+                                    log_warn!("execution-db", shard_db; "event=pending_drain_failed error={error}");
+                                }
+                            }
+                        }
+                        let wait = if handoff.is_some() { 20 } else { 250 };
+                        let first = match rx.recv_timeout(Duration::from_millis(wait)) {
                             Ok(first) => first,
                             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                                if let Err(error) = sweep_pending_execution_shard(
-                                    &shard_store,
-                                    shard_db,
-                                ) {
-                                    log_warn!("execution-db", shard_db; "event=pending_sweep_failed error={error}");
+                                if last_sweep.elapsed() >= Duration::from_millis(250) {
+                                    last_sweep = std::time::Instant::now();
+                                    if let Err(error) = sweep_pending_execution_shard(
+                                        &shard_store,
+                                        shard_db,
+                                    ) {
+                                        log_warn!("execution-db", shard_db; "event=pending_sweep_failed error={error}");
+                                    }
                                 }
                                 continue;
                             }
@@ -3970,8 +4081,18 @@ fn main() {
             open_when_ready(&shard_urls, routing, metrics.clone(), all_dbs, false)
         }
     });
+    // When this process writes both commands and execution events for its
+    // databases, only the execution writer drains pending events (see
+    // `DrainHandoff`); a command-only worker keeps draining inline.
+    let drain_handoff = (kafka.db_consumers > 0
+        && kafka.execution_consumers > 0
+        && env_enabled("TC_ORDER_DRAIN_HANDOFF", true))
+    .then(|| Arc::new(DrainHandoff::new(routing)));
     let command_db_forwarder = (kafka.db_consumers > 0).then(|| {
-        CommandDbForwarder::spawn(store.as_ref().expect("DB consumers require MySQL").clone())
+        CommandDbForwarder::spawn(
+            store.as_ref().expect("DB consumers require MySQL").clone(),
+            drain_handoff.clone(),
+        )
     });
     let execution_db_forwarder = (kafka.execution_consumers > 0).then(|| {
         ExecutionDbForwarder::spawn(
@@ -3979,6 +4100,7 @@ fn main() {
                 .as_ref()
                 .expect("execution DB consumers require MySQL")
                 .clone(),
+            drain_handoff.clone(),
         )
     });
     if kafka.db_consumers > 0 || kafka.execution_consumers > 0 {
@@ -4796,6 +4918,57 @@ mod tests {
         assert_eq!(row(&mut conn), Some((4, "FILLED".into())));
         let pending: u64 = conn
             .query_first("SELECT COUNT(*) FROM order_db_0.pending_execution_events")
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending, 0);
+    }
+
+    /// With the drain handed off, the command writer only inserts the order
+    /// row and marks its table; the event that arrived first stays pending
+    /// until the execution writer drains the marked table.
+    #[test]
+    #[ignore = "requires disposable MySQL 8 via TC_TEST_MYSQL_URL"]
+    fn mysql8_command_writer_hands_the_pending_drain_to_the_execution_writer() {
+        let store = mysql_test_store().expect("TC_TEST_MYSQL_URL must be set");
+        let seed = (std::process::id() as u64) << 32 | journal::now_nanos() as u64 & 0xffff_ffff;
+        let order = seed | 1;
+        let instrument = 42_004;
+        let route = store.routing.route_order_id(order);
+        let row = |conn: &mut mysql::PooledConn| -> Option<(u64, String)> {
+            conn.exec_first(
+                format!(
+                    "SELECT filled_qty,status FROM order_db_0.{} WHERE order_id=:id",
+                    route.table_name()
+                ),
+                params! {"id" => order},
+            )
+            .unwrap()
+        };
+        // The fill reaches MySQL before the order row.
+        persist_events(
+            &store,
+            vec![
+                report_event(wire::RT_ACCEPTED, order, instrument, seed, 1),
+                trade_event(order, seed | 2, instrument, 4, seed + 1, 0, 2),
+                report_event(wire::RT_FILLED, order, instrument, seed + 2, 3),
+            ],
+        )
+        .unwrap();
+        let handoff = DrainHandoff::new(store.routing);
+        handoff.take(0); // drop the start-up "everything" mark
+        persist_mysql_shard_with(&store, 0, &[kafka_new(order, 66_003, instrument, 4, 1)], Some(&handoff))
+            .unwrap();
+        let mut conn = store.shard(0).get_conn().unwrap();
+        assert_eq!(row(&mut conn), Some((0, "PENDING".into())), "drain ran inline");
+        let marked = handoff.take(0);
+        assert_eq!(marked, std::iter::once(route.table).collect());
+        drain_marked_tables(&store, 0, &marked).unwrap();
+        assert_eq!(row(&mut conn), Some((4, "FILLED".into())));
+        let pending: u64 = conn
+            .exec_first(
+                "SELECT COUNT(*) FROM order_db_0.pending_execution_events WHERE target_order_id=?",
+                (order,),
+            )
             .unwrap()
             .unwrap();
         assert_eq!(pending, 0);
