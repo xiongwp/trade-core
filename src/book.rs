@@ -746,6 +746,36 @@ impl OrderBook {
         sum
     }
 
+    /// Does `user` own a live order among the opposite-side liquidity an
+    /// aggressor with limit `limit` would need for `qty` (best price first,
+    /// whole levels)? Fill-or-kill under self-trade prevention uses it: a
+    /// self order in that range would stop or shrink the fill midway.
+    pub fn user_in_fill_path(&self, aggressor: Side, limit: Price, qty: Qty, user: u64) -> bool {
+        let levels = self.side(aggressor.opposite());
+        let mut needed = qty;
+        let mut found = false;
+        let mut visit = |px: Price, lv: &Level| {
+            let within = match aggressor {
+                Side::Buy => px <= limit,
+                Side::Sell => px >= limit,
+            };
+            if !within || needed == 0 {
+                return false;
+            }
+            found = lv.orders.iter().any(|&slot| {
+                let order = self.pool.get(slot);
+                order.remaining > 0 && order.user == user
+            });
+            needed = needed.saturating_sub(lv.qty);
+            !found
+        };
+        match aggressor {
+            Side::Buy => levels.walk_asc(&mut visit),
+            Side::Sell => levels.walk_desc(&mut visit),
+        }
+        found
+    }
+
     /// Try to insert a resting order. Returns `false` for a duplicate id or a
     /// zero-quantity order, without modifying the book.
     pub fn try_insert(&mut self, order: Order) -> bool {

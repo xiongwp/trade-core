@@ -231,8 +231,16 @@ fn main() {
     let mut traded = HashMap::<u64, u64>::new();
     let mut events = 0u64;
     let mut republished = 0u64;
-    let deadline = Instant::now() + Duration::from_secs(600);
+    let deadline = Instant::now() + Duration::from_secs(900);
     let mut quiet_since = Instant::now();
+    // Orders still without any result, counted down as results arrive (a
+    // full scan per message made the check itself the bottleneck).
+    let mut missing = orders.len();
+    let found = |id: u64, has_result: &mut HashSet<u64>, missing: &mut usize| {
+        if orders.contains_key(&id) && has_result.insert(id) {
+            *missing -= 1;
+        }
+    };
     loop {
         match consumer.poll(Duration::from_millis(200)) {
             Some(Ok(message)) => {
@@ -247,9 +255,9 @@ fn main() {
                 }
                 events += 1;
                 let target = event.target_order_id;
-                has_result.insert(target);
+                found(target, &mut has_result, &mut missing);
                 if event.report.type_code == wire::RT_CMD_REJECTED {
-                    has_result.insert(event.report.order_id.0);
+                    found(event.report.order_id.0, &mut has_result, &mut missing);
                 }
                 if event.report.type_code == wire::RT_ACCEPTED {
                     accepted_at.entry(target).or_default().insert((event.raft_group, event.raft_index));
@@ -261,7 +269,6 @@ fn main() {
             Some(Err(error)) => eprintln!("kafka: {error}"),
             None => {}
         }
-        let missing = orders.keys().filter(|id| !has_result.contains(id)).count();
         if missing == 0 && quiet_since.elapsed() > Duration::from_secs(5) {
             break;
         }

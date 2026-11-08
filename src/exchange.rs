@@ -1038,6 +1038,13 @@ impl RecentCommandIds {
     }
 }
 
+/// Lowest and highest price of one sweep's trades. A sweep walks one side
+/// best-first, so its prints are monotone: the ends are the extremes.
+fn print_range(trades: &[crate::trade::Trade]) -> Option<(Price, Price)> {
+    let (first, last) = (trades.first()?.price, trades.last()?.price);
+    Some((first.min(last), first.max(last)))
+}
+
 /// Untriggered conditional orders of one instrument, in firing priority:
 /// rising triggers lowest-first, falling triggers highest-first, ties by
 /// arrival. Determinism: the order in which a single trade print fires
@@ -1080,14 +1087,18 @@ impl TriggerBook {
     /// Remove and return the next stop armed by a trade at `price`: rising
     /// triggers first (lowest price, earliest arrival), then falling ones
     /// (highest price, earliest arrival).
-    fn pop_triggered(&mut self, price: Price) -> Option<StopOrder> {
+    /// Next stop the prints in `[low, high]` trigger: a rising stop at or
+    /// below the highest print, else a falling stop at or above the lowest.
+    /// Every print counts, not just the last: a sweep printing 100, 101, 102
+    /// passes a sell stop at 101 although it ends at 102.
+    fn pop_triggered(&mut self, (low, high): (Price, Price)) -> Option<StopOrder> {
         let key = match self.rises.first_key_value() {
-            Some((&key, _)) if key.0 <= price => Some((true, key)),
+            Some((&key, _)) if key.0 <= high => Some((true, key)),
             _ => self
                 .falls
                 .iter()
                 .rev()
-                .find(|(key, _)| key.0 >= price)
+                .find(|(key, _)| key.0 >= low)
                 .and_then(|(_, stop)| {
                     // Highest price first; among equal prices, earliest arrival.
                     self.falls
@@ -1534,6 +1545,42 @@ impl Processor {
                         }
                     }
                 }
+                // An amend that re-enters the book (new price or more size)
+                // can trade, so it passes the gates a new order passes: halt,
+                // user suspension, static limits and the price band. It used
+                // to skip them all. A reduce in place cannot trade and stays
+                // allowed, so users can always pull size.
+                if let Some(mut probe) = self
+                    .engines
+                    .get(&instrument)
+                    .and_then(|engine| engine.book().get(order_id).copied())
+                {
+                    if new_qty > 0 && (new_price != probe.price || new_qty > probe.remaining) {
+                        probe.price = new_price;
+                        probe.quantity = new_qty;
+                        probe.remaining = new_qty;
+                        let reason = if self.halted.contains(&instrument) {
+                            Some("halted")
+                        } else if probe.user != 0 && self.suspended.contains(&probe.user) {
+                            Some("user-suspended")
+                        } else {
+                            self.limits
+                                .as_ref()
+                                .and_then(|limits| limits.check_static(&probe).err())
+                                .or_else(|| {
+                                    self.guard.as_ref().and_then(|guard| guard.vet(&mut probe).err())
+                                })
+                        };
+                        if let Some(reason) = reason {
+                            emit(ExecReport::CommandRejected {
+                                instrument,
+                                command_id: cmd_id,
+                                reason,
+                            });
+                            return;
+                        }
+                    }
+                }
                 let engine = self.engine_for(instrument);
                 let user = engine.book().get(order_id).map_or(0, |order| order.user);
                 match engine.modify(order_id, new_price, new_qty) {
@@ -1556,8 +1603,32 @@ impl Processor {
                         user,
                     }),
                     ModifyOutcome::Requoted(report) => {
-                        let last_price = report.trades.last().map(|t| t.price);
+                        let last_price = print_range(&report.trades);
+                        // The re-entry is a new submission: report makers that
+                        // self-trade prevention cancelled, and book positions,
+                        // exactly as for a new order (both were missing).
+                        if self.stp != SelfTradePolicy::Allow {
+                            let engine = self.engines.get(&instrument).expect("engine exists");
+                            for &(order_id, user) in engine.stp_cancelled() {
+                                emit(ExecReport::Cancelled {
+                                    instrument,
+                                    order_id,
+                                    user,
+                                });
+                            }
+                        }
                         for t in &report.trades {
+                            let q = t.quantity as i64;
+                            let (buyer, seller) = match t.aggressor {
+                                Side::Buy => (t.taker_user, t.maker_user),
+                                Side::Sell => (t.maker_user, t.taker_user),
+                            };
+                            if buyer != 0 {
+                                *self.positions.entry((buyer, instrument)).or_insert(0) += q;
+                            }
+                            if seller != 0 {
+                                *self.positions.entry((seller, instrument)).or_insert(0) -= q;
+                            }
                             let (maker_fee, taker_fee) = self.fees.fees(t.price, t.quantity);
                             emit(ExecReport::Trade {
                                 instrument,
@@ -1579,26 +1650,30 @@ impl Processor {
                                 });
                             }
                         }
+                        // Whether the order is still on the book decides the
+                        // report: a taker stopped by STP after a partial fill
+                        // is PartiallyFilled but gone, and was reported as
+                        // Modified (still live) before.
                         let remaining = new_qty.saturating_sub(report.filled);
-                        match report.status {
-                            OrderStatus::Filled => emit(ExecReport::Filled {
+                        if report.resting {
+                            emit(ExecReport::Modified {
+                                instrument,
+                                order_id,
+                                remaining,
+                                user,
+                            });
+                        } else if report.status == OrderStatus::Filled {
+                            emit(ExecReport::Filled {
                                 instrument,
                                 order_id,
                                 user,
-                            }),
-                            OrderStatus::Resting | OrderStatus::PartiallyFilled => {
-                                emit(ExecReport::Modified {
-                                    instrument,
-                                    order_id,
-                                    remaining,
-                                    user,
-                                })
-                            }
-                            _ => emit(ExecReport::Cancelled {
+                            });
+                        } else {
+                            emit(ExecReport::Cancelled {
                                 instrument,
                                 order_id,
                                 user,
-                            }),
+                            });
                         }
                         if self.pending_stops > 0 {
                             self.fire_stops(instrument, last_price, emit);
@@ -1647,7 +1722,12 @@ impl Processor {
 
     /// Admit and match one ordinary order. Returns the price of the last trade
     /// it printed (the input to [`Self::fire_stops`]), if any.
-    fn process_new(&mut self, mut order: Order, emit: &mut dyn FnMut(ExecReport)) -> Option<Price> {
+    /// Returns the lowest and highest trade price this order printed.
+    fn process_new(
+        &mut self,
+        mut order: Order,
+        emit: &mut dyn FnMut(ExecReport),
+    ) -> Option<(Price, Price)> {
         let instrument = order.instrument;
         let id = order.id;
         let user = order.user;
@@ -1676,6 +1756,16 @@ impl Processor {
         // Order-shape checks, cheapest first:
         // 0. post-only must be a limit (a market order always takes), and the
         //    instrument's trading rules (tick / lot / qty / price / notional);
+        // A zero-quantity order would be reported Filled without trading.
+        if order.quantity == 0 {
+            emit(ExecReport::Rejected {
+                instrument,
+                order_id: id,
+                user,
+                reason: "min-qty",
+            });
+            return None;
+        }
         let post_only = order.tif == TimeInForce::PostOnly;
         if post_only && order.order_type == OrderType::Market {
             emit(ExecReport::Rejected {
@@ -1799,7 +1889,7 @@ impl Processor {
                 });
             }
         }
-        let last_price = trades.last().map(|t| t.price);
+        let last_price = print_range(&trades);
         self.trades_buf = trades;
         match status {
             OrderStatus::Filled => emit(ExecReport::Filled {
@@ -1910,15 +2000,15 @@ impl Processor {
     fn fire_stops(
         &mut self,
         instrument: InstrumentId,
-        mut last_price: Option<Price>,
+        mut prints: Option<(Price, Price)>,
         emit: &mut dyn FnMut(ExecReport),
     ) {
         while self.pending_stops > 0 {
-            let Some(price) = last_price else { return };
+            let Some(range) = prints else { return };
             let Some(stop) = self
                 .stops
                 .get_mut(&instrument)
-                .and_then(|book| book.pop_triggered(price))
+                .and_then(|book| book.pop_triggered(range))
             else {
                 return;
             };
@@ -1931,8 +2021,9 @@ impl Processor {
                 order_id: stop.order.id,
                 user: stop.order.user,
             });
-            if let Some(price) = self.process_new(stop.order, emit) {
-                last_price = Some(price);
+            // A fired stop's own prints widen the range for the cascade.
+            if let Some((low, high)) = self.process_new(stop.order, emit) {
+                prints = Some((range.0.min(low), range.1.max(high)));
             }
         }
     }

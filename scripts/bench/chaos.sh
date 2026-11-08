@@ -51,7 +51,7 @@ echo "== ready, image $(docker inspect trade-core-order-1 --format '{{.Image}}' 
 # shellcheck disable=SC1091
 [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
 cargo bench --bench chaos_e2e -q -- 127.0.0.1:9200 "${TC_ORDER_API_TOKEN:-local-order-api-token}" \
-    "$COMMANDS" 2>&1 | sed 's/^/   /' &
+    "$COMMANDS" 2>&1 | sed -l 's/^/   /' &
 CLIENT=$!
 
 fault() { # at-second action container

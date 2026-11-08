@@ -159,12 +159,15 @@ impl MatchingEngine {
             None => return ModifyOutcome::NotFound,
         };
 
+        // Amending to zero cancels, whatever the new price. (With a price
+        // change it used to re-enter a zero-quantity order and report it
+        // Filled without any trade.)
+        if new_qty == 0 {
+            self.book.cancel(id);
+            return ModifyOutcome::Cancelled { order_id: id };
+        }
         // Fast path: same price, not increasing size -> reduce in place.
         if new_price == existing.price && new_qty <= existing.remaining {
-            if new_qty == 0 {
-                self.book.cancel(id);
-                return ModifyOutcome::Cancelled { order_id: id };
-            }
             self.book.reduce(id, new_qty);
             return ModifyOutcome::Reduced {
                 order_id: id,
@@ -222,7 +225,9 @@ impl MatchingEngine {
                 // ceil(budget/qty) — convert (see TimeInForce docs).
                 Side::Sell => {
                     let q = order.quantity.max(1);
-                    order.price = (budget + q - 1) / q; // ceil (MSRV 1.70)
+                    // ceil(budget / q) without the `budget + q - 1` overflow
+                    // (a near-u64::MAX budget wrapped to a floor of 0).
+                    order.price = budget / q + u64::from(budget % q != 0);
                     order.tif = if order.tif == TimeInForce::FokBudget {
                         TimeInForce::Fok
                     } else {
@@ -236,7 +241,10 @@ impl MatchingEngine {
                     order.price = Price::MAX;
                     if order.tif == TimeInForce::FokBudget {
                         let (fillable, cost) = self.book.cost_to_fill(Side::Buy, order.quantity);
-                        if fillable < order.quantity || cost > budget_left {
+                        if fillable < order.quantity
+                            || cost > budget_left
+                            || self.self_trade_in_fok_path(&order)
+                        {
                             return (order.id, OrderStatus::Rejected, 0, false);
                         }
                         order.tif = TimeInForce::IocBudget; // precheck passed: will fill fully
@@ -255,7 +263,8 @@ impl MatchingEngine {
 
         // Fill-or-kill: reject up front unless the whole quantity can fill now.
         if order.tif == TimeInForce::Fok
-            && self.book.crossable_qty(order.side, order.price) < order.remaining
+            && (self.book.crossable_qty(order.side, order.price) < order.remaining
+                || self.self_trade_in_fok_path(&order))
         {
             return (order.id, OrderStatus::Rejected, 0, false);
         }
@@ -273,6 +282,18 @@ impl MatchingEngine {
             return (order.id, status, filled, false);
         }
         self.finalize(order)
+    }
+
+    /// Under self-trade prevention a fill-or-kill order must not meet its own
+    /// orders: STP would stop or shrink the fill midway and leave it
+    /// partially filled (the up-front check counts self liquidity too). Such
+    /// an order is rejected whole instead. Never consulted under `Allow`.
+    fn self_trade_in_fok_path(&self, order: &Order) -> bool {
+        self.stp != SelfTradePolicy::Allow
+            && order.user != 0
+            && self
+                .book
+                .user_in_fill_path(order.side, order.price, order.remaining, order.user)
     }
 
     /// Walk the opposite side best-price-first, delegating intra-level allocation
