@@ -215,6 +215,18 @@ assert_eq!(summary.fingerprint, live_fingerprint);
 | [`cluster`](src/cluster.rs) | instrument → machine routing for scale-out |
 | [`affinity`](src/affinity.rs) | CPU pinning (Linux hard / macOS advisory) |
 
+### Services (`src/bin/`)
+
+| Binary | Entry point | Role |
+|---|---|---|
+| `order-api` | [`order_api/main.rs`](src/bin/order_api/main.rs) `main()` | intake + Kafka + Raft forwarding + MySQL projection + query API; roles chosen by env |
+| `raft-multi-node` | [`raft_multi_node.rs`](src/bin/raft_multi_node.rs) | supervises one `raft-node` child per Raft group on a machine |
+| `raft-node` | [`raft_node.rs`](src/bin/raft_node.rs) | one Raft replica: consensus, matching (`exchange::build`), execution outbox → Kafka |
+| `user-stream` | [`user_stream.rs`](src/bin/user_stream.rs) | per-user WebSocket push straight from the execution topic |
+| `market-data` | [`market_data.rs`](src/bin/market_data.rs) | K-lines, depth, chart UI |
+
+`order-api` modules: `ingress` (HTTP/WS order parsing, Kafka producer), `http` (connection handler, routing), `admin` (route-migration endpoints), `backpressure`, `dlq`, `raft_forward` (Kafka → Raft leader, packing), `kafka_stage` (consumer loops, commit/rewind, lag), `command_projection` / `execution_projection` (the two MySQL writers per database), `dedupe_retention`, `schema` (bootstrap DDL), `store` (shard pools), `order_query` (read API), `pipeline_metrics`, `tests`.
+
 ## License
 
 MIT OR Apache-2.0.

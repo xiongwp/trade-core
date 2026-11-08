@@ -105,7 +105,7 @@ path = "src/bin/raft_multi_node.rs"
 
 [[bin]]
 name = "order-api"
-path = "src/bin/order_api.rs"
+path = "src/bin/order_api/main.rs"
 
 [[bin]]
 name = "user-stream"
