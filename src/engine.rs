@@ -36,8 +36,9 @@ pub struct MatchingEngine {
     view_buf: Vec<crate::strategy::RestingOrder>,
     alloc_buf: Vec<crate::strategy::Allocation>,
     fills_buf: Vec<(OrderId, Qty)>,
-    /// Maker orders cancelled by STP during the last submit (for reporting).
-    stp_cancelled: Vec<OrderId>,
+    /// Maker orders (with their owners) cancelled by STP during the last
+    /// submit (for reporting).
+    stp_cancelled: Vec<(OrderId, u64)>,
 }
 
 impl MatchingEngine {
@@ -76,7 +77,7 @@ impl MatchingEngine {
 
     /// Maker orders cancelled by STP during the most recent `submit`/
     /// `submit_into` call (drain for reporting).
-    pub fn stp_cancelled(&self) -> &[OrderId] {
+    pub fn stp_cancelled(&self) -> &[(OrderId, u64)] {
         &self.stp_cancelled
     }
 
@@ -132,6 +133,11 @@ impl MatchingEngine {
     /// Cancel a resting order. Returns `true` if an order was removed.
     pub fn cancel(&mut self, id: OrderId) -> bool {
         self.book.cancel(id).is_some()
+    }
+
+    /// Cancel a resting order, returning it (e.g. to report its owner).
+    pub fn cancel_order(&mut self, id: OrderId) -> Option<Order> {
+        self.book.cancel(id)
     }
 
     /// Amend a resting order.
@@ -325,7 +331,7 @@ impl MatchingEngine {
                                 let r = self.view_buf[i];
                                 if r.user == order.user {
                                     self.book.cancel(r.id);
-                                    self.stp_cancelled.push(r.id);
+                                    self.stp_cancelled.push((r.id, r.user));
                                 }
                             }
                             if self.stp == SelfTradePolicy::CancelBoth {

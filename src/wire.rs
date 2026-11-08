@@ -134,7 +134,11 @@ pub const REPORT_LEN: usize = 56;
 pub const EXECUTION_EVENT_V1_LEN: usize = 88;
 /// Version 2 adds the target order id. A trade is published once for the taker
 /// and once for the maker, each keyed and partitioned by this field.
-pub const EXECUTION_EVENT_LEN: usize = 96;
+pub const EXECUTION_EVENT_V2_LEN: usize = 96;
+/// Version 3 appends the target order's owner (`u64` at 96..104), so a
+/// result can be pushed to its user without any lookup; read it with
+/// [`execution_event_target_user`]. Versions 1 and 2 still decode.
+pub const EXECUTION_EVENT_LEN: usize = 104;
 const EXECUTION_EVENT_MAGIC: [u8; 4] = *b"EX01";
 
 const MT_NEW: u8 = 1;
@@ -510,6 +514,7 @@ pub fn encode_report(r: &ExecReport, out: &mut [u8; REPORT_LEN]) {
         ExecReport::Accepted {
             instrument,
             order_id,
+            ..
         } => put(RT_ACCEPTED, instrument, order_id, 0, 0, 0, 0),
         ExecReport::Trade {
             instrument,
@@ -520,6 +525,7 @@ pub fn encode_report(r: &ExecReport, out: &mut [u8; REPORT_LEN]) {
             qty,
             maker_fee,
             taker_fee,
+            ..
         } => {
             put(
                 RT_TRADE,
@@ -539,24 +545,29 @@ pub fn encode_report(r: &ExecReport, out: &mut [u8; REPORT_LEN]) {
         ExecReport::Filled {
             instrument,
             order_id,
+            ..
         } => put(RT_FILLED, instrument, order_id, 0, 0, 0, 0),
         ExecReport::PartiallyFilled {
             instrument,
             order_id,
             filled,
+            ..
         } => put(RT_PARTIAL, instrument, order_id, 0, 0, filled, 0),
         ExecReport::Resting {
             instrument,
             order_id,
+            ..
         } => put(RT_RESTING, instrument, order_id, 0, 0, 0, 0),
         ExecReport::Cancelled {
             instrument,
             order_id,
+            ..
         } => put(RT_CANCELLED, instrument, order_id, 0, 0, 0, 0),
         ExecReport::Rejected {
             instrument,
             order_id,
             reason,
+            ..
         } => put(
             RT_REJECTED,
             instrument,
@@ -569,10 +580,12 @@ pub fn encode_report(r: &ExecReport, out: &mut [u8; REPORT_LEN]) {
         ExecReport::StopAccepted {
             instrument,
             order_id,
+            ..
         } => put(RT_STOP_ACCEPTED, instrument, order_id, 0, 0, 0, 0),
         ExecReport::Triggered {
             instrument,
             order_id,
+            ..
         } => put(RT_TRIGGERED, instrument, order_id, 0, 0, 0, 0),
         ExecReport::CommandRejected {
             instrument,
@@ -591,6 +604,7 @@ pub fn encode_report(r: &ExecReport, out: &mut [u8; REPORT_LEN]) {
             instrument,
             order_id,
             remaining,
+            ..
         } => put(RT_MODIFIED, instrument, order_id, 0, 0, remaining, 0),
         ExecReport::NotFound {
             instrument,
@@ -737,16 +751,59 @@ pub fn encode_execution_event_for_target(
     report: &ExecReport,
     out: &mut [u8; EXECUTION_EVENT_LEN],
 ) {
+    let mut frame = [0u8; REPORT_LEN];
+    encode_report(report, &mut frame);
+    let [user, maker_user] = report.users();
+    let target_user = match report {
+        ExecReport::Trade { maker, .. } if maker.0 == target_order_id => maker_user,
+        _ => user,
+    };
+    encode_execution_event_frame(
+        raft_group,
+        raft_index,
+        ordinal,
+        target_order_id,
+        target_user,
+        &frame,
+        out,
+    );
+}
+
+/// Build a v3 envelope around an already-encoded report frame.
+pub fn encode_execution_event_frame(
+    raft_group: u32,
+    raft_index: u64,
+    ordinal: u32,
+    target_order_id: u64,
+    target_user: u64,
+    frame: &[u8; REPORT_LEN],
+    out: &mut [u8; EXECUTION_EVENT_LEN],
+) {
     out.fill(0);
     out[..4].copy_from_slice(&EXECUTION_EVENT_MAGIC);
-    out[4..8].copy_from_slice(&2u32.to_le_bytes());
+    out[4..8].copy_from_slice(&3u32.to_le_bytes());
     out[8..12].copy_from_slice(&raft_group.to_le_bytes());
     out[16..24].copy_from_slice(&raft_index.to_le_bytes());
     out[24..28].copy_from_slice(&ordinal.to_le_bytes());
     out[32..40].copy_from_slice(&target_order_id.to_le_bytes());
-    let mut frame = [0u8; REPORT_LEN];
-    encode_report(report, &mut frame);
-    out[40..].copy_from_slice(&frame);
+    out[40..40 + REPORT_LEN].copy_from_slice(frame);
+    out[EXECUTION_EVENT_V2_LEN..EXECUTION_EVENT_LEN].copy_from_slice(&target_user.to_le_bytes());
+}
+
+/// Owner of an execution event's target order: the v3 trailer, or 0 for a
+/// v1/v2 event (published before the field existed) or a malformed buffer.
+pub fn execution_event_target_user(buf: &[u8]) -> u64 {
+    if buf.len() < EXECUTION_EVENT_LEN || buf[..4] != EXECUTION_EVENT_MAGIC {
+        return 0;
+    }
+    match u32::from_le_bytes(buf[4..8].try_into().unwrap()) {
+        3 => u64::from_le_bytes(
+            buf[EXECUTION_EVENT_V2_LEN..EXECUTION_EVENT_LEN]
+                .try_into()
+                .unwrap(),
+        ),
+        _ => 0,
+    }
 }
 
 pub fn decode_execution_event(buf: &[u8]) -> Option<ExecutionEvent> {
@@ -760,7 +817,11 @@ pub fn decode_execution_event(buf: &[u8]) -> Option<ExecutionEvent> {
                 let report = decode_report(&buf[32..32 + REPORT_LEN])?;
                 (report.order_id.0, report)
             }
-            2 if buf.len() >= EXECUTION_EVENT_LEN => (
+            2 if buf.len() >= EXECUTION_EVENT_V2_LEN => (
+                u64::from_le_bytes(buf[32..40].try_into().ok()?),
+                decode_report(&buf[40..40 + REPORT_LEN])?,
+            ),
+            3 if buf.len() >= EXECUTION_EVENT_LEN => (
                 u64::from_le_bytes(buf[32..40].try_into().ok()?),
                 decode_report(&buf[40..40 + REPORT_LEN])?,
             ),
@@ -859,6 +920,8 @@ mod tests {
             qty: 5,
             maker_fee: 49,
             taker_fee: 99,
+            taker_user: 0,
+            maker_user: 0,
         };
         let mut frame = [0u8; REPORT_LEN];
         encode_report(&r, &mut frame);
@@ -878,6 +941,7 @@ mod tests {
         let r = ExecReport::Resting {
             instrument: InstrumentId(42),
             order_id: OrderId(99),
+            user: 0,
         };
         let mut payload = [0u8; EXECUTION_EVENT_LEN];
         encode_execution_event(7, 1234, 5, &r, &mut payload);

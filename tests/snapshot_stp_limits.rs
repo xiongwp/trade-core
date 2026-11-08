@@ -184,6 +184,7 @@ fn stp_cancel_taker_blocks_self_trade() {
     assert!(reports.contains(&ExecReport::Cancelled {
         instrument: InstrumentId(0),
         order_id: OrderId(2),
+        user: 7,
     }));
     assert!(reports.iter().any(|r| matches!(
         r, ExecReport::Trade { taker, maker, .. }
@@ -214,6 +215,7 @@ fn stp_cancel_maker_pulls_resting_and_matches_rest() {
         reports.contains(&ExecReport::Cancelled {
             instrument: InstrumentId(0),
             order_id: OrderId(1),
+            user: 7,
         }),
         "self maker must be cancelled: {reports:?}"
     );
@@ -264,7 +266,8 @@ fn risk_limits_reject_oversize_and_order_count() {
     assert!(rejected_with(5, "max-user-orders"), "{reports:?}");
     assert!(reports.contains(&ExecReport::Resting {
         instrument: sym,
-        order_id: OrderId(4)
+        order_id: OrderId(4),
+        user: 9,
     }));
 }
 

@@ -326,6 +326,7 @@ fn post_only_and_reject_reasons_survive_the_wire() {
                 instrument: SYM,
                 order_id: OrderId(9),
                 reason,
+                user: 0,
             },
             &mut report,
         );
@@ -430,6 +431,7 @@ fn report_fingerprint_matches_proofs_written_before_reason_codes() {
         instrument: SYM,
         order_id: OrderId(id),
         reason: "unknown",
+        user: 0,
     };
     assert_eq!(wire::reject_reason_code("unknown"), 0);
     assert_eq!(
@@ -437,6 +439,7 @@ fn report_fingerprint_matches_proofs_written_before_reason_codes() {
             instrument: SYM,
             order_id: OrderId(5),
             reason: "post-only",
+            user: 0,
         }]),
         fingerprint_reports(&[legacy(5)])
     );

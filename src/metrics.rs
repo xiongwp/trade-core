@@ -704,10 +704,12 @@ mod tests {
         m.record(&ExecReport::Accepted {
             instrument: InstrumentId(1),
             order_id: OrderId(1),
+            user: 0,
         });
         m.record(&ExecReport::Cancelled {
             instrument: InstrumentId(1),
             order_id: OrderId(1),
+            user: 0,
         });
         let text = m.render();
         assert!(text.contains("tc_orders_accepted 1"));

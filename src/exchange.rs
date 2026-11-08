@@ -166,11 +166,18 @@ impl Command {
 }
 
 /// An asynchronous execution notification from the matching side.
+///
+/// `user` / `taker_user` / `maker_user` name the account that owns the order
+/// (0 = unattributed), so results can be pushed straight to that user. They
+/// travel beside the fixed 56-byte report frame (outbox record, execution
+/// event envelope), not inside it: the frame — and with it the report
+/// fingerprints persisted in Raft application proofs — is unchanged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecReport {
     Accepted {
         instrument: InstrumentId,
         order_id: OrderId,
+        user: u64,
     },
     Trade {
         instrument: InstrumentId,
@@ -182,40 +189,49 @@ pub enum ExecReport {
         /// Authoritative fees (ticks), computed in the matching path.
         maker_fee: u64,
         taker_fee: u64,
+        taker_user: u64,
+        maker_user: u64,
     },
     Filled {
         instrument: InstrumentId,
         order_id: OrderId,
+        user: u64,
     },
     PartiallyFilled {
         instrument: InstrumentId,
         order_id: OrderId,
         filled: Qty,
+        user: u64,
     },
     Resting {
         instrument: InstrumentId,
         order_id: OrderId,
+        user: u64,
     },
     Cancelled {
         instrument: InstrumentId,
         order_id: OrderId,
+        user: u64,
     },
     Rejected {
         instrument: InstrumentId,
         order_id: OrderId,
         reason: &'static str,
+        user: u64,
     },
     /// A conditional order was accepted and is waiting for its trigger (it is
     /// not on the book yet).
     StopAccepted {
         instrument: InstrumentId,
         order_id: OrderId,
+        user: u64,
     },
     /// A conditional order's trigger printed: it now enters as an ordinary
     /// order, and the usual Accepted / Trade / Filled ... reports follow.
     Triggered {
         instrument: InstrumentId,
         order_id: OrderId,
+        user: u64,
     },
     /// A command was refused without changing any order: a re-sent duplicate,
     /// or an amend that breaks the instrument's trading rules. `command_id` is
@@ -231,6 +247,7 @@ pub enum ExecReport {
         instrument: InstrumentId,
         order_id: OrderId,
         remaining: Qty,
+        user: u64,
     },
     NotFound {
         instrument: InstrumentId,
@@ -268,6 +285,30 @@ pub enum ExecReport {
         instrument: InstrumentId,
         user: u64,
     },
+}
+
+impl ExecReport {
+    /// `[owner of the report's order, maker's owner for a trade]`; 0 where
+    /// unknown (`NotFound`, command rejects, market-data and admin acks).
+    pub fn users(&self) -> [u64; 2] {
+        match *self {
+            ExecReport::Trade {
+                taker_user,
+                maker_user,
+                ..
+            } => [taker_user, maker_user],
+            ExecReport::Accepted { user, .. }
+            | ExecReport::Filled { user, .. }
+            | ExecReport::PartiallyFilled { user, .. }
+            | ExecReport::Resting { user, .. }
+            | ExecReport::Cancelled { user, .. }
+            | ExecReport::Rejected { user, .. }
+            | ExecReport::StopAccepted { user, .. }
+            | ExecReport::Triggered { user, .. }
+            | ExecReport::Modified { user, .. } => [user, 0],
+            _ => [0, 0],
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1258,22 +1299,22 @@ impl Processor {
                 order_id,
                 ..
             } => {
-                if self.engine_for(instrument).cancel(order_id) {
+                if let Some(cancelled) = self.engine_for(instrument).cancel_order(order_id) {
                     emit(ExecReport::Cancelled {
                         instrument,
                         order_id,
+                        user: cancelled.user,
                     });
-                } else if self.pending_stops > 0
-                    && self
-                        .stops
-                        .get_mut(&instrument)
-                        .and_then(|book| book.remove(order_id))
-                        .is_some()
+                } else if let Some(stop) = (self.pending_stops > 0)
+                    .then(|| self.stops.get_mut(&instrument))
+                    .flatten()
+                    .and_then(|book| book.remove(order_id))
                 {
                     self.pending_stops -= 1;
                     emit(ExecReport::Cancelled {
                         instrument,
                         order_id,
+                        user: stop.order.user,
                     });
                 } else {
                     emit(ExecReport::NotFound {
@@ -1318,10 +1359,9 @@ impl Processor {
                         }
                     }
                 }
-                match self
-                    .engine_for(instrument)
-                    .modify(order_id, new_price, new_qty)
-                {
+                let engine = self.engine_for(instrument);
+                let user = engine.book().get(order_id).map_or(0, |order| order.user);
+                match engine.modify(order_id, new_price, new_qty) {
                     ModifyOutcome::NotFound => emit(ExecReport::NotFound {
                         instrument,
                         order_id,
@@ -1333,10 +1373,12 @@ impl Processor {
                         instrument,
                         order_id,
                         remaining,
+                        user,
                     }),
                     ModifyOutcome::Cancelled { order_id } => emit(ExecReport::Cancelled {
                         instrument,
                         order_id,
+                        user,
                     }),
                     ModifyOutcome::Requoted(report) => {
                         let last_price = report.trades.last().map(|t| t.price);
@@ -1351,6 +1393,8 @@ impl Processor {
                                 qty: t.quantity,
                                 maker_fee,
                                 taker_fee,
+                                taker_user: t.taker_user,
+                                maker_user: t.maker_user,
                             });
                         }
                         let remaining = new_qty.saturating_sub(report.filled);
@@ -1358,17 +1402,20 @@ impl Processor {
                             OrderStatus::Filled => emit(ExecReport::Filled {
                                 instrument,
                                 order_id,
+                                user,
                             }),
                             OrderStatus::Resting | OrderStatus::PartiallyFilled => {
                                 emit(ExecReport::Modified {
                                     instrument,
                                     order_id,
                                     remaining,
+                                    user,
                                 })
                             }
                             _ => emit(ExecReport::Cancelled {
                                 instrument,
                                 order_id,
+                                user,
                             }),
                         }
                         if self.pending_stops > 0 {
@@ -1398,6 +1445,7 @@ impl Processor {
                     emit(ExecReport::Cancelled {
                         instrument,
                         order_id,
+                        user,
                     });
                 }
                 // 2. Flatten the position with a protected market order.
@@ -1420,6 +1468,7 @@ impl Processor {
     fn process_new(&mut self, mut order: Order, emit: &mut dyn FnMut(ExecReport)) -> Option<Price> {
         let instrument = order.instrument;
         let id = order.id;
+        let user = order.user;
 
         // Circuit breaker: a halted instrument accepts no new orders (cancels
         // and modifies still work so users can pull quotes).
@@ -1427,6 +1476,7 @@ impl Processor {
             emit(ExecReport::Rejected {
                 instrument,
                 order_id: id,
+                user,
                 reason: "halted",
             });
             return None;
@@ -1435,6 +1485,7 @@ impl Processor {
             emit(ExecReport::Rejected {
                 instrument,
                 order_id: id,
+                user,
                 reason: "user-suspended",
             });
             return None;
@@ -1448,6 +1499,7 @@ impl Processor {
             emit(ExecReport::Rejected {
                 instrument,
                 order_id: id,
+                user,
                 reason: "post-only",
             });
             return None;
@@ -1458,6 +1510,7 @@ impl Processor {
                     emit(ExecReport::Rejected {
                         instrument,
                         order_id: id,
+                        user,
                         reason,
                     });
                     return None;
@@ -1471,6 +1524,7 @@ impl Processor {
                 emit(ExecReport::Rejected {
                     instrument,
                     order_id: id,
+                    user,
                     reason,
                 });
                 return None;
@@ -1483,6 +1537,7 @@ impl Processor {
                 emit(ExecReport::Rejected {
                     instrument,
                     order_id: id,
+                    user,
                     reason,
                 });
                 return None;
@@ -1499,6 +1554,7 @@ impl Processor {
                     emit(ExecReport::Rejected {
                         instrument,
                         order_id: id,
+                        user,
                         reason: "max-user-orders",
                     });
                     return None;
@@ -1509,6 +1565,7 @@ impl Processor {
         emit(ExecReport::Accepted {
             instrument,
             order_id: id,
+            user,
         });
         // Zero-allocation submit: trades land in the processor's scratch buffer.
         let mut trades = std::mem::take(&mut self.trades_buf);
@@ -1518,10 +1575,11 @@ impl Processor {
         // entirely under `Allow` — no extra lookup on the default hot path.
         if self.stp != SelfTradePolicy::Allow {
             let engine = self.engines.get(&instrument).expect("engine exists");
-            for &order_id in engine.stp_cancelled() {
+            for &(order_id, user) in engine.stp_cancelled() {
                 emit(ExecReport::Cancelled {
                     instrument,
                     order_id,
+                    user,
                 });
             }
         }
@@ -1548,6 +1606,8 @@ impl Processor {
                 qty: t.quantity,
                 maker_fee,
                 taker_fee,
+                taker_user: t.taker_user,
+                maker_user: t.maker_user,
             });
         }
         let last_price = trades.last().map(|t| t.price);
@@ -1556,23 +1616,28 @@ impl Processor {
             OrderStatus::Filled => emit(ExecReport::Filled {
                 instrument,
                 order_id: id,
+                user,
             }),
             OrderStatus::PartiallyFilled => emit(ExecReport::PartiallyFilled {
                 instrument,
                 order_id: id,
+                user,
                 filled,
             }),
             OrderStatus::Resting => emit(ExecReport::Resting {
                 instrument,
                 order_id: id,
+                user,
             }),
             OrderStatus::Cancelled => emit(ExecReport::Cancelled {
                 instrument,
                 order_id: id,
+                user,
             }),
             OrderStatus::Rejected => emit(ExecReport::Rejected {
                 instrument,
                 order_id: id,
+                user,
                 // The engine rejects a post-only that would take liquidity,
                 // and a FOK that cannot fill whole.
                 reason: if post_only { "post-only" } else { "unfillable" },
@@ -1592,10 +1657,12 @@ impl Processor {
     fn place_stop(&mut self, order: Order, trigger: Trigger, emit: &mut dyn FnMut(ExecReport)) {
         let instrument = order.instrument;
         let id = order.id;
+        let user = order.user;
         let reject = |reason, emit: &mut dyn FnMut(ExecReport)| {
             emit(ExecReport::Rejected {
                 instrument,
                 order_id: id,
+                user,
                 reason,
             })
         };
@@ -1640,6 +1707,7 @@ impl Processor {
         emit(ExecReport::StopAccepted {
             instrument,
             order_id: id,
+            user,
         });
     }
 
@@ -1672,6 +1740,7 @@ impl Processor {
             emit(ExecReport::Triggered {
                 instrument,
                 order_id: stop.order.id,
+                user: stop.order.user,
             });
             if let Some(price) = self.process_new(stop.order, emit) {
                 last_price = Some(price);

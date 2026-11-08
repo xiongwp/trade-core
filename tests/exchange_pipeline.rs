@@ -126,18 +126,21 @@ fn async_results_report_full_lifecycle() {
 
     assert!(reports.contains(&ExecReport::Accepted {
         instrument: sym,
-        order_id: OrderId(1)
+        order_id: OrderId(1),
+        user: 0,
     }));
     assert!(reports.contains(&ExecReport::Resting {
         instrument: sym,
-        order_id: OrderId(1)
+        order_id: OrderId(1),
+        user: 0,
     }));
     assert!(reports.iter().any(|r| matches!(
         r, ExecReport::Trade { taker, maker, qty, .. }
         if *taker == OrderId(2) && *maker == OrderId(1) && *qty == 5)));
     assert!(reports.contains(&ExecReport::Filled {
         instrument: sym,
-        order_id: OrderId(2)
+        order_id: OrderId(2),
+        user: 0,
     }));
 }
 
@@ -158,7 +161,8 @@ fn cancel_takes_priority_over_queued_new_orders() {
     let acked = collect(&sink, 2); // Accepted + Resting
     assert!(acked.contains(&ExecReport::Resting {
         instrument: sym,
-        order_id: OrderId(1)
+        order_id: OrderId(1),
+        user: 0,
     }));
 
     // Quiesce the shard, THEN stage a wall of crossing buys (normal queue) and a
@@ -220,5 +224,6 @@ fn modify_reduce_keeps_priority_and_reports_modified() {
         instrument: sym,
         order_id: OrderId(1),
         remaining: 4,
+        user: 0,
     }));
 }

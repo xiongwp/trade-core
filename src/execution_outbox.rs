@@ -7,8 +7,61 @@ use crate::exchange::ExecReport;
 use crate::journal::fnv1a;
 use crate::wire::{self, EXECUTION_EVENT_LEN, REPORT_LEN};
 
-pub const OUTBOX_HEADER: [u8; 8] = *b"TCEX\x01\0\0\0";
-pub const OUTBOX_RECORD_LEN: usize = 4 + 8 + 4 + REPORT_LEN + 8;
+/// Segment header, format v2: records carry the order owners (see
+/// [`OutboxRecord::users`]). v1 segments (no users) are still read, trimmed
+/// and published; the writer never appends to one (it rotates instead).
+pub const OUTBOX_HEADER: [u8; 8] = *b"TCEX\x02\0\0\0";
+const OUTBOX_HEADER_V1: [u8; 8] = *b"TCEX\x01\0\0\0";
+/// Record length of format v2: group, index, ordinal, report, 2 users, checksum.
+pub const OUTBOX_RECORD_LEN: usize = 4 + 8 + 4 + REPORT_LEN + 16 + 8;
+/// Record length of format v1 (no users).
+pub const OUTBOX_RECORD_LEN_V1: usize = 4 + 8 + 4 + REPORT_LEN + 8;
+
+/// Record length for a segment header, or `None` for an unknown format.
+fn record_len_for(header: &[u8; 8]) -> Option<usize> {
+    if *header == OUTBOX_HEADER {
+        Some(OUTBOX_RECORD_LEN)
+    } else if *header == OUTBOX_HEADER_V1 {
+        Some(OUTBOX_RECORD_LEN_V1)
+    } else {
+        None
+    }
+}
+
+fn header_mismatch(path: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("execution outbox header/version mismatch in {}", path.display()),
+    )
+}
+
+/// Decode one record of `record_len` bytes; `None` if its checksum fails
+/// (a torn or partial trailing record).
+fn decode_record(bytes: &[u8]) -> Option<OutboxRecord> {
+    let n = bytes.len();
+    let expected = u64::from_le_bytes(bytes[n - 8..].try_into().ok()?);
+    if fnv1a(&bytes[..n - 8]) != expected {
+        return None;
+    }
+    let mut frame = [0u8; REPORT_LEN];
+    frame.copy_from_slice(&bytes[16..16 + REPORT_LEN]);
+    let users = if n == OUTBOX_RECORD_LEN {
+        let at = 16 + REPORT_LEN;
+        [
+            u64::from_le_bytes(bytes[at..at + 8].try_into().ok()?),
+            u64::from_le_bytes(bytes[at + 8..at + 16].try_into().ok()?),
+        ]
+    } else {
+        [0, 0]
+    };
+    Some(OutboxRecord {
+        raft_group: u32::from_le_bytes(bytes[0..4].try_into().ok()?),
+        raft_index: u64::from_le_bytes(bytes[4..12].try_into().ok()?),
+        ordinal: u32::from_le_bytes(bytes[12..16].try_into().ok()?),
+        report_frame: frame,
+        users,
+    })
+}
 const CURSOR_HEADER: [u8; 8] = *b"TCEC\x01\0\0\0";
 const CURSOR_LEN: usize = CURSOR_HEADER.len() + 8 + 8;
 
@@ -18,6 +71,10 @@ pub struct OutboxRecord {
     pub raft_index: u64,
     pub ordinal: u32,
     pub report_frame: [u8; REPORT_LEN],
+    /// Owners of the report's orders: `[order_id's user, maker's user for a
+    /// trade]` ([`ExecReport::users`]); zeros for records read from a v1
+    /// segment.
+    pub users: [u64; 2],
 }
 
 impl OutboxRecord {
@@ -42,14 +99,26 @@ impl OutboxRecord {
     }
 
     pub fn kafka_payload_for(&self, target_order_id: u64) -> [u8; EXECUTION_EVENT_LEN] {
+        let report = wire::decode_report(&self.report_frame).expect("valid outbox report");
+        // A trade's maker copy belongs to the maker's owner.
+        let target_user = if report.type_code == wire::RT_TRADE
+            && report.aux_id == target_order_id
+            && report.order_id.0 != target_order_id
+        {
+            self.users[1]
+        } else {
+            self.users[0]
+        };
         let mut payload = [0u8; EXECUTION_EVENT_LEN];
-        payload[..4].copy_from_slice(b"EX01");
-        payload[4..8].copy_from_slice(&2u32.to_le_bytes());
-        payload[8..12].copy_from_slice(&self.raft_group.to_le_bytes());
-        payload[16..24].copy_from_slice(&self.raft_index.to_le_bytes());
-        payload[24..28].copy_from_slice(&self.ordinal.to_le_bytes());
-        payload[32..40].copy_from_slice(&target_order_id.to_le_bytes());
-        payload[40..40 + REPORT_LEN].copy_from_slice(&self.report_frame);
+        wire::encode_execution_event_frame(
+            self.raft_group,
+            self.raft_index,
+            self.ordinal,
+            target_order_id,
+            target_user,
+            &self.report_frame,
+            &mut payload,
+        );
         debug_assert_eq!(
             wire::decode_execution_event(&payload)
                 .unwrap()
@@ -145,37 +214,30 @@ pub fn latest_segment(base: &Path) -> io::Result<PathBuf> {
         .unwrap_or_else(|| base.to_path_buf()))
 }
 
-/// Create-or-validate one segment file and return an append handle plus its
-/// current logical length.
-fn open_segment(path: &Path) -> io::Result<(File, u64)> {
+/// Create-or-validate one segment file and return an append handle, its
+/// current logical length and its record length (format version).
+fn open_segment(path: &Path) -> io::Result<(File, u64, usize)> {
     let mut file = OpenOptions::new()
         .read(true)
         .create(true)
         .append(true)
         .open(path)?;
     let mut len = file.metadata()?.len();
-    if len == 0 {
+    let record_len = if len == 0 {
         file.write_all(&OUTBOX_HEADER)?;
         file.sync_data()?;
         if let Some(parent) = path.parent() {
             File::open(parent)?.sync_all()?;
         }
         len = OUTBOX_HEADER.len() as u64;
+        OUTBOX_RECORD_LEN
     } else {
         file.seek(SeekFrom::Start(0))?;
         let mut header = [0u8; OUTBOX_HEADER.len()];
         file.read_exact(&mut header)?;
-        if header != OUTBOX_HEADER {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "execution outbox header/version mismatch in {}",
-                    path.display()
-                ),
-            ));
-        }
-    }
-    Ok((OpenOptions::new().append(true).open(path)?, len))
+        record_len_for(&header).ok_or_else(|| header_mismatch(path))?
+    };
+    Ok((OpenOptions::new().append(true).open(path)?, len, record_len))
 }
 
 impl ExecutionOutboxWriter {
@@ -190,9 +252,20 @@ impl ExecutionOutboxWriter {
             std::fs::create_dir_all(parent)?;
         }
         let base = path.to_path_buf();
-        let current = latest_segment(&base)?;
-        let current_seq = segment_seq_of(&base, &current).unwrap_or(0);
-        let (file, len) = open_segment(&current)?;
+        let mut current = latest_segment(&base)?;
+        let mut current_seq = segment_seq_of(&base, &current).unwrap_or(0);
+        let (mut file, mut len, record_len) = open_segment(&current)?;
+        if record_len != OUTBOX_RECORD_LEN {
+            // The newest segment predates the current record format (an
+            // upgrade). Recovery has already trimmed it to watermark-covered
+            // records, so seal it as-is — the publisher still reads it — and
+            // append to a fresh segment in the current format.
+            current_seq += 1;
+            current = segment_path(&base, current_seq);
+            let (fresh, fresh_len, _) = open_segment(&current)?;
+            file = fresh;
+            len = fresh_len;
+        }
         Ok(ExecutionOutboxWriter {
             writer: BufWriter::with_capacity(64 * 1024, file),
             path: current,
@@ -235,7 +308,7 @@ impl ExecutionOutboxWriter {
             self.sync_data()?;
         }
         let next = segment_path(&self.base, self.next_segment_seq);
-        let (file, len) = open_segment(&next)?;
+        let (file, len, _) = open_segment(&next)?;
         self.writer = BufWriter::with_capacity(64 * 1024, file);
         self.path = next;
         self.next_segment_seq += 1;
@@ -303,6 +376,7 @@ impl ExecutionOutboxWriter {
             raft_index,
             ordinal,
             report_frame: frame,
+            users: report.users(),
         };
         write_record(&mut self.writer, &record)?;
         self.segment_bytes += OUTBOX_RECORD_LEN as u64;
@@ -336,6 +410,7 @@ impl ExecutionOutboxWriter {
             raft_index,
             ordinal,
             report_frame: frame,
+            users: report.users(),
         };
         write_record(&mut self.writer, &record)?;
         self.segment_bytes += OUTBOX_RECORD_LEN as u64;
@@ -392,29 +467,22 @@ pub fn truncate_after_applied(path: &Path, max_applied_index: Option<u64>) -> io
     }
     let mut header = [0u8; OUTBOX_HEADER.len()];
     file.read_exact(&mut header)?;
-    if header != OUTBOX_HEADER {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "execution outbox header/version mismatch",
-        ));
-    }
+    let record_len = record_len_for(&header).ok_or_else(|| header_mismatch(path))?;
     let mut reader = BufReader::new(&file);
     let mut keep = OUTBOX_HEADER.len() as u64;
     loop {
-        let mut bytes = [0u8; OUTBOX_RECORD_LEN];
-        match reader.read_exact(&mut bytes) {
+        let mut buf = [0u8; OUTBOX_RECORD_LEN];
+        let bytes = &mut buf[..record_len];
+        match reader.read_exact(bytes) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
             Err(error) => return Err(error),
         }
-        let expected =
-            u64::from_le_bytes(bytes[OUTBOX_RECORD_LEN - 8..].try_into().expect("checksum"));
-        if fnv1a(&bytes[..OUTBOX_RECORD_LEN - 8]) != expected {
+        let Some(record) = decode_record(bytes) else {
             break; // torn/partial trailing record: discard from here on
-        }
-        let raft_index = u64::from_le_bytes(bytes[4..12].try_into().expect("index"));
+        };
         match max_applied_index {
-            Some(max) if raft_index <= max => keep += OUTBOX_RECORD_LEN as u64,
+            Some(max) if record.raft_index <= max => keep += record_len as u64,
             _ => break, // first record past the durable watermark
         }
     }
@@ -435,6 +503,9 @@ fn write_record(mut writer: impl Write, record: &OutboxRecord) -> io::Result<()>
     bytes[4..12].copy_from_slice(&record.raft_index.to_le_bytes());
     bytes[12..16].copy_from_slice(&record.ordinal.to_le_bytes());
     bytes[16..16 + REPORT_LEN].copy_from_slice(&record.report_frame);
+    let at = 16 + REPORT_LEN;
+    bytes[at..at + 8].copy_from_slice(&record.users[0].to_le_bytes());
+    bytes[at + 8..at + 16].copy_from_slice(&record.users[1].to_le_bytes());
     let checksum = fnv1a(&bytes[..OUTBOX_RECORD_LEN - 8]);
     bytes[OUTBOX_RECORD_LEN - 8..].copy_from_slice(&checksum.to_le_bytes());
     writer.write_all(&bytes)
@@ -444,6 +515,8 @@ pub struct ExecutionOutboxReader {
     path: PathBuf,
     cursor_path: Option<PathBuf>,
     offset: u64,
+    /// This segment's record length (its format version).
+    record_len: usize,
 }
 
 impl ExecutionOutboxReader {
@@ -451,16 +524,12 @@ impl ExecutionOutboxReader {
         let mut file = File::open(&path)?;
         let mut header = [0u8; OUTBOX_HEADER.len()];
         file.read_exact(&mut header)?;
-        if header != OUTBOX_HEADER {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "execution outbox header/version mismatch",
-            ));
-        }
+        let record_len = record_len_for(&header).ok_or_else(|| header_mismatch(&path))?;
         Ok(ExecutionOutboxReader {
             path,
             cursor_path: None,
             offset: OUTBOX_HEADER.len() as u64,
+            record_len,
         })
     }
 
@@ -478,7 +547,7 @@ impl ExecutionOutboxReader {
                 )
             })?;
             if offset < OUTBOX_HEADER.len() as u64
-                || (offset - OUTBOX_HEADER.len() as u64) % OUTBOX_RECORD_LEN as u64 != 0
+                || (offset - OUTBOX_HEADER.len() as u64) % reader.record_len as u64 != 0
                 || offset > std::fs::metadata(&reader.path)?.len()
             {
                 return Err(io::Error::new(
@@ -503,25 +572,17 @@ impl ExecutionOutboxReader {
         reader.seek(SeekFrom::Start(self.offset))?;
         let mut records = Vec::with_capacity(max_records.min(1024));
         while records.len() < max_records {
-            let mut bytes = [0u8; OUTBOX_RECORD_LEN];
-            match reader.read_exact(&mut bytes) {
+            let mut buf = [0u8; OUTBOX_RECORD_LEN];
+            let bytes = &mut buf[..self.record_len];
+            match reader.read_exact(bytes) {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
                 Err(error) => return Err(error),
             }
-            let expected =
-                u64::from_le_bytes(bytes[OUTBOX_RECORD_LEN - 8..].try_into().expect("checksum"));
-            if fnv1a(&bytes[..OUTBOX_RECORD_LEN - 8]) != expected {
+            let Some(record) = decode_record(bytes) else {
                 break;
-            }
-            let mut frame = [0u8; REPORT_LEN];
-            frame.copy_from_slice(&bytes[16..16 + REPORT_LEN]);
-            records.push(OutboxRecord {
-                raft_group: u32::from_le_bytes(bytes[0..4].try_into().expect("group")),
-                raft_index: u64::from_le_bytes(bytes[4..12].try_into().expect("index")),
-                ordinal: u32::from_le_bytes(bytes[12..16].try_into().expect("ordinal")),
-                report_frame: frame,
-            });
+            };
+            records.push(record);
         }
         Ok(records)
     }
@@ -531,7 +592,7 @@ impl ExecutionOutboxReader {
             return Ok(());
         }
         let advance = (records as u64)
-            .checked_mul(OUTBOX_RECORD_LEN as u64)
+            .checked_mul(self.record_len as u64)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "cursor overflow"))?;
         let next = self
             .offset
@@ -559,7 +620,7 @@ impl ExecutionOutboxReader {
         }
         let len = std::fs::metadata(&self.path)?.len();
         if offset < OUTBOX_HEADER.len() as u64
-            || (offset - OUTBOX_HEADER.len() as u64) % OUTBOX_RECORD_LEN as u64 != 0
+            || (offset - OUTBOX_HEADER.len() as u64) % self.record_len as u64 != 0
             || offset > len
         {
             return Err(io::Error::new(
@@ -582,11 +643,16 @@ impl ExecutionOutboxReader {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
             Err(error) => return Err(error),
         };
-        Ok(len.saturating_sub(self.offset) / OUTBOX_RECORD_LEN as u64)
+        Ok(len.saturating_sub(self.offset) / self.record_len as u64)
     }
 
     pub fn offset(&self) -> u64 {
         self.offset
+    }
+
+    /// Bytes per record in this segment (depends on its format version).
+    pub fn record_len(&self) -> usize {
+        self.record_len
     }
 
     pub fn read_available(&mut self, mut emit: impl FnMut(OutboxRecord)) -> io::Result<usize> {
@@ -675,6 +741,7 @@ mod tests {
                     &ExecReport::Accepted {
                         instrument: InstrumentId(42),
                         order_id: OrderId(7),
+                        user: 0,
                     },
                 )
                 .unwrap();
@@ -711,6 +778,8 @@ mod tests {
                 qty: 7,
                 maker_fee: 1,
                 taker_fee: 2,
+                taker_user: 0,
+                maker_user: 0,
             },
             &mut frame,
         );
@@ -719,6 +788,8 @@ mod tests {
             raft_index: 55,
             ordinal: 3,
             report_frame: frame,
+            users: [0,
+            0],
         };
         assert_eq!(record.target_order_ids(), vec![101, 202]);
         for target in [101, 202] {
@@ -746,6 +817,7 @@ mod tests {
                         &ExecReport::Accepted {
                             instrument: InstrumentId(index as u32),
                             order_id: OrderId(ordinal as u64),
+                            user: 0,
                         },
                     )
                     .unwrap();
@@ -774,6 +846,7 @@ mod tests {
         let report = |index: u64| ExecReport::Accepted {
             instrument: InstrumentId(index as u32),
             order_id: OrderId(index),
+            user: 0,
         };
 
         let mut writer = ExecutionOutboxWriter::open(&base, Duration::from_secs(60), usize::MAX)
@@ -931,6 +1004,7 @@ mod tests {
                         &ExecReport::Accepted {
                             instrument: InstrumentId(5),
                             order_id: OrderId(index),
+                            user: 0,
                         },
                     )
                     .unwrap();

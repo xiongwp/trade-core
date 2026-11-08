@@ -378,6 +378,7 @@ fn conditional_orders_survive_the_wire() {
             ExecReport::StopAccepted {
                 instrument: SYM,
                 order_id: OrderId(9),
+                user: 0,
             },
             wire::RT_STOP_ACCEPTED,
         ),
@@ -385,6 +386,7 @@ fn conditional_orders_survive_the_wire() {
             ExecReport::Triggered {
                 instrument: SYM,
                 order_id: OrderId(9),
+                user: 0,
             },
             wire::RT_TRIGGERED,
         ),

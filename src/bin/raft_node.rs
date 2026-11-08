@@ -944,8 +944,7 @@ fn spawn_execution_outbox_publisher(
                                     continue;
                                 };
                                 let next_offset = reader.offset()
-                                    + records.len() as u64
-                                        * trade_core::execution_outbox::OUTBOX_RECORD_LEN as u64;
+                                    + records.len() as u64 * reader.record_len() as u64;
                                 let batch_count = batches_since_checkpoint
                                     .entry(name.clone())
                                     .and_modify(|count| *count += 1)
@@ -1259,6 +1258,7 @@ mod tests {
             &ExecReport::Accepted {
                 instrument: InstrumentId(instrument),
                 order_id: OrderId(instrument as u64),
+                user: 0,
             },
             &mut frame,
         );
