@@ -445,67 +445,53 @@ fn mysql8_projection_is_race_safe_and_idempotent() {
 }
 
 #[test]
-fn dedupe_ring_keeps_the_retention_window_and_the_next_hour() {
-    let retention = 24;
-    for hour in [0u64, 7, 47, 48, 1_000_000] {
-        let expired = expired_buckets(hour, retention);
-        assert_eq!(expired.len() as u64, DEDUPE_BUCKETS - retention - 2);
-        for age in 0..=retention {
-            let bucket = (hour + DEDUPE_BUCKETS - age) % DEDUPE_BUCKETS;
-            assert!(!expired.contains(&bucket), "hour {hour}: live bucket {bucket} (age {age}) expired");
-        }
-        assert!(!expired.contains(&((hour + 1) % DEDUPE_BUCKETS)), "next hour's bucket");
-        assert!(expired.contains(&((hour + DEDUPE_BUCKETS - retention - 1) % DEDUPE_BUCKETS)));
+fn dedupe_ring_clears_only_the_partition_after_the_current_one() {
+    for period in [0u64, 1, 2, 3, 1_000_000] {
+        let current = period % DEDUPE_PARTITIONS;
+        let previous = (period + DEDUPE_PARTITIONS - 1) % DEDUPE_PARTITIONS;
+        let cleared = bucket_to_clear(period);
+        assert_ne!(cleared, current, "period {period}");
+        assert_ne!(cleared, previous, "period {period}");
     }
-    // The largest retention still leaves one bucket to clear.
-    assert_eq!(expired_buckets(5, DEDUPE_BUCKETS - 3).len(), 1);
 }
 
-/// Same disposable MySQL 8 as above. Rows land in the current hour's
-/// partition; truncation clears expired hours and nothing in the window.
+/// Same disposable MySQL 8 as above. Rows land in the current period's
+/// partition; only the next period's partition (two periods old) is cleared.
 #[test]
 #[ignore = "requires disposable MySQL 8 via TC_TEST_MYSQL_URL"]
-fn mysql8_dedupe_ring_truncates_only_expired_hour_partitions() {
+fn mysql8_dedupe_ring_truncates_only_the_stale_partition() {
     let store = mysql_test_store().expect("TC_TEST_MYSQL_URL must be set");
     // A raft group no other test uses, so concurrent tests keep their rows.
     let group = 1_000_000 + (std::process::id() % 1_000_000);
     let mut conn = store.shard(0).get_conn().unwrap();
-    let hour: u64 = conn.query_first("SELECT UNIX_TIMESTAMP() DIV 3600").unwrap().unwrap();
-    let bucket_of = |age: i64| ((hour as i64 - age).rem_euclid(DEDUPE_BUCKETS as i64)) as u64;
-    // (raft_index, age in hours): the next hour, live hours, then expired ones.
-    let rows = [(1u64, -1i64), (2, 0), (3, 5), (4, 24), (5, 25), (6, 30), (7, 46)];
-    for (index, age) in rows {
+    let period: u64 = conn
+        .query_first(format!("SELECT UNIX_TIMESTAMP() DIV {}", dedupe_retention_hours() * 3600))
+        .unwrap()
+        .unwrap();
+    let bucket_of = |age: u64| (period + DEDUPE_PARTITIONS - age) % DEDUPE_PARTITIONS;
+    // (raft_index, age in periods): current, previous, and two periods old.
+    for (index, age) in [(1u64, 0u64), (2, 1), (3, 2)] {
         conn.exec_drop(
             "INSERT INTO order_db_0.processed_execution_events (raft_group,raft_index,report_ordinal,target_order_id,shard_table,instrument,report_type,kafka_partition,kafka_offset,bucket) VALUES (?,?,0,1,0,0,12,0,0,?)",
             (group, index, bucket_of(age)),
         )
         .unwrap();
     }
-    // The bucket the projection computes is the current hour's.
-    let computed: u64 = conn.query_first(format!("SELECT {DEDUPE_BUCKET_SQL}")).unwrap().unwrap();
+    // The bucket the projection computes is the current period's.
+    let computed: u64 = conn.query_first(format!("SELECT {}", dedupe_bucket_sql())).unwrap().unwrap();
     assert_eq!(computed, bucket_of(0));
 
+    let left = |conn: &mut mysql::PooledConn| -> Vec<u64> {
+        conn.exec("SELECT raft_index FROM order_db_0.processed_execution_events WHERE raft_group=? ORDER BY raft_index", (group,))
+            .unwrap()
+    };
     let mut ring = DedupeRing::new();
-    // Only the expired partitions holding rows (ages 25, 30, 46) are touched.
-    let truncated = ring.advance(&mut conn, 0, hour).unwrap();
-    assert_eq!(truncated, 3);
-    let left: Vec<u64> = conn
-        .exec("SELECT raft_index FROM order_db_0.processed_execution_events WHERE raft_group=? ORDER BY raft_index", (group,))
-        .unwrap();
-    assert_eq!(left, vec![1, 2, 3, 4], "rows aged 25, 30 and 46 hours go");
-    // Same hour again: nothing to do. Next hour: exactly the bucket aged out.
-    assert_eq!(ring.advance(&mut conn, 0, hour).unwrap(), 0);
-    assert_eq!(ring.advance(&mut conn, 0, hour + 1).unwrap(), 1);
-    let left: Vec<u64> = conn
-        .exec("SELECT raft_index FROM order_db_0.processed_execution_events WHERE raft_group=? ORDER BY raft_index", (group,))
-        .unwrap();
-    assert_eq!(left, vec![1, 2, 3], "the 24-hour-old row is now 25 hours old");
-    // The server clock steps back an hour: nothing is truncated.
-    assert_eq!(ring.advance(&mut conn, 0, hour).unwrap(), 0);
-    let left: Vec<u64> = conn
-        .exec("SELECT raft_index FROM order_db_0.processed_execution_events WHERE raft_group=? ORDER BY raft_index", (group,))
-        .unwrap();
-    assert_eq!(left, vec![1, 2, 3]);
+    assert_eq!(ring.advance(&mut conn, 0, period).unwrap(), 1);
+    assert_eq!(left(&mut conn), vec![1, 2], "only the two-period-old row goes");
+    // Same period again, or the clock stepping back: nothing more.
+    assert_eq!(ring.advance(&mut conn, 0, period).unwrap(), 0);
+    assert_eq!(ring.advance(&mut conn, 0, period - 1).unwrap(), 0);
+    assert_eq!(left(&mut conn), vec![1, 2]);
     conn.exec_drop("DELETE FROM order_db_0.processed_execution_events WHERE raft_group=?", (group,))
         .unwrap();
 }
@@ -534,7 +520,7 @@ fn mysql8_legacy_dedupe_table_is_renamed_and_still_consulted() {
         .query_first("SELECT COUNT(*) FROM information_schema.partitions WHERE table_schema='order_db_0' AND table_name='processed_execution_events'")
         .unwrap()
         .unwrap();
-    assert_eq!(partitions, DEDUPE_BUCKETS);
+    assert_eq!(partitions, DEDUPE_PARTITIONS);
 
     // The same event arrives again: it is recognised through the legacy table.
     conn.exec_drop(

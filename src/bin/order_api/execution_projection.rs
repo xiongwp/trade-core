@@ -671,8 +671,9 @@ pub(crate) fn apply_pending_execution_table(
     .map_err(|error| error.to_string())?;
     tx.query_drop(format!(
         "INSERT IGNORE INTO {db}.processed_execution_events (raft_group,raft_index,report_ordinal,target_order_id,shard_table,instrument,report_type,kafka_partition,kafka_offset,bucket) \
-         SELECT p.raft_group,p.raft_index,p.report_ordinal,p.target_order_id,p.shard_table,p.instrument,p.report_type,p.kafka_partition,p.kafka_offset,{DEDUPE_BUCKET_SQL} \
-         FROM {db}.pending_execution_events p INNER JOIN {db}.{table} o ON o.order_id=p.target_order_id WHERE p.shard_table={shard_table}"
+         SELECT p.raft_group,p.raft_index,p.report_ordinal,p.target_order_id,p.shard_table,p.instrument,p.report_type,p.kafka_partition,p.kafka_offset,{bucket} \
+         FROM {db}.pending_execution_events p INNER JOIN {db}.{table} o ON o.order_id=p.target_order_id WHERE p.shard_table={shard_table}",
+        bucket = dedupe_bucket_sql(),
     ))
     .map_err(|error| error.to_string())?;
     // Same join as the promotion above, so a fill lands exactly when its event
