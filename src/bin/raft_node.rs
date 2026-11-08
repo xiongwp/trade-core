@@ -556,9 +556,19 @@ fn main() {
                                     .snapshot_index()
                                     .saturating_add(compact_threshold)
                         {
-                            match std::fs::read(&runtime_snapshot_path)
-                                .and_then(|bytes| node.compact(index, bytes).map(|_| ()))
-                            {
+                            // Read the file once and take the index from those
+                            // same bytes: the background snapshot writer can
+                            // rename a newer file in between, and compacting at
+                            // the probed index with the newer blob stored a
+                            // snapshot whose label and contents disagreed (it
+                            // then failed to install on restart).
+                            match std::fs::read(&runtime_snapshot_path).and_then(|bytes| {
+                                let stored = trade_core::snapshot::raft_applied_index_of(&bytes)?;
+                                if stored > node.applied_index() {
+                                    return Ok(()); // newer than applied: next pass
+                                }
+                                node.compact(stored, bytes).map(|_| ())
+                            }) {
                                 Ok(()) => log_info!(
                                     "raft-node",
                                     "compacted Raft WAL through matching snapshot index {index}"

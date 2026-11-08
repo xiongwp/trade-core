@@ -121,3 +121,27 @@ fn a_pre_window_snapshot_restores_with_the_legacy_seed() {
     assert!(!run(&mut restored, new(8, Side::Sell, 100, 5))[0].contains("duplicate"));
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn force_close_cancels_in_the_same_order_on_every_replica() {
+    // Many resting orders of one user: HashMap iteration order differs per
+    // process, so the cancel report order used to differ between replicas.
+    let mut a = processor(1_000);
+    for id in 1..=40 {
+        run(&mut a, Command::New(Order::limit(OrderId(id), Side::Buy, 50 + id % 7, 1).on(INSTRUMENT).by(9)));
+    }
+    let mut b = restart(&a, 1_000, "forceclose");
+    let close = || Command::ForceClose {
+        instrument: INSTRUMENT,
+        user: 9,
+        close_order_id: OrderId(1_000),
+        close_side: Side::Sell,
+        close_qty: 0,
+    };
+    let ra = run(&mut a, close());
+    let rb = run(&mut b, close());
+    assert_eq!(ra, rb);
+    let cancelled: Vec<&String> = ra.iter().filter(|r| r.starts_with("Cancelled")).collect();
+    assert_eq!(cancelled.len(), 40);
+    assert!(cancelled[0].contains("OrderId(1)"), "{:?}", cancelled[0]);
+}

@@ -309,6 +309,24 @@ pub fn install_bytes(path: &Path, bytes: &[u8], expected_index: u64) -> io::Resu
     Ok(())
 }
 
+/// The Raft applied index recorded in snapshot `bytes`, after checking the
+/// magic and checksum (without decoding the books).
+pub fn raft_applied_index_of(bytes: &[u8]) -> io::Result<u64> {
+    let corrupt = |msg: &str| io::Error::new(io::ErrorKind::InvalidData, msg.to_string());
+    if bytes.len() < 32 || &bytes[0..4] != MAGIC {
+        return Err(corrupt("bad magic/size"));
+    }
+    let body_len = bytes.len() - 8;
+    if fnv1a(&bytes[..body_len]) != u64::from_le_bytes(bytes[body_len..].try_into().unwrap()) {
+        return Err(corrupt("checksum mismatch"));
+    }
+    let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+    if version < 4 {
+        return Err(corrupt("snapshot has no Raft applied index"));
+    }
+    Ok(u64::from_le_bytes(bytes[16..24].try_into().unwrap()))
+}
+
 /// Load a snapshot; `Err` on missing file, corruption, or version mismatch.
 pub fn load(path: &Path) -> io::Result<Snapshot> {
     let mut buf = Vec::new();
@@ -437,6 +455,32 @@ pub fn load(path: &Path) -> io::Result<Snapshot> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn applied_index_is_read_from_the_same_bytes() {
+        let dir = std::env::temp_dir().join(format!("tc-snap-index-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.bin");
+        let data = |index| SnapshotData {
+            journal_seq: 0,
+            raft_applied_index: index,
+            max_cmd_id: 0,
+            max_admin_id: 0,
+            halted: &[],
+            suspended: &[],
+            positions: &[],
+            engines: &[],
+            recent_command_ids: Some(&[1, 2, 3]),
+        };
+        write(&path, data(41)).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        write(&path, data(42)).unwrap(); // a newer snapshot replaces the file
+        assert_eq!(raft_applied_index_of(&bytes).unwrap(), 41);
+        let mut torn = bytes.clone();
+        torn[20] ^= 1;
+        assert!(raft_applied_index_of(&torn).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn snapshot_round_trips_and_detects_corruption() {

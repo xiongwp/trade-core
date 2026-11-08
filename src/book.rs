@@ -923,12 +923,20 @@ impl OrderBook {
 
     /// All resting order ids belonging to `user` (for forced liquidation).
     /// O(resting orders); force-close is a rare administrative action.
+    ///
+    /// In time priority: the result drives the order of replicated cancel
+    /// reports, so it must not follow `HashMap` iteration (which differs
+    /// between processes and broke replay proofs of force-closes).
     pub fn orders_of_user(&self, user: u64) -> Vec<OrderId> {
-        self.locate
+        let mut orders: Vec<(Timestamp, OrderId)> = self
+            .locate
             .iter()
-            .filter(|(_, loc)| self.pool.get(loc.slot).user == user)
-            .map(|(&id, _)| id)
-            .collect()
+            .map(|(&id, loc)| (self.pool.get(loc.slot), id))
+            .filter(|(order, _)| order.user == user)
+            .map(|(order, id)| (order.timestamp, id))
+            .collect();
+        orders.sort_unstable();
+        orders.into_iter().map(|(_, id)| id).collect()
     }
 
     /// The top `n` levels of `side` as `(price, total_qty)`, best price first —

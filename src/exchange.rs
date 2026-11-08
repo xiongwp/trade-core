@@ -1084,7 +1084,10 @@ impl TriggerBook {
             .filter(|(_, stop)| stop.order.user == user)
             .map(|(&(price, seq), stop)| (price, seq, stop.order.id))
             .collect();
-        ids.sort_by_key(|&(_, seq, _)| seq); // arrival order: deterministic
+        // By order id, not arrival seq: seq is renumbered on restore (rising
+        // book first), so a restarted replica would cancel a user's rising
+        // and falling stops in a different order than a live one.
+        ids.sort_by_key(|&(_, _, id)| id);
         ids.into_iter()
             .filter_map(|(_, _, id)| self.remove(id).map(|stop| stop.order.id))
             .collect()
