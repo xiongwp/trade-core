@@ -945,9 +945,9 @@ fn bootstrap(store: &OrderStore) -> mysql::Result<()> {
         let mut conn = store.shard(db as u32).get_conn()?;
         let db_name = format!("order_db_{db}");
         conn.query_drop(format!("CREATE DATABASE IF NOT EXISTS {db_name}"))?;
-        conn.query_drop(format!("CREATE TABLE IF NOT EXISTS {db_name}.processed_commands (category_id INT UNSIGNED NOT NULL, kafka_partition INT NOT NULL, kafka_offset BIGINT UNSIGNED NOT NULL, command_id BIGINT UNSIGNED NOT NULL UNIQUE, user_id BIGINT UNSIGNED NOT NULL, shard_table INT UNSIGNED NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(category_id,kafka_offset), KEY idx_partition_offset (kafka_partition,kafka_offset)) ENGINE=InnoDB"))?;
+        conn.query_drop(format!("CREATE TABLE IF NOT EXISTS {db_name}.processed_commands (category_id INT UNSIGNED NOT NULL, kafka_partition INT NOT NULL, kafka_offset BIGINT UNSIGNED NOT NULL, command_id BIGINT UNSIGNED NOT NULL UNIQUE, user_id BIGINT UNSIGNED NOT NULL, shard_table INT UNSIGNED NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(category_id,kafka_offset)) ENGINE=InnoDB"))?;
         conn.query_drop(format!("CREATE TABLE IF NOT EXISTS {db_name}.processed_executions (kafka_partition INT NOT NULL, kafka_offset BIGINT UNSIGNED NOT NULL, instrument INT UNSIGNED NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(kafka_partition,kafka_offset), KEY idx_instrument_offset (instrument,kafka_offset)) ENGINE=InnoDB"))?;
-        conn.query_drop(format!("CREATE TABLE IF NOT EXISTS {db_name}.processed_execution_events (raft_group INT UNSIGNED NOT NULL, raft_index BIGINT UNSIGNED NOT NULL, report_ordinal INT UNSIGNED NOT NULL, target_order_id BIGINT UNSIGNED NOT NULL, shard_table INT UNSIGNED NOT NULL, instrument INT UNSIGNED NOT NULL, report_type TINYINT UNSIGNED NOT NULL, kafka_partition INT NOT NULL, kafka_offset BIGINT UNSIGNED NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(raft_group,raft_index,report_ordinal,target_order_id), KEY idx_instrument_index (instrument,raft_index), KEY idx_order_event (target_order_id,raft_index)) ENGINE=InnoDB"))?;
+        conn.query_drop(format!("CREATE TABLE IF NOT EXISTS {db_name}.processed_execution_events (raft_group INT UNSIGNED NOT NULL, raft_index BIGINT UNSIGNED NOT NULL, report_ordinal INT UNSIGNED NOT NULL, target_order_id BIGINT UNSIGNED NOT NULL, shard_table INT UNSIGNED NOT NULL, instrument INT UNSIGNED NOT NULL, report_type TINYINT UNSIGNED NOT NULL, kafka_partition INT NOT NULL, kafka_offset BIGINT UNSIGNED NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(raft_group,raft_index,report_ordinal,target_order_id)) ENGINE=InnoDB"))?;
         conn.query_drop(format!("CREATE TABLE IF NOT EXISTS {db_name}.pending_execution_events (raft_group INT UNSIGNED NOT NULL, raft_index BIGINT UNSIGNED NOT NULL, report_ordinal INT UNSIGNED NOT NULL, target_order_id BIGINT UNSIGNED NOT NULL, shard_table INT UNSIGNED NOT NULL, instrument INT UNSIGNED NOT NULL, report_type TINYINT UNSIGNED NOT NULL, event_qty BIGINT UNSIGNED NOT NULL, event_price BIGINT UNSIGNED NOT NULL DEFAULT 0, event_fee BIGINT UNSIGNED NOT NULL DEFAULT 0, fill_role TINYINT UNSIGNED NOT NULL DEFAULT 0, kafka_partition INT NOT NULL, kafka_offset BIGINT UNSIGNED NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(raft_group,raft_index,report_ordinal,target_order_id), KEY idx_pending_table_order (shard_table,target_order_id,raft_index,report_ordinal)) ENGINE=InnoDB"))?;
         // One row per (fill, side): a Trade is materialized once for the taker
         // and once for the maker, keyed exactly like processed_execution_events.
@@ -962,6 +962,32 @@ fn bootstrap(store: &OrderStore) -> mysql::Result<()> {
             conn.query_drop(format!("CREATE TABLE IF NOT EXISTS {db_name}.asset_orders_{table:03} (row_seq BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, order_id BIGINT UNSIGNED NOT NULL UNIQUE, category_id INT UNSIGNED NOT NULL, user_id BIGINT UNSIGNED NOT NULL, instrument INT UNSIGNED NOT NULL, side TINYINT NOT NULL, price BIGINT UNSIGNED NOT NULL, qty BIGINT UNSIGNED NOT NULL, filled_qty BIGINT UNSIGNED NOT NULL DEFAULT 0, filled_notional DECIMAL(38,0) NOT NULL DEFAULT 0, status VARCHAR(16) NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, KEY idx_category_row (category_id,row_seq), KEY idx_user_created (user_id,created_at)) ENGINE=InnoDB"))?;
         }
         add_missing_columns(&mut conn, &db_name, store.routing.tables_per_db)?;
+        drop_unused_indexes(&mut conn, &db_name)?;
+    }
+    Ok(())
+}
+
+/// Secondary indexes that no query reads (both tables are only looked up by
+/// primary key, and per-order fills are served from `order_fills`) but that
+/// every command paid for: ~7 index writes per command on the MySQL
+/// bottleneck (one per command, two per execution event x ~3.2 events).
+const UNUSED_INDEXES: &[(&str, &str)] = &[
+    ("processed_commands", "idx_partition_offset"),
+    ("processed_execution_events", "idx_instrument_index"),
+    ("processed_execution_events", "idx_order_event"),
+];
+
+/// Drop [`UNUSED_INDEXES`] from tables created before they were removed from
+/// the DDL. Dropping a secondary index is an in-place, metadata-only change.
+fn drop_unused_indexes(conn: &mut mysql::PooledConn, db_name: &str) -> mysql::Result<()> {
+    for (table, index) in UNUSED_INDEXES {
+        let present: Option<u8> = conn.exec_first(
+            "SELECT 1 FROM information_schema.statistics WHERE table_schema=:db AND table_name=:t AND index_name=:i LIMIT 1",
+            params! {"db" => db_name, "t" => *table, "i" => *index},
+        )?;
+        if present.is_some() {
+            conn.query_drop(format!("ALTER TABLE {db_name}.{table} DROP INDEX {index}"))?;
+        }
     }
     Ok(())
 }
@@ -4654,6 +4680,38 @@ mod tests {
         )
         .unwrap();
         assert_eq!(status(open).as_deref(), Some("CANCELLED"));
+    }
+
+    /// Same disposable MySQL 8 as above.
+    #[test]
+    #[ignore = "requires disposable MySQL 8 via TC_TEST_MYSQL_URL"]
+    fn mysql8_bootstrap_drops_indexes_no_query_reads() {
+        let store = mysql_test_store().expect("TC_TEST_MYSQL_URL must be set");
+        let mut conn = store.shard(0).get_conn().unwrap();
+        // Recreate the indexes as an older deployment had them.
+        for (table, index, cols) in [
+            ("processed_commands", "idx_partition_offset", "kafka_partition,kafka_offset"),
+            ("processed_execution_events", "idx_instrument_index", "instrument,raft_index"),
+            ("processed_execution_events", "idx_order_event", "target_order_id,raft_index"),
+        ] {
+            conn.query_drop(format!(
+                "ALTER TABLE order_db_0.{table} ADD INDEX {index} ({cols})"
+            ))
+            .unwrap();
+        }
+        let count = |conn: &mut mysql::PooledConn| -> u64 {
+            conn.query_first(
+                "SELECT COUNT(*) FROM information_schema.statistics WHERE table_schema='order_db_0' \
+                 AND index_name IN ('idx_partition_offset','idx_instrument_index','idx_order_event')",
+            )
+            .unwrap()
+            .unwrap()
+        };
+        assert!(count(&mut conn) > 0);
+        bootstrap(&store).unwrap();
+        assert_eq!(count(&mut conn), 0);
+        bootstrap(&store).unwrap(); // idempotent
+        assert_eq!(count(&mut conn), 0);
     }
 
     #[test]
