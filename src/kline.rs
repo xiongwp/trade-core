@@ -246,6 +246,13 @@ impl KlineAggregator {
     /// Load history saved by [`save`](Self::save). Corrupt/missing = `Err`.
     pub fn load(path: &std::path::Path) -> std::io::Result<Self> {
         let buf = std::fs::read(path)?;
+        Self::decode(&buf)
+    }
+
+    /// Decode an [`encode`](Self::encode) buffer. Exposed so a service can
+    /// atomically envelope candle history with its own consumption watermark
+    /// instead of writing two crash-inconsistent files.
+    pub fn decode(buf: &[u8]) -> std::io::Result<Self> {
         let bad = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, m.to_string());
         if buf.len() < 28 || &buf[0..4] != b"TCK2" {
             return Err(bad("bad magic"));
