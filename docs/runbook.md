@@ -70,9 +70,15 @@ curl -s localhost:9201/metrics | grep -E 'tc_raft_(role|leader_id|commit_index|a
 docker ps -a --filter "name=${PREFIX}-raft" --format '{{.Names}}\t{{.Status}}'
 docker logs --tail 100 ${PREFIX}-raft-3-1
 # 3. If it's a transient crash, just restart it — it rejoins and catches up
-#    from the leader. Raft log compaction stays disabled until matching-state
-#    snapshot transfer/install is atomic with the consensus snapshot.
+#    from the leader (log tail, or the compaction snapshot if it is too far
+#    behind).
 docker start ${PREFIX}-raft-3-1
+# 4. If its data is lost or corrupt (crash-loops on a checksum error) while the
+#    other members have a leader: rebuild it empty, one replica at a time.
+scripts/ops/rebuild-replica.sh 1 /data localhost:9213 localhost:9211 localhost:9212 \
+    localhost:9214 localhost:9215 --docker ${PREFIX}-raft-3-1          # dry run
+#    (add --yes) — it moves the group dir aside, marks the empty one for
+#    same-id rejoin and waits until the node has caught up and cleared it.
 ```
 
 **Verify recovery.** On the restarted node, all four group `/metrics`
@@ -99,9 +105,14 @@ docker ps -a --filter "name=${PREFIX}-raft"
 # 2. Bring back enough original members to reach 3/5. If their volumes survived,
 #    just restart — durable raft.state + memory snapshot recover in place.
 docker start ${PREFIX}-raft-2-1 ${PREFIX}-raft-4-1
-# 3. If a node's DISK is lost, restore its volume from the latest backup FIRST
-#    with restore-node.sh --rejoin (§ docs/backup-restore.md), then start it. A restored member rejoins as a
-#    follower and is reconciled by the leader.
+# 3. If a node's DISK is lost and the other recovered members already form a
+#    quorum, restore its volume with restore-node.sh --rejoin
+#    (docs/backup-restore.md) and start it once they have a leader.
+#    A rejoining member does NOT vote, so it cannot help form a quorum. If a
+#    quorum is only reachable by counting a restored member, restore it
+#    WITHOUT --rejoin: it then votes with its backup-era log, and entries it
+#    acknowledged after the backup are lost if no surviving member has them.
+#    That is a data-loss recovery: get sign-off first, like the one below.
 ```
 **Do NOT** attempt to force a single survivor into a 1-node cluster unless you
 accept losing any commits that only reached the down majority; that is a
@@ -121,7 +132,10 @@ downstream of the Kafka execution stream).
 
 **Impact.** Executions for shard K are not persisted to MySQL. They remain
 durable in the raft **execution-outbox** and on the Kafka topic; the order-api
-consumer is at-least-once, so nothing is lost — persistence is delayed. Poison
+consumer is at-least-once, so nothing is lost — persistence is delayed. Order
+intake keeps running: MySQL lag does not throttle categories, but it counts
+toward the global pipeline backlog (`TC_ORDER_MAX_PIPELINE_BACKLOG`), so a long
+outage eventually answers new orders with 429 everywhere. Poison
 messages that exhaust retries are appended to the **DLQ file** (fail-safe).
 
 **Procedure.**
@@ -135,16 +149,23 @@ docker start ${PREFIX}-mysql-order-K-1
 #    the backlog automatically. Watch it catch up.
 ```
 
-**Draining the DLQ.** The DLQ is an append-only file (env `TC_ORDER_DLQ_PATH`,
-default `order-execution-dlq.wal`) written by order-api's `DlqWriter`. Format:
-8-byte magic `TCDLQ01\0`, then per record `len:u32 | body | fnv1a:u64`, where
-`body = ts_ns:u64 | partition:i32 | offset:i64 | reason_len:u32 | reason |
-payload_len:u32 | payload`. A torn tail is dropped on read (checksum). The
-`payload` is the original Kafka execution-event frame. To replay after fixing
-the shard: parse the file, filter records whose `partition` maps to shard K, and
-re-submit each `payload` to the order-api persist path (or hand to the
-reprocessing tool). After a successful drain, archive the DLQ file and confirm
-`tc_order_dlq_total` stops rising.
+**Draining the DLQ.** Two append-only files: executions
+(`TC_ORDER_DLQ_PATH`) and commands (`TC_ORDER_COMMAND_DLQ_PATH`). Format
+`TCDLQ02\0`, then per record `len:u32 | body | fnv1a:u64` with
+`body = ts_ns:u64 | partition:i32 | offset:i64 | topic_len:u32 | topic |
+reason_len:u32 | reason | payload_len:u32 | payload`; a torn tail is dropped on
+read. Inspect and replay with `dlq-tool` (in the node image):
+```bash
+docker exec ${PREFIX}-order-1 dlq-tool list /data/order-execution-dlq.wal
+# after fixing the cause: dry run, then publish back to the original
+# topic/partition (consumers deduplicate, so a repeat is harmless)
+docker exec ${PREFIX}-order-1 dlq-tool replay /data/order-execution-dlq.wal redpanda:9092
+docker exec ${PREFIX}-order-1 dlq-tool replay /data/order-execution-dlq.wal redpanda:9092 --yes
+```
+Replay writes `FILE.replayed` and refuses a second run while it exists. A
+replayed **command** is matched again if its id has left the dedupe window:
+replay command DLQ records only when you know they were never applied.
+Afterwards archive the file and confirm `tc_order_dlq_total` stops rising.
 
 **Verify recovery.** Shard K `healthy`; consumer lag returns to ~0; row counts
 for shard K resume advancing; no new `event=dlq_write_failed`.
@@ -205,6 +226,11 @@ docker logs --tail 50 ${PREFIX}-raft-3-1 | grep -E 'fsync_failed|ENOSPC|No space
 #    - prune dead containers/images:  docker system prune
 #    - the biggest reclaimable in-app source is a long Kafka outage's outbox
 #      backlog (see §4) — restoring Kafka lets fully-published segments GC.
+#    - with the node stopped, leftovers of interrupted atomic writes are safe
+#      to delete in a group directory: *.tmp, *.compacting, *.installing (the
+#      real file is the one they would have been renamed to). Fully published
+#      outbox segments are deleted by the node itself once Kafka is back.
+#      Never delete raft.state, journal/, or execution-outbox segments.
 # 3. If the app itself can't free enough, grow the underlying disk/volume, then
 #    let the node restart-recover (or `docker start` it).
 ```
@@ -238,6 +264,8 @@ docker logs --tail 60 ${PREFIX}-raft-3-1
 #    boot recovery and must complete before the node becomes ready.
 # 3. Preferred fix: this node is one replica of an intact quorum. REBUILD it
 #    from a peer/backup rather than hand-editing files:
+#      - rebuild just the broken group's replica empty from the leader:
+#        scripts/ops/rebuild-replica.sh (section 1), OR
 #      - restore its volume from the latest good backup with `--rejoin`
 #        (docs/backup-restore.md), OR add a replacement under a NEW voter id
 #        with the ConfChange procedure in section 7.
@@ -354,3 +382,21 @@ and restore/verification steps. Recommended policy:
   filesystem/LVM/ZFS volume snapshot or a brief `docker pause`, and use Percona
   XtraBackup for MySQL. The provided scripts use hot copy + `mysqldump
   --single-transaction`, which is consistent and non-blocking for this scale.
+
+---
+
+## 10. Operations tooling
+
+| Tool | Use |
+|---|---|
+| `python3 scripts/ops/health.py [out/health.json] [--quiet]` | One-shot check of every group (quorum, leader, apply spread, WAL errors, outbox), order-api (lags, DLQ, failing groups, unfinished migrations), user-stream and market-data. Exit 0 healthy / 1 warnings / 2 failures; each finding names its runbook action. `gen_config.py` writes `health.json`. |
+| `scripts/ops/rebuild-replica.sh` | Rebuild one replica with lost/corrupt data while the rest of its group has a leader (§1, §6). One replica at a time. |
+| `scripts/ops/abort-migrations.sh [ADDR] [--yes]` | Roll back every category migration whose orchestrator died (the category stays frozen and refuses orders until then). Safe to repeat. |
+| `dlq-tool list/replay` | Inspect and replay the order-api dead-letter files (§3). |
+| `scripts/bench/recovery.sh` | Local drill: loses a replica's data mid-load and rebuilds it, kills order-api mid-migration and aborts it, then checks exactly-once results and runs `health.py`. |
+
+Consumer groups refuse to start when a committed offset is below the
+partition's low watermark (retention deleted unprocessed data) or missing on a
+truncated partition (offsets lost): `event=offset_preflight_failed` in the log.
+Decide whether to accept the gap or restore the data, then start once with
+`TC_KAFKA_OFFSET_PREFLIGHT=warn`.

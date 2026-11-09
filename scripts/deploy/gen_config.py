@@ -141,6 +141,23 @@ def main(inventory_path, out_dir):
         for g in range(groups):
             hosts = [raft_hosts[(g + r) % len(raft_hosts)] for r in range(replicas)]
             members[g] = [(node + 1, host) for node, host in enumerate(hosts)]
+    # Existing groups must keep their members: a node's data directory holds
+    # one group's log for one (node id, peer set), so moving a group to other
+    # hosts or ids by regenerating (e.g. after adding raft_failure_domains)
+    # would boot those directories into the wrong membership. Placement is
+    # recorded on first generation and may only grow by new groups.
+    placement_path = os.path.join(out_dir, "placement.json")
+    current = {str(g): [[node, host] for node, host in nodes] for g, nodes in members.items()}
+    if os.path.exists(placement_path):
+        previous = json.load(open(placement_path))
+        moved = sorted(
+            (int(g) for g in previous if g in current and previous[g] != current[g]), key=int
+        )
+        assert not moved or inv.get("allow_placement_change"), (
+            f"raft groups {moved} would change members ({placement_path}); "
+            "migrate them deliberately and set allow_placement_change in the inventory"
+        )
+    json.dump(current, open(placement_path, "w"), indent=1)
     for g, nodes in members.items():
         peers = ",".join(f"{node}@{host}:{raft_port(g, node)}" for node, host in nodes)
         for node, host in nodes:
@@ -183,13 +200,17 @@ def main(inventory_path, out_dir):
         "TC_EXECUTION_KAFKA_BATCH_MESSAGES": 10_000,
         "TC_EXECUTION_KAFKA_COMPRESSION": "lz4",
         "TC_EXECUTION_KAFKA_DELIVERY_TIMEOUT_MS": 15000,
+        # One cursor partition per group (topics.sh creates exactly that
+        # many); the node default (16) would map groups onto partitions that
+        # do not exist or leave created ones unused.
+        "TC_EXECUTION_CURSOR_PARTITIONS": groups,
         "TC_SUPERVISOR_LIVENESS_GRACE_SECS": 300,
         "TC_SUPERVISOR_LIVENESS_FAILURES": 6,
     }
     partitions = groups * 16
     per_partition = max(1, 2_000_000 // partitions)  # design commands/s/partition
     ingress_defaults = {
-        "TC_RAFT_PACK_SIZE": 5000,
+        "TC_RAFT_PACK_SIZE": 1000,
         "TC_RAFT_FORWARD_QUEUE": 64,
         "TC_RAFT_MATCHER_IO_TIMEOUT_MS": 5000,
         "TC_WS_MAX_BATCH": 5000,
@@ -295,17 +316,32 @@ def main(inventory_path, out_dir):
             "TC_USER_STREAM_SHARD": i,
         })
 
+    # Endpoints for scripts/ops/health.py: every replica's metrics port per
+    # group, and every service's.
+    health = {
+        "raft_groups": {str(g): [f"{host}:{service_ports(g)[2]}" for _, host in members[g]] for g in range(groups)},
+        "order_api": [f"{host}:9200" for host in inv["ingress_hosts"] + projection],
+        "user_stream": [f"{host}:9300" for host in push_hosts],
+        "market_data": [f"{host}:8080" for host in inv.get("market_data_hosts", [])],
+    }
+    with open(os.path.join(out_dir, "health.json"), "w") as f:
+        json.dump(health, f, indent=1)
+
     with open(os.path.join(out_dir, "topics.sh"), "w") as f:
         # Redpanda's acks=all already waits for a majority; on Apache Kafka add
         # `-c min.insync.replicas=2` to every topic.
-        f.write("#!/bin/sh\nset -eu\nB=" + inv["kafka_brokers"][0] + "\n")
-        f.write(f"for g in $(seq 0 {groups - 1}); do rpk topic create --brokers=$B -p 16 -r 3 \"orders-v2-g$g\"; done\n")
-        f.write(f"rpk topic create --brokers=$B -p {db_count} -r 3 trade-order-db-v1\n")
-        f.write(f"rpk topic create --brokers=$B -p {db_count} -r 3 trade-executions-v1\n")
+        # Explicit retention: a consumer down for longer than this loses
+        # data, which the order-api offset preflight then refuses to start
+        # over. Size it well above the longest outage you would ride out.
+        retention_ms = int(inv.get("kafka_retention_hours", 168)) * 3_600_000
+        f.write("#!/bin/sh\nset -eu\nB=" + inv["kafka_brokers"][0] + f"\nR={retention_ms}\n")
+        f.write(f"for g in $(seq 0 {groups - 1}); do rpk topic create --brokers=$B -p 16 -r 3 -c retention.ms=$R \"orders-v2-g$g\"; done\n")
+        f.write(f"rpk topic create --brokers=$B -p {db_count} -r 3 -c retention.ms=$R trade-order-db-v1\n")
+        f.write(f"rpk topic create --brokers=$B -p {db_count} -r 3 -c retention.ms=$R trade-executions-v1\n")
         f.write(f"rpk topic create --brokers=$B -p {groups} -r 3 -c cleanup.policy=compact trade-execution-outbox-cursors-v1\n")
         f.write("rpk topic create --brokers=$B -p 1 -r 3 -c cleanup.policy=compact trade-route-control-v1\n")
         if push_hosts:
-            f.write(f"rpk topic create --brokers=$B -p {user_partitions} -r 3 trade-user-events-v1\n")
+            f.write(f"rpk topic create --brokers=$B -p {user_partitions} -r 3 -c retention.ms=$R trade-user-events-v1\n")
     print(f"db_count={db_count} groups={groups} replicas={replicas}: wrote {out_dir}/")
 
 

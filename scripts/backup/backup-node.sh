@@ -143,9 +143,8 @@ backup_raft_node() {
   mkdir -p "$data_dir"
   log "node $node: source=$container -> $data_dir"
 
-  # Discover groups. Group 0 lives at /data root; group M at /data/group-M.
-  # (raft_multi_node.rs: group 0 uses data_root, others data_root/group-M.)
-  local groups=(0)
+  # Discover groups: group M lives at /data/group-M (raft_multi_node.rs).
+  local groups=()
   while IFS= read -r g; do
     [[ -n "$g" ]] && groups+=("$g")
   done < <(docker exec "$container" sh -c \
@@ -164,11 +163,7 @@ backup_raft_node() {
   local group
   for group in "${groups[@]}"; do
     local src dst tag
-    if [[ "$group" == "0" ]]; then
-      src="/data"; dst="$data_dir"; tag="group-0"
-    else
-      src="/data/group-${group}"; dst="$data_dir/group-${group}"; tag="group-${group}"
-    fi
+    src="/data/group-${group}"; dst="$data_dir/group-${group}"; tag="group-${group}"
     mkdir -p "$dst/journal/assets" "$dst/execution-outbox"
     log "node $node $tag: copying (journal -> snapshot -> assets -> outbox -> raft.state)"
 
@@ -185,13 +180,18 @@ backup_raft_node() {
       docker cp "$container:$f" "$dst/journal/$base"
     done
     # ---- 3. per-asset WALs + watermarks (self-reconciling on replay) --------
-    #        (production holds raft-batches.applied.v2; legacy files are copied too)
+    #        (and the raft-batches.applied.v2.* application-proof segments)
     if docker exec "$container" sh -c "[ -d $src/journal/assets ]"; then
       docker cp "$container:$src/journal/assets/." "$dst/journal/assets/"
     fi
     # ---- 4. execution outbox (recovery trims past the durable watermark) ----
     if docker exec "$container" sh -c "[ -d $src/execution-outbox ]"; then
       docker cp "$container:$src/execution-outbox/." "$dst/execution-outbox/"
+    fi
+    # ---- the group's announced deterministic config (keeps the restored
+    #      member's config-mismatch guard armed before the next announcement)
+    if docker exec "$container" sh -c "[ -f $src/group-config.fingerprint ]"; then
+      docker cp "$container:$src/group-config.fingerprint" "$dst/group-config.fingerprint"
     fi
     # ---- 5. raft.state LAST (consensus view >= committed engine state) ------
     if docker exec "$container" sh -c "[ -f $src/raft.state ]"; then

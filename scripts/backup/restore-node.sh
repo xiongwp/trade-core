@@ -115,6 +115,11 @@ fi
 [[ -n "$VOLUME" ]] || die "--volume VOL is required (omit only with --dry-run)"
 
 # ---- 3. build the target volume ---------------------------------------------
+# Never write under a running node: with `restart: unless-stopped` a member
+# that restarts mid-copy boots from half a volume, before the rejoin marker
+# exists, as an ordinary voter that has silently lost its log.
+users="$(docker ps -q --filter volume="$VOLUME" 2>/dev/null || true)"
+[[ -z "$users" ]] || die "volume $VOLUME is mounted by running container(s) $(echo $users): docker stop them first"
 if docker volume inspect "$VOLUME" >/dev/null 2>&1; then
   # non-empty check
   nonempty="$(docker run --rm -v "$VOLUME":/v "$NODE_IMAGE" \
@@ -136,15 +141,21 @@ docker run --rm -v "$DATA_DIR":/b:ro -v "$VOLUME":/data "$NODE_IMAGE" \
 
 if [[ "$REJOIN" -eq 1 ]]; then
   log "marking restored Raft groups for safe same-ID rejoin"
-  docker run --rm -v "$VOLUME":/data "$NODE_IMAGE" '
+  marked="$(docker run --rm -v "$VOLUME":/data "$NODE_IMAGE" '
     set -e
-    find /data -type f -name raft.state -print | while read -r state; do
-      dir=${state%/raft.state}
+    for dir in /data/group-*; do
+      [ -d "$dir" ] || continue
       : > "$dir/raft-rejoin.required"
-      echo "marked $dir"
+      echo "$dir"
     done
     sync
-  '
+  ' | wc -l | tr -d ' ')"
+  # Every group directory must be marked: an unmarked one would boot as a
+  # same-ID voter that lost its log.
+  expected="$(find "$DATA_DIR" -mindepth 1 -maxdepth 1 -type d -name 'group-*' | wc -l | tr -d ' ')"
+  [[ "$marked" -ge 1 && "$marked" -eq "$expected" ]] \
+    || die "marked $marked group directories, the backup has $expected"
+  log "marked $marked group directories for rejoin"
 fi
 
 # sanity: same file count as the manifest
@@ -163,23 +174,33 @@ exp_journal_seq="$(awk '/^\[group group-0\]/{g=1} g&&/^metric tc_journal_seq=/{s
 exp_applied="$(awk '/^\[group group-0\]/{g=1} g&&/^metric tc_raft_applied_index=/{sub(/^metric tc_raft_applied_index=/,"");print;exit}' "$MANIFEST")"
 
 CNAME="tc-restore-verify-$$"
-log "booting group-0 recovery node ($CNAME) on /metrics port $METRICS_PORT"
+# Boot a throwaway copy: the check node campaigns as a single voter and
+# would persist a new term and vote (or commit a no-op) into the restored
+# data that the real member is about to rejoin with.
+VERIFY_VOLUME="tc-restore-verify-$$"
+cleanup() {
+  docker rm -f "$CNAME" >/dev/null 2>&1 || true
+  docker volume rm -f "$VERIFY_VOLUME" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+docker volume create "$VERIFY_VOLUME" >/dev/null
+docker run --rm -v "$VOLUME":/src:ro -v "$VERIFY_VOLUME":/data "$NODE_IMAGE" \
+  "cp -a /src/. /data/ && rm -f /data/group-*/raft-rejoin.required"
+log "booting group-0 recovery node ($CNAME) on a copy, /metrics port $METRICS_PORT"
 # Single-voter argv so ClusterConfig is valid; it will NOT reach the original
 # 5-voter quorum (so it stays a follower/candidate) but engine recovery
 # (snapshot + journal tail + asset WAL replay) runs at startup regardless and
-# populates tc_journal_seq / tc_raft_applied_index. TC_RAFT_GROUP_ID=0 + /data.
+# populates tc_journal_seq / tc_raft_applied_index. TC_RAFT_GROUP_ID=0 + /data/group-0.
 # No Kafka brokers set => publisher is idle (nothing external touched).
 docker run -d --name "$CNAME" \
   -e TC_RAFT_GROUP_ID=0 -e TC_LOG=info -e RUST_BACKTRACE=1 \
   -e TC_SNAPSHOT_EVERY_SECS=0 \
-  -v "$VOLUME":/data \
+  -v "$VERIFY_VOLUME":/data \
   -p "${METRICS_PORT}:9102" \
   "$NODE_IMAGE" \
-  "exec raft-node 1 0.0.0.0:7000 1@127.0.0.1:7000 0.0.0.0:9001 /data 0.0.0.0:9101 0.0.0.0:9102" \
+  "exec raft-node 1 0.0.0.0:7000 1@127.0.0.1:7000 0.0.0.0:9001 /data/group-0 0.0.0.0:9101 0.0.0.0:9102" \
   >/dev/null
 
-cleanup() { docker rm -f "$CNAME" >/dev/null 2>&1 || true; }
-trap cleanup EXIT
 
 # poll /metrics until journal_seq shows up (recovery finished) or timeout.
 got_journal_seq=""; got_applied=""

@@ -41,8 +41,9 @@ proven in the source:
    - *memory snapshot* — atomic temp+fsync+rename image containing the exact
      `raft_applied_index`; recovery never applies an entry at or below it.
    - *Raft WAL* — the authoritative committed command sequence. Compaction is
-     currently disabled, so every snapshot can always be paired with its full
-     committed tail. A torn tail is removed when the log opens.
+     enabled (`TC_RAFT_COMPACT_APPLIED_THRESHOLD`): `raft.state` holds the
+     compaction snapshot plus the un-compacted tail after it, written
+     atomically (temp + rename). A torn tail is removed when the log opens.
    - *application proofs* — each complete v2 record binds one Raft index to the
      exact result count and fingerprint. Replay suppresses duplicate output only
      after recomputing and matching both values; mismatch is fail-stop.
@@ -53,12 +54,11 @@ proven in the source:
    - *raft.state* — a torn tail record is truncated at open
      (`raft_log.rs::read_or_truncate_torn_tail`).
 
-2. **Copy `raft.state` last.** The full authoritative WAL is retained, so an
-   older snapshot only increases replay work and cannot create a command gap.
-   Copying `raft.state` after the atomic snapshot/proof/outbox files guarantees
-   the backup's command source is at least as new as its derived state. Any
-   unproved outbox tail is trimmed and deterministically regenerated from that
-   WAL during recovery.
+2. **Copy `raft.state` last.** It is at least as new as every derived file
+   copied before it, and its embedded compaction snapshot replaces an older
+   engine snapshot at boot, so an older copy of the derived files only adds
+   replay work and cannot create a command gap. Any unproved outbox tail is
+   trimmed and deterministically regenerated from the log during recovery.
 
 `backup-node.sh` implements exactly this order and then **proves** consistency
 after the fact: `--verify` checks supported durable segments and re-checks the
@@ -113,8 +113,10 @@ Percona XtraBackup** for physical, fast-to-restore shard backups.
 
 ## restore-node.sh
 
-Rebuilds a node volume from a backup and verifies it, **without touching any
-running node** (fresh volume + throwaway container, backup mounted read-only).
+Rebuilds a node volume from a backup and verifies it. It refuses a volume that
+a running container mounts (stop the member first), and the boot check runs on
+a throwaway copy of the restored volume, so the volume you attach is exactly
+the backup.
 
 ```bash
 # 1. Validation-only (safe anytime; make a habit of it on every backup):
@@ -136,8 +138,8 @@ What it does:
    additionally validates Raft log, snapshot and application proofs together.
 3. **Volume populate** — `cp -a` the data mirror into the target volume (must be
    empty unless `--force`).
-4. **Boot verify** (default) — starts a single group-0 `raft-node` against the
-   volume on an isolated port, waits for engine recovery, then reads `/metrics`
+4. **Boot verify** (default) — starts a single group-0 `raft-node` against a
+   throwaway copy of the volume on an isolated port, waits for engine recovery, then reads `/metrics`
    and checks the applied/commit watermarks did not regress. Stops and
    removes the container. *(A single-voter boot will not reach the original
    5-voter quorum, so it stays a follower; engine recovery — memory snapshot +
@@ -149,8 +151,10 @@ What it does:
 
 To return a repaired/replaced node to service:
 ```bash
-# a) Restore its volume from the latest verified backup. --rejoin is mandatory
-#    when the live cluster still knows this voter id:
+# a) Stop the member (restore refuses a mounted volume), then restore its
+#    volume from the latest verified backup. --rejoin is mandatory when the
+#    live cluster still knows this voter id:
+docker stop ${PREFIX}-raft-3-1
 scripts/backup/restore-node.sh --backup /backups/…/raft-3 --volume ${PREFIX}_raft-3-data --force --no-boot --rejoin
 # b) Start ONE repaired member. Rejoin mode suppresses its election and sends
 #    an explicit same-ID replacement handshake. The leader lowers only that
@@ -159,8 +163,12 @@ scripts/backup/restore-node.sh --backup /backups/…/raft-3 --volume ${PREFIX}_r
 docker start ${PREFIX}-raft-3-1
 ```
 Wait until every group on the member reports `tc_ready 1` and logs
-`event=rejoin_complete` before replacing another member. Never mark a quorum of
-members at once: rejoining members do not campaign. For a brand-new member with
+`event=rejoin_complete` before replacing another member. A rejoining member
+neither campaigns nor votes (it forgot its vote and the entries it
+acknowledged, so its vote could elect a leader missing committed entries), so
+the other members must hold a quorum and a leader on their own: never mark a
+quorum of members at once. When a quorum can only be reached by counting a
+restored member, see runbook §2. For a brand-new member with
 a new voter id, seed the volume to shorten catch-up, then do the ConfChange
 add/remove procedure (runbook §7) instead of `--rejoin`.
 
