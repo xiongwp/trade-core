@@ -106,6 +106,7 @@ impl Registry {
         }
     }
 
+    #[cfg(test)]
     fn subscribe(&self, user: u64, tx: SyncSender<Outgoing>, max_per_user: usize) -> Option<u64> {
         self.subscribe_since(user, tx, max_per_user, None)
     }
