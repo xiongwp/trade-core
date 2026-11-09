@@ -116,6 +116,7 @@ pub(crate) fn run_execution_mysql_consumer(
         kafka.execution_group, kafka.execution_topic, kafka.execution_batch_size
     );
     let mut last_failure_log = std::time::Instant::now() - Duration::from_secs(30);
+    let mut idle_commit = IdleCommit::default();
     loop {
         // Between batches only: a batch in hand is finished and its offsets
         // committed. Returning drops the consumer, which leaves its group so
@@ -125,6 +126,7 @@ pub(crate) fn run_execution_mysql_consumer(
             return;
         }
         let Some(first) = consumer.poll(Duration::from_millis(100)) else {
+            idle_commit.flush(&consumer);
             continue;
         };
         let first = match first {
@@ -138,15 +140,8 @@ pub(crate) fn run_execution_mysql_consumer(
             }
         };
         let mut records = Vec::with_capacity(kafka.execution_batch_size);
-        push_execution_record(
-            &metrics,
-            &dlq,
-            &consumer,
-            worker,
-            kafka.async_offset_commits,
-            &first,
-            &mut records,
-        );
+        let mut dead_lettered = Vec::new();
+        push_execution_record(&metrics, &dlq, worker, &first, &mut records, &mut dead_lettered);
         let deadline = std::time::Instant::now() + kafka.execution_linger;
         while records.len() < kafka.execution_batch_size && std::time::Instant::now() < deadline {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -154,11 +149,10 @@ pub(crate) fn run_execution_mysql_consumer(
                 Some(Ok(message)) => push_execution_record(
                     &metrics,
                     &dlq,
-                    &consumer,
                     worker,
-                    kafka.async_offset_commits,
                     &message,
                     &mut records,
+                    &mut dead_lettered,
                 ),
                 Some(Err(error)) => {
                     log_warn!("execution-mysql", worker; "event=poll_failed error={error}")
@@ -167,6 +161,10 @@ pub(crate) fn run_execution_mysql_consumer(
             }
         }
         if records.is_empty() {
+            // Only dead letters: nothing earlier in this batch is unpersisted.
+            for (topic, partition, offset) in &dead_lettered {
+                idle_commit.record_offset(topic, *partition, *offset);
+            }
             continue;
         }
         let persist_started = std::time::Instant::now();
@@ -192,10 +190,19 @@ pub(crate) fn run_execution_mysql_consumer(
         }
         if committed {
             metrics.record_execution_mysql_batch(persist_started.elapsed(), records.len() as u64);
-            if let Err(error) =
-                commit_execution_batch(&consumer, &records, kafka.async_offset_commits)
-            {
+            if let Err(error) = commit_execution_batch(
+                &consumer,
+                &records,
+                &dead_lettered,
+                kafka.async_offset_commits,
+            ) {
                 log_error!("execution-mysql", worker; "event=offset_commit_failed error={error}");
+            }
+            for record in &records {
+                idle_commit.record_offset(&record.topic, record.partition, record.offset);
+            }
+            for (topic, partition, offset) in &dead_lettered {
+                idle_commit.record_offset(topic, *partition, *offset);
             }
         } else {
             rewind_execution_batch(&consumer, &records);
@@ -211,14 +218,17 @@ pub(crate) struct ExecutionKafkaRecord {
     pub(crate) event: wire::ExecutionEvent,
 }
 
+/// An undecodable message, already written to the dead-letter file: its
+/// offset is committed with the rest of its batch, never ahead of it.
+pub(crate) type DeadLettered = (String, i32, i64);
+
 pub(crate) fn push_execution_record(
     metrics: &OrderPipelineMetrics,
     dlq: &Arc<Mutex<DlqWriter>>,
-    consumer: &BaseConsumer,
     worker: usize,
-    async_commit: bool,
     message: &rdkafka::message::BorrowedMessage<'_>,
     records: &mut Vec<ExecutionKafkaRecord>,
+    dead_lettered: &mut Vec<DeadLettered>,
 ) {
     let partition = message.partition();
     let offset = message.offset();
@@ -231,37 +241,38 @@ pub(crate) fn push_execution_record(
         });
         return;
     }
+    // Committing this offset at once (as before) moved the partition's
+    // committed position past records of the same batch that were not
+    // persisted yet: a crash then skipped them for good. And a failed
+    // dead-letter write dropped the message silently. Now the offset goes
+    // with its batch, and a failed write stops the process before any
+    // offset moves, so the message is redelivered.
     let payload = message.payload().unwrap_or(&[]);
-    if let Ok(mut writer) = dlq.lock() {
-        if writer
-            .append(partition, offset, "invalid execution report", payload)
-            .is_ok()
-        {
-            metrics.dlq_total.fetch_add(1, AtomicOrdering::Relaxed);
-            let _ = consumer.commit_message(
-                message,
-                if async_commit {
-                    CommitMode::Async
-                } else {
-                    CommitMode::Sync
-                },
-            );
-            log_warn!("execution-mysql", worker; "event=dead_lettered reason=undecodable partition={partition} offset={offset}");
-        }
-    }
+    dlq.lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .append(partition, offset, "invalid execution report", payload)
+        .unwrap_or_else(|error| panic!("execution DLQ append failed ({error}); refusing to skip offset {offset}"));
+    metrics.dlq_total.fetch_add(1, AtomicOrdering::Relaxed);
+    dead_lettered.push((message.topic().to_string(), partition, offset));
+    log_warn!("execution-mysql", worker; "event=dead_lettered reason=undecodable partition={partition} offset={offset}");
 }
 
 pub(crate) fn commit_execution_batch(
     consumer: &BaseConsumer,
     records: &[ExecutionKafkaRecord],
+    dead_lettered: &[DeadLettered],
     async_commit: bool,
 ) -> Result<(), String> {
     let mut offsets: HashMap<(&str, i32), i64> = HashMap::new();
-    for record in records {
+    let positions = records
+        .iter()
+        .map(|record| (record.topic.as_str(), record.partition, record.offset))
+        .chain(dead_lettered.iter().map(|(topic, partition, offset)| (topic.as_str(), *partition, *offset)));
+    for (topic, partition, offset) in positions {
         offsets
-            .entry((&record.topic, record.partition))
-            .and_modify(|offset| *offset = (*offset).max(record.offset + 1))
-            .or_insert(record.offset + 1);
+            .entry((topic, partition))
+            .and_modify(|next| *next = (*next).max(offset + 1))
+            .or_insert(offset + 1);
     }
     let mut list = TopicPartitionList::new();
     for ((topic, partition), offset) in offsets {

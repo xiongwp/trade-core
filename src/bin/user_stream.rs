@@ -13,15 +13,22 @@
 //!   TRADE      price, qty, fee, maker/taker role, counterparty order
 //!   PARTIAL / FILLED / RESTING / CANCELLED / MODIFIED / TRIGGERED
 //!   REJECTED   with the reason (`tick-size`, `post-only`, ...)
-//! Every event carries `event_id` = raft group:index:ordinal. Delivery is
-//! at-least-once (Kafka redelivery), so clients dedupe on it.
+//! Every event carries `event_id` = raft group:index:ordinal:order (the
+//! order id tells apart the two sides of a self-trade, which share the rest)
+//! and `ts`, the event's Kafka timestamp in milliseconds. Delivery is
+//! at-least-once, so clients dedupe on `event_id`.
 //!
-//! It is a live stream: an instance starts at the topic's tail and keeps no
-//! history (reconcile through the order query API after a reconnect). Each
-//! instance reads the whole topic and pushes only to its own connections;
-//! beyond what one consumer can read, split the topic by user.
+//! Reconnects resume: each user's recent events (TC_USER_STREAM_REPLAY_EVENTS,
+//! default 512, and at most TC_USER_STREAM_REPLAY_SECS, default 300 s) are
+//! kept, and `since=<ts>` on reconnect replays the ones at or after it before
+//! the live stream continues, with no gap or reordering between the two. An
+//! instance rebuilds that window from Kafka when it starts, so a restart of
+//! the service does not lose it either. Beyond the window, reconcile through
+//! the order query API. Each instance reads the whole topic and pushes only
+//! to its own connections; beyond what one consumer can read, split the
+//! topic by user.
 //!
-//!   GET /ws/user?user=U   (Authorization: Bearer <TC_USER_STREAM_TOKEN>)
+//!   GET /ws/user?user=U[&since=<ts ms>]   (Authorization: Bearer <TC_USER_STREAM_TOKEN>)
 //!   GET /metrics
 //!
 //! Env: TC_USER_STREAM_ADDR (0.0.0.0:9300), TC_USER_STREAM_TOKEN (falls back
@@ -29,15 +36,16 @@
 //! (trade-executions-v1), TC_USER_STREAM_QUEUE (per-connection backlog before a
 //! slow client is dropped, 10000), TC_USER_STREAM_MAX_CONNECTIONS_PER_USER (16).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use rdkafka::consumer::{BaseConsumer, Consumer};
+use rdkafka::topic_partition_list::{Offset, TopicPartitionList};
 use rdkafka::{ClientConfig, Message as KafkaMessage};
 use trade_core::websocket::{self, ClientEvent, EventReader};
 use trade_core::{log_info, log_warn, wire};
@@ -75,23 +83,86 @@ impl Metrics {
     }
 }
 
-/// user -> that user's live connections (id, outbound queue).
+/// user -> that user's live connections (id, outbound queue), plus each
+/// user's recent events for resuming after a reconnect.
 #[derive(Default)]
 struct Registry {
     users: RwLock<HashMap<u64, Vec<(u64, SyncSender<Outgoing>)>>>,
     next_id: AtomicU64,
+    /// Lock order: `history`, then `users`. Appending an event and pushing it
+    /// happen under `history`, and so do subscribing and queuing a replay:
+    /// every event is therefore either replayed or pushed live, in order.
+    history: Mutex<HashMap<u64, VecDeque<(i64, Arc<str>)>>>,
+    replay_events: usize,
+    replay_ms: i64,
 }
 
 impl Registry {
+    fn with_replay(events: usize, secs: u64) -> Self {
+        Self {
+            replay_events: events,
+            replay_ms: secs as i64 * 1000,
+            ..Self::default()
+        }
+    }
+
     fn subscribe(&self, user: u64, tx: SyncSender<Outgoing>, max_per_user: usize) -> Option<u64> {
+        self.subscribe_since(user, tx, max_per_user, None)
+    }
+
+    /// Subscribe, first queuing the user's kept events at or after `since`.
+    fn subscribe_since(
+        &self,
+        user: u64,
+        tx: SyncSender<Outgoing>,
+        max_per_user: usize,
+        since: Option<i64>,
+    ) -> Option<u64> {
+        let history = self.history.lock().unwrap();
         let mut users = self.users.write().unwrap();
         let conns = users.entry(user).or_default();
         if conns.len() >= max_per_user {
             return None;
         }
+        if let (Some(since), Some(events)) = (since, history.get(&user)) {
+            for (_, json) in events.iter().filter(|(ts, _)| *ts >= since) {
+                if tx.try_send(Outgoing::Text(json.clone())).is_err() {
+                    break; // more than the queue holds: the client reconciles
+                }
+            }
+        }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         conns.push((id, tx));
         Some(id)
+    }
+
+    /// Keep `json` (timestamp `ts`) for `user`'s reconnects and push it to
+    /// the user's live connections. Returns connections reached.
+    fn record_and_push(&self, user: u64, ts: i64, json: &Arc<str>, metrics: &Metrics) -> usize {
+        let mut history = self.history.lock().unwrap();
+        if self.replay_events > 0 {
+            let events = history.entry(user).or_default();
+            events.push_back((ts, json.clone()));
+            while events.len() > self.replay_events
+                || events.front().is_some_and(|(oldest, _)| *oldest < ts - self.replay_ms)
+            {
+                events.pop_front();
+            }
+        }
+        let reached = self.push(user, json, metrics);
+        drop(history);
+        reached
+    }
+
+    /// Forget events older than the replay window (users who went quiet).
+    fn prune(&self, now_ms: i64) {
+        let horizon = now_ms - self.replay_ms;
+        self.history.lock().unwrap().retain(|_, events| {
+            while events.front().is_some_and(|(ts, _)| *ts < horizon) {
+                events.pop_front();
+            }
+            !events.is_empty()
+        });
     }
 
     fn unsubscribe(&self, user: u64, id: u64) {
@@ -139,7 +210,7 @@ fn event_json(payload: &[u8]) -> Option<(u64, String)> {
     let report = event.report;
     let order_id = event.target_order_id;
     let base = format!(
-        "\"order_id\":{order_id},\"user\":{user},\"instrument\":{},\"event_id\":\"{}:{}:{}\"",
+        "\"order_id\":{order_id},\"user\":{user},\"instrument\":{},\"event_id\":\"{}:{}:{}:{order_id}\"",
         report.instrument.0, event.raft_group, event.raft_index, event.ordinal
     );
     let json = match report.type_code {
@@ -181,6 +252,21 @@ fn event_json(payload: &[u8]) -> Option<(u64, String)> {
     Some((user, json))
 }
 
+/// [`event_json`] with the event's timestamp (ms) as `"ts"`, the value a
+/// client passes back as `since` when it reconnects.
+fn event_json_at(payload: &[u8], ts: i64) -> Option<(u64, String)> {
+    let (user, mut json) = event_json(payload)?;
+    json.pop(); // the closing brace
+    json.push_str(&format!(",\"ts\":{ts}}}"));
+    Some((user, json))
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as i64)
+}
+
 fn consume(
     brokers: String,
     topic: String,
@@ -191,26 +277,47 @@ fn consume(
     let consumer: BaseConsumer = ClientConfig::new()
         .set("bootstrap.servers", &brokers)
         .set("group.id", &group)
-        // A live stream: start at the tail, never commit (each instance has
-        // its own group and sees every event).
+        // Never commit: each instance reads every partition itself.
         .set("auto.offset.reset", "latest")
         .set("enable.auto.commit", "false")
         .set("fetch.wait.max.ms", "5")
         .create()
         .expect("create execution consumer");
-    consumer
-        .subscribe(&[&topic])
-        .expect("subscribe execution topic");
-    log_info!("user-stream", "consuming {topic} from {brokers} as {group}");
+    // Start one replay window back, so reconnects can resume right after an
+    // instance (re)starts; the tail when replay is off.
+    let start_ms = now_ms() - registry.replay_ms;
+    let assignment = loop {
+        match start_positions(&consumer, &topic, (registry.replay_events > 0).then_some(start_ms)) {
+            Ok(assignment) => break assignment,
+            Err(error) => {
+                log_warn!("user-stream", "event=assign_failed error={error}");
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+    };
+    consumer.assign(&assignment).expect("assign execution partitions");
+    log_info!(
+        "user-stream",
+        "consuming {topic} from {brokers}, {} partitions, replay window {} s",
+        assignment.count(),
+        registry.replay_ms / 1000
+    );
+    let mut last_prune = std::time::Instant::now();
     loop {
+        if last_prune.elapsed() >= Duration::from_secs(10) {
+            registry.prune(now_ms());
+            last_prune = std::time::Instant::now();
+        }
         match consumer.poll(Duration::from_millis(100)) {
             Some(Ok(message)) => {
                 metrics.events_consumed.fetch_add(1, Ordering::Relaxed);
-                let Some((user, json)) = message.payload().and_then(event_json) else {
+                let ts = message.timestamp().to_millis().unwrap_or_else(now_ms);
+                let Some((user, json)) = message.payload().and_then(|payload| event_json_at(payload, ts))
+                else {
                     continue;
                 };
                 let json: Arc<str> = json.into();
-                if registry.push(user, &json, &metrics) > 0 {
+                if registry.record_and_push(user, ts, &json, &metrics) > 0 {
                     metrics.events_pushed.fetch_add(1, Ordering::Relaxed);
                 } else {
                     metrics
@@ -225,6 +332,37 @@ fn consume(
             None => {}
         }
     }
+}
+
+/// Every partition of `topic`, positioned at the first message at or after
+/// `since_ms` (the tail where there is none, or when `None`).
+fn start_positions(
+    consumer: &BaseConsumer,
+    topic: &str,
+    since_ms: Option<i64>,
+) -> Result<TopicPartitionList, String> {
+    let metadata = consumer
+        .fetch_metadata(Some(topic), Duration::from_secs(10))
+        .map_err(|error| error.to_string())?;
+    let partitions = metadata
+        .topics()
+        .iter()
+        .find(|meta| meta.name() == topic)
+        .map(|meta| meta.partitions().len())
+        .filter(|count| *count > 0)
+        .ok_or_else(|| format!("topic {topic} has no partitions yet"))?;
+    let mut list = TopicPartitionList::new();
+    for partition in 0..partitions as i32 {
+        let offset = since_ms.map_or(Offset::End, Offset::Offset);
+        list.add_partition_offset(topic, partition, offset)
+            .map_err(|error| error.to_string())?;
+    }
+    if since_ms.is_none() {
+        return Ok(list);
+    }
+    consumer
+        .offsets_for_times(list, Duration::from_secs(10))
+        .map_err(|error| error.to_string())
 }
 
 fn respond(stream: &mut TcpStream, status: &str, body: &str) {
@@ -306,8 +444,9 @@ fn handle(stream: TcpStream, config: &Config, registry: &Registry, metrics: &Met
         respond(&mut writer, "400 Bad Request", "websocket upgrade required");
         return;
     };
+    let since = query_param(query, "since").and_then(|v| v.parse::<i64>().ok());
     let (tx, rx) = mpsc::sync_channel::<Outgoing>(config.queue);
-    let Some(conn) = registry.subscribe(user, tx.clone(), config.max_per_user) else {
+    let Some(conn) = registry.subscribe_since(user, tx.clone(), config.max_per_user, since) else {
         respond(
             &mut writer,
             "429 Too Many Requests",
@@ -426,7 +565,10 @@ fn main() {
             .unwrap_or(16)
             .max(1),
     });
-    let registry = Arc::new(Registry::default());
+    let registry = Arc::new(Registry::with_replay(
+        env("TC_USER_STREAM_REPLAY_EVENTS", "512").parse().unwrap_or(512),
+        env("TC_USER_STREAM_REPLAY_SECS", "300").parse().unwrap_or(300),
+    ));
     let metrics = Arc::new(Metrics::default());
     {
         let (registry, metrics) = (registry.clone(), metrics.clone());
@@ -467,7 +609,7 @@ mod tests {
             event_json(&payload(&committed, 1)).unwrap(),
             (
                 11,
-                r#"{"e":"COMMITTED","order_id":1,"user":11,"instrument":5,"event_id":"7:42:3"}"#
+                r#"{"e":"COMMITTED","order_id":1,"user":11,"instrument":5,"event_id":"7:42:3:1"}"#
                     .into()
             )
         );
@@ -525,7 +667,7 @@ mod tests {
             event_json(&payload(&maker_filled, 1)).unwrap(),
             (
                 11,
-                r#"{"e":"FILLED","order_id":1,"user":11,"instrument":5,"event_id":"7:42:3","role":"maker"}"#
+                r#"{"e":"FILLED","order_id":1,"user":11,"instrument":5,"event_id":"7:42:3:1","role":"maker"}"#
                     .into()
             )
         );
@@ -537,6 +679,53 @@ mod tests {
         };
         assert_eq!(event_json(&payload(&unowned, 9)), None);
         assert_eq!(event_json(b"garbage"), None);
+    }
+
+    #[test]
+    fn the_two_sides_of_a_self_trade_have_distinct_event_ids() {
+        let trade = ExecReport::Trade {
+            instrument: InstrumentId(5),
+            taker: OrderId(1),
+            maker: OrderId(2),
+            aggressor: Side::Buy,
+            price: 100,
+            qty: 1,
+            maker_fee: 0,
+            taker_fee: 0,
+            taker_user: 11,
+            maker_user: 11,
+        };
+        let (_, taker) = event_json(&payload(&trade, 1)).unwrap();
+        let (_, maker) = event_json(&payload(&trade, 2)).unwrap();
+        let id = |json: &str| json.split("\"event_id\":\"").nth(1).unwrap().split('"').next().unwrap().to_string();
+        assert_ne!(id(&taker), id(&maker));
+        let (_, stamped) = event_json_at(&payload(&trade, 1), 1_700_000_000_123).unwrap();
+        assert!(stamped.ends_with(r#","ts":1700000000123}"#), "{stamped}");
+    }
+
+    #[test]
+    fn a_reconnect_replays_events_since_its_last_timestamp_then_goes_live() {
+        let registry = Registry::with_replay(3, 60);
+        let metrics = Metrics::default();
+        let text = |n: i64| -> Arc<str> { format!("e{n}").into() };
+        for ts in 1..=4 {
+            registry.record_and_push(7, ts * 1000, &text(ts), &metrics);
+        }
+        // Only the last 3 are kept; `since` picks those at or after it.
+        let (tx, rx) = mpsc::sync_channel(16);
+        registry.subscribe_since(7, tx, 4, Some(3_000)).unwrap();
+        registry.record_and_push(7, 5_000, &text(5), &metrics);
+        let got: Vec<String> = rx
+            .try_iter()
+            .map(|frame| match frame {
+                Outgoing::Text(json) => json.to_string(),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(got, ["e3", "e4", "e5"], "replay, then live, in order");
+        // Events older than the window are forgotten.
+        registry.prune(5_000 + 61_000);
+        assert!(registry.history.lock().unwrap().is_empty());
     }
 
     #[test]

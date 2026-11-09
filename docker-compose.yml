@@ -134,6 +134,9 @@ services:
     environment:
       TC_USER_STREAM_ADDR: 0.0.0.0:9300
       TC_USER_STREAM_TOKEN: ${TC_USER_STREAM_TOKEN:-local-order-api-token}
+      # Per-user events kept for `since=` resumes after a reconnect.
+      TC_USER_STREAM_REPLAY_EVENTS: ${TC_USER_STREAM_REPLAY_EVENTS:-512}
+      TC_USER_STREAM_REPLAY_SECS: ${TC_USER_STREAM_REPLAY_SECS:-300}
       TC_EXECUTION_KAFKA_BROKERS: ${TC_EXECUTION_KAFKA_BROKERS:-redpanda:9092,redpanda-2:9092,redpanda-3:9092}
       TC_EXECUTION_KAFKA_TOPIC: ${TC_EXECUTION_KAFKA_TOPIC:-trade-executions-v1}
       TC_LOG: ${TC_LOG:-info}

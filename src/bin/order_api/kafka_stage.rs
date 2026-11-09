@@ -80,13 +80,15 @@ pub(crate) struct IdleCommit {
 impl IdleCommit {
     pub(crate) fn record(&mut self, records: &[KafkaRecord]) {
         for record in records {
-            let next = self
-                .offsets
-                .entry((record.topic.clone(), record.partition))
-                .or_insert(0);
-            *next = (*next).max(record.offset + 1);
+            self.record_offset(&record.topic, record.partition, record.offset);
         }
-        self.dirty |= !records.is_empty();
+    }
+
+    /// Note that `offset` of `topic`/`partition` has been processed.
+    pub(crate) fn record_offset(&mut self, topic: &str, partition: i32, offset: i64) {
+        let next = self.offsets.entry((topic.to_string(), partition)).or_insert(0);
+        *next = (*next).max(offset + 1);
+        self.dirty = true;
     }
 
     pub(crate) fn flush(&mut self, consumer: &BaseConsumer) {
