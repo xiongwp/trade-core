@@ -130,9 +130,22 @@ pub(crate) fn open_when_ready(
                 // per-transaction round trip), whatever the server default.
                 let opts = mysql::Opts::from_url(url.as_str())
                     .map_err(|e| mysql::Error::from(io_shard_error(idx, &e)))?;
-                let opts = mysql::OptsBuilder::from_opts(opts).init(vec![
-                    "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ",
-                ]);
+                // Bounded I/O: a blackholed host must fail a connect or a
+                // statement (the caller retries; the projection is
+                // idempotent) instead of holding a query worker or a
+                // projection thread for the OS's TCP timeout.
+                let io_timeout =
+                    Duration::from_millis(env_number("TC_ORDER_MYSQL_IO_TIMEOUT_MS", 30_000u64));
+                let opts = mysql::OptsBuilder::from_opts(opts)
+                    .init(vec![
+                        "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+                    ])
+                    .tcp_connect_timeout(Some(Duration::from_millis(env_number(
+                        "TC_ORDER_MYSQL_CONNECT_TIMEOUT_MS",
+                        5_000u64,
+                    ))))
+                    .read_timeout(Some(io_timeout))
+                    .write_timeout(Some(io_timeout));
                 let pool =
                     Pool::new(opts).map_err(|e| mysql::Error::from(io_shard_error(idx, &e)))?;
                 pool.get_conn()
