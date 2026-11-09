@@ -266,7 +266,7 @@ pub(crate) fn persist_mysql_shard_with(
         ));
     }
     if !statements.is_empty() {
-        tx.query_drop(statements.join(";\n"))
+        exec_batch(&mut tx, &statements.join(";\n"))
             .map_err(|error| error.to_string())?;
     }
     // Results may have reached this database before the command projection.

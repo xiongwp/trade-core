@@ -109,6 +109,27 @@ impl IdleCommit {
                 .collect();
             self.offsets.retain(|key, _| owned.contains(key));
         }
+        // Never move a committed offset back. A partition that went to
+        // another consumer and came back keeps an old entry here, and the
+        // other consumer may have committed further meanwhile: re-committing
+        // ours would redeliver everything in between on the next restart.
+        let mut probe = TopicPartitionList::new();
+        for (topic, partition) in self.offsets.keys() {
+            let _ = probe.add_partition(topic, *partition);
+        }
+        let committed: HashMap<(String, i32), i64> = match consumer.committed_offsets(probe, Duration::from_secs(5)) {
+            Ok(list) => list
+                .elements()
+                .iter()
+                .filter_map(|element| match element.offset() {
+                    Offset::Offset(offset) => Some(((element.topic().to_string(), element.partition()), offset)),
+                    _ => None,
+                })
+                .collect(),
+            Err(_) => return, // retried on the next idle tick
+        };
+        self.offsets
+            .retain(|key, offset| committed.get(key).is_none_or(|current| *offset > *current));
         let mut list = TopicPartitionList::new();
         for ((topic, partition), offset) in &self.offsets {
             if list
@@ -118,8 +139,16 @@ impl IdleCommit {
                 return;
             }
         }
+        if list.count() == 0 {
+            self.dirty = false;
+            return;
+        }
         match consumer.commit(&list, CommitMode::Sync) {
-            Ok(()) => self.dirty = false,
+            Ok(()) => {
+                // Committed: forget them, so no entry outlives its partition.
+                self.offsets.clear();
+                self.dirty = false;
+            }
             Err(error) => {
                 if self.last_failure_log.is_none_or(|at| at.elapsed() >= Duration::from_secs(30)) {
                     log_warn!("order-kafka", "event=idle_commit_failed partitions={} error={error}", self.offsets.len());

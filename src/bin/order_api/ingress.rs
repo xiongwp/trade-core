@@ -54,7 +54,7 @@ pub(crate) fn ws_order_session(
                 let code = status.split_whitespace().next().unwrap_or("500");
                 format!(
                     "{{\"seq\":{seq},\"accepted\":false,\"code\":{code},\"error\":\"{}\"}}",
-                    error.replace('"', "'")
+                    json_escape(&error)
                 )
             }
         };
@@ -389,23 +389,22 @@ impl KafkaIngress {
     /// still isolates other categories' *separate* requests, which is the
     /// isolation the design requires.
     pub(crate) fn admit_batch(&self, records: &[BatchRecord]) -> Result<(), String> {
-        if let Some(record) = records
+        // Each distinct category once: the route checks take shared locks,
+        // and a 5,000-record batch usually spans a handful of categories.
+        let mut categories: Vec<u32> = records.iter().map(|record| record.category_id).collect();
+        categories.sort_unstable();
+        categories.dedup();
+        if let Some(category) = categories
             .iter()
-            .find(|record| !self.route_control.accepts(record.category_id))
+            .find(|category| !self.route_control.accepts(**category))
         {
             return Err(format!(
-                "backpressure-emergency: category {} is frozen for route migration",
-                record.category_id
+                "backpressure-emergency: category {category} is frozen for route migration"
             ));
         }
-        let Some(worst) = records
+        let Some(worst) = categories
             .iter()
-            .map(|record| {
-                (
-                    self.backpressure.tier_for_category(record.category_id),
-                    record.category_id,
-                )
-            })
+            .map(|category| (self.backpressure.tier_for_category(*category), *category))
             .max()
         else {
             return Ok(());
@@ -509,6 +508,20 @@ impl KafkaIngress {
     }
 }
 
+/// `text` as the inside of a JSON string literal.
+pub(crate) fn json_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// A batch record that was not published (see [`KafkaIngress::publish_batch`]).
 #[derive(Debug)]
 pub(crate) struct FailedRecord {
@@ -533,7 +546,7 @@ pub(crate) fn batch_accepted_json(published: usize, failed: &[FailedRecord]) -> 
                 "{{\"index\":{},\"order_id\":{},\"error\":\"{}\"}}",
                 record.index,
                 record.order_id,
-                record.error.replace('"', "'")
+                json_escape(&record.error)
             ));
         }
         body.push(']');

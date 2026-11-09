@@ -29,6 +29,21 @@ impl OrderStore {
 /// statements. The prepared multi-row insert it replaced cost a prepare and
 /// an execute per table, and its text changed with the row count, so the
 /// server-side statement cache rarely hit.
+/// Run several `;`-separated statements in one round trip and fail if ANY of
+/// them fails. `query_drop` returns only the first statement's error: a later
+/// one (a deadlock, which rolls the whole transaction back, or a lock wait
+/// timeout, which rolls back just that statement) was discarded, and the
+/// caller then committed a transaction that silently lacked those writes.
+pub(crate) fn exec_batch(conn: &mut impl Queryable, sql: &str) -> mysql::Result<()> {
+    let mut result = conn.query_iter(sql)?;
+    while let Some(set) = result.iter() {
+        for row in set {
+            row?;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn multi_insert_sql(prefix: &str, columns: usize, values: &[Value]) -> Option<String> {
     if values.is_empty() {
         return None;
@@ -106,7 +121,17 @@ pub(crate) fn open_when_ready(
                 // Probe each shard eagerly so a bad shard is named in the
                 // startup warning (Pool::new is lazy; without this the retry
                 // loop reports bare auth/DNS errors with no shard context).
-                let pool = Pool::new(url.as_str())
+                // The projection's drains assume REPEATABLE READ: the apply
+                // UPDATE's next-key locks keep an order row from appearing
+                // before the promote INSERT ... SELECT of the same
+                // transaction, which under READ COMMITTED would mark a fill
+                // applied without applying it. Pinned per connection (no
+                // per-transaction round trip), whatever the server default.
+                let opts = mysql::Opts::from_url(url.as_str())
+                    .map_err(|e| mysql::Error::from(io_shard_error(idx, &e)))?;
+                let opts = mysql::OptsBuilder::from_opts(opts)
+                    .init(vec!["SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ"]);
+                let pool = Pool::new(opts)
                     .map_err(|e| mysql::Error::from(io_shard_error(idx, &e)))?;
                 pool.get_conn()
                     .map_err(|e| mysql::Error::from(io_shard_error(idx, &e)))?;

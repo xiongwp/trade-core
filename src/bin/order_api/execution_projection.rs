@@ -596,7 +596,7 @@ pub(crate) fn persist_execution_shard(
         // Every touched table was just staged into, so drain them all (an
         // empty drain is a cheap empty range scan).
         statements.extend(touched.into_iter().map(|table| drain_statements(&db, table, period)));
-        tx.query_drop(statements.join(";\n"))
+        exec_batch(&mut tx, &statements.join(";\n"))
             .map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())?;
     }
@@ -612,7 +612,7 @@ pub(crate) fn discard_redelivered_events(
     shard_db: u32,
     period: u64,
 ) -> Result<(), String> {
-    tx.query_drop(discard_statements(db, shard_db, period))
+    exec_batch(&mut *tx, &discard_statements(db, shard_db, period))
         .map_err(|error| error.to_string())
 }
 
@@ -642,7 +642,7 @@ pub(crate) fn apply_pending_execution_table(
     shard_table: u32,
     period: u64,
 ) -> Result<(), String> {
-    tx.query_drop(drain_statements(db, shard_table, period))
+    exec_batch(&mut *tx, &drain_statements(db, shard_table, period))
         .map_err(|error| error.to_string())
 }
 
@@ -671,7 +671,7 @@ pub(crate) fn drain_statements(db: &str, shard_table: u32, period: u64) -> Strin
                 MAX(IF(rn=1,report_type,0)) latest_type, \
                 SUM(IF(report_type={trade},CAST(event_qty AS DECIMAL(38,0))*event_price,0)) trade_notional \
          FROM ( \
-           SELECT p.*, ROW_NUMBER() OVER (PARTITION BY target_order_id ORDER BY raft_index DESC,report_ordinal DESC) rn \
+           SELECT p.*, ROW_NUMBER() OVER (PARTITION BY target_order_id ORDER BY kafka_offset DESC) rn \
            FROM {db}.pending_execution_events p WHERE shard_table={shard_table} \
          ) ranked GROUP BY target_order_id \
          ) e ON e.target_order_id=o.order_id \

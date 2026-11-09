@@ -339,14 +339,25 @@ impl DurableRaftLog {
         // Atomic on POSIX: readers see either the old full log or the compacted
         // one. The snapshot is durable in `tmp` before it can become "the" log.
         std::fs::rename(&tmp, &self.path)?;
+        // From here on the old file is unlinked: `self.file` must point at the
+        // new one before anything else can fail, or later appends (entries,
+        // votes) would be fsynced into a file that no longer exists. Any
+        // failure past the rename is therefore fatal, never a warning.
+        let reopened = OpenOptions::new()
+            .append(true)
+            .open(&self.path)
+            .and_then(|file| file.sync_all().map(|()| file));
+        self.file = reopened.unwrap_or_else(|error| {
+            panic!("reopen compacted Raft log {}: {error}", self.path.display())
+        });
         // The rename is only durable once the directory entry is: without
         // this, power loss can bring back the old log next to an engine
         // snapshot that was taken against the compacted one.
         if let Some(parent) = self.path.parent() {
-            File::open(parent)?.sync_all()?;
+            if let Err(error) = File::open(parent).and_then(|dir| dir.sync_all()) {
+                panic!("fsync Raft log directory {}: {error}", parent.display());
+            }
         }
-        self.file = OpenOptions::new().append(true).open(&self.path)?;
-        self.file.sync_all()?;
         Ok(())
     }
 

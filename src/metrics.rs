@@ -699,10 +699,18 @@ fn serve_admin_connection(
     // Read until the request line is complete: a client may send
     // it in several segments, and acting on a partial line
     // answered the wrong route and broke the client's pipe.
-    let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+    // One deadline for the whole request line, not per read (a client
+    // trickling a byte at a time would otherwise hold a slot for minutes),
+    // and a write timeout so a peer that stops reading cannot either.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let _ = s.set_write_timeout(Some(std::time::Duration::from_secs(5)));
     let mut request = [0u8; 1024];
     let mut n = 0;
     while n < request.len() && !request[..n].contains(&b'\n') {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() || s.set_read_timeout(Some(left)).is_err() {
+            return;
+        }
         match s.read(&mut request[n..]) {
             Ok(0) | Err(_) => break,
             Ok(read) => n += read,

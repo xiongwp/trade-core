@@ -136,7 +136,9 @@ fn read_event_into(
             return Err(invalid("invalid control frame"));
         }
         let buffered = message.as_ref().map_or(0, |(_, data)| data.len() as u64);
-        if !control && buffered + len > max_len as u64 {
+        // Compare without adding: a 64-bit length near u64::MAX made
+        // `buffered + len` wrap, pass, and then abort on the allocation.
+        if !control && len > (max_len as u64).saturating_sub(buffered) {
             return Err(invalid("message too large"));
         }
         let mut mask = [0u8; 4];
@@ -388,5 +390,31 @@ mod tests {
 
         // A clean end of stream between messages is not an error.
         assert_eq!(read_message(&mut &[][..], &mut Vec::new(), 100).unwrap(), None);
+    }
+}
+
+#[cfg(test)]
+mod length_overflow {
+    use super::*;
+
+    #[test]
+    fn a_continuation_with_a_huge_length_is_rejected_not_allocated() {
+        let mut wire = Vec::new();
+        // A 10-byte non-final text fragment...
+        wire.extend_from_slice(&[0x01, 0x80 | 10, 0, 0, 0, 0]);
+        wire.extend_from_slice(&[b'x'; 10]);
+        // ...then a continuation claiming u64::MAX - 9 bytes (sum wraps to 0).
+        wire.extend_from_slice(&[0x80, 0x80 | 127]);
+        wire.extend_from_slice(&(u64::MAX - 9).to_be_bytes());
+        wire.extend_from_slice(&[0, 0, 0, 0]);
+        let mut events = EventReader::new();
+        let error = loop {
+            match events.next(&mut &wire[..], 1024) {
+                Ok(Some(_)) => continue,
+                Ok(None) => panic!("stream ended without an error"),
+                Err(error) => break error,
+            }
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
     }
 }

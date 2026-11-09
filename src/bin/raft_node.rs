@@ -658,11 +658,11 @@ fn main() {
                         }
                     }
                 }
+                // No `pending == 0` gate: a group under sustained load always
+                // has a few records in flight, so it would never compact.
+                // `execution_outbox_drained_through` below is what keeps
+                // unpublished entries out of a compaction.
                 if compact_threshold > 0
-                    && runtime_metrics
-                        .execution_outbox_pending
-                        .load(Ordering::Acquire)
-                        == 0
                     && runtime_metrics
                         .execution_outbox_publish_healthy
                         .load(Ordering::Acquire)
@@ -846,11 +846,13 @@ fn main() {
             )
             // A message that times out is skipped (the idempotent producer
             // bumps its epoch past it) while later ones may still land, so
-            // the resend arrives out of order. Outlast a broker failover.
+            // the resend arrives out of order. Outlast a broker failover, but
+            // not by much: the publisher blocks for this long, with health and
+            // pending gauges frozen at their last values.
             .set(
                 "message.timeout.ms",
                 std::env::var("TC_EXECUTION_KAFKA_DELIVERY_TIMEOUT_MS")
-                    .unwrap_or_else(|_| "60000".into()),
+                    .unwrap_or_else(|_| "15000".into()),
             );
         let producer = config
             .create::<FutureProducer>()
@@ -1011,6 +1013,11 @@ fn spawn_execution_outbox_publisher(
                                 message.payload(),
                             ) {
                                 shared_position = shared_position.max(Some(position));
+                                // Every event of the entries before the
+                                // checkpointed one is on Kafka.
+                                metrics
+                                    .execution_outbox_drained_through
+                                    .fetch_max(position.0.saturating_sub(1), Ordering::AcqRel);
                             }
                         }
                         Err(error) => {
@@ -1184,6 +1191,15 @@ fn spawn_execution_outbox_publisher(
                                         "event=cursor_failed error={error}"
                                     );
                                 } else {
+                                    // Segments publish oldest first and in
+                                    // (index, ordinal) order, so every entry
+                                    // before the last acknowledged one is
+                                    // fully on Kafka, even while newer
+                                    // records keep `pending` above zero.
+                                    metrics.execution_outbox_drained_through.fetch_max(
+                                        last.raft_index.saturating_sub(1),
+                                        Ordering::AcqRel,
+                                    );
                                     metrics
                                         .execution_outbox_published
                                         .fetch_add(prepared.len() as u64, Ordering::Relaxed);

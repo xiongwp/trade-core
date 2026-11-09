@@ -134,6 +134,25 @@ impl JournalWriter {
         let (recovered_seq, valid_len) = scan_valid_prefix(path)?;
         let mut len = std::fs::metadata(path)?.len();
         if len > valid_len {
+            // More than one torn record means a corrupt record mid-file, not
+            // a crash mid-append: replay never applied what follows it, but
+            // keep those bytes beside the journal for an operator to inspect.
+            if len - valid_len > RECORD_LEN as u64 {
+                let mut tail = Vec::new();
+                let mut source = File::open(path)?;
+                std::io::Seek::seek(&mut source, std::io::SeekFrom::Start(valid_len))?;
+                source.read_to_end(&mut tail)?;
+                let mut kept = path.as_os_str().to_owned();
+                kept.push(format!(".dropped-{}", now_nanos()));
+                std::fs::write(&kept, &tail)?;
+                crate::log_warn!(
+                    "journal",
+                    "event=corrupt_suffix_set_aside path={} valid_bytes={valid_len} dropped_bytes={} kept={}",
+                    path.display(),
+                    len - valid_len,
+                    std::path::Path::new(&kept).display()
+                );
+            }
             let file = OpenOptions::new().write(true).open(path)?;
             file.set_len(valid_len)?;
             file.sync_all()?;

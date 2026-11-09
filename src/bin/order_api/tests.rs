@@ -1662,7 +1662,7 @@ fn a_partly_published_batch_is_accepted_with_the_failed_records() {
     ];
     assert_eq!(
         batch_accepted_json(3, &failed),
-        r#""accepted":true,"status":"PENDING","count":3,"failed":[{"index":1,"order_id":42,"error":"Message timed out"},{"index":4,"order_id":45,"error":"a 'quoted' error"}]"#
+        r#""accepted":true,"status":"PENDING","count":3,"failed":[{"index":1,"order_id":42,"error":"Message timed out"},{"index":4,"order_id":45,"error":"a \"quoted\" error"}]"#
     );
 }
 
@@ -1676,4 +1676,42 @@ fn backpressure_follows_a_migrated_category_to_its_new_group() {
     bp.routes.restore_pin(5, 2);
     assert_eq!(bp.raft_group(5), 2);
     assert_eq!(bp.tier_for_category(5), BackpressureTier::Normal);
+}
+
+#[test]
+#[ignore = "requires disposable MySQL 8 via TC_TEST_MYSQL_URL"]
+fn mysql8_a_failing_later_statement_fails_the_batch() {
+    let store = mysql_test_store().expect("TC_TEST_MYSQL_URL must be set");
+    let mut conn = store.shard(0).get_conn().unwrap();
+    let batch = "SELECT 1;\nSELECT * FROM order_db_0.no_such_table_for_this_test";
+    // What `query_drop` did: the second statement's error is lost.
+    assert!(conn.query_drop(batch).is_ok());
+    assert!(exec_batch(&mut conn, batch).is_err());
+    assert!(exec_batch(&mut conn, "SELECT 1;\nSELECT 2").is_ok());
+    // The connection is usable afterwards.
+    assert!(exec_batch(&mut conn, "SELECT 3").is_ok());
+}
+
+#[test]
+#[ignore = "requires disposable MySQL 8 via TC_TEST_MYSQL_URL"]
+fn mysql8_a_different_dedupe_period_refuses_to_start() {
+    let store = mysql_test_store().expect("TC_TEST_MYSQL_URL must be set");
+    let mut conn = store.shard(0).get_conn().unwrap();
+    conn.query_drop("CREATE DATABASE IF NOT EXISTS order_db_period_test").unwrap();
+    conn.query_drop("DROP TABLE IF EXISTS order_db_period_test.dedupe_settings").unwrap();
+    check_dedupe_period(&mut conn, "order_db_period_test").unwrap();
+    check_dedupe_period(&mut conn, "order_db_period_test").unwrap(); // same: fine
+    conn.query_drop("UPDATE order_db_period_test.dedupe_settings SET value=value*2").unwrap();
+    let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        check_dedupe_period(&mut conn, "order_db_period_test")
+    }));
+    assert!(refused.is_err(), "a changed period must refuse");
+    let mut conn = store.shard(0).get_conn().unwrap();
+    conn.query_drop("DROP DATABASE order_db_period_test").unwrap();
+}
+
+#[test]
+fn json_escape_keeps_acks_valid_json() {
+    assert_eq!(json_escape("plain"), "plain");
+    assert_eq!(json_escape("a\"b\\c\nd\u{1}"), "a\\\"b\\\\c\\u000ad\\u0001");
 }

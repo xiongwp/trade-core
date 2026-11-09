@@ -49,6 +49,12 @@ fn read_status(reader: &mut BufReader<TcpStream>) -> std::io::Result<u16> {
     }
     let mut body = vec![0; content_length];
     reader.read_exact(&mut body)?;
+    // A partly published batch is accepted with the records that did not
+    // make it; report it as retryable so the whole batch is resent (the
+    // published ones are deduplicated by command id).
+    if status == 202 && body.windows(10).any(|w| w == b"\"failed\":[") {
+        return Ok(429);
+    }
     Ok(status)
 }
 

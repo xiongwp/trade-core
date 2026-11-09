@@ -118,7 +118,7 @@ raft-multi-node 1 64 /data
 | `TC_EXECUTION_KAFKA_LINGER_MS` | 2 | 发布成交时 Kafka producer 的攒批时间 |
 | `TC_EXECUTION_KAFKA_BATCH_MESSAGES` | 10000 | 同上，每批最多条数 |
 | `TC_EXECUTION_KAFKA_COMPRESSION` | lz4 | 压缩算法 |
-| `TC_EXECUTION_KAFKA_DELIVERY_TIMEOUT_MS` | 60000 | 发布超时。要长于 broker 切主时间：超时的消息会被跳过而后面的照样写入，重发后同一订单的事件会乱序 |
+| `TC_EXECUTION_KAFKA_DELIVERY_TIMEOUT_MS` | 15000 | 发布超时。要长于 broker 切主时间：超时的消息会被跳过而后面的照样写入，重发后同一订单的事件会乱序。也不能太长：等待期间发布线程阻塞，健康状态和积压指标停在旧值 |
 | `TC_SUPERVISOR_LIVENESS_GRACE_SECS` | 300 | 子进程启动后多久才开始做存活探测，要大于最长的 WAL 恢复时间 |
 | `TC_SUPERVISOR_LIVENESS_FAILURES` | 6 | 连续这么多次探测失败（每 5 秒一次）就杀掉重启 |
 
@@ -272,3 +272,9 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
 | `tc_order_dedupe_truncated_partitions` | 去重表轮转清理次数 |
 | 各 Raft 组的 apply lag 和选举次数 | 撮合健康状况 |
 | MySQL 复制延迟 | 从库是否跟得上 |
+
+### 11.1 升级（换新版本）
+
+- 新版本如果改了撮合结果（`DETERMINISM_VERSION` 变了，例如 2026-11-09 的强平改动），同一个组的副本必须**一起升级**；混跑时配置指纹不一致，副本会拒绝当 leader。
+- 升级前每个节点都要**先做一次完整快照**：用 SIGTERM 正常停机（停机时会写最终快照）。不要在 kill -9 或崩溃之后直接换新版本：重启时要按老版本的结果去校验重放的日志，结果不同会触发 "Raft replay mismatch"，节点起不来。崩溃过的节点先用老版本启动一次，再正常停机升级。
+- 快照格式 v6/v7 老版本读不了，升级后不能直接回退到老版本。

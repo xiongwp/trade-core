@@ -13,6 +13,7 @@ pub(crate) fn bootstrap(store: &OrderStore) -> mysql::Result<()> {
         conn.query_drop(format!("CREATE TABLE IF NOT EXISTS {db_name}.processed_commands (category_id INT UNSIGNED NOT NULL, kafka_partition INT NOT NULL, kafka_offset BIGINT UNSIGNED NOT NULL, command_id BIGINT UNSIGNED NOT NULL UNIQUE, user_id BIGINT UNSIGNED NOT NULL, shard_table INT UNSIGNED NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(category_id,kafka_offset)) ENGINE=InnoDB"))?;
         conn.query_drop(format!("CREATE TABLE IF NOT EXISTS {db_name}.processed_executions (kafka_partition INT NOT NULL, kafka_offset BIGINT UNSIGNED NOT NULL, instrument INT UNSIGNED NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(kafka_partition,kafka_offset), KEY idx_instrument_offset (instrument,kafka_offset)) ENGINE=InnoDB"))?;
         migrate_legacy_dedupe_table(&mut conn, &db_name, db as u32)?;
+        check_dedupe_period(&mut conn, &db_name)?;
         for table in 0..DEDUPE_TABLES {
             conn.query_drop(format!("CREATE TABLE IF NOT EXISTS {db_name}.processed_execution_events_{table} (raft_group INT UNSIGNED NOT NULL, raft_index BIGINT UNSIGNED NOT NULL, report_ordinal INT UNSIGNED NOT NULL, target_order_id BIGINT UNSIGNED NOT NULL, shard_table INT UNSIGNED NOT NULL, instrument INT UNSIGNED NOT NULL, report_type TINYINT UNSIGNED NOT NULL, kafka_partition INT NOT NULL, kafka_offset BIGINT UNSIGNED NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(raft_group,raft_index,report_ordinal,target_order_id)) ENGINE=InnoDB"))?;
         }
@@ -95,6 +96,35 @@ pub(crate) fn add_missing_columns(
         if !missing.is_empty() {
             conn.query_drop(format!("ALTER TABLE {db_name}.{table} {}", missing.join(", ")))?;
         }
+    }
+    Ok(())
+}
+
+/// The dedupe tables are keyed by `UNIX_TIMESTAMP() DIV period`: a different
+/// `TC_ORDER_DEDUPE_RETENTION_HOURS` renumbers the periods, maps the live
+/// history to the "next" table, and the first rotation truncates it. So the
+/// period is recorded with the data, and a start with another one refuses.
+pub(crate) fn check_dedupe_period(conn: &mut mysql::PooledConn, db_name: &str) -> mysql::Result<()> {
+    let period_secs = dedupe_retention_hours() * 3600;
+    conn.query_drop(format!(
+        "CREATE TABLE IF NOT EXISTS {db_name}.dedupe_settings (name VARCHAR(32) NOT NULL PRIMARY KEY, value BIGINT UNSIGNED NOT NULL) ENGINE=InnoDB"
+    ))?;
+    conn.query_drop(format!(
+        "INSERT IGNORE INTO {db_name}.dedupe_settings (name,value) VALUES ('period_secs',{period_secs})"
+    ))?;
+    let stored: Option<u64> = conn.query_first(format!(
+        "SELECT value FROM {db_name}.dedupe_settings WHERE name='period_secs'"
+    ))?;
+    if let Some(stored) = stored.filter(|stored| *stored != period_secs) {
+        panic!(
+            "{db_name}: TC_ORDER_DEDUPE_RETENTION_HOURS is {} h but its dedupe history was \
+             written with {} h; changing it would truncate live history. Keep {} h, or \
+             stop the projection, wait one full period, empty the processed_execution_events_* \
+             tables and delete the dedupe_settings row",
+            period_secs / 3600,
+            stored / 3600,
+            stored / 3600,
+        );
     }
     Ok(())
 }
