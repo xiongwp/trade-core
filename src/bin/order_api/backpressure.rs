@@ -116,9 +116,10 @@ impl Backpressure {
 
     pub(crate) fn set_partition_lags(&self, stage: &str, lags: &[u64]) {
         match stage {
-            "mysql" => self
-                .mysql_lag
-                .store(lags.iter().copied().max().unwrap_or(0), AtomicOrdering::Release),
+            "mysql" => self.mysql_lag.store(
+                lags.iter().copied().max().unwrap_or(0),
+                AtomicOrdering::Release,
+            ),
             "match" => {
                 for (slot, lag) in self.match_lag.iter().zip(lags.iter()) {
                     slot.store(*lag, AtomicOrdering::Release);
@@ -130,7 +131,11 @@ impl Backpressure {
 
     pub(crate) fn set_group_health(&self, group: usize, healthy: bool) {
         if let Some(until) = self.group_unhealthy.get(group) {
-            let value = if healthy { 0 } else { now_ms() + GROUP_UNHEALTHY_MS };
+            let value = if healthy {
+                0
+            } else {
+                now_ms() + GROUP_UNHEALTHY_MS
+            };
             until.store(value, AtomicOrdering::Release);
         }
     }

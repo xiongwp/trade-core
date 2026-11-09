@@ -169,7 +169,9 @@ pub(crate) fn dead_letter_command(
     dlq.lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .append(partition, offset, &reason, payload)
-        .unwrap_or_else(|io| panic!("command DLQ append failed ({io}); refusing to skip offset {offset}"));
+        .unwrap_or_else(|io| {
+            panic!("command DLQ append failed ({io}); refusing to skip offset {offset}")
+        });
     let total = DEAD_LETTERED.fetch_add(1, AtomicOrdering::Relaxed) + 1;
     log_error!("order-kafka", stage; "event=command_dead_lettered partition={partition} offset={offset} total={total} error={error}");
 }

@@ -37,7 +37,10 @@ impl RouteRecord {
             "pin" => Some(RouteRecord::Pin(rest.parse().ok()?)),
             "freeze" => {
                 let (to, from) = rest.split_once(':')?;
-                Some(RouteRecord::Freeze { to: to.parse().ok()?, from: from.parse().ok()? })
+                Some(RouteRecord::Freeze {
+                    to: to.parse().ok()?,
+                    from: from.parse().ok()?,
+                })
             }
             _ => None,
         }
@@ -67,24 +70,34 @@ pub(crate) fn view() -> &'static Mutex<RouteLogView> {
 }
 
 fn observe(category: u32, offset: i64, record: RouteRecord) {
-    let mut view = view().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut view = view()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     view.latest.insert(category, (offset, record));
     view.next_offset = view.next_offset.max(offset + 1);
 }
 
 /// The category's latest record and its offset, once this process has read
 /// up to `through` (waits up to `timeout` for the follower).
-pub(crate) fn latest_after(category: u32, through: i64, timeout: Duration) -> Result<Option<(i64, RouteRecord)>, String> {
+pub(crate) fn latest_after(
+    category: u32,
+    through: i64,
+    timeout: Duration,
+) -> Result<Option<(i64, RouteRecord)>, String> {
     let deadline = std::time::Instant::now() + timeout;
     loop {
         {
-            let view = view().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let view = view()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if view.next_offset > through {
                 return Ok(view.latest.get(&category).copied());
             }
         }
         if std::time::Instant::now() >= deadline {
-            return Err(format!("route log not read up to offset {through} within {timeout:?}"));
+            return Err(format!(
+                "route log not read up to offset {through} within {timeout:?}"
+            ));
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -94,24 +107,38 @@ pub(crate) fn latest_after(category: u32, through: i64, timeout: Duration) -> Re
 /// finish (its orchestrator stopped). They stay frozen until
 /// `/admin/routes/abort` rolls them back.
 pub(crate) fn frozen_categories() -> Vec<(u32, i64, RouteRecord)> {
-    let view = view().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    view.latest
+    let view = view()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut frozen = view
+        .latest
         .iter()
         .filter(|(_, (_, record))| matches!(record, RouteRecord::Freeze { .. }))
         .map(|(&category, &(offset, record))| (category, offset, record))
-        .collect()
+        .collect::<Vec<_>>();
+    frozen.sort_unstable_by_key(|(category, _, _)| *category);
+    frozen
 }
 
 /// Write a route record and wait for the brokers to acknowledge it; returns
 /// its offset.
-pub(crate) fn publish(kafka: &KafkaIngress, category: u32, record: RouteRecord) -> Result<i64, String> {
+pub(crate) fn publish(
+    kafka: &KafkaIngress,
+    category: u32,
+    record: RouteRecord,
+) -> Result<i64, String> {
     let topic = route_log_topic();
     let key = category.to_be_bytes();
     let value = record.encode();
-    futures::executor::block_on(kafka.producer.send(
-        FutureRecord::to(&topic).partition(0).key(&key[..]).payload(value.as_bytes()),
-        Duration::from_secs(10),
-    ))
+    futures::executor::block_on(
+        kafka.producer.send(
+            FutureRecord::to(&topic)
+                .partition(0)
+                .key(&key[..])
+                .payload(value.as_bytes()),
+            Duration::from_secs(10),
+        ),
+    )
     .map(|delivery| delivery.offset)
     .map_err(|(error, _)| format!("route log write failed: {error}"))
 }
@@ -161,7 +188,9 @@ pub(crate) fn load_and_follow(kafka: &KafkaIngress) {
             record.apply(&control, category);
             observe(category, message.offset(), record);
         }
-        let mut view = view().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut view = view()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         view.next_offset = view.next_offset.max(message.offset() + 1);
     };
     // Every record up to the end seen at start, however long it takes.
@@ -180,7 +209,9 @@ pub(crate) fn load_and_follow(kafka: &KafkaIngress) {
         }
     }
     {
-        let mut view = view().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut view = view()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         view.next_offset = view.next_offset.max(end);
     }
     log_info!("route-log", "event=loaded topic={topic} records={position}");

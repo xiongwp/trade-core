@@ -31,7 +31,10 @@ pub(crate) fn bootstrap(store: &OrderStore) -> mysql::Result<()> {
 /// `TC_ORDER_DEDUPE_RETENTION_HOURS` renumbers the periods, maps the live
 /// history to the "next" table, and the first rotation truncates it. So the
 /// period is recorded with the data, and a start with another one refuses.
-pub(crate) fn check_dedupe_period(conn: &mut mysql::PooledConn, db_name: &str) -> mysql::Result<()> {
+pub(crate) fn check_dedupe_period(
+    conn: &mut mysql::PooledConn,
+    db_name: &str,
+) -> mysql::Result<()> {
     let period_secs = dedupe_retention_hours() * 3600;
     conn.query_drop(format!(
         "CREATE TABLE IF NOT EXISTS {db_name}.dedupe_settings (name VARCHAR(32) NOT NULL PRIMARY KEY, value BIGINT UNSIGNED NOT NULL) ENGINE=InnoDB"

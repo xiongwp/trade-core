@@ -5,14 +5,19 @@ use super::*;
 pub(crate) const QUERY_DEFAULT_LIMIT: usize = 100;
 pub(crate) const QUERY_MAX_LIMIT: usize = 1_000;
 /// `status=open`: every non-terminal projection status.
-pub(crate) const OPEN_STATUSES_SQL: &str = "'PENDING','OPEN','PARTIAL','UNTRIGGERED','MODIFY_PENDING'";
+pub(crate) const OPEN_STATUSES_SQL: &str =
+    "'PENDING','OPEN','PARTIAL','UNTRIGGERED','MODIFY_PENDING'";
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum OrderQuery {
     /// `GET /orders/{order_id}`
     Order(u64),
     /// `GET /orders?user=U[&status=open|all][&limit=N]`
-    UserOrders { user: u64, open_only: bool, limit: usize },
+    UserOrders {
+        user: u64,
+        open_only: bool,
+        limit: usize,
+    },
     /// `GET /fills?order_id=X[&limit=N]`
     OrderFills { order_id: u64, limit: usize },
     /// `GET /fills?user=U[&limit=N]`
@@ -21,7 +26,11 @@ pub(crate) enum OrderQuery {
 
 /// `None` when the request is not an order query, so it falls through to the
 /// other routes (`POST /orders` among them).
-pub(crate) fn parse_order_query(method: &str, path: &str, query: &str) -> Option<Result<OrderQuery, String>> {
+pub(crate) fn parse_order_query(
+    method: &str,
+    path: &str,
+    query: &str,
+) -> Option<Result<OrderQuery, String>> {
     if method != "GET" {
         return None;
     }
@@ -81,10 +90,24 @@ CAST(filled_notional AS CHAR) filled_notional,status, \
 CAST(UNIX_TIMESTAMP(created_at)*1000 AS UNSIGNED) created_ms, \
 CAST(UNIX_TIMESTAMP(updated_at)*1000 AS UNSIGNED) updated_ms,row_seq";
 
-pub(crate) type OrderRow = (u64, u64, u32, i8, u64, u64, u64, String, String, u64, u64, u64);
+pub(crate) type OrderRow = (
+    u64,
+    u64,
+    u32,
+    i8,
+    u64,
+    u64,
+    u64,
+    String,
+    String,
+    u64,
+    u64,
+    u64,
+);
 
 /// Columns of an `order_fills` row, in [`FillRow`] order.
-pub(crate) const FILL_COLUMNS: &str = "raft_group,raft_index,report_ordinal,order_id,user_id,instrument, \
+pub(crate) const FILL_COLUMNS: &str =
+    "raft_group,raft_index,report_ordinal,order_id,user_id,instrument, \
 side,price,qty,fee,fill_role,CAST(UNIX_TIMESTAMP(created_at)*1000 AS UNSIGNED) created_ms";
 
 pub(crate) type FillRow = (u32, u64, u32, u64, u64, u32, i8, u64, u64, u64, u8, u64);
@@ -120,8 +143,20 @@ pub(crate) fn average_price(notional: &str, filled_qty: u64) -> String {
 }
 
 pub(crate) fn order_json(row: &OrderRow) -> String {
-    let (order_id, user, instrument, side, price, qty, filled, notional, status, created, updated, _) =
-        row;
+    let (
+        order_id,
+        user,
+        instrument,
+        side,
+        price,
+        qty,
+        filled,
+        notional,
+        status,
+        created,
+        updated,
+        _,
+    ) = row;
     format!(
         "{{\"order_id\":{order_id},\"user_id\":{user},\"instrument\":{instrument},\"side\":\"{}\",\"price\":{price},\"qty\":{qty},\"filled_qty\":{filled},\"avg_fill_price\":{},\"status\":\"{status}\",\"created_at\":{created},\"updated_at\":{updated}}}",
         side_name(*side),
@@ -140,7 +175,10 @@ pub(crate) fn fill_json(row: &FillRow) -> String {
 }
 
 pub(crate) fn json_array<T>(rows: &[T], render: fn(&T) -> String) -> String {
-    format!("[{}]", rows.iter().map(render).collect::<Vec<_>>().join(","))
+    format!(
+        "[{}]",
+        rows.iter().map(render).collect::<Vec<_>>().join(",")
+    )
 }
 
 pub(crate) fn query_conn(store: &OrderStore, db: u32) -> Result<mysql::PooledConn, String> {
@@ -162,12 +200,20 @@ pub(crate) fn fan_out<T: mysql::prelude::FromRow + Send>(
         let workers = (0..store.routing.db_count as u32)
             .map(|db| {
                 let sql = sql_for_db(db);
-                scope.spawn(move || query_conn(store, db)?.query::<T, _>(sql).map_err(|e| e.to_string()))
+                scope.spawn(move || {
+                    query_conn(store, db)?
+                        .query::<T, _>(sql)
+                        .map_err(|e| e.to_string())
+                })
             })
             .collect::<Vec<_>>();
         let mut rows = Vec::new();
         for worker in workers {
-            rows.extend(worker.join().map_err(|_| "query worker panicked".to_string())??);
+            rows.extend(
+                worker
+                    .join()
+                    .map_err(|_| "query worker panicked".to_string())??,
+            );
         }
         Ok(rows)
     })
@@ -192,13 +238,19 @@ pub(crate) fn order_location(routing: &sharding::RouteConfig, order_id: u64) -> 
 }
 
 /// `Ok(None)` means 404 (only `GET /orders/{id}` has one).
-pub(crate) fn serve_order_query(store: &OrderStore, request: &OrderQuery) -> Result<Option<String>, String> {
+pub(crate) fn serve_order_query(
+    store: &OrderStore,
+    request: &OrderQuery,
+) -> Result<Option<String>, String> {
     match *request {
         OrderQuery::Order(order_id) => {
             let at = order_location(&store.routing, order_id);
             let row: Option<OrderRow> = query_conn(store, at.db)?
                 .exec_first(
-                    format!("SELECT {ORDER_COLUMNS} FROM {} WHERE order_id=?", at.orders_table),
+                    format!(
+                        "SELECT {ORDER_COLUMNS} FROM {} WHERE order_id=?",
+                        at.orders_table
+                    ),
                     (order_id,),
                 )
                 .map_err(|error| error.to_string())?;
@@ -284,15 +336,22 @@ pub(crate) fn order_query_response(
     let Some(store) = store else {
         return (
             "503 Service Unavailable",
-            "{\"error\":\"order queries are disabled on this worker (TC_ORDER_QUERY_ENABLED)\"}".into(),
+            "{\"error\":\"order queries are disabled on this worker (TC_ORDER_QUERY_ENABLED)\"}"
+                .into(),
         );
     };
     match serve_order_query(store, &request) {
         Ok(Some(body)) => ("200 OK", body),
         Ok(None) => ("404 Not Found", "{\"error\":\"order not found\"}".into()),
         Err(error) => {
-            log_warn!("order-api", "event=order_query_failed request={request:?} error={error}");
-            ("503 Service Unavailable", "{\"error\":\"order query failed\"}".into())
+            log_warn!(
+                "order-api",
+                "event=order_query_failed request={request:?} error={error}"
+            );
+            (
+                "503 Service Unavailable",
+                "{\"error\":\"order query failed\"}".into(),
+            )
         }
     }
 }

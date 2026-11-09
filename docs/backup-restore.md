@@ -149,14 +149,18 @@ What it does:
 
 To return a repaired/replaced node to service:
 ```bash
-# a) Restore its volume from the latest verified backup:
-scripts/backup/restore-node.sh --backup /backups/…/raft-3 --volume ${PREFIX}_raft-3-data --force --no-boot
-# b) Start the member; it rejoins as a follower and the leader reconciles it
-#    (log replication, or a shipped snapshot if its log was compacted away).
+# a) Restore its volume from the latest verified backup. --rejoin is mandatory
+#    when the live cluster still knows this voter id:
+scripts/backup/restore-node.sh --backup /backups/…/raft-3 --volume ${PREFIX}_raft-3-data --force --no-boot --rejoin
+# b) Start ONE repaired member. Rejoin mode suppresses its election and makes
+#    the leader rediscover the restored log end before normal replication.
 docker start ${PREFIX}-raft-3-1
 ```
-For a brand-new member (hardware replacement) seed the volume the same way to
-shorten catch-up, then do the ConfChange add/remove dance (runbook §7).
+Wait until every group on the member reports `tc_ready 1` and logs
+`event=rejoin_complete` before replacing another member. Never mark a quorum of
+members at once: rejoining members do not campaign. For a brand-new member with
+a new voter id, seed the volume to shorten catch-up, then do the ConfChange
+add/remove procedure (runbook §7) instead of `--rejoin`.
 
 ### Restoring MySQL
 

@@ -95,7 +95,7 @@ docker ps -a --filter "name=${PREFIX}-raft"
 #    just restart — durable raft.state + memory snapshot recover in place.
 docker start ${PREFIX}-raft-2-1 ${PREFIX}-raft-4-1
 # 3. If a node's DISK is lost, restore its volume from the latest backup FIRST
-#    (§ docs/backup-restore.md), then start it. A restored member rejoins as a
+#    with restore-node.sh --rejoin (§ docs/backup-restore.md), then start it. A restored member rejoins as a
 #    follower and is reconciled by the leader.
 ```
 **Do NOT** attempt to force a single survivor into a 1-node cluster unless you
@@ -233,9 +233,9 @@ docker logs --tail 60 ${PREFIX}-raft-3-1
 #    boot recovery and must complete before the node becomes ready.
 # 3. Preferred fix: this node is one replica of an intact quorum. REBUILD it
 #    from a peer/backup rather than hand-editing files:
-#      - restore its volume from the latest good backup (docs/backup-restore.md),
-#        OR add an empty replacement member and let it receive the retained full
-#        Raft log. Then `docker start` it.
+#      - restore its volume from the latest good backup with `--rejoin`
+#        (docs/backup-restore.md), OR add a replacement under a NEW voter id
+#        with the ConfChange procedure in section 7.
 # 4. NEVER delete individual records to "fix" a checksum error — that breaks the
 #    total order. Replace the whole file family from a consistent source.
 ```

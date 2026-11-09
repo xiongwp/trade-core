@@ -6,22 +6,33 @@ use super::*;
 /// may list every replica of a group (`0=raft-1:9102|raft-2:9102|...`); the
 /// steps that propose through the group's log must reach its current leader,
 /// found by asking each replica's `/metrics` for `tc_raft_role 2`.
-pub(crate) fn group_leader(endpoints: &HashMap<usize, String>, group: usize) -> Result<String, String> {
+pub(crate) fn group_leader(
+    endpoints: &HashMap<usize, String>,
+    group: usize,
+) -> Result<String, String> {
     let spec = endpoints
         .get(&group)
         .ok_or_else(|| format!("no TC_MIGRATION_GROUP_ENDPOINTS entry for group {group}"))?;
-    let replicas: Vec<&str> = spec.split('|').map(str::trim).filter(|addr| !addr.is_empty()).collect();
+    let replicas: Vec<&str> = spec
+        .split('|')
+        .map(str::trim)
+        .filter(|addr| !addr.is_empty())
+        .collect();
     if replicas.len() == 1 {
         return Ok(replicas[0].to_string());
     }
     for addr in &replicas {
-        if let Ok((200, body)) = trade_core::migration::http_get(addr, "/metrics", Duration::from_secs(2)) {
+        if let Ok((200, body)) =
+            trade_core::migration::http_get(addr, "/metrics", Duration::from_secs(2))
+        {
             if body.lines().any(|line| line.trim() == "tc_raft_role 2") {
                 return Ok(addr.to_string());
             }
         }
     }
-    Err(format!("group {group} has no reachable leader among {spec}"))
+    Err(format!(
+        "group {group} has no reachable leader among {spec}"
+    ))
 }
 
 fn admin_call(addr: &str, path: &str) -> Result<String, String> {
@@ -61,7 +72,12 @@ fn propose_until_committed(
 
 /// `(sealed, epoch)` of `category` in `addr`'s durable snapshot, once that
 /// snapshot covers `index`.
-fn migration_status_at(addr: &str, category: u32, index: u64, timeout: Duration) -> Result<(bool, u64), String> {
+fn migration_status_at(
+    addr: &str,
+    category: u32,
+    index: u64,
+    timeout: Duration,
+) -> Result<(bool, u64), String> {
     let deadline = std::time::Instant::now() + timeout;
     let mut next_request = std::time::Instant::now();
     loop {
@@ -71,11 +87,16 @@ fn migration_status_at(addr: &str, category: u32, index: u64, timeout: Duration)
         }
         if let Ok(body) = admin_call(addr, &format!("/migration/status?category={category}")) {
             if json_number(&body, "raft_applied_index").is_some_and(|applied| applied >= index) {
-                return Ok((body.contains("\"sealed\":true"), json_number(&body, "epoch").unwrap_or(0)));
+                return Ok((
+                    body.contains("\"sealed\":true"),
+                    json_number(&body, "epoch").unwrap_or(0),
+                ));
             }
         }
         if std::time::Instant::now() >= deadline {
-            return Err(format!("{addr}: no snapshot at or after index {index} within {timeout:?}"));
+            return Err(format!(
+                "{addr}: no snapshot at or after index {index} within {timeout:?}"
+            ));
         }
         std::thread::sleep(Duration::from_millis(300));
     }
@@ -106,15 +127,19 @@ fn snapshot_fingerprint_at(
             admin_call(addr, "/migration/snapshot")?;
             next_request = std::time::Instant::now() + Duration::from_secs(5);
         }
-        if let Ok(Some(fingerprint)) =
-            trade_core::migration::fetch_category_fingerprint(addr, category, Duration::from_secs(5))
-        {
+        if let Ok(Some(fingerprint)) = trade_core::migration::fetch_category_fingerprint(
+            addr,
+            category,
+            Duration::from_secs(5),
+        ) {
             if fingerprint.raft_applied_index >= index {
                 return Ok(fingerprint);
             }
         }
         if std::time::Instant::now() >= deadline {
-            return Err(format!("{addr}: no snapshot at or after index {index} within {timeout:?}"));
+            return Err(format!(
+                "{addr}: no snapshot at or after index {index} within {timeout:?}"
+            ));
         }
         std::thread::sleep(Duration::from_millis(300));
     }
@@ -146,14 +171,21 @@ fn snapshot_fingerprint_at(
 /// source unseals what this epoch sealed, and the route returns to the
 /// source. The same rollback runs from `/admin/routes/abort` for a
 /// migration whose orchestrator stopped mid-way.
-pub(crate) fn migrate_category(kafka: &KafkaIngress, category: u32, to_group: usize) -> Result<String, String> {
+pub(crate) fn migrate_category(
+    kafka: &KafkaIngress,
+    category: u32,
+    to_group: usize,
+) -> Result<String, String> {
     let started = std::time::Instant::now();
     let endpoints = &kafka.migration_endpoints;
     let control = &kafka.route_control;
     let wait = Duration::from_secs(env_number("TC_MIGRATION_STEP_TIMEOUT_SECS", 60u64));
     let migration = control.begin(category, to_group)?;
     let from_group = migration.from_group;
-    let freeze = route_log::RouteRecord::Freeze { to: to_group, from: from_group };
+    let freeze = route_log::RouteRecord::Freeze {
+        to: to_group,
+        from: from_group,
+    };
     let freeze_offset = match route_log::publish(kafka, category, freeze) {
         Ok(offset) => offset,
         Err(error) => {
@@ -173,7 +205,10 @@ pub(crate) fn migrate_category(kafka: &KafkaIngress, category: u32, to_group: us
         }
     };
     log_info!("migration", category; "event=frozen from={from_group} to={to_group} epoch={epoch}");
-    std::thread::sleep(Duration::from_millis(env_number("TC_MIGRATION_DRAIN_MS", 1_500u64)));
+    std::thread::sleep(Duration::from_millis(env_number(
+        "TC_MIGRATION_DRAIN_MS",
+        1_500u64,
+    )));
 
     let mut seal_attempted = false;
     let mut install_attempted = false;
@@ -182,7 +217,10 @@ pub(crate) fn migrate_category(kafka: &KafkaIngress, category: u32, to_group: us
         let source = group_leader(endpoints, from_group)?;
         seal_attempted = true;
         let seal_index = json_number(
-            &admin_call(&source, &format!("/migration/seal?category={category}&epoch={epoch}"))?,
+            &admin_call(
+                &source,
+                &format!("/migration/seal?category={category}&epoch={epoch}"),
+            )?,
             "index",
         )
         .ok_or("seal answered no index")?;
@@ -204,7 +242,9 @@ pub(crate) fn migrate_category(kafka: &KafkaIngress, category: u32, to_group: us
                 break;
             }
             if std::time::Instant::now() >= deadline {
-                return Err(format!("source outbox still has {pending:?} unpublished events"));
+                return Err(format!(
+                    "source outbox still has {pending:?} unpublished events"
+                ));
             }
             std::thread::sleep(Duration::from_millis(200));
         }
@@ -243,7 +283,16 @@ pub(crate) fn migrate_category(kafka: &KafkaIngress, category: u32, to_group: us
         Ok(done) => done,
         Err(error) => {
             log_error!("migration", category; "event=failed error={error}; rolling back");
-            let undone = roll_back(kafka, category, from_group, to_group, epoch, freeze_offset, seal_attempted, install_attempted);
+            let undone = roll_back(
+                kafka,
+                category,
+                from_group,
+                to_group,
+                epoch,
+                freeze_offset,
+                seal_attempted,
+                install_attempted,
+            );
             control.abort(category);
             return Err(match undone {
                 Ok(()) => error,
@@ -317,10 +366,20 @@ fn roll_back(
     let endpoints = &kafka.migration_endpoints;
     let wait = Duration::from_secs(env_number("TC_MIGRATION_STEP_TIMEOUT_SECS", 60u64));
     if install_attempted {
-        propose_until_committed(endpoints, to_group, &format!("/migration/drop?category={category}&epoch={epoch}"), wait)?;
+        propose_until_committed(
+            endpoints,
+            to_group,
+            &format!("/migration/drop?category={category}&epoch={epoch}"),
+            wait,
+        )?;
     }
     if seal_attempted {
-        propose_until_committed(endpoints, from_group, &format!("/migration/unseal?category={category}&epoch={epoch}"), wait)?;
+        propose_until_committed(
+            endpoints,
+            from_group,
+            &format!("/migration/unseal?category={category}&epoch={epoch}"),
+            wait,
+        )?;
     }
     match route_log::latest_after(category, freeze_offset, Duration::from_secs(10))? {
         Some((offset, _)) if offset == freeze_offset => {
@@ -347,4 +406,31 @@ pub(crate) fn abort_migration(kafka: &KafkaIngress, category: u32) -> Result<Str
     roll_back(kafka, category, from, to, epoch, offset, true, true)?;
     kafka.route_control.abort(category);
     Ok(format!("{{\"aborted\":true,\"category\":{category},\"from\":{from},\"to\":{to},\"epoch\":{epoch}}}"))
+}
+
+/// Stable, operator-facing inventory of migrations that still hold their
+/// category frozen. The epoch is the durable freeze offset plus one, matching
+/// every idempotent migration command sent to the Raft groups.
+pub(crate) fn unfinished_migrations_json() -> String {
+    unfinished_migrations_json_from(route_log::frozen_categories())
+}
+
+pub(crate) fn unfinished_migrations_json_from(
+    frozen: Vec<(u32, i64, route_log::RouteRecord)>,
+) -> String {
+    let mut body = format!("{{\"count\":{},\"migrations\":[", frozen.len());
+    for (position, (category, offset, record)) in frozen.into_iter().enumerate() {
+        if position > 0 {
+            body.push(',');
+        }
+        let route_log::RouteRecord::Freeze { to, from } = record else {
+            continue;
+        };
+        body.push_str(&format!(
+            "{{\"category\":{category},\"from\":{from},\"to\":{to},\"epoch\":{},\"freeze_offset\":{offset}}}",
+            offset + 1
+        ));
+    }
+    body.push_str("]}");
+    body
 }

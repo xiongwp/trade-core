@@ -141,7 +141,14 @@ pub(crate) fn run_execution_mysql_consumer(
         };
         let mut records = Vec::with_capacity(kafka.execution_batch_size);
         let mut dead_lettered = Vec::new();
-        push_execution_record(&metrics, &dlq, worker, &first, &mut records, &mut dead_lettered);
+        push_execution_record(
+            &metrics,
+            &dlq,
+            worker,
+            &first,
+            &mut records,
+            &mut dead_lettered,
+        );
         let deadline = std::time::Instant::now() + kafka.execution_linger;
         while records.len() < kafka.execution_batch_size && std::time::Instant::now() < deadline {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -251,7 +258,9 @@ pub(crate) fn push_execution_record(
     dlq.lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .append(partition, offset, "invalid execution report", payload)
-        .unwrap_or_else(|error| panic!("execution DLQ append failed ({error}); refusing to skip offset {offset}"));
+        .unwrap_or_else(|error| {
+            panic!("execution DLQ append failed ({error}); refusing to skip offset {offset}")
+        });
     metrics.dlq_total.fetch_add(1, AtomicOrdering::Relaxed);
     dead_lettered.push((message.topic().to_string(), partition, offset));
     log_warn!("execution-mysql", worker; "event=dead_lettered reason=undecodable partition={partition} offset={offset}");
@@ -267,7 +276,11 @@ pub(crate) fn commit_execution_batch(
     let positions = records
         .iter()
         .map(|record| (record.topic.as_str(), record.partition, record.offset))
-        .chain(dead_lettered.iter().map(|(topic, partition, offset)| (topic.as_str(), *partition, *offset)));
+        .chain(
+            dead_lettered
+                .iter()
+                .map(|(topic, partition, offset)| (topic.as_str(), *partition, *offset)),
+        );
     for (topic, partition, offset) in positions {
         offsets
             .entry((topic, partition))
@@ -294,7 +307,9 @@ pub(crate) fn commit_execution_batch(
 pub(crate) fn rewind_execution_batch(consumer: &BaseConsumer, records: &[ExecutionKafkaRecord]) {
     rewind_to_earliest(
         consumer,
-        records.iter().map(|record| (record.topic.as_str(), record.partition, record.offset)),
+        records
+            .iter()
+            .map(|record| (record.topic.as_str(), record.partition, record.offset)),
     );
 }
 
@@ -496,8 +511,10 @@ pub(crate) fn trade_fill(report: &wire::DecodedReport, target_order_id: u64) -> 
     })
 }
 
-
-pub(crate) fn sweep_pending_execution_shard(store: &OrderStore, shard_db: u32) -> Result<(), String> {
+pub(crate) fn sweep_pending_execution_shard(
+    store: &OrderStore,
+    shard_db: u32,
+) -> Result<(), String> {
     let db = format!("order_db_{shard_db}");
     let mut conn = store
         .shard(shard_db)
@@ -587,9 +604,12 @@ pub(crate) fn persist_execution_shard(
         statements.push(discard_statements(&db, period));
         // Every touched table was just staged into, so drain them all (an
         // empty drain is a cheap empty range scan).
-        statements.extend(touched.into_iter().map(|table| drain_statements(&db, table, period)));
-        exec_batch(&mut tx, &statements.join(";\n"))
-            .map_err(|error| error.to_string())?;
+        statements.extend(
+            touched
+                .into_iter()
+                .map(|table| drain_statements(&db, table, period)),
+        );
+        exec_batch(&mut tx, &statements.join(";\n")).map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())?;
     }
     Ok(())
@@ -603,8 +623,7 @@ pub(crate) fn discard_redelivered_events(
     db: &str,
     period: u64,
 ) -> Result<(), String> {
-    exec_batch(&mut *tx, &discard_statements(db, period))
-        .map_err(|error| error.to_string())
+    exec_batch(&mut *tx, &discard_statements(db, period)).map_err(|error| error.to_string())
 }
 
 /// The statements that drop already-applied (redelivered) events from
@@ -612,7 +631,10 @@ pub(crate) fn discard_redelivered_events(
 /// hold every event applied within the last retention period (see
 /// `DEDUPE_TABLES`).
 pub(crate) fn discard_statements(db: &str, period: u64) -> String {
-    let tables = [dedupe_table(period), dedupe_table(period + DEDUPE_TABLES - 1)];
+    let tables = [
+        dedupe_table(period),
+        dedupe_table(period + DEDUPE_TABLES - 1),
+    ];
     tables
         .iter()
         .map(|table| {

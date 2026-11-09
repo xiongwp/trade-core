@@ -55,9 +55,12 @@ pub(crate) fn dedupe_table(period: u64) -> String {
 /// the rotation reads too, so host clock skew plays no part. One cheap
 /// query per transaction; every statement of the transaction uses it.
 pub(crate) fn dedupe_period(conn: &mut impl Queryable) -> Result<u64, String> {
-    conn.query_first(format!("SELECT UNIX_TIMESTAMP() DIV {}", dedupe_retention_hours() * 3600))
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| "no clock row".to_string())
+    conn.query_first(format!(
+        "SELECT UNIX_TIMESTAMP() DIV {}",
+        dedupe_retention_hours() * 3600
+    ))
+    .map_err(|error| error.to_string())?
+    .ok_or_else(|| "no clock row".to_string())
 }
 
 /// Period maintenance of one database's dedupe tables, run by that
@@ -87,7 +90,10 @@ impl DedupeRing {
             return Ok(0);
         }
         self.next_check = now + Duration::from_secs(10);
-        let mut conn = store.shard(db).get_conn().map_err(|error| error.to_string())?;
+        let mut conn = store
+            .shard(db)
+            .get_conn()
+            .map_err(|error| error.to_string())?;
         let period = dedupe_period(&mut conn)?;
         self.advance(&mut conn, db, period)
     }

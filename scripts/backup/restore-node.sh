@@ -15,7 +15,7 @@
 #
 # Usage:
 #   restore-node.sh --backup DIR --volume VOL [--dry-run] [--no-boot]
-#                   [--force] [--port N]
+#                   [--force] [--rejoin] [--port N]
 #
 #   --backup DIR   A node backup dir (…/raft-N) containing data/ + manifest.txt.
 #   --volume VOL   Target docker volume name to (re)build. Must be empty unless
@@ -24,13 +24,15 @@
 #                  boot nothing. Prints every action it would take.
 #   --no-boot      Populate the volume but skip the boot/metrics recovery check.
 #   --force        Allow using a non-empty target volume (wipes it first).
+#   --rejoin       Mark every restored Raft group as a same-ID disk replacement.
+#                  Required before attaching an old backup to a live cluster.
 #   --port N       Host port for the verification node's /metrics (default 9299).
 # =============================================================================
 
 set -euo pipefail
 
 NODE_IMAGE="${TC_NODE_IMAGE:-trade-core-node}"
-BACKUP=""; VOLUME=""; DRY_RUN=0; DO_BOOT=1; FORCE=0; METRICS_PORT=9299
+BACKUP=""; VOLUME=""; DRY_RUN=0; DO_BOOT=1; FORCE=0; REJOIN=0; METRICS_PORT=9299
 
 usage() { sed -n '2,40p' "$0" >&2; exit "${1:-2}"; }
 
@@ -54,6 +56,7 @@ while [[ $# -gt 0 ]]; do
     --dry-run) DRY_RUN=1; shift ;;
     --no-boot) DO_BOOT=0; shift ;;
     --force)   FORCE=1; shift ;;
+    --rejoin)  REJOIN=1; shift ;;
     --port)    METRICS_PORT="$2"; shift 2 ;;
     -h|--help) usage 0 ;;
     *) echo "unknown argument: $1" >&2; usage 2 ;;
@@ -130,6 +133,19 @@ log "populating $VOLUME from $DATA_DIR (exact /data mirror)"
 # Mount backup ro at /b and volume rw at /data; copy the whole mirror in.
 docker run --rm -v "$DATA_DIR":/b:ro -v "$VOLUME":/data "$NODE_IMAGE" \
   "cp -a /b/. /data/ && echo populated"
+
+if [[ "$REJOIN" -eq 1 ]]; then
+  log "marking restored Raft groups for safe same-ID rejoin"
+  docker run --rm -v "$VOLUME":/data "$NODE_IMAGE" '
+    set -e
+    find /data -type f -name raft.state -print | while read -r state; do
+      dir=${state%/raft.state}
+      : > "$dir/raft-rejoin.required"
+      echo "marked $dir"
+    done
+    sync
+  '
+fi
 
 # sanity: same file count as the manifest
 vfiles="$(docker run --rm -v "$VOLUME":/data "$NODE_IMAGE" \

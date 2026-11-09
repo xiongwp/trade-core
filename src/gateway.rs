@@ -49,25 +49,41 @@ const COMMITTED_BATCH_MAGIC: [u8; 4] = *b"TCB1";
 /// e.g. depth, or a standalone exchange).
 #[derive(Clone, Default)]
 pub struct MdFanout {
-    subs: Arc<Mutex<Vec<std::sync::mpsc::SyncSender<Arc<[u8]>>>>>,
+    subs: Arc<Mutex<Vec<MdSubscriber>>>,
     group: u32,
 }
 
-/// Broadcast chunks a subscriber may lag behind before it is dropped.
-const MD_SUBSCRIBER_QUEUE: usize = 4096;
-/// Most market-data subscribers per node.
-const MD_MAX_SUBSCRIBERS: usize = 64;
-/// A write that makes no progress for this long means a dead subscriber.
-const MD_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+struct MdSubscriber {
+    tx: std::sync::mpsc::SyncSender<Arc<[u8]>>,
+    active: Arc<AtomicBool>,
+}
+
+fn md_limit(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+        .max(1)
+}
+
+fn peer_closed(stream: &std::net::TcpStream) -> bool {
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(1)));
+    let mut byte = [0u8; 1];
+    matches!(stream.peek(&mut byte), Ok(0))
+}
 
 impl MdFanout {
     /// Accept subscriber connections on `listener` in a background thread.
     pub fn accept_on(listener: TcpListener, running: Arc<AtomicBool>, group: u32) -> MdFanout {
         let fanout = MdFanout { group, ..MdFanout::default() };
         let subs = fanout.subs.clone();
+        let max_subscribers = md_limit("TC_MD_MAX_SUBSCRIBERS", 64);
+        let queue_capacity = md_limit("TC_MD_SUBSCRIBER_QUEUE", 4096);
+        let write_timeout = Duration::from_millis(md_limit("TC_MD_WRITE_TIMEOUT_MS", 5_000) as u64);
         thread::Builder::new()
             .name("md-accept".into())
             .spawn(move || {
+                let mut last_refusal_log = std::time::Instant::now() - Duration::from_secs(30);
                 for stream in listener.incoming() {
                     if !running.load(Ordering::Acquire) {
                         break;
@@ -76,24 +92,44 @@ impl MdFanout {
                         thread::sleep(Duration::from_millis(50)); // e.g. out of fds
                         continue;
                     };
-                    if subs.lock().unwrap().len() >= MD_MAX_SUBSCRIBERS {
-                        crate::log_warn!("gateway", "event=md_subscriber_refused reason=limit");
-                        continue;
+                    {
+                        let mut subscribers = subs.lock().unwrap();
+                        subscribers.retain(|subscriber| subscriber.active.load(Ordering::Acquire));
+                        if subscribers.len() >= max_subscribers {
+                            if last_refusal_log.elapsed() >= Duration::from_secs(30) {
+                                crate::log_warn!(
+                                    "gateway",
+                                    "event=md_subscriber_refused reason=limit active={} limit={max_subscribers}",
+                                    subscribers.len()
+                                );
+                                last_refusal_log = std::time::Instant::now();
+                            }
+                            continue;
+                        }
                     }
                     stream.set_nodelay(true).ok();
-                    stream.set_write_timeout(Some(MD_WRITE_TIMEOUT)).ok();
-                    let (tx, rx) = std::sync::mpsc::sync_channel::<Arc<[u8]>>(MD_SUBSCRIBER_QUEUE);
+                    stream.set_write_timeout(Some(write_timeout)).ok();
+                    let (tx, rx) = std::sync::mpsc::sync_channel::<Arc<[u8]>>(queue_capacity);
+                    let active = Arc::new(AtomicBool::new(true));
+                    let writer_active = active.clone();
                     let spawned = thread::Builder::new().name("md-subscriber".into()).spawn(move || {
-                        for chunk in rx {
-                            if stream.write_all(&chunk).is_err() {
+                        loop {
+                            match rx.recv_timeout(Duration::from_secs(1)) {
+                                Ok(chunk) if stream.write_all(&chunk).is_err() => break,
+                                Ok(_) => {}
+                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                            }
+                            if peer_closed(&stream) {
                                 break;
                             }
                         }
+                        writer_active.store(false, Ordering::Release);
                         let _ = stream.shutdown(std::net::Shutdown::Both);
                     });
                     if spawned.is_ok() {
                         crate::log_info!("gateway", "market-data subscriber connected");
-                        subs.lock().unwrap().push(tx);
+                        subs.lock().unwrap().push(MdSubscriber { tx, active });
                     }
                 }
             })
@@ -115,13 +151,19 @@ impl MdFanout {
             return;
         }
         let chunk: Arc<[u8]> = bytes.into();
-        subs.retain(|tx| match tx.try_send(chunk.clone()) {
-            Ok(()) => true,
-            Err(std::sync::mpsc::TrySendError::Full(_)) => {
-                crate::log_warn!("gateway", "event=md_subscriber_dropped reason=slow");
-                false // dropping the sender ends its writer thread
+        subs.retain(|subscriber| {
+            if !subscriber.active.load(Ordering::Acquire) {
+                return false;
             }
-            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
+            match subscriber.tx.try_send(chunk.clone()) {
+                Ok(()) => true,
+                Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                    crate::log_warn!("gateway", "event=md_subscriber_dropped reason=slow");
+                    subscriber.active.store(false, Ordering::Release);
+                    false // dropping the sender ends its writer thread
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
+            }
         });
     }
 }
@@ -275,6 +317,10 @@ where
     let local = listener.local_addr()?;
     crate::log_info!("gateway", "committed ingress listening on {local}");
     let sessions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let max_sessions = md_limit("TC_COMMITTED_MAX_SESSIONS", 256);
+    let session_idle_timeout = Duration::from_millis(
+        md_limit("TC_COMMITTED_SESSION_IDLE_TIMEOUT_MS", 300_000) as u64,
+    );
     while running.load(Ordering::Acquire) {
         // A failed accept (out of fds, an aborted handshake) is transient:
         // it must not take the matching node down.
@@ -286,14 +332,17 @@ where
                 continue;
             }
         };
-        if sessions.load(Ordering::Acquire) >= MAX_COMMITTED_SESSIONS {
-            crate::log_warn!("gateway", "event=session_refused peer={peer} reason=limit");
+        if sessions.load(Ordering::Acquire) >= max_sessions {
+            crate::log_warn!(
+                "gateway",
+                "event=session_refused peer={peer} reason=limit limit={max_sessions}"
+            );
             continue;
         }
         stream.set_nodelay(true).ok();
         // A peer that vanished without a FIN (crashed host, partition) would
         // otherwise hold its thread and fd forever; live clients reconnect.
-        stream.set_read_timeout(Some(SESSION_IDLE_TIMEOUT)).ok();
+        stream.set_read_timeout(Some(session_idle_timeout)).ok();
         let session_running = running.clone();
         let session_submit = submit.clone();
         let done = sessions.clone();
@@ -579,11 +628,6 @@ fn report_writer<S: Write>(
     sink
 }
 
-/// Most concurrent committed-ingress sessions (order-api forwarders).
-const MAX_COMMITTED_SESSIONS: usize = 256;
-/// A session silent for this long is closed (its client reconnects).
-const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
-
 fn report_fanout_drain(
     sink: ResultSink,
     fanout: Option<MdFanout>,
@@ -628,6 +672,20 @@ mod tests {
     use crate::order::Order;
     use crate::types::{InstrumentId, OrderId, Side};
     use std::io::Cursor;
+
+    #[test]
+    fn quiet_market_data_peer_disconnect_is_detected() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        assert!(!peer_closed(&server));
+        drop(client);
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !peer_closed(&server) && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(peer_closed(&server));
+    }
 
     #[test]
     fn committed_batch_protocol_acks_one_index_for_many_commands() {

@@ -10,6 +10,11 @@ x-raft-environment: &raft-environment
   TC_SLOW_FSYNC_WARN_MS: "${TC_SLOW_FSYNC_WARN_MS:-50}"
   TC_MATCH_POOL_PER_ASSET: "${TC_MATCH_POOL_PER_ASSET:-2}"
   TC_RAFT_TRANSPORT_QUEUE: "${TC_RAFT_TRANSPORT_QUEUE:-8192}"
+  TC_COMMITTED_MAX_SESSIONS: "${TC_COMMITTED_MAX_SESSIONS:-256}"
+  TC_COMMITTED_SESSION_IDLE_TIMEOUT_MS: "${TC_COMMITTED_SESSION_IDLE_TIMEOUT_MS:-300000}"
+  TC_MD_MAX_SUBSCRIBERS: "${TC_MD_MAX_SUBSCRIBERS:-64}"
+  TC_MD_SUBSCRIBER_QUEUE: "${TC_MD_SUBSCRIBER_QUEUE:-4096}"
+  TC_MD_WRITE_TIMEOUT_MS: "${TC_MD_WRITE_TIMEOUT_MS:-5000}"
   TC_RAFT_READY_MAX_APPLY_LAG: "${TC_RAFT_READY_MAX_APPLY_LAG:-32}"
   TC_RAFT_READY_MAX_OUTBOX_PENDING: "${TC_RAFT_READY_MAX_OUTBOX_PENDING:-10000}"
   TC_RAFT_DEDUP_MAX_IDS: "${TC_RAFT_DEDUP_MAX_IDS:-1000000}"
@@ -25,8 +30,8 @@ x-raft-environment: &raft-environment
   # Durable in-memory engine snapshot cadence. Recovery loads this image and
   # deterministically replays the committed Raft tail above its embedded index.
   TC_SNAPSHOT_EVERY_SECS: "${TC_SNAPSHOT_EVERY_SECS:-30}"
-  # Must remain 0 until matching snapshot transfer is atomically coupled to
-  # follower Raft snapshot installation. The node fails closed otherwise.
+  # Compact only after a matching snapshot and execution-outbox drain cover
+  # the same applied index; that application snapshot is shipped with Raft.
   TC_RAFT_COMPACT_APPLIED_THRESHOLD: "${TC_RAFT_COMPACT_APPLIED_THRESHOLD:-1000}"
   TC_ORDER_CATEGORY_SIZE: "${TC_ORDER_CATEGORY_SIZE:-1000}"
   TC_EXECUTION_OUTBOX_SYNC_EVERY: "${TC_EXECUTION_OUTBOX_SYNC_EVERY:-1}"

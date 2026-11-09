@@ -2,6 +2,9 @@
 
 use super::*;
 
+pub(crate) type PartitionKey = (String, i32);
+pub(crate) type PartitionFailures = BTreeMap<PartitionKey, String>;
+
 #[derive(Clone)]
 pub(crate) struct MatcherTarget {
     pub(crate) order_addr: String,
@@ -22,14 +25,17 @@ pub(crate) struct RaftForwarder {
 }
 
 impl RaftForwarder {
-    pub(crate) fn spawn(target_groups: Vec<Vec<MatcherTarget>>, backpressure: Arc<Backpressure>) -> Self {
+    pub(crate) fn spawn(
+        target_groups: Vec<Vec<MatcherTarget>>,
+        backpressure: Arc<Backpressure>,
+    ) -> Self {
         let queue_capacity = env_number("TC_RAFT_FORWARD_QUEUE", 64usize).max(1);
         // Each request blocks until its Raft entry commits — one WAL fsync
         // plus a replication round trip — so the entry is the unit of cost.
         // Pack up to this many commands per entry, across categories and
         // across the jobs queued behind each other.
-        let pack_size = env_number("TC_RAFT_PACK_SIZE", 5_000usize)
-            .clamp(1, wire::RAFT_BATCH_MAX_COMMANDS);
+        let pack_size =
+            env_number("TC_RAFT_PACK_SIZE", 1_000usize).clamp(1, wire::RAFT_BATCH_MAX_COMMANDS);
         let mut groups = Vec::with_capacity(target_groups.len());
         for (group, targets) in target_groups.into_iter().enumerate() {
             let (tx, rx) = std::sync::mpsc::sync_channel::<RaftForwardJob>(queue_capacity);
@@ -63,45 +69,92 @@ impl RaftForwarder {
         &self,
         records: &[KafkaRecord],
         control: &trade_core::cluster::RouteControlPlane,
-    ) -> Result<(), String> {
+    ) -> Result<PartitionFailures, String> {
         if self.groups.is_empty() {
             return Err("no Raft groups configured".into());
         }
         let mut grouped = (0..self.groups.len())
-            .map(|_| BTreeMap::<u32, Vec<[u8; wire::MSG_LEN]>>::new())
+            .map(|_| {
+                (
+                    BTreeMap::<u32, Vec<[u8; wire::MSG_LEN]>>::new(),
+                    std::collections::BTreeSet::<PartitionKey>::new(),
+                )
+            })
             .collect::<Vec<_>>();
+        let mut failures = PartitionFailures::new();
         for record in records {
+            let partition = (record.topic.clone(), record.partition);
             if !control.accepts(record.category_id) {
-                return Err(format!(
-                    "category {} is frozen for migration",
-                    record.category_id
-                ));
+                failures.insert(
+                    partition,
+                    format!("category {} is frozen for migration", record.category_id),
+                );
+                continue;
             }
             let group = control.group_for(record.category_id);
-            grouped[group]
+            let Some((categories, partitions)) = grouped.get_mut(group) else {
+                failures.insert(
+                    partition,
+                    format!(
+                        "category {} routes to missing Raft group {group}",
+                        record.category_id
+                    ),
+                );
+                continue;
+            };
+            categories
                 .entry(record.category_id)
                 .or_default()
                 .push(record.frame);
+            partitions.insert(partition);
         }
 
         let mut replies = Vec::new();
-        for (group, categories) in grouped.into_iter().enumerate() {
+        for (group, (categories, partitions)) in grouped.into_iter().enumerate() {
             if categories.is_empty() {
                 continue;
             }
             let frames = categories.into_values().flatten().collect();
             let (reply, result) = std::sync::mpsc::sync_channel(1);
-            self.groups[group]
-                .send(RaftForwardJob { frames, reply })
-                .map_err(|_| format!("Raft group {group} forwarding worker stopped"))?;
-            replies.push(result);
+            match self.groups[group].try_send(RaftForwardJob { frames, reply }) {
+                Ok(()) => replies.push((group, partitions, result)),
+                Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                    let error = format!("Raft group {group} forwarding queue is full");
+                    for partition in partitions {
+                        failures.entry(partition).or_insert_with(|| error.clone());
+                    }
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                    let error = format!("Raft group {group} forwarding worker stopped");
+                    for partition in partitions {
+                        failures.entry(partition).or_insert_with(|| error.clone());
+                    }
+                }
+            }
         }
-        for reply in replies {
-            reply
-                .recv()
-                .map_err(|_| "Raft forwarding worker dropped acknowledgement".to_string())??;
+        let ack_timeout =
+            Duration::from_millis(env_number("TC_RAFT_FORWARD_ACK_TIMEOUT_MS", 15_000u64));
+        for (group, partitions, reply) in replies {
+            let result = reply
+                .recv_timeout(ack_timeout)
+                .map_err(|error| match error {
+                    std::sync::mpsc::RecvTimeoutError::Timeout => {
+                        format!(
+                            "Raft group {group} acknowledgement timed out after {ack_timeout:?}"
+                        )
+                    }
+                    std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                        format!("Raft group {group} forwarding worker dropped acknowledgement")
+                    }
+                })
+                .and_then(|result| result);
+            if let Err(error) = result {
+                for partition in partitions {
+                    failures.entry(partition).or_insert_with(|| error.clone());
+                }
+            }
         }
-        Ok(())
+        Ok(failures)
     }
 }
 
@@ -131,7 +184,10 @@ pub(crate) fn packs(
     jobs: &[RaftForwardJob],
     pack_size: usize,
 ) -> impl Iterator<Item = Vec<[u8; wire::MSG_LEN]>> + '_ {
-    let mut frames = jobs.iter().flat_map(|job| job.frames.iter().copied()).peekable();
+    let mut frames = jobs
+        .iter()
+        .flat_map(|job| job.frames.iter().copied())
+        .peekable();
     std::iter::from_fn(move || {
         frames.peek()?;
         Some(frames.by_ref().take(pack_size).collect())
@@ -142,7 +198,7 @@ pub(crate) fn forward_kafka_batch(
     forwarder: &RaftForwarder,
     records: &[KafkaRecord],
     control: &trade_core::cluster::RouteControlPlane,
-) -> Result<(), String> {
+) -> Result<PartitionFailures, String> {
     if forwarder.groups.is_empty() {
         return Err("no Raft groups configured".into());
     }

@@ -370,10 +370,11 @@ services:
       TC_RAFT_CATEGORY_PINS: ${TC_RAFT_CATEGORY_PINS:-}
       TC_RAFT_LEADER_PROBE_TIMEOUT_MS: ${TC_RAFT_LEADER_PROBE_TIMEOUT_MS:-1000}
       TC_RAFT_MATCHER_IO_TIMEOUT_MS: ${TC_RAFT_MATCHER_IO_TIMEOUT_MS:-5000}
+      TC_RAFT_FORWARD_ACK_TIMEOUT_MS: ${TC_RAFT_FORWARD_ACK_TIMEOUT_MS:-15000}
       TC_RAFT_FORWARD_QUEUE: ${TC_RAFT_FORWARD_QUEUE:-64}
       # Commands packed into one Raft entry (= one WAL fsync), across categories
       # and queued Kafka batches; capped at the Raft entry limit of 10000.
-      TC_RAFT_PACK_SIZE: ${TC_RAFT_PACK_SIZE:-5000}
+      TC_RAFT_PACK_SIZE: ${TC_RAFT_PACK_SIZE:-1000}
       # Category migration (POST /admin/routes/migrate?category=C&to=G): every
       # replica's admin address per group; the leader is found per step.
       TC_MIGRATION_GROUP_ENDPOINTS: ${TC_MIGRATION_GROUP_ENDPOINTS:-0=raft-1:9102|raft-2:9102|raft-3:9102|raft-4:9102|raft-5:9102,1=raft-1:9112|raft-2:9112|raft-3:9112|raft-4:9112|raft-5:9112,2=raft-1:9122|raft-2:9122|raft-3:9122|raft-4:9122|raft-5:9122,3=raft-1:9132|raft-2:9132|raft-3:9132|raft-4:9132|raft-5:9132}

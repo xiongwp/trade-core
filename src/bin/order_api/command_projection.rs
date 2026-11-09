@@ -165,7 +165,11 @@ pub(crate) fn persist_mysql_shard_with(
         .start_transaction(TxOpts::default())
         .map_err(|error| error.to_string())?;
 
-    let mut processed = Vec::with_capacity(if command_log_enabled() { records.len() * 6 } else { 0 });
+    let mut processed = Vec::with_capacity(if command_log_enabled() {
+        records.len() * 6
+    } else {
+        0
+    });
     let mut orders_by_table: BTreeMap<u32, Vec<Value>> = BTreeMap::new();
     let mut modifies = Vec::new();
 
@@ -177,12 +181,12 @@ pub(crate) fn persist_mysql_shard_with(
         let route = store.routing.route_order_id(database_order_id(&command));
         if command_log_enabled() {
             processed.extend([
-            Value::from(record.category_id),
-            Value::from(record.partition),
-            Value::from((record.offset as u64).saturating_add(1)),
-            Value::from(id),
-            Value::from(record.user),
-            Value::from(route.table),
+                Value::from(record.category_id),
+                Value::from(record.partition),
+                Value::from((record.offset as u64).saturating_add(1)),
+                Value::from(id),
+                Value::from(record.user),
+                Value::from(route.table),
             ]);
         }
 
@@ -266,8 +270,7 @@ pub(crate) fn persist_mysql_shard_with(
         ));
     }
     if !statements.is_empty() {
-        exec_batch(&mut tx, &statements.join(";\n"))
-            .map_err(|error| error.to_string())?;
+        exec_batch(&mut tx, &statements.join(";\n")).map_err(|error| error.to_string())?;
     }
     // Results may have reached this database before the command projection.
     // Once the order rows exist, drain their durable pending events in the same

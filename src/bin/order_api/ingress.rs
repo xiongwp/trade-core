@@ -34,7 +34,11 @@ pub(crate) fn ws_order_session(
             Ok(Some(message)) => message,
             Ok(None) => return Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
-                let code: u16 = if error.to_string().contains("too large") { 1009 } else { 1002 };
+                let code: u16 = if error.to_string().contains("too large") {
+                    1009
+                } else {
+                    1002
+                };
                 let _ = websocket::write_frame(w, websocket::OP_CLOSE, &code.to_be_bytes());
                 return Err(error);
             }
@@ -45,7 +49,9 @@ pub(crate) fn ws_order_session(
             Message::Binary(body) => submit(&body),
             Message::Text(_) => Err((
                 "400 Bad Request",
-                format!("binary batches only: up to {max_batch} records of {BATCH_RECORD_LEN} bytes"),
+                format!(
+                    "binary batches only: up to {max_batch} records of {BATCH_RECORD_LEN} bytes"
+                ),
             )),
         };
         let ack = match result {
@@ -95,7 +101,10 @@ pub(crate) fn order_from_query(query: &str) -> Result<Order, String> {
         return Err("order_id must be non-zero".into());
     }
     if qty == 0 || qty > trade_core::exchange::MAX_ORDER_QTY {
-        return Err(format!("qty must be 1..={}", trade_core::exchange::MAX_ORDER_QTY));
+        return Err(format!(
+            "qty must be 1..={}",
+            trade_core::exchange::MAX_ORDER_QTY
+        ));
     }
     let mut order = match query_param(query, "type") {
         None | Some("limit") => Order::limit(order_id, side, required(query, "price")?, qty),
@@ -322,7 +331,10 @@ impl KafkaIngress {
                 .filter(|spec| !spec.trim().is_empty())
                 .map(|spec| {
                     trade_core::migration::parse_group_endpoints(&spec).unwrap_or_else(|error| {
-                        log_warn!("order-api", "ignoring TC_MIGRATION_GROUP_ENDPOINTS: {error}");
+                        log_warn!(
+                            "order-api",
+                            "ignoring TC_MIGRATION_GROUP_ENDPOINTS: {error}"
+                        );
                         HashMap::new()
                     })
                 })
@@ -470,7 +482,10 @@ impl KafkaIngress {
     /// then answered as accepted with the records that did not make it, for
     /// the client to resend (resending one that did land is deduplicated by
     /// command id). `Err` means nothing was published.
-    pub(crate) fn publish_batch(&self, records: &[BatchRecord]) -> Result<Vec<FailedRecord>, String> {
+    pub(crate) fn publish_batch(
+        &self,
+        records: &[BatchRecord],
+    ) -> Result<Vec<FailedRecord>, String> {
         self.admit_batch(records)?;
         self.reserve(records.len())?;
         let prepared = records
@@ -506,10 +521,8 @@ impl KafkaIngress {
                 })
             })
             .collect::<Vec<_>>();
-        self.metrics.finish_reservation(
-            records.len() as u64,
-            (records.len() - failed.len()) as u64,
-        );
+        self.metrics
+            .finish_reservation(records.len() as u64, (records.len() - failed.len()) as u64);
         if failed.len() == records.len() {
             return Err(failed
                 .into_iter()
@@ -592,7 +605,10 @@ pub(crate) fn decode_batch(body: &[u8], category_size: u32) -> Result<Vec<BatchR
         if let trade_core::Command::New(order) | trade_core::Command::NewConditional(order, _) =
             &command
         {
-            if order.id.0 == 0 || order.quantity == 0 || order.quantity > trade_core::exchange::MAX_ORDER_QTY {
+            if order.id.0 == 0
+                || order.quantity == 0
+                || order.quantity > trade_core::exchange::MAX_ORDER_QTY
+            {
                 return Err(format!(
                     "{INVALID_REQUEST}order {} needs a non-zero id and a qty of 1..={}",
                     order.id.0,

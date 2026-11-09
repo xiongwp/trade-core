@@ -33,6 +33,16 @@ const PROPOSAL_BATCH: usize = 512;
 /// the old 16 MiB limit left a lagging follower unable to ever catch up once
 /// the books grew (it reset the link on every attempt).
 const MAX_RAFT_MESSAGE_BYTES: usize = 256 << 20;
+/// Operator-created marker for replacing a voter's lost stable storage while
+/// retaining its configured node id. It persists across process crashes and
+/// is removed only after the leader has rediscovered this member's real log
+/// end and replication has caught up to a safe heartbeat boundary.
+const REJOIN_MARKER: &str = "raft-rejoin.required";
+
+fn mark_non_command_applied(metrics: &trade_core::metrics::Metrics, index: u64) {
+    metrics.set_raft_enqueued_index(index);
+    metrics.set_raft_applied_index(index);
+}
 
 /// Set by the SIGTERM/SIGINT handler (async-signal-safe: a lone atomic store).
 /// A watcher thread turns it into the normal drain path.
@@ -171,6 +181,7 @@ fn main() {
 
     let config = ClusterConfig::new(id, voters).expect("valid cluster membership");
     let state_path = data_dir.join("raft.state");
+    let rejoin_marker_path = data_dir.join(REJOIN_MARKER);
     let engine_snapshot_path = data_dir.join("journal").join("snapshot-shard-0.bin");
     // Open consensus before constructing the matching engine. A follower may
     // have durably installed a Raft snapshot immediately before a crash; its
@@ -180,9 +191,22 @@ fn main() {
     // placement, or a supervisor restarted next to orphaned children — would
     // interleave WAL writes and snapshot renames.
     let _data_dir_lock = lock_data_dir(&data_dir).unwrap_or_else(|error| {
-        panic!("cannot lock Raft data directory {}: {error}", data_dir.display())
+        panic!(
+            "cannot lock Raft data directory {}: {error}",
+            data_dir.display()
+        )
     });
     let mut raft_node = RaftNode::open(config, state_path).expect("open durable raft state");
+    if rejoin_marker_path.exists() {
+        raft_node.begin_rejoin();
+        log_warn!(
+            "raft-node",
+            "event=rejoin_started marker={} local_last={} local_commit={}",
+            rejoin_marker_path.display(),
+            raft_node.last_index(),
+            raft_node.commit_index()
+        );
+    }
     if let Some((index, bytes)) = raft_node.take_installed_snapshot_with_index() {
         trade_core::snapshot::install_bytes(&engine_snapshot_path, &bytes, index)
             .expect("atomically install matching snapshot recovered from Raft");
@@ -206,7 +230,8 @@ fn main() {
     let instrument_specs = if instrument_specs_text.trim().is_empty() {
         trade_core::InstrumentSpecs::default()
     } else {
-        trade_core::InstrumentSpecs::parse(&instrument_specs_text).expect("valid TC_INSTRUMENT_SPECS")
+        trade_core::InstrumentSpecs::parse(&instrument_specs_text)
+            .expect("valid TC_INSTRUMENT_SPECS")
     };
     // The committed prefix recovered from the WAL, replayed below on top of
     // the engine snapshot (which records the index it covers).
@@ -320,6 +345,7 @@ fn main() {
         .max(1);
     let asset_root = data_dir.join("journal").join("assets");
     let runtime_snapshot_path = engine_snapshot_path.clone();
+    let runtime_rejoin_marker_path = rejoin_marker_path.clone();
     // Migration steps proposed by the admin routes below: (entry, reply with
     // the committed index). Only a leader proposes; elsewhere the reply
     // channel is dropped and the caller is told to ask the leader.
@@ -392,7 +418,7 @@ fn main() {
                             "event=historic_config_differs index={index} logged={fingerprint:016x} ({description}) local={config_fingerprint:016x}"
                         );
                     }
-                    runtime_metrics.set_raft_enqueued_index(index);
+                    mark_non_command_applied(&runtime_metrics, index);
                     continue;
                 }
                 // Every replica holds the same bytes, so skipping an entry
@@ -400,7 +426,7 @@ fn main() {
                 // crash-loop the whole group on every restart.
                 let Some(commands) = wire::decode_raft_entry(&payload) else {
                     log_error!("raft-node", "event=undecodable_entry index={index} bytes={}; skipped", payload.len());
-                    runtime_metrics.set_raft_enqueued_index(index);
+                    mark_non_command_applied(&runtime_metrics, index);
                     continue;
                 };
                 if index <= engine_snapshot_index {
@@ -452,8 +478,23 @@ fn main() {
                         log_warn!("raft-node", "event=peer_proposal_dropped from={}", message.from);
                         continue;
                     }
+                    let was_rejoining = node.is_rejoining();
                     if let Err(error) = node.step(message) {
                         log_warn!("raft-node", "event=step_failed error={error:?}");
+                    } else if was_rejoining && !node.is_rejoining() {
+                        match clear_rejoin_marker(&runtime_rejoin_marker_path) {
+                            Ok(()) => log_info!(
+                                "raft-node",
+                                "event=rejoin_complete local_last={} local_commit={}",
+                                node.last_index(),
+                                node.commit_index()
+                            ),
+                            Err(error) => log_error!(
+                                "raft-node",
+                                "event=rejoin_marker_clear_failed marker={} error={error}",
+                                runtime_rejoin_marker_path.display()
+                            ),
+                        }
                     }
                 }
                 if let Some((index, bytes)) = node.take_installed_snapshot_with_index() {
@@ -538,6 +579,7 @@ fn main() {
                     node.commit_index(),
                 );
                 let ready = node.leader_id() != 0
+                    && !node.is_rejoining()
                     && runtime_metrics.raft_apply_lag() <= max_apply_lag
                     && runtime_metrics.asset_wal_errors.load(Ordering::Relaxed) == 0
                     && runtime_metrics
@@ -640,12 +682,12 @@ fn main() {
                             );
                             std::process::exit(78);
                         }
-                        runtime_metrics.set_raft_enqueued_index(index);
+                        mark_non_command_applied(&runtime_metrics, index);
                         continue;
                     }
                     let Some(commands) = wire::decode_raft_entry(&payload) else {
                         log_error!("raft-node", "event=undecodable_entry index={index} bytes={}; skipped", payload.len());
-                        runtime_metrics.set_raft_enqueued_index(index);
+                        mark_non_command_applied(&runtime_metrics, index);
                         continue;
                     };
                     // Every committed command goes to the engine, whose
@@ -858,7 +900,8 @@ fn main() {
             )
             .set(
                 "queue.buffering.max.messages",
-                std::env::var("TC_EXECUTION_KAFKA_QUEUE_MESSAGES").unwrap_or_else(|_| "2000000".into()),
+                std::env::var("TC_EXECUTION_KAFKA_QUEUE_MESSAGES")
+                    .unwrap_or_else(|_| "2000000".into()),
             )
             .set(
                 "queue.buffering.max.kbytes",
@@ -1288,11 +1331,17 @@ fn spawn_execution_outbox_publisher(
                 // still in the outbox, so a fresh producer resends it in order.
                 if pass_failed {
                     if let Some((code, reason)) = producer.client().fatal_error() {
-                        log_warn!("execution-kafka", "event=producer_recreated fatal={code:?} reason={reason}");
+                        log_warn!(
+                            "execution-kafka",
+                            "event=producer_recreated fatal={code:?} reason={reason}"
+                        );
                         match producer_config.create::<FutureProducer>() {
                             Ok(fresh) => producer = fresh,
                             Err(error) => {
-                                log_error!("execution-kafka", "event=producer_recreate_failed error={error}");
+                                log_error!(
+                                    "execution-kafka",
+                                    "event=producer_recreate_failed error={error}"
+                                );
                                 thread::sleep(Duration::from_secs(1));
                             }
                         }
@@ -1314,7 +1363,6 @@ fn is_execution_outbox_file(path: &std::path::Path) -> bool {
             .is_some_and(|name| name.starts_with("outbox-shard-"))
 }
 
-
 /// Which outbox segment each engine shard publishes from this pass: its
 /// oldest segment that still has unpublished records (an unreadable pending
 /// count counts as pending). One per shard, so a newer segment is never
@@ -1326,7 +1374,9 @@ fn is_execution_outbox_file(path: &std::path::Path) -> bool {
 /// Stopping at the drained segment wedged the group permanently (the 25,630
 /// records in the next segment could never publish, so readiness never
 /// returned, so nothing rotated).
-fn select_publish_segments(mut segments: Vec<(std::path::PathBuf, u64)>) -> Vec<std::path::PathBuf> {
+fn select_publish_segments(
+    mut segments: Vec<(std::path::PathBuf, u64)>,
+) -> Vec<std::path::PathBuf> {
     segments.sort_by_key(|(path, _)| outbox_segment_order(path).unwrap_or((u32::MAX, u64::MAX)));
     let mut chosen_shards = HashSet::new();
     segments
@@ -1398,7 +1448,11 @@ fn execution_category_key(frame: &[u8; wire::REPORT_LEN], category_size: u32) ->
 type RouteResponse = (String, String, String);
 
 fn route_reply(status: &str, body: String) -> RouteResponse {
-    let content_type = if body.starts_with('{') { "application/json" } else { "text/plain" };
+    let content_type = if body.starts_with('{') {
+        "application/json"
+    } else {
+        "text/plain"
+    };
     (status.to_string(), content_type.to_string(), body)
 }
 
@@ -1472,16 +1526,28 @@ fn migration_route(
             route_reply("200 OK", "{\"requested\":true}".into())
         }
         "/migration/seal" => match category().and_then(|c| Ok((c, epoch()?))) {
-            Ok((category, epoch)) => propose(CategoryOp::Seal { category, category_size, epoch }),
+            Ok((category, epoch)) => propose(CategoryOp::Seal {
+                category,
+                category_size,
+                epoch,
+            }),
             Err(response) => response,
         },
         "/migration/drop" => match category().and_then(|c| Ok((c, epoch()?))) {
-            Ok((category, epoch)) => propose(CategoryOp::Drop { category, category_size, epoch }),
+            Ok((category, epoch)) => propose(CategoryOp::Drop {
+                category,
+                category_size,
+                epoch,
+            }),
             Err(response) => response,
         },
         // Undo a seal (a migration that failed before cutover).
         "/migration/unseal" => match category().and_then(|c| Ok((c, epoch()?))) {
-            Ok((category, epoch)) => propose(CategoryOp::Unseal { category, category_size, epoch }),
+            Ok((category, epoch)) => propose(CategoryOp::Unseal {
+                category,
+                category_size,
+                epoch,
+            }),
             Err(response) => response,
         },
         // Whether the category is sealed here and the epoch of its last
@@ -1489,21 +1555,33 @@ fn migration_route(
         // checks that its steps applied, not just committed).
         "/migration/status" => match category() {
             Err(response) => response,
-            Ok(category) => match trade_core::migration::snapshot_migration_status(snapshot_path, category) {
+            Ok(category) => match trade_core::migration::snapshot_migration_status(
+                snapshot_path,
+                category,
+            ) {
                 Ok(Some((index, sealed, epoch))) => route_reply(
                     "200 OK",
-                    format!("{{\"raft_applied_index\":{index},\"sealed\":{sealed},\"epoch\":{epoch}}}"),
+                    format!(
+                        "{{\"raft_applied_index\":{index},\"sealed\":{sealed},\"epoch\":{epoch}}}"
+                    ),
                 ),
-                Ok(None) => route_reply("503 Service Unavailable", "no durable snapshot yet\n".into()),
+                Ok(None) => route_reply(
+                    "503 Service Unavailable",
+                    "no durable snapshot yet\n".into(),
+                ),
                 Err(error) => route_reply("500 Internal Server Error", format!("{error}\n")),
             },
         },
         "/category-state" => match category() {
             Err(response) => response,
             Ok(category) => match trade_core::snapshot::load(snapshot_path) {
-                Err(error) => route_reply("503 Service Unavailable", format!("no durable snapshot: {error}\n")),
+                Err(error) => route_reply(
+                    "503 Service Unavailable",
+                    format!("no durable snapshot: {error}\n"),
+                ),
                 Ok(snap) => {
-                    let export = trade_core::migration::export_category(&snap, category, category_size);
+                    let export =
+                        trade_core::migration::export_category(&snap, category, category_size);
                     let bytes = trade_core::migration::encode_category_state(
                         snap.raft_applied_index,
                         &export.engines,
@@ -1514,7 +1592,10 @@ fn migration_route(
                     let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
                     route_reply(
                         "200 OK",
-                        format!("{{\"raft_applied_index\":{},\"state\":\"{hex}\"}}", snap.raft_applied_index),
+                        format!(
+                            "{{\"raft_applied_index\":{},\"state\":\"{hex}\"}}",
+                            snap.raft_applied_index
+                        ),
                     )
                 }
             },
@@ -1524,10 +1605,14 @@ fn migration_route(
                 Ok(pair) => pair,
                 Err(response) => return Some(response),
             };
-            let (Some(from), Some(min_index)) =
-                (param("from"), param("min_index").and_then(|v| v.parse::<u64>().ok()))
-            else {
-                return Some(route_reply("400 Bad Request", "from=<host:port>&min_index=<n> required\n".into()));
+            let (Some(from), Some(min_index)) = (
+                param("from"),
+                param("min_index").and_then(|v| v.parse::<u64>().ok()),
+            ) else {
+                return Some(route_reply(
+                    "400 Bad Request",
+                    "from=<host:port>&min_index=<n> required\n".into(),
+                ));
             };
             let fetched = trade_core::migration::http_get(
                 from,
@@ -1537,9 +1622,17 @@ fn migration_route(
             let body = match fetched {
                 Ok((200, body)) => body,
                 Ok((status, body)) => {
-                    return Some(route_reply("502 Bad Gateway", format!("source answered {status}: {body}\n")))
+                    return Some(route_reply(
+                        "502 Bad Gateway",
+                        format!("source answered {status}: {body}\n"),
+                    ))
                 }
-                Err(error) => return Some(route_reply("502 Bad Gateway", format!("source unreachable: {error}\n"))),
+                Err(error) => {
+                    return Some(route_reply(
+                        "502 Bad Gateway",
+                        format!("source unreachable: {error}\n"),
+                    ))
+                }
             };
             let hex = body
                 .split("\"state\":\"")
@@ -1548,11 +1641,19 @@ fn migration_route(
                 .unwrap_or("");
             let bytes: Option<Vec<u8>> = (0..hex.len())
                 .step_by(2)
-                .map(|at| hex.get(at..at + 2).and_then(|pair| u8::from_str_radix(pair, 16).ok()))
+                .map(|at| {
+                    hex.get(at..at + 2)
+                        .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+                })
                 .collect();
             let state = match bytes.as_deref().map(trade_core::snapshot::decode) {
                 Some(Ok(state)) => state,
-                _ => return Some(route_reply("502 Bad Gateway", "undecodable category state\n".into())),
+                _ => {
+                    return Some(route_reply(
+                        "502 Bad Gateway",
+                        "undecodable category state\n".into(),
+                    ))
+                }
             };
             if state.raft_applied_index < min_index {
                 return Some(route_reply(
@@ -1599,7 +1700,10 @@ fn deterministic_config(instrument_specs: &str, command_id_window: usize) -> (u6
         env("TC_EXECUTION_KAFKA_PARTITIONS").trim(),
         trade_core::sharding::RouteConfig::from_env(),
     );
-    (trade_core::journal::fnv1a(description.as_bytes()), description)
+    (
+        trade_core::journal::fnv1a(description.as_bytes()),
+        description,
+    )
 }
 
 /// Record the group's latest announced config fingerprint (in memory and,
@@ -1614,8 +1718,23 @@ fn remember_group_config(path: &std::path::Path, current: &mut Option<u64>, fing
         .and_then(|()| std::fs::File::open(&tmp)?.sync_all())
         .and_then(|()| std::fs::rename(&tmp, path));
     if let Err(error) = written {
-        log_warn!("raft-node", "event=group_config_persist_failed error={error}");
+        log_warn!(
+            "raft-node",
+            "event=group_config_persist_failed error={error}"
+        );
     }
+}
+
+fn clear_rejoin_marker(path: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
 }
 
 /// Take an exclusive, non-blocking `flock` on `<dir>/.raft-node.lock`. The
@@ -1775,6 +1894,16 @@ fn run_peer_writer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn non_command_entries_do_not_create_permanent_apply_lag() {
+        let metrics = trade_core::metrics::Metrics::default();
+        metrics.set_raft_enqueued_index(40);
+        metrics.set_raft_applied_index(7);
+        mark_non_command_applied(&metrics, 41);
+        assert_eq!(metrics.raft_apply_lag(), 0);
+        assert_eq!(metrics.raft_applied_index.load(Ordering::Acquire), 41);
+    }
     use std::io::Cursor;
     use trade_core::{ExecReport, InstrumentId, OrderId};
 
@@ -1846,7 +1975,10 @@ mod tests {
     fn a_data_dir_can_be_locked_by_only_one_process_handle() {
         let dir = std::env::temp_dir().join(format!("tc-raft-lock-{}", std::process::id()));
         let first = lock_data_dir(&dir).expect("first lock");
-        assert!(lock_data_dir(&dir).is_err(), "second lock must fail while held");
+        assert!(
+            lock_data_dir(&dir).is_err(),
+            "second lock must fail while held"
+        );
         drop(first);
         assert!(lock_data_dir(&dir).is_ok(), "released with the handle");
         std::fs::remove_dir_all(&dir).unwrap();
@@ -1869,7 +2001,10 @@ mod tests {
             decode_outbox_checkpoint(7, Some(&key), Some(&payload)),
             Some((12_345, 3))
         );
-        assert_eq!(decode_outbox_checkpoint(8, Some(&key), Some(&payload)), None);
+        assert_eq!(
+            decode_outbox_checkpoint(8, Some(&key), Some(&payload)),
+            None
+        );
         // An older build's byte-offset checkpoint is ignored, not misread.
         let mut legacy_key = 7u32.to_be_bytes().to_vec();
         legacy_key.extend_from_slice(b"outbox-shard-0.bin");

@@ -68,7 +68,6 @@ pub(crate) fn multi_insert_sql(prefix: &str, columns: usize, values: &[Value]) -
     Some(sql)
 }
 
-
 /// One MySQL URL per physical database. An explicit `TC_ORDER_MYSQL_SHARD_URLS`
 /// list must match the configured `db_count` (part of the versioned route
 /// record); otherwise a single `TC_ORDER_MYSQL_URL` is fanned out to every
@@ -129,10 +128,11 @@ pub(crate) fn open_when_ready(
                 // per-transaction round trip), whatever the server default.
                 let opts = mysql::Opts::from_url(url.as_str())
                     .map_err(|e| mysql::Error::from(io_shard_error(idx, &e)))?;
-                let opts = mysql::OptsBuilder::from_opts(opts)
-                    .init(vec!["SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ"]);
-                let pool = Pool::new(opts)
-                    .map_err(|e| mysql::Error::from(io_shard_error(idx, &e)))?;
+                let opts = mysql::OptsBuilder::from_opts(opts).init(vec![
+                    "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+                ]);
+                let pool =
+                    Pool::new(opts).map_err(|e| mysql::Error::from(io_shard_error(idx, &e)))?;
                 pool.get_conn()
                     .map_err(|e| mysql::Error::from(io_shard_error(idx, &e)))?;
                 shards.push(Some(pool));

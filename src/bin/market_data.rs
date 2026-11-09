@@ -139,21 +139,34 @@ const MAX_CONNECTIONS: usize = 4096;
 /// Highest depth level accepted from a frame (the engine publishes 5).
 const MAX_DEPTH_LEVELS: usize = 64;
 
+fn idle_feed_read(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
+}
+
 fn feed_one(md_addr: String, state: Arc<Mutex<State>>) {
+    let mut last_connect_warning = std::time::Instant::now() - Duration::from_secs(30);
+    let mut last_disconnect_warning = std::time::Instant::now() - Duration::from_secs(30);
     loop {
         let mut sock = match TcpStream::connect(&md_addr) {
             Ok(s) => s,
             Err(e) => {
-                log_warn!(
-                    "market-data",
-                    "waiting for trade-core fanout at {md_addr} ({e})"
-                );
+                if last_connect_warning.elapsed() >= Duration::from_secs(30) {
+                    log_warn!(
+                        "market-data",
+                        "waiting for trade-core fanout at {md_addr} ({e})"
+                    );
+                    last_connect_warning = std::time::Instant::now();
+                }
                 std::thread::sleep(Duration::from_secs(1));
                 continue;
             }
         };
-        // Depth arrives every 200 ms from a live node: silence means a dead
-        // connection (host gone without a FIN), so reconnect.
+        // A quiet market has no frames to publish. Keep a finite read timeout
+        // so the thread remains interruptible, but do not mistake an idle
+        // socket for a failed feed. EOF or a real I/O error still reconnects.
         sock.set_read_timeout(Some(Duration::from_secs(10))).ok();
         log_info!("market-data", "subscribed to {md_addr}");
         let mut buf = vec![0u8; EXECUTION_EVENT_LEN * 512];
@@ -164,7 +177,11 @@ fn feed_one(md_addr: String, state: Arc<Mutex<State>>) {
         let mut last_index = 0u64;
         loop {
             match sock.read(&mut buf[filled..]) {
-                Ok(0) | Err(_) => break,
+                Ok(0) => break,
+                Err(error) if idle_feed_read(&error) => {
+                    continue;
+                }
+                Err(_) => break,
                 Ok(n) => {
                     filled += n;
                     let mut off = 0;
@@ -229,7 +246,11 @@ fn feed_one(md_addr: String, state: Arc<Mutex<State>>) {
                 }
             }
         }
-        log_warn!("market-data", "feed {md_addr} disconnected, retrying");
+        if last_disconnect_warning.elapsed() >= Duration::from_secs(30) {
+            log_warn!("market-data", "feed {md_addr} disconnected, retrying");
+            last_disconnect_warning = std::time::Instant::now();
+        }
+        std::thread::sleep(Duration::from_secs(1));
     }
 }
 
@@ -888,16 +909,18 @@ fn main() {
                 let order_api = order_api_pool.clone();
                 let done = connections.clone();
                 connections.fetch_add(1, Ordering::AcqRel);
-                let spawned = std::thread::Builder::new().name("md-http".into()).spawn(move || {
-                    handle_http(
-                        stream,
-                        &state,
-                        admin_token.as_deref(),
-                        trading_token.as_deref(),
-                        &order_api,
-                    );
-                    done.fetch_sub(1, Ordering::AcqRel);
-                });
+                let spawned = std::thread::Builder::new()
+                    .name("md-http".into())
+                    .spawn(move || {
+                        handle_http(
+                            stream,
+                            &state,
+                            admin_token.as_deref(),
+                            trading_token.as_deref(),
+                            &order_api,
+                        );
+                        done.fetch_sub(1, Ordering::AcqRel);
+                    });
                 if spawned.is_err() {
                     connections.fetch_sub(1, Ordering::AcqRel);
                 }
@@ -924,6 +947,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn idle_feed_timeout_is_not_a_disconnect() {
+        for kind in [std::io::ErrorKind::WouldBlock, std::io::ErrorKind::TimedOut] {
+            assert!(idle_feed_read(&std::io::Error::from(kind)));
+        }
+        assert!(!idle_feed_read(&std::io::Error::from(
+            std::io::ErrorKind::ConnectionReset
+        )));
+    }
+
+    #[test]
     fn each_trade_counts_once_across_replicas_and_replays() {
         let mut st = State {
             agg: KlineAggregator::new(10),
@@ -934,12 +967,24 @@ mod tests {
         };
         // Replica A delivers group 3's entries 10..=12; replica B, behind,
         // delivers 10 and 11 again; a restarted node replays 9..=12.
-        let a: Vec<bool> = [(10, 0), (10, 1), (11, 0), (12, 0)].iter().map(|&(i, o)| st.take(3, i, o)).collect();
+        let a: Vec<bool> = [(10, 0), (10, 1), (11, 0), (12, 0)]
+            .iter()
+            .map(|&(i, o)| st.take(3, i, o))
+            .collect();
         assert_eq!(a, [true, true, true, true]);
-        assert!(!st.take(3, 10, 1) && !st.take(3, 11, 0), "a lagging replica's copies");
+        assert!(
+            !st.take(3, 10, 1) && !st.take(3, 11, 0),
+            "a lagging replica's copies"
+        );
         assert!((9..=12).all(|i| !st.take(3, i, 0)), "a replayed tail");
-        assert!(st.take(3, 13, 0) && st.take(4, 1, 0), "new entries, other groups");
-        assert!(st.take(0, 0, 0) && st.take(0, 0, 0), "not from a Raft entry: always");
+        assert!(
+            st.take(3, 13, 0) && st.take(4, 1, 0),
+            "new entries, other groups"
+        );
+        assert!(
+            st.take(0, 0, 0) && st.take(0, 0, 0),
+            "not from a Raft entry: always"
+        );
         // Depth from a feed behind the group is not current.
         assert!(!st.current(3, 12) && st.current(3, 13) && st.current(9, 0));
     }

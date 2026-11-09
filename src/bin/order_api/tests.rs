@@ -71,14 +71,27 @@ fn websocket_session_acknowledges_each_batch_in_order() {
         .filter(|(op, _)| *op == OP_TEXT)
         .map(|(_, t)| t.as_str())
         .collect();
-    assert_eq!(texts[0], r#"{"seq":1,"accepted":true,"status":"PENDING","count":3}"#);
+    assert_eq!(
+        texts[0],
+        r#"{"seq":1,"accepted":true,"status":"PENDING","count":3}"#
+    );
     assert_eq!(
         texts[1],
         r#"{"seq":2,"accepted":false,"code":429,"error":"backpressure: hard"}"#
     );
-    assert!(texts[2].starts_with(r#"{"seq":3,"accepted":false,"code":400,"#), "{}", texts[2]);
-    assert_eq!(texts[3], r#"{"seq":4,"accepted":true,"status":"PENDING","count":5}"#);
-    assert!(acks.iter().any(|(op, t)| *op == 0xA && t == "hi"), "ping answered");
+    assert!(
+        texts[2].starts_with(r#"{"seq":3,"accepted":false,"code":400,"#),
+        "{}",
+        texts[2]
+    );
+    assert_eq!(
+        texts[3],
+        r#"{"seq":4,"accepted":true,"status":"PENDING","count":5}"#
+    );
+    assert!(
+        acks.iter().any(|(op, t)| *op == 0xA && t == "hi"),
+        "ping answered"
+    );
     assert_eq!(acks.last().unwrap().0, OP_CLOSE);
 }
 
@@ -99,6 +112,18 @@ fn websocket_session_closes_on_a_batch_above_the_limit() {
 }
 
 #[test]
+fn unfinished_migration_inventory_is_stable_and_actionable() {
+    let frozen = vec![
+        (2, 9, route_log::RouteRecord::Freeze { from: 0, to: 1 }),
+        (19, 41, route_log::RouteRecord::Freeze { from: 3, to: 7 }),
+    ];
+    assert_eq!(
+        unfinished_migrations_json_from(frozen),
+        "{\"count\":2,\"migrations\":[{\"category\":2,\"from\":0,\"to\":1,\"epoch\":10,\"freeze_offset\":9},{\"category\":19,\"from\":3,\"to\":7,\"epoch\":42,\"freeze_offset\":41}]}"
+    );
+}
+
+#[test]
 fn queued_jobs_are_packed_in_order_up_to_the_pack_size() {
     let (tx, rx) = std::sync::mpsc::sync_channel(8);
     tx.send(forward_job(3..6)).unwrap();
@@ -116,11 +141,63 @@ fn queued_jobs_are_packed_in_order_up_to_the_pack_size() {
     let packed: Vec<Vec<u64>> = packs(&rest, 5).map(|pack| ids(&pack)).collect();
     assert_eq!(
         packed,
-        vec![vec![6, 7, 8, 9, 10], vec![11, 12, 13, 14, 15], vec![16, 17, 18, 19]]
+        vec![
+            vec![6, 7, 8, 9, 10],
+            vec![11, 12, 13, 14, 15],
+            vec![16, 17, 18, 19]
+        ]
     );
     // A full first job takes nothing else; an empty one yields no pack.
     assert_eq!(drain_queued_jobs(forward_job(0..5), &rx, 5).len(), 1);
     assert_eq!(packs(&[forward_job(0..0)], 5).count(), 0);
+}
+
+#[test]
+fn raft_group_failure_only_retries_its_kafka_partitions() {
+    let mut groups = Vec::new();
+    for group in 0..2 {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<RaftForwardJob>(1);
+        std::thread::spawn(move || {
+            let job = rx.recv().unwrap();
+            let result = if group == 0 {
+                Ok(())
+            } else {
+                Err("group 1 lost quorum".to_string())
+            };
+            job.reply.send(result).unwrap();
+        });
+        groups.push(tx);
+    }
+    let forwarder = RaftForwarder {
+        groups: Arc::new(groups),
+    };
+    let records = [
+        KafkaRecord {
+            topic: "orders".into(),
+            partition: 4,
+            offset: 10,
+            category_id: 0,
+            user: 1,
+            frame: [0; wire::MSG_LEN],
+        },
+        KafkaRecord {
+            topic: "orders".into(),
+            partition: 7,
+            offset: 20,
+            category_id: 1,
+            user: 2,
+            frame: [0; wire::MSG_LEN],
+        },
+    ];
+    let routes = trade_core::cluster::RouteControlPlane::new(2, HashMap::new());
+
+    let failures = forwarder.submit(&records, &routes).unwrap();
+
+    assert_eq!(failures.len(), 1);
+    assert!(!failures.contains_key(&("orders".to_string(), 4)));
+    assert!(failures
+        .get(&("orders".to_string(), 7))
+        .is_some_and(|error| error.contains("lost quorum")));
 }
 
 #[test]
@@ -134,7 +211,10 @@ fn order_query_parses_type_and_tif() {
     let maker = order_from_query(&format!("{base}&price=100&tif=post_only")).unwrap();
     assert_eq!(maker.tif, TimeInForce::PostOnly);
     let ioc = order_from_query(&format!("{base}&type=market&tif=ioc")).unwrap();
-    assert_eq!((ioc.order_type, ioc.tif), (OrderType::Market, TimeInForce::Ioc));
+    assert_eq!(
+        (ioc.order_type, ioc.tif),
+        (OrderType::Market, TimeInForce::Ioc)
+    );
 
     assert!(order_from_query(base).is_err(), "limit needs a price");
     assert!(order_from_query(&format!("{base}&type=market&tif=post_only")).is_err());
@@ -158,8 +238,7 @@ fn order_query_with_stop_price_is_a_conditional_order() {
         }
         other => panic!("expected a conditional order, got {other:?}"),
     }
-    match order_command_from_query(&format!("{base}&price=120&stop_price=118&trigger=tp"))
-        .unwrap()
+    match order_command_from_query(&format!("{base}&price=120&stop_price=118&trigger=tp")).unwrap()
     {
         trade_core::Command::NewConditional(order, trigger) => {
             assert_eq!((order.price, trigger.price), (120, 118));
@@ -172,13 +251,16 @@ fn order_query_with_stop_price_is_a_conditional_order() {
         trade_core::Command::New(_)
     ));
     for bad in [
-        "&price=100&trigger=tp",               // trigger without stop_price
-        "&price=100&stop_price=0",             // zero trigger
-        "&price=100&stop_price=x",             // malformed
-        "&price=100&stop_price=95&trigger=x",  // unknown kind
+        "&price=100&trigger=tp",              // trigger without stop_price
+        "&price=100&stop_price=0",            // zero trigger
+        "&price=100&stop_price=x",            // malformed
+        "&price=100&stop_price=95&trigger=x", // unknown kind
         "&price=100&stop_price=95&tif=post_only",
     ] {
-        assert!(order_command_from_query(&format!("{base}{bad}")).is_err(), "{bad}");
+        assert!(
+            order_command_from_query(&format!("{base}{bad}")).is_err(),
+            "{bad}"
+        );
     }
 }
 
@@ -198,7 +280,17 @@ fn only_order_state_reports_are_staged_for_projection() {
     }
     // NotFound, depth, halt/resume acks (12..=15), command rejects,
     // stop-fired markers.
-    for code in [wire::RT_NOTFOUND, wire::RT_DEPTH_LEVEL, wire::RT_DEPTH_END, 12, 13, 14, 15, wire::RT_CMD_REJECTED, wire::RT_TRIGGERED] {
+    for code in [
+        wire::RT_NOTFOUND,
+        wire::RT_DEPTH_LEVEL,
+        wire::RT_DEPTH_END,
+        12,
+        13,
+        14,
+        15,
+        wire::RT_CMD_REJECTED,
+        wire::RT_TRIGGERED,
+    ] {
         assert!(!projects_order_state(code), "type {code}");
     }
     // A stop firing is followed by the fired order's own reports; the
@@ -255,9 +347,20 @@ fn kafka_new(order_id: u64, user: u64, instrument: u32, qty: u64, offset: i64) -
     }
 }
 
-fn kafka_cancel(order_id: u64, cmd_id: u64, user: u64, instrument: u32, offset: i64) -> KafkaRecord {
+fn kafka_cancel(
+    order_id: u64,
+    cmd_id: u64,
+    user: u64,
+    instrument: u32,
+    offset: i64,
+) -> KafkaRecord {
     let mut frame = [0u8; wire::MSG_LEN];
-    wire::encode_cancel(InstrumentId(instrument), OrderId(order_id), cmd_id, &mut frame);
+    wire::encode_cancel(
+        InstrumentId(instrument),
+        OrderId(order_id),
+        cmd_id,
+        &mut frame,
+    );
     KafkaRecord {
         topic: "mysql-it".into(),
         partition: 0,
@@ -313,10 +416,7 @@ fn trade_event(
     }
 }
 
-fn persist_events(
-    store: &OrderStore,
-    records: Vec<ExecutionKafkaRecord>,
-) -> Result<(), String> {
+fn persist_events(store: &OrderStore, records: Vec<ExecutionKafkaRecord>) -> Result<(), String> {
     let mut tables = ExecutionShardTables::new();
     for record in records {
         let target = record.event.target_order_id;
@@ -465,8 +565,10 @@ fn mysql8_dedupe_rotation_truncates_only_the_stale_table() {
     let mut conn = store.shard(0).get_conn().unwrap();
     let period = dedupe_period(&mut conn).unwrap();
     for table in 0..DEDUPE_TABLES {
-        conn.query_drop(format!("TRUNCATE TABLE order_db_0.processed_execution_events_{table}"))
-            .unwrap();
+        conn.query_drop(format!(
+            "TRUNCATE TABLE order_db_0.processed_execution_events_{table}"
+        ))
+        .unwrap();
     }
     // (raft_index, age in periods): current, previous, and two periods old.
     for (index, age) in [(1u64, 0u64), (2, 1), (3, 2)] {
@@ -487,7 +589,11 @@ fn mysql8_dedupe_rotation_truncates_only_the_stale_table() {
     };
     let mut ring = DedupeRing::new();
     assert_eq!(ring.advance(&mut conn, 0, period).unwrap(), 1);
-    assert_eq!(left(&mut conn), vec![1, 2], "only the two-period-old row goes");
+    assert_eq!(
+        left(&mut conn),
+        vec![1, 2],
+        "only the two-period-old row goes"
+    );
     // Same period again, or the clock stepping back: nothing more.
     assert_eq!(ring.advance(&mut conn, 0, period).unwrap(), 0);
     assert_eq!(ring.advance(&mut conn, 0, period - 1).unwrap(), 0);
@@ -507,8 +613,10 @@ fn mysql8_dedupe_rotation_truncates_only_the_stale_table() {
         .unwrap();
     assert_eq!(pending, 0);
     for table in 0..DEDUPE_TABLES {
-        conn.query_drop(format!("TRUNCATE TABLE order_db_0.processed_execution_events_{table}"))
-            .unwrap();
+        conn.query_drop(format!(
+            "TRUNCATE TABLE order_db_0.processed_execution_events_{table}"
+        ))
+        .unwrap();
     }
 }
 
@@ -553,7 +661,13 @@ fn mysql8_projection_ignores_reports_that_change_no_order() {
     // A repeated cancel answers NotFound; it must not reopen the order.
     persist_events(
         &store,
-        vec![report_event(wire::RT_NOTFOUND, order, instrument, seed + 2, 3)],
+        vec![report_event(
+            wire::RT_NOTFOUND,
+            order,
+            instrument,
+            seed + 2,
+            3,
+        )],
     )
     .unwrap();
     assert_eq!(status(&mut conn).as_deref(), Some("CANCELLED"));
@@ -566,7 +680,13 @@ fn mysql8_projection_ignores_reports_that_change_no_order() {
         vec![
             report_event(wire::RT_CMD_REJECTED, order, instrument, seed + 3, 4),
             report_event(12, 0, instrument, seed + 4, 5),
-            report_event(wire::RT_CMD_REJECTED, seed | 0xffff, instrument, seed + 5, 6),
+            report_event(
+                wire::RT_CMD_REJECTED,
+                seed | 0xffff,
+                instrument,
+                seed + 5,
+                6,
+            ),
         ],
     )
     .unwrap();
@@ -596,7 +716,13 @@ fn mysql8_projection_tracks_a_conditional_order_from_untriggered_to_filled() {
     persist_mysql_shard(&store, 0, &[kafka_new(order, 66_002, instrument, 4, 1)]).unwrap();
     persist_events(
         &store,
-        vec![report_event(wire::RT_STOP_ACCEPTED, order, instrument, seed, 1)],
+        vec![report_event(
+            wire::RT_STOP_ACCEPTED,
+            order,
+            instrument,
+            seed,
+            1,
+        )],
     )
     .unwrap();
     let mut conn = store.shard(0).get_conn().unwrap();
@@ -657,10 +783,19 @@ fn mysql8_command_writer_hands_the_pending_drain_to_the_execution_writer() {
     .unwrap();
     let handoff = DrainHandoff::new(store.routing);
     handoff.take(0); // drop the start-up "everything" mark
-    persist_mysql_shard_with(&store, 0, &[kafka_new(order, 66_003, instrument, 4, 1)], Some(&handoff))
-        .unwrap();
+    persist_mysql_shard_with(
+        &store,
+        0,
+        &[kafka_new(order, 66_003, instrument, 4, 1)],
+        Some(&handoff),
+    )
+    .unwrap();
     let mut conn = store.shard(0).get_conn().unwrap();
-    assert_eq!(row(&mut conn), Some((0, "PENDING".into())), "drain ran inline");
+    assert_eq!(
+        row(&mut conn),
+        Some((0, "PENDING".into())),
+        "drain ran inline"
+    );
     let marked = handoff.take(0);
     assert_eq!(marked, std::iter::once(route.table).collect());
     drain_marked_tables(&store, 0, &marked).unwrap();
@@ -691,7 +826,10 @@ fn mysql8_cancel_request_never_overwrites_order_status() {
             .get_conn()
             .unwrap()
             .exec_first(
-                format!("SELECT status FROM order_db_0.{} WHERE order_id=:id", route.table_name()),
+                format!(
+                    "SELECT status FROM order_db_0.{} WHERE order_id=:id",
+                    route.table_name()
+                ),
                 params! {"id" => order},
             )
             .unwrap()
@@ -700,7 +838,10 @@ fn mysql8_cancel_request_never_overwrites_order_status() {
     persist_mysql_shard(
         &store,
         0,
-        &[kafka_new(filled, user, instrument, 3, 1), kafka_new(open, user, instrument, 3, 2)],
+        &[
+            kafka_new(filled, user, instrument, 3, 1),
+            kafka_new(open, user, instrument, 3, 2),
+        ],
     )
     .unwrap();
     persist_events(
@@ -728,7 +869,13 @@ fn mysql8_cancel_request_never_overwrites_order_status() {
     .unwrap();
     persist_events(
         &store,
-        vec![report_event(wire::RT_NOTFOUND, filled, instrument, seed + 3, 4)],
+        vec![report_event(
+            wire::RT_NOTFOUND,
+            filled,
+            instrument,
+            seed + 3,
+            4,
+        )],
     )
     .unwrap();
     assert_eq!(status(filled).as_deref(), Some("FILLED"));
@@ -737,7 +884,13 @@ fn mysql8_cancel_request_never_overwrites_order_status() {
     // Only the engine's confirmation cancels.
     persist_events(
         &store,
-        vec![report_event(wire::RT_CANCELLED, open, instrument, seed + 4, 5)],
+        vec![report_event(
+            wire::RT_CANCELLED,
+            open,
+            instrument,
+            seed + 4,
+            5,
+        )],
     )
     .unwrap();
     assert_eq!(status(open).as_deref(), Some("CANCELLED"));
@@ -861,8 +1014,8 @@ fn backpressure_is_isolated_per_category_and_takes_group_max() {
     assert_eq!(bp.tier_for_category(0), BackpressureTier::Hard);
     assert_eq!(bp.tier_for_category(1), BackpressureTier::Normal);
     assert_eq!(bp.tier_for_category(4), BackpressureTier::Hard); // 4 -> partition 0
-    // MySQL lag is per database, and every category writes to every
-    // database: one slow database throttles every category.
+                                                                 // MySQL lag is per database, and every category writes to every
+                                                                 // database: one slow database throttles every category.
     bp.set_partition_lags("match", &[0, 0, 0, 0]);
     bp.set_partition_lags("mysql", &[0, 0, 800, 0, 0, 0]);
     for category in 0..4 {
@@ -967,8 +1120,7 @@ fn read_dlq(path: &Path) -> Vec<(i32, i64, String, Vec<u8>)> {
         let reason_len = u32::from_le_bytes(body[20..24].try_into().unwrap()) as usize;
         let reason = String::from_utf8(body[24..24 + reason_len].to_vec()).unwrap();
         let mut cursor = 24 + reason_len;
-        let payload_len =
-            u32::from_le_bytes(body[cursor..cursor + 4].try_into().unwrap()) as usize;
+        let payload_len = u32::from_le_bytes(body[cursor..cursor + 4].try_into().unwrap()) as usize;
         cursor += 4;
         let payload = body[cursor..cursor + payload_len].to_vec();
         out.push((partition, offset, reason, payload));
@@ -1050,7 +1202,10 @@ fn persist_retry_commits_and_skips_dlq_on_eventual_success() {
 #[test]
 fn order_query_parses_routes_filters_and_limits() {
     let parse = |method: &str, path: &str, query: &str| parse_order_query(method, path, query);
-    assert_eq!(parse("GET", "/orders/42", ""), Some(Ok(OrderQuery::Order(42))));
+    assert_eq!(
+        parse("GET", "/orders/42", ""),
+        Some(Ok(OrderQuery::Order(42)))
+    );
     assert!(matches!(parse("GET", "/orders/x", ""), Some(Err(_))));
     // Not queries: they fall through to ingress / metrics / 404.
     assert_eq!(parse("POST", "/orders", "user=1"), None);
@@ -1059,23 +1214,48 @@ fn order_query_parses_routes_filters_and_limits() {
 
     assert_eq!(
         parse("GET", "/orders", "user=7"),
-        Some(Ok(OrderQuery::UserOrders { user: 7, open_only: false, limit: 100 }))
+        Some(Ok(OrderQuery::UserOrders {
+            user: 7,
+            open_only: false,
+            limit: 100
+        }))
     );
     assert_eq!(
         parse("GET", "/orders", "user=7&status=open&limit=1000"),
-        Some(Ok(OrderQuery::UserOrders { user: 7, open_only: true, limit: 1000 }))
+        Some(Ok(OrderQuery::UserOrders {
+            user: 7,
+            open_only: true,
+            limit: 1000
+        }))
     );
     assert_eq!(
         parse("GET", "/orders", "status=all&user=7&limit=1"),
-        Some(Ok(OrderQuery::UserOrders { user: 7, open_only: false, limit: 1 }))
+        Some(Ok(OrderQuery::UserOrders {
+            user: 7,
+            open_only: false,
+            limit: 1
+        }))
     );
-    for bad in ["", "user=x", "user=7&status=filled", "user=7&limit=0", "user=7&limit=1001", "user=7&limit=-1"] {
-        assert!(matches!(parse("GET", "/orders", bad), Some(Err(_))), "{bad}");
+    for bad in [
+        "",
+        "user=x",
+        "user=7&status=filled",
+        "user=7&limit=0",
+        "user=7&limit=1001",
+        "user=7&limit=-1",
+    ] {
+        assert!(
+            matches!(parse("GET", "/orders", bad), Some(Err(_))),
+            "{bad}"
+        );
     }
 
     assert_eq!(
         parse("GET", "/fills", "order_id=3"),
-        Some(Ok(OrderQuery::OrderFills { order_id: 3, limit: 100 }))
+        Some(Ok(OrderQuery::OrderFills {
+            order_id: 3,
+            limit: 100
+        }))
     );
     assert_eq!(
         parse("GET", "/fills", "user=4&limit=50"),
@@ -1086,8 +1266,14 @@ fn order_query_parses_routes_filters_and_limits() {
     }
     // A parse error is a 400 even on a worker without MySQL.
     let (status, body) = order_query_response(None, Err("invalid order_id".into()));
-    assert_eq!((status, body.as_str()), ("400 Bad Request", "{\"error\":\"invalid order_id\"}"));
-    assert_eq!(order_query_response(None, Ok(OrderQuery::Order(1))).0, "503 Service Unavailable");
+    assert_eq!(
+        (status, body.as_str()),
+        ("400 Bad Request", "{\"error\":\"invalid order_id\"}")
+    );
+    assert_eq!(
+        order_query_response(None, Ok(OrderQuery::Order(1))).0,
+        "503 Service Unavailable"
+    );
 }
 
 #[test]
@@ -1103,8 +1289,14 @@ fn order_lookups_route_where_the_projections_write() {
         let written = routing.route_order_id(database_order_id(&trade_core::Command::New(order)));
         let at = order_location(&routing, id);
         assert_eq!(at.db, written.db);
-        assert_eq!(at.orders_table, format!("order_db_{}.asset_orders_{:03}", written.db, written.table));
-        assert_eq!(at.fills_table, format!("order_db_{}.order_fills", written.db));
+        assert_eq!(
+            at.orders_table,
+            format!("order_db_{}.asset_orders_{:03}", written.db, written.table)
+        );
+        assert_eq!(
+            at.fills_table,
+            format!("order_db_{}.order_fills", written.db)
+        );
         dbs.insert(at.db);
     }
     // One user's orders land in every DB, hence the per-user fan-out.
@@ -1139,13 +1331,24 @@ fn trade_fill_takes_role_and_fee_from_the_target_side() {
     };
     assert_eq!(
         trade_fill(&report, 10),
-        Some(TradeFill { price: 1_001, fee: 7, role: FILL_ROLE_TAKER })
+        Some(TradeFill {
+            price: 1_001,
+            fee: 7,
+            role: FILL_ROLE_TAKER
+        })
     );
     assert_eq!(
         trade_fill(&report, 20),
-        Some(TradeFill { price: 1_001, fee: 3, role: FILL_ROLE_MAKER })
+        Some(TradeFill {
+            price: 1_001,
+            fee: 3,
+            role: FILL_ROLE_MAKER
+        })
     );
-    let filled = wire::DecodedReport { type_code: wire::RT_FILLED, ..report };
+    let filled = wire::DecodedReport {
+        type_code: wire::RT_FILLED,
+        ..report
+    };
     assert_eq!(trade_fill(&filled, 10), None);
 }
 
@@ -1181,7 +1384,15 @@ fn trade_pair(
     [taker, maker]
         .into_iter()
         .map(|target| {
-            let mut record = trade_event(target, 0, instrument, qty, raft_index, ordinal, raft_index as i64);
+            let mut record = trade_event(
+                target,
+                0,
+                instrument,
+                qty,
+                raft_index,
+                ordinal,
+                raft_index as i64,
+            );
             record.event.report.order_id = OrderId(taker);
             record.event.report.aux_id = maker;
             record.event.report.price = price;
@@ -1229,11 +1440,20 @@ fn mysql8_avg_price_and_fills_after_partial_then_full_fill() {
     assert!(body.contains(&format!("\"order_id\":{taker},\"user_id\":{taker_user},\"instrument\":{instrument},\"side\":\"BUY\",\"price\":1005,\"qty\":10,\"filled_qty\":4,\"avg_fill_price\":1000,\"status\":\"PARTIAL\"")), "{body}");
     let (_, fills) = query_ok(&store, "/fills", &format!("order_id={taker}"));
     assert_eq!(fills.matches("\"order_id\"").count(), 1, "{fills}");
-    assert!(fills.contains("\"price\":1000,\"qty\":4,\"fee\":5,\"role\":\"taker\""), "{fills}");
+    assert!(
+        fills.contains("\"price\":1000,\"qty\":4,\"fee\":5,\"role\":\"taker\""),
+        "{fills}"
+    );
 
     // Full: 6 @ 1001 against maker2 (maker fee 3, taker fee 7).
     let mut second = trade_pair(taker, maker2, instrument, 1_001, 6, (3, 7), seed + 1, 0);
-    second.push(report_event(wire::RT_FILLED, maker2, instrument, seed + 1, 1));
+    second.push(report_event(
+        wire::RT_FILLED,
+        maker2,
+        instrument,
+        seed + 1,
+        1,
+    ));
     let mut filled = report_event(wire::RT_FILLED, taker, instrument, seed + 1, 1);
     filled.event.ordinal = 2;
     second.push(filled);
@@ -1242,7 +1462,10 @@ fn mysql8_avg_price_and_fills_after_partial_then_full_fill() {
 
     let (_, body) = query_ok(&store, &format!("/orders/{taker}"), "");
     // (4 * 1000 + 6 * 1001) / 10
-    assert!(body.contains("\"filled_qty\":10,\"avg_fill_price\":1000.6,\"status\":\"FILLED\""), "{body}");
+    assert!(
+        body.contains("\"filled_qty\":10,\"avg_fill_price\":1000.6,\"status\":\"FILLED\""),
+        "{body}"
+    );
     let (_, body) = query_ok(&store, &format!("/orders/{maker2}"), "");
     assert!(body.contains("\"side\":\"SELL\",\"price\":1001,\"qty\":6,\"filled_qty\":6,\"avg_fill_price\":1001,\"status\":\"FILLED\""), "{body}");
 
@@ -1268,17 +1491,28 @@ fn mysql8_avg_price_and_fills_after_partial_then_full_fill() {
     };
     assert_eq!(
         shape(&fills),
-        vec![fill(1_001, 6, 7, "taker", seed + 1), fill(1_000, 4, 5, "taker", seed)]
+        vec![
+            fill(1_001, 6, 7, "taker", seed + 1),
+            fill(1_000, 4, 5, "taker", seed)
+        ]
     );
     let (_, fills) = query_ok(&store, "/fills", &format!("order_id={maker2}"));
     assert_eq!(shape(&fills), vec![fill(1_001, 6, 3, "maker", seed + 1)]);
-    assert!(fills.contains(&format!("\"user_id\":{maker_user},\"instrument\":{instrument},\"side\":\"SELL\"")), "{fills}");
+    assert!(
+        fills.contains(&format!(
+            "\"user_id\":{maker_user},\"instrument\":{instrument},\"side\":\"SELL\""
+        )),
+        "{fills}"
+    );
 
     // Per user, across orders: the maker's two fills, newest first.
     let (_, fills) = query_ok(&store, "/fills", &format!("user={maker_user}"));
     assert_eq!(
         shape(&fills),
-        vec![fill(1_001, 6, 3, "maker", seed + 1), fill(1_000, 4, 2, "maker", seed)]
+        vec![
+            fill(1_001, 6, 3, "maker", seed + 1),
+            fill(1_000, 4, 2, "maker", seed)
+        ]
     );
     let (_, fills) = query_ok(&store, "/fills", &format!("user={maker_user}&limit=1"));
     assert_eq!(shape(&fills), vec![fill(1_001, 6, 3, "maker", seed + 1)]);
@@ -1300,7 +1534,17 @@ fn mysql8_order_queries_get_list_open_filter_and_404() {
     let records: Vec<KafkaRecord> = orders
         .iter()
         .enumerate()
-        .map(|(n, &id)| kafka_order(id, user, instrument, Side::Buy, 1_000 + n as u64, 5, n as i64))
+        .map(|(n, &id)| {
+            kafka_order(
+                id,
+                user,
+                instrument,
+                Side::Buy,
+                1_000 + n as u64,
+                5,
+                n as i64,
+            )
+        })
         .collect();
     persist_mysql_shard(&store, 0, &records).unwrap();
     assert!(
@@ -1343,30 +1587,60 @@ fn mysql8_order_queries_get_list_open_filter_and_404() {
     let ids = |body: &str| -> Vec<u64> {
         body.split("\"order_id\":")
             .skip(1)
-            .map(|rest| rest.chars().take_while(char::is_ascii_digit).collect::<String>().parse().unwrap())
+            .map(|rest| {
+                rest.chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>()
+                    .parse()
+                    .unwrap()
+            })
             .collect()
     };
     let newest_first: Vec<u64> = orders.iter().rev().copied().collect();
     let (status, body) = query_ok(&store, "/orders", &format!("user={user}"));
     assert_eq!(status, "200 OK");
     assert_eq!(ids(&body), newest_first);
-    let (_, body) = query_ok(&store, "/orders", &format!("user={user}&status=all&limit=3"));
+    let (_, body) = query_ok(
+        &store,
+        "/orders",
+        &format!("user={user}&status=all&limit=3"),
+    );
     assert_eq!(ids(&body), newest_first[..3]);
     let (_, body) = query_ok(&store, "/orders", &format!("user={user}&status=open"));
     assert_eq!(ids(&body), newest_first[4..]);
     assert!(body.contains(&format!("\"order_id\":{},\"user_id\":{user},\"instrument\":{instrument},\"side\":\"BUY\",\"price\":1006,\"qty\":5,\"filled_qty\":2,\"avg_fill_price\":1000,\"status\":\"PARTIAL\",\"created_at\":1700000006000,", orders[6])), "{body}");
-    assert!(body.contains(&format!("\"order_id\":{},", orders[7])) && body.contains("\"status\":\"OPEN\""), "{body}");
+    assert!(
+        body.contains(&format!("\"order_id\":{},", orders[7]))
+            && body.contains("\"status\":\"OPEN\""),
+        "{body}"
+    );
     assert!(body.contains("\"status\":\"PENDING\""), "{body}");
-    let (_, body) = query_ok(&store, "/orders", &format!("user={user}&status=open&limit=2"));
+    let (_, body) = query_ok(
+        &store,
+        "/orders",
+        &format!("user={user}&status=open&limit=2"),
+    );
     assert_eq!(ids(&body), newest_first[4..6]);
-    assert_eq!(query_ok(&store, "/orders", &format!("user={}", user + 1)).1, "[]");
+    assert_eq!(
+        query_ok(&store, "/orders", &format!("user={}", user + 1)).1,
+        "[]"
+    );
 
     let (status, body) = query_ok(&store, &format!("/orders/{}", orders[11]), "");
     assert_eq!(status, "200 OK");
-    assert!(body.contains("\"status\":\"CANCELLED\",\"created_at\":1700000011000,\"updated_at\":"), "{body}");
+    assert!(
+        body.contains("\"status\":\"CANCELLED\",\"created_at\":1700000011000,\"updated_at\":"),
+        "{body}"
+    );
     let (status, body) = query_ok(&store, &format!("/orders/{}", seed << 4), "");
-    assert_eq!((status, body.as_str()), ("404 Not Found", "{\"error\":\"order not found\"}"));
-    assert_eq!(query_ok(&store, "/fills", &format!("order_id={}", orders[0])).1, "[]");
+    assert_eq!(
+        (status, body.as_str()),
+        ("404 Not Found", "{\"error\":\"order not found\"}")
+    );
+    assert_eq!(
+        query_ok(&store, "/fills", &format!("order_id={}", orders[0])).1,
+        "[]"
+    );
 }
 
 /// Same disposable MySQL 8 as above.
@@ -1377,8 +1651,16 @@ fn a_partly_published_batch_is_accepted_with_the_failed_records() {
         r#""accepted":true,"status":"PENDING","count":3"#
     );
     let failed = [
-        FailedRecord { index: 1, order_id: 42, error: "Message timed out".into() },
-        FailedRecord { index: 4, order_id: 45, error: "a \"quoted\" error".into() },
+        FailedRecord {
+            index: 1,
+            order_id: 42,
+            error: "Message timed out".into(),
+        },
+        FailedRecord {
+            index: 4,
+            order_id: 45,
+            error: "a \"quoted\" error".into(),
+        },
     ];
     assert_eq!(
         batch_accepted_json(3, &failed),
@@ -1390,7 +1672,7 @@ fn a_partly_published_batch_is_accepted_with_the_failed_records() {
 fn backpressure_follows_a_migrated_category_to_its_new_group() {
     let bp = test_backpressure(100, 250, 750, 4, 4);
     bp.set_group_health(1, false); // group 1 lost quorum
-    // Category 5 starts on group 1 (5 mod 4).
+                                   // Category 5 starts on group 1 (5 mod 4).
     assert_eq!(bp.tier_for_category(5), BackpressureTier::Emergency);
     // Moved to group 2 (as order-api applies a migration), it is writable.
     bp.routes.restore_pin(5, 2);
@@ -1417,17 +1699,21 @@ fn mysql8_a_failing_later_statement_fails_the_batch() {
 fn mysql8_a_different_dedupe_period_refuses_to_start() {
     let store = mysql_test_store().expect("TC_TEST_MYSQL_URL must be set");
     let mut conn = store.shard(0).get_conn().unwrap();
-    conn.query_drop("CREATE DATABASE IF NOT EXISTS order_db_period_test").unwrap();
-    conn.query_drop("DROP TABLE IF EXISTS order_db_period_test.dedupe_settings").unwrap();
+    conn.query_drop("CREATE DATABASE IF NOT EXISTS order_db_period_test")
+        .unwrap();
+    conn.query_drop("DROP TABLE IF EXISTS order_db_period_test.dedupe_settings")
+        .unwrap();
     check_dedupe_period(&mut conn, "order_db_period_test").unwrap();
     check_dedupe_period(&mut conn, "order_db_period_test").unwrap(); // same: fine
-    conn.query_drop("UPDATE order_db_period_test.dedupe_settings SET value=value*2").unwrap();
+    conn.query_drop("UPDATE order_db_period_test.dedupe_settings SET value=value*2")
+        .unwrap();
     let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         check_dedupe_period(&mut conn, "order_db_period_test")
     }));
     assert!(refused.is_err(), "a changed period must refuse");
     let mut conn = store.shard(0).get_conn().unwrap();
-    conn.query_drop("DROP DATABASE order_db_period_test").unwrap();
+    conn.query_drop("DROP DATABASE order_db_period_test")
+        .unwrap();
 }
 
 #[test]

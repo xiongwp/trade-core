@@ -23,7 +23,9 @@ use trade_core::metrics::LatencyHistogram;
 use trade_core::order::Order;
 use trade_core::order_queue::{encode_envelope, QueueEnvelope, QueueRouter};
 use trade_core::sharding::{self, DEFAULT_ASSET_CATEGORY_SIZE};
-use trade_core::types::{InstrumentId, OrderId, OrderType, Side, TimeInForce, Trigger, TriggerKind};
+use trade_core::types::{
+    InstrumentId, OrderId, OrderType, Side, TimeInForce, Trigger, TriggerKind,
+};
 use trade_core::wire;
 use trade_core::{log_error, log_info, log_warn};
 
@@ -38,8 +40,8 @@ mod ingress;
 mod kafka_stage;
 mod order_query;
 mod pipeline_metrics;
-mod route_log;
 mod raft_forward;
+mod route_log;
 mod schema;
 mod store;
 #[cfg(test)]
@@ -137,7 +139,13 @@ fn main() {
         if let Err(error) = validate_shard_urls(&shard_urls, routing.db_count as usize) {
             panic!("shard routing mismatch: {error}");
         }
-        open_when_ready(&shard_urls, routing, metrics.clone(), owned_dbs.clone(), true)
+        open_when_ready(
+            &shard_urls,
+            routing,
+            metrics.clone(),
+            owned_dbs.clone(),
+            true,
+        )
     });
     // Order queries read every physical DB (one user's orders span all of
     // them). Reuse the projection pools when this worker owns every DB;
@@ -255,7 +263,10 @@ fn main() {
                     group_id,
                     "db-route",
                     worker,
-                    move |batch| route_command_db_batch(&process_kafka, routing, batch),
+                    move |batch| {
+                        route_command_db_batch(&process_kafka, routing, batch)
+                            .map(|()| PartitionFailures::new())
+                    },
                 )
             })
             .expect("spawn command DB route consumer");

@@ -87,7 +87,10 @@ impl IdleCommit {
 
     /// Note that `offset` of `topic`/`partition` has been processed.
     pub(crate) fn record_offset(&mut self, topic: &str, partition: i32, offset: i64) {
-        let next = self.offsets.entry((topic.to_string(), partition)).or_insert(0);
+        let next = self
+            .offsets
+            .entry((topic.to_string(), partition))
+            .or_insert(0);
         *next = (*next).max(offset + 1);
         self.dirty = true;
     }
@@ -117,17 +120,20 @@ impl IdleCommit {
         for (topic, partition) in self.offsets.keys() {
             let _ = probe.add_partition(topic, *partition);
         }
-        let committed: HashMap<(String, i32), i64> = match consumer.committed_offsets(probe, Duration::from_secs(5)) {
-            Ok(list) => list
-                .elements()
-                .iter()
-                .filter_map(|element| match element.offset() {
-                    Offset::Offset(offset) => Some(((element.topic().to_string(), element.partition()), offset)),
-                    _ => None,
-                })
-                .collect(),
-            Err(_) => return, // retried on the next idle tick
-        };
+        let committed: HashMap<(String, i32), i64> =
+            match consumer.committed_offsets(probe, Duration::from_secs(5)) {
+                Ok(list) => list
+                    .elements()
+                    .iter()
+                    .filter_map(|element| match element.offset() {
+                        Offset::Offset(offset) => {
+                            Some(((element.topic().to_string(), element.partition()), offset))
+                        }
+                        _ => None,
+                    })
+                    .collect(),
+                Err(_) => return, // retried on the next idle tick
+            };
         self.offsets
             .retain(|key, offset| committed.get(key).is_none_or(|current| *offset > *current));
         let mut list = TopicPartitionList::new();
@@ -150,8 +156,15 @@ impl IdleCommit {
                 self.dirty = false;
             }
             Err(error) => {
-                if self.last_failure_log.is_none_or(|at| at.elapsed() >= Duration::from_secs(30)) {
-                    log_warn!("order-kafka", "event=idle_commit_failed partitions={} error={error}", self.offsets.len());
+                if self
+                    .last_failure_log
+                    .is_none_or(|at| at.elapsed() >= Duration::from_secs(30))
+                {
+                    log_warn!(
+                        "order-kafka",
+                        "event=idle_commit_failed partitions={} error={error}",
+                        self.offsets.len()
+                    );
                     self.last_failure_log = Some(std::time::Instant::now());
                 }
             }
@@ -162,7 +175,9 @@ impl IdleCommit {
 pub(crate) fn rewind_kafka_batch(consumer: &BaseConsumer, records: &[KafkaRecord]) {
     rewind_to_earliest(
         consumer,
-        records.iter().map(|record| (record.topic.as_str(), record.partition, record.offset)),
+        records
+            .iter()
+            .map(|record| (record.topic.as_str(), record.partition, record.offset)),
     );
 }
 
@@ -187,9 +202,12 @@ pub(crate) fn rewind_to_earliest<'a>(
     for ((topic, partition), offset) in offsets {
         let mut attempt = 0;
         loop {
-            let Err(error) =
-                consumer.seek(topic, partition, Offset::Offset(offset), Duration::from_secs(1))
-            else {
+            let Err(error) = consumer.seek(
+                topic,
+                partition,
+                Offset::Offset(offset),
+                Duration::from_secs(1),
+            ) else {
                 break;
             };
             let assigned = consumer.assignment().map(|list| {
@@ -376,7 +394,7 @@ pub(crate) fn run_kafka_stage<F>(
     worker: usize,
     mut process: F,
 ) where
-    F: FnMut(&[KafkaRecord]) -> Result<(), String>,
+    F: FnMut(&[KafkaRecord]) -> Result<PartitionFailures, String>,
 {
     // Matching has a much more expensive durability boundary than the command
     // DB projection: each Raft application batch crosses quorum WAL plus the
@@ -415,9 +433,11 @@ pub(crate) fn run_kafka_stage<F>(
     );
     let mut consecutive_failures = 0u32;
     let mut last_failure_log = std::time::Instant::now() - Duration::from_secs(30);
+    let mut partition_retries = HashMap::<PartitionKey, PartitionRetry>::new();
 
     let mut idle_commit = IdleCommit::default();
     loop {
+        resume_due_partitions(&consumer, &mut partition_retries);
         // Between batches only: a batch in hand is finished and its offsets
         // committed. Returning drops the consumer, which leaves its group so
         // the partitions move to the replacement at once instead of after the
@@ -433,9 +453,7 @@ pub(crate) fn run_kafka_stage<F>(
         match first {
             Ok(message) => match decode_kafka_record(&message, &kafka.router, category_size) {
                 Ok(record) => batch.push(record),
-                Err(error) => {
-                    dead_letter_command(stage, &message, &error)
-                }
+                Err(error) => dead_letter_command(stage, &message, &error),
             },
             Err(error) => {
                 if last_failure_log.elapsed() >= Duration::from_secs(30) {
@@ -452,9 +470,7 @@ pub(crate) fn run_kafka_stage<F>(
                 Some(Ok(message)) => {
                     match decode_kafka_record(&message, &kafka.router, category_size) {
                         Ok(record) => batch.push(record),
-                        Err(error) => {
-                            dead_letter_command(stage, &message, &error)
-                        }
+                        Err(error) => dead_letter_command(stage, &message, &error),
                     }
                 }
                 Some(Err(error)) => {
@@ -466,31 +482,223 @@ pub(crate) fn run_kafka_stage<F>(
                 None => break,
             }
         }
-        match process(&batch)
-            .and_then(|()| commit_kafka_batch(&consumer, &batch, kafka.async_offset_commits))
-        {
-            Ok(()) => {
+        match process(&batch) {
+            Ok(failures) if failures.is_empty() => {
+                if let Err(error) =
+                    commit_kafka_batch(&consumer, &batch, kafka.async_offset_commits)
+                {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    log_retry(
+                        stage,
+                        worker,
+                        consecutive_failures,
+                        &mut last_failure_log,
+                        &error,
+                    );
+                    rewind_kafka_batch(&consumer, &batch);
+                    let shift = consecutive_failures.saturating_sub(1).min(6);
+                    std::thread::sleep(Duration::from_millis((100u64 << shift).min(5_000)));
+                    continue;
+                }
                 idle_commit.record(&batch);
+                clear_partition_retries(&batch, &mut partition_retries);
                 kafka.metrics.complete(stage, batch.len() as u64);
                 consecutive_failures = 0;
             }
-            Err(error) => {
-                consecutive_failures = consecutive_failures.saturating_add(1);
-                if consecutive_failures == 1
-                    || last_failure_log.elapsed() >= Duration::from_secs(30)
-                {
+            Ok(failures) => {
+                let (completed, failed): (Vec<_>, Vec<_>) =
+                    batch.iter().cloned().partition(|record| {
+                        !failures.contains_key(&(record.topic.clone(), record.partition))
+                    });
+                rewind_kafka_batch(&consumer, &failed);
+                pause_failed_partitions(&consumer, &failures, &mut partition_retries);
+                if !completed.is_empty() {
+                    match commit_kafka_batch(&consumer, &completed, kafka.async_offset_commits) {
+                        Ok(()) => {
+                            idle_commit.record(&completed);
+                            clear_partition_retries(&completed, &mut partition_retries);
+                            kafka.metrics.complete(stage, completed.len() as u64);
+                        }
+                        Err(error) => {
+                            // The healthy partitions were processed but their
+                            // commit failed. Rewind them too; downstream
+                            // command IDs make the replay idempotent.
+                            rewind_kafka_batch(&consumer, &completed);
+                            consecutive_failures = consecutive_failures.saturating_add(1);
+                            log_retry(
+                                stage,
+                                worker,
+                                consecutive_failures,
+                                &mut last_failure_log,
+                                &error,
+                            );
+                        }
+                    }
+                }
+                if last_failure_log.elapsed() >= Duration::from_secs(30) {
+                    let first = failures
+                        .values()
+                        .next()
+                        .map(String::as_str)
+                        .unwrap_or("unknown");
                     log_warn!(
                         "order-kafka", format_args!("{stage}-{worker}");
-                        "event=batch_retained_for_retry failures={consecutive_failures} error={error}"
+                        "event=partitions_paused failed={} completed={} error={first}",
+                        failures.len(),
+                        completed.len()
                     );
                     last_failure_log = std::time::Instant::now();
                 }
+            }
+            Err(error) => {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                log_retry(
+                    stage,
+                    worker,
+                    consecutive_failures,
+                    &mut last_failure_log,
+                    &error,
+                );
                 rewind_kafka_batch(&consumer, &batch);
                 let shift = consecutive_failures.saturating_sub(1).min(6);
                 let backoff_ms = (100u64 << shift).min(5_000);
                 std::thread::sleep(Duration::from_millis(backoff_ms));
             }
         }
+    }
+}
+
+fn log_retry(
+    stage: &str,
+    worker: usize,
+    failures: u32,
+    last_log: &mut std::time::Instant,
+    error: &str,
+) {
+    if failures == 1 || last_log.elapsed() >= Duration::from_secs(30) {
+        log_warn!(
+            "order-kafka", format_args!("{stage}-{worker}");
+            "event=batch_retained_for_retry failures={failures} error={error}"
+        );
+        *last_log = std::time::Instant::now();
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PartitionRetry {
+    attempts: u32,
+    resume_at: Option<std::time::Instant>,
+}
+
+fn schedule_partition_retry(
+    retries: &mut HashMap<PartitionKey, PartitionRetry>,
+    key: PartitionKey,
+    now: std::time::Instant,
+) -> Duration {
+    let attempt = retries
+        .get(&key)
+        .map_or(1, |state| state.attempts.saturating_add(1));
+    let delay = Duration::from_millis((100u64 << attempt.saturating_sub(1).min(6)).min(5_000));
+    retries.insert(
+        key,
+        PartitionRetry {
+            attempts: attempt,
+            resume_at: Some(now + delay),
+        },
+    );
+    delay
+}
+
+fn clear_partition_retries(
+    records: &[KafkaRecord],
+    retries: &mut HashMap<PartitionKey, PartitionRetry>,
+) {
+    for record in records {
+        retries.remove(&(record.topic.clone(), record.partition));
+    }
+}
+
+fn pause_failed_partitions(
+    consumer: &BaseConsumer,
+    failures: &PartitionFailures,
+    retries: &mut HashMap<PartitionKey, PartitionRetry>,
+) {
+    let mut partitions = TopicPartitionList::new();
+    for ((topic, partition), _) in failures {
+        partitions.add_partition(topic, *partition);
+        schedule_partition_retry(
+            retries,
+            (topic.clone(), *partition),
+            std::time::Instant::now(),
+        );
+    }
+    if let Err(error) = consumer.pause(&partitions) {
+        log_warn!("order-kafka", "event=partition_pause_failed error={error}");
+    }
+}
+
+fn resume_due_partitions(
+    consumer: &BaseConsumer,
+    retries: &mut HashMap<PartitionKey, PartitionRetry>,
+) {
+    let now = std::time::Instant::now();
+    let due = retries
+        .iter()
+        .filter(|(_, state)| state.resume_at.is_some_and(|resume_at| resume_at <= now))
+        .map(|(key, _)| key.clone())
+        .collect::<Vec<_>>();
+    if due.is_empty() {
+        return;
+    }
+    let mut partitions = TopicPartitionList::new();
+    for (topic, partition) in &due {
+        partitions.add_partition(topic, *partition);
+    }
+    if let Err(error) = consumer.resume(&partitions) {
+        log_warn!("order-kafka", "event=partition_resume_failed error={error}");
+        return;
+    }
+    for key in due {
+        if let Some(state) = retries.get_mut(&key) {
+            // Keep the attempt count until this partition is processed and
+            // committed successfully. A persistent group failure therefore
+            // backs off exponentially instead of restarting at 100 ms.
+            state.resume_at = None;
+        }
+    }
+}
+
+#[cfg(test)]
+mod partition_retry_tests {
+    use super::*;
+
+    #[test]
+    fn retry_backoff_survives_resume_until_success() {
+        let key = ("orders".to_string(), 7);
+        let now = std::time::Instant::now();
+        let mut retries = HashMap::new();
+
+        assert_eq!(
+            schedule_partition_retry(&mut retries, key.clone(), now),
+            Duration::from_millis(100)
+        );
+        retries.get_mut(&key).unwrap().resume_at = None;
+        assert_eq!(
+            schedule_partition_retry(&mut retries, key.clone(), now),
+            Duration::from_millis(200)
+        );
+        assert_eq!(retries[&key].attempts, 2);
+
+        let record = KafkaRecord {
+            topic: key.0.clone(),
+            partition: key.1,
+            offset: 1,
+            category_id: 0,
+            user: 1,
+            frame: [0; wire::MSG_LEN],
+        };
+        clear_partition_retries(&[record], &mut retries);
+        assert!(!retries.contains_key(&key));
     }
 }
 

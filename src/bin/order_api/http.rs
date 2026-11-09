@@ -2,6 +2,18 @@
 
 use super::*;
 
+fn should_log_ingress_rejection() -> bool {
+    static LAST_LOG_SEC: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs());
+    let previous = LAST_LOG_SEC.load(AtomicOrdering::Relaxed);
+    now >= previous.saturating_add(5)
+        && LAST_LOG_SEC
+            .compare_exchange(previous, now, AtomicOrdering::Relaxed, AtomicOrdering::Relaxed)
+            .is_ok()
+}
+
 pub(crate) fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
     query.split('&').find_map(|part| {
         let (k, v) = part.split_once('=')?;
@@ -135,6 +147,18 @@ pub(crate) fn handle(
             }
             continue;
         }
+        if method == "GET" && path == "/admin/routes/unfinished" {
+            respond(
+                reader.get_mut(),
+                "200 OK",
+                &unfinished_migrations_json(),
+                keep_alive,
+            );
+            if !keep_alive {
+                return;
+            }
+            continue;
+        }
         if method == "POST" && path.starts_with("/admin/routes/") {
             let category = required::<u32>(query, "category");
             let result: Result<String, String> = category.and_then(|category| match path {
@@ -163,9 +187,17 @@ pub(crate) fn handle(
                 let (status, error) = if ingress_enabled {
                     ("400 Bad Request", "websocket upgrade required")
                 } else {
-                    ("503 Service Unavailable", "ingress disabled for this worker role")
+                    (
+                        "503 Service Unavailable",
+                        "ingress disabled for this worker role",
+                    )
                 };
-                respond(reader.get_mut(), status, &format!("{{\"error\":\"{error}\"}}"), false);
+                respond(
+                    reader.get_mut(),
+                    status,
+                    &format!("{{\"error\":\"{error}\"}}"),
+                    false,
+                );
                 return;
             };
             let Ok(mut writer) = reader.get_ref().try_clone() else {
@@ -179,15 +211,21 @@ pub(crate) fn handle(
             }
             // `reader` may already hold frames the client pipelined behind
             // the handshake, so it stays the read side.
-            let result = ws_order_session(&mut reader, &mut writer, ws_max_batch(), |body| {
-                match decode_batch(body, category_size) {
-                    Ok(records) => match kafka.publish_batch(&records) {
-                        Ok(failed) => Ok(batch_accepted_json(records.len() - failed.len(), &failed)),
-                        Err(error) => Err((ingress_error_status(&error), error)),
+            let result =
+                ws_order_session(
+                    &mut reader,
+                    &mut writer,
+                    ws_max_batch(),
+                    |body| match decode_batch(body, category_size) {
+                        Ok(records) => match kafka.publish_batch(&records) {
+                            Ok(failed) => {
+                                Ok(batch_accepted_json(records.len() - failed.len(), &failed))
+                            }
+                            Err(error) => Err((ingress_error_status(&error), error)),
+                        },
+                        Err(error) => Err(("400 Bad Request", error)),
                     },
-                    Err(error) => Err(("400 Bad Request", error)),
-                }
-            });
+                );
             if let Err(error) = result {
                 log_warn!("order-api", "event=ws_session_closed error={error}");
             }
@@ -222,7 +260,10 @@ pub(crate) fn handle(
                         respond(
                             reader.get_mut(),
                             "202 Accepted",
-                            &format!("{{{}}}", batch_accepted_json(records.len() - failed.len(), &failed)),
+                            &format!(
+                                "{{{}}}",
+                                batch_accepted_json(records.len() - failed.len(), &failed)
+                            ),
                             keep_alive,
                         )
                     }
@@ -230,11 +271,13 @@ pub(crate) fn handle(
                         let status = ingress_error_status(&error);
                         // Rejected ingress is an異常 path: keep it correlatable
                         // (success stays silent — the metrics carry it).
-                        log_warn!(
-                            "order-api",
-                            "event=batch_rejected status=\"{status}\" count={} error={error}",
-                            records.len()
-                        );
+                        if should_log_ingress_rejection() {
+                            log_warn!(
+                                "order-api",
+                                "event=batch_rejected status=\"{status}\" count={} error={error}",
+                                records.len()
+                            );
+                        }
                         respond(
                             reader.get_mut(),
                             status,

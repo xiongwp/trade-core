@@ -39,7 +39,12 @@ pub(crate) struct OrderPipelineMetrics {
 }
 
 impl OrderPipelineMetrics {
-    pub(crate) fn record(total: &AtomicU64, max: &AtomicU64, samples: &AtomicU64, elapsed: Duration) {
+    pub(crate) fn record(
+        total: &AtomicU64,
+        max: &AtomicU64,
+        samples: &AtomicU64,
+        elapsed: Duration,
+    ) {
         let ns = elapsed.as_nanos() as u64;
         total.fetch_add(ns, AtomicOrdering::Relaxed);
         max.fetch_max(ns, AtomicOrdering::Relaxed);

@@ -32,7 +32,7 @@ use std::sync::{Arc, RwLock};
 
 use protobuf::Message as PbMessage;
 use raft::eraftpb::{ConfChange, ConfChangeType, ConfState, Entry, EntryType, HardState, Snapshot};
-use raft::prelude::Message;
+use raft::prelude::{Message, MessageType};
 use raft::storage::MemStorage;
 use raft::{Config, GetEntriesContext, RaftState, RawNode, StateRole, Storage};
 
@@ -189,7 +189,10 @@ impl DurableRaftLog {
             // made a node with a ~17 MiB book unable to restart). A record
             // longer than the remaining bytes cannot be complete — the same
             // torn tail that reading it would hit.
-            let remaining = read.metadata()?.len().saturating_sub(read.stream_position()?);
+            let remaining = read
+                .metadata()?
+                .len()
+                .saturating_sub(read.stream_position()?);
             if length as u64 + 8 > remaining {
                 read.set_len(record_start)?;
                 read.sync_all()?;
@@ -515,6 +518,12 @@ pub struct RaftNode {
     /// Application snapshot blob installed from a peer, awaiting the state
     /// machine's attention.
     installed_snapshot: Option<Snapshot>,
+    /// Explicit disk-replacement mode. Raft normally assumes a voter never
+    /// loses stable storage while retaining its identity. A replacement with
+    /// the same id must first force the leader's remembered progress back to
+    /// probe mode, otherwise an optimistic heartbeat can commit beyond this
+    /// member's empty log and raft-rs aborts.
+    rejoining: bool,
 }
 
 impl RaftNode {
@@ -611,6 +620,7 @@ impl RaftNode {
             committed: Vec::new(),
             durable,
             installed_snapshot: None,
+            rejoining: false,
         })
     }
 
@@ -683,6 +693,19 @@ impl RaftNode {
             .unwrap()
             .as_ref()
             .map_or(0, |s| s.get_metadata().index)
+    }
+
+    /// Enter explicit stable-storage replacement mode. While active this node
+    /// never campaigns and rejects a heartbeat whose commit is beyond its
+    /// local log, making the leader rediscover the common prefix and send the
+    /// missing append entries or a snapshot.
+    pub fn begin_rejoin(&mut self) {
+        self.rejoining = true;
+    }
+
+    #[inline]
+    pub fn is_rejoining(&self) -> bool {
+        self.rejoining
     }
 
     /// The current voter set, sorted.
@@ -810,12 +833,46 @@ impl RaftNode {
 
     /// Advance logical time and produce heartbeat/election traffic.
     pub fn tick(&mut self) {
+        if self.rejoining {
+            return;
+        }
         self.node.tick();
         self.drive();
     }
 
     /// Deliver one peer message received from the cluster transport.
     pub fn step(&mut self, message: Message) -> Result<(), raft::Error> {
+        if self.rejoining
+            && message.get_msg_type() == MessageType::MsgHeartbeat
+            && message.term >= self.term()
+        {
+            if message.commit > self.last_index() {
+                // The leader can still remember this member as fully matched
+                // from before its disk was replaced. A rejection index above
+                // every real log index is deliberate: in replicate mode it is
+                // guaranteed not to look stale, so raft-rs moves the peer to
+                // probe mode. Its first normal append then receives the exact
+                // local reject_hint and replication resumes from there.
+                let mut rejection = Message::default();
+                rejection.set_msg_type(MessageType::MsgAppendResponse);
+                rejection.from = self.id();
+                rejection.to = message.from;
+                rejection.term = message.term;
+                rejection.reject = true;
+                rejection.index = u64::MAX;
+                rejection.reject_hint = self.last_index();
+                rejection.commit = self.commit_index();
+                self.outbound.push(rejection);
+                return Ok(());
+            }
+            // A heartbeat at or below our durable end proves the leader no
+            // longer assumes progress we lost. Process it normally, then let
+            // the runtime remove its persistent rejoin marker.
+            self.node.step(message)?;
+            self.drive();
+            self.rejoining = false;
+            return Ok(());
+        }
         self.node.step(message)?;
         self.drive();
         Ok(())
@@ -1033,6 +1090,47 @@ mod tests {
     fn follower_cannot_accept_client_commands() {
         let mut follower = node(2);
         assert_eq!(follower.propose(vec![1]), Err(ProposeError::NotLeader));
+    }
+
+    #[test]
+    fn replacement_voter_forces_stale_leader_progress_back_to_probe() {
+        let mut nodes = (1..=5).map(node).collect::<Vec<_>>();
+        elect(&mut nodes, 0);
+        for command in [b"one".as_slice(), b"two", b"three"] {
+            nodes[0].propose(command.to_vec()).unwrap();
+            pump(&mut nodes);
+        }
+        let leader_last = nodes[0].last_index();
+        assert!(leader_last > 1);
+
+        // Replace voter 2 with an empty disk while the live leader still
+        // remembers the old instance as fully replicated.
+        nodes[1] = node(2);
+        nodes[1].begin_rejoin();
+        assert_eq!(nodes[1].last_index(), 0);
+
+        // The first heartbeat used to call commit_to(leader_commit) against
+        // last_index=0 and panic. Rejoin mode emits a rejection, the leader
+        // probes, and the replacement receives the complete committed log.
+        nodes[0].tick();
+        nodes[0].tick();
+        pump(&mut nodes);
+        nodes[0].tick();
+        nodes[0].tick();
+        pump(&mut nodes);
+
+        assert_eq!(nodes[1].last_index(), leader_last);
+        assert_eq!(nodes[1].commit_index(), nodes[0].commit_index());
+        assert!(!nodes[1].is_rejoining());
+        let recovered = nodes[1]
+            .take_committed()
+            .into_iter()
+            .map(|entry| entry.data)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            recovered,
+            [b"one".to_vec(), b"two".to_vec(), b"three".to_vec()]
+        );
     }
 
     #[test]
@@ -1324,7 +1422,11 @@ mod tests {
         drop(file);
         let mut again = RaftNode::open(config, &path).unwrap();
         assert!(again.take_installed_snapshot().is_some());
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), len, "torn record trimmed");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            len,
+            "torn record trimmed"
+        );
         std::fs::remove_file(path).ok();
     }
 
