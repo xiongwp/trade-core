@@ -75,6 +75,7 @@ pub(crate) fn commit_kafka_batch(
 pub(crate) struct IdleCommit {
     offsets: HashMap<(String, i32), i64>,
     dirty: bool,
+    last_failure_log: Option<std::time::Instant>,
 }
 
 impl IdleCommit {
@@ -95,6 +96,19 @@ impl IdleCommit {
         if !self.dirty {
             return;
         }
+        // Only partitions this consumer still owns. After a rebalance moved a
+        // partition away, a commit that names it is refused whole, so one
+        // stale entry kept every offset of this consumer uncommitted for good
+        // (observed: 7 partitions stuck, group lag never draining). The new
+        // owner commits a moved partition itself.
+        if let Ok(assignment) = consumer.assignment() {
+            let owned: std::collections::HashSet<(String, i32)> = assignment
+                .elements()
+                .iter()
+                .map(|element| (element.topic().to_string(), element.partition()))
+                .collect();
+            self.offsets.retain(|key, _| owned.contains(key));
+        }
         let mut list = TopicPartitionList::new();
         for ((topic, partition), offset) in &self.offsets {
             if list
@@ -104,8 +118,14 @@ impl IdleCommit {
                 return;
             }
         }
-        if consumer.commit(&list, CommitMode::Sync).is_ok() {
-            self.dirty = false;
+        match consumer.commit(&list, CommitMode::Sync) {
+            Ok(()) => self.dirty = false,
+            Err(error) => {
+                if self.last_failure_log.is_none_or(|at| at.elapsed() >= Duration::from_secs(30)) {
+                    log_warn!("order-kafka", "event=idle_commit_failed partitions={} error={error}", self.offsets.len());
+                    self.last_failure_log = Some(std::time::Instant::now());
+                }
+            }
         }
     }
 }
