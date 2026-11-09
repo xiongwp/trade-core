@@ -108,6 +108,86 @@ impl State {
     }
 }
 
+const MARKET_STATE_MAGIC: &[u8; 4] = b"TCM1";
+
+/// Candle history and its exact replay watermark must cross the durability
+/// boundary together. Otherwise a crash after saving candles but before
+/// saving the watermark counts the same execution again when any Raft replica
+/// replays its tail.
+fn encode_market_state(state: &State) -> Vec<u8> {
+    let candles = state.agg.encode();
+    let mut applied: Vec<_> = state.applied.iter().collect();
+    applied.sort_unstable_by_key(|(group, _)| **group);
+    let mut out = Vec::with_capacity(24 + candles.len() + applied.len() * 16);
+    out.extend_from_slice(MARKET_STATE_MAGIC);
+    out.extend_from_slice(&(candles.len() as u64).to_le_bytes());
+    out.extend_from_slice(&candles);
+    out.extend_from_slice(&(applied.len() as u32).to_le_bytes());
+    for (&group, &(index, ordinal)) in applied {
+        out.extend_from_slice(&group.to_le_bytes());
+        out.extend_from_slice(&index.to_le_bytes());
+        out.extend_from_slice(&ordinal.to_le_bytes());
+    }
+    out.extend_from_slice(&state.last_ts.to_le_bytes());
+    let checksum = trade_core::journal::fnv1a(&out);
+    out.extend_from_slice(&checksum.to_le_bytes());
+    out
+}
+
+fn decode_market_state(
+    bytes: &[u8],
+) -> std::io::Result<(KlineAggregator, HashMap<u32, (u64, u32)>, u64)> {
+    let bad =
+        |message: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, message.to_string());
+    // Backwards-compatible one-time upgrade from candle-only TCK2 snapshots.
+    if bytes.starts_with(b"TCK2") {
+        return Ok((KlineAggregator::decode(bytes)?, HashMap::new(), 0));
+    }
+    if bytes.len() < 32 || &bytes[..4] != MARKET_STATE_MAGIC {
+        return Err(bad("bad market state magic"));
+    }
+    let body_end = bytes.len() - 8;
+    let stored = u64::from_le_bytes(bytes[body_end..].try_into().unwrap());
+    if trade_core::journal::fnv1a(&bytes[..body_end]) != stored {
+        return Err(bad("market state checksum mismatch"));
+    }
+    let candle_len = u64::from_le_bytes(bytes[4..12].try_into().unwrap()) as usize;
+    let candle_end = 12usize
+        .checked_add(candle_len)
+        .ok_or_else(|| bad("market state length overflow"))?;
+    if candle_end + 4 > body_end {
+        return Err(bad("truncated market candle state"));
+    }
+    let agg = KlineAggregator::decode(&bytes[12..candle_end])?;
+    let count = u32::from_le_bytes(bytes[candle_end..candle_end + 4].try_into().unwrap()) as usize;
+    let marks_start = candle_end + 4;
+    let marks_end = marks_start
+        .checked_add(
+            count
+                .checked_mul(16)
+                .ok_or_else(|| bad("market watermark count overflow"))?,
+        )
+        .ok_or_else(|| bad("market watermark length overflow"))?;
+    if marks_end + 8 != body_end {
+        return Err(bad("truncated or trailing market watermarks"));
+    }
+    let mut applied = HashMap::with_capacity(count);
+    for record in bytes[marks_start..marks_end].chunks_exact(16) {
+        let group = u32::from_le_bytes(record[0..4].try_into().unwrap());
+        let index = u64::from_le_bytes(record[4..12].try_into().unwrap());
+        let ordinal = u32::from_le_bytes(record[12..16].try_into().unwrap());
+        if applied.insert(group, (index, ordinal)).is_some() {
+            return Err(bad("duplicate market watermark group"));
+        }
+    }
+    let last_ts = u64::from_le_bytes(bytes[marks_end..body_end].try_into().unwrap());
+    Ok((agg, applied, last_ts))
+}
+
+fn write_market_state(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    KlineAggregator::write_encoded(path, bytes)
+}
+
 fn now_sec() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -823,37 +903,43 @@ fn main() {
         std::fs::create_dir_all(&data_dir).expect("create data dir");
         PathBuf::from(&data_dir).join("klines.bin")
     });
-    let agg = persist
+    let restored = persist
         .as_ref()
-        .and_then(|p| match KlineAggregator::load(p) {
-            Ok(a) => {
-                log_info!("market-data", "loaded candle history from {}", p.display());
-                Some(a)
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => {
-                // Keep the unreadable file for inspection; the next save
-                // would otherwise replace it.
-                let mut aside = p.as_os_str().to_owned();
-                aside.push(format!(".unreadable-{}", now_sec()));
-                let moved = std::fs::rename(p, &aside);
-                log_warn!(
-                    "market-data",
-                    "event=history_load_failed path={} error={error} moved_aside={}",
-                    p.display(),
-                    moved.is_ok()
-                );
-                None
-            }
-        })
-        .unwrap_or_else(|| KlineAggregator::new(2000));
+        .and_then(
+            |p| match std::fs::read(p).and_then(|bytes| decode_market_state(&bytes)) {
+                Ok(state) => {
+                    log_info!(
+                        "market-data",
+                        "loaded durable market state from {}",
+                        p.display()
+                    );
+                    Some(state)
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => {
+                    // Keep the unreadable file for inspection; the next save
+                    // would otherwise replace it.
+                    let mut aside = p.as_os_str().to_owned();
+                    aside.push(format!(".unreadable-{}", now_sec()));
+                    let moved = std::fs::rename(p, &aside);
+                    log_warn!(
+                        "market-data",
+                        "event=history_load_failed path={} error={error} moved_aside={}",
+                        p.display(),
+                        moved.is_ok()
+                    );
+                    None
+                }
+            },
+        )
+        .unwrap_or_else(|| (KlineAggregator::new(2000), HashMap::new(), 0));
 
     let state = Arc::new(Mutex::new(State {
-        agg,
+        agg: restored.0,
         depth: DepthStore::default(),
         trades: HashMap::new(),
-        applied: HashMap::new(),
-        last_ts: 0,
+        applied: restored.1,
+        last_ts: restored.2,
     }));
 
     // Feed thread.
@@ -873,8 +959,8 @@ fn main() {
                 std::thread::sleep(Duration::from_secs(10));
                 // Encode under the lock, write and fsync after releasing it:
                 // the feed threads must not wait on the disk.
-                let bytes = save_state.lock().unwrap().agg.encode();
-                if let Err(error) = KlineAggregator::write_encoded(&path, &bytes) {
+                let bytes = encode_market_state(&save_state.lock().unwrap());
+                if let Err(error) = write_market_state(&path, &bytes) {
                     log_warn!("market-data", "event=history_save_failed error={error}");
                 }
             })
@@ -937,8 +1023,11 @@ fn main() {
     // history up to the moment of shutdown (mirrors the periodic snapshot).
     if let Some(path) = persist {
         let st = state.lock().unwrap();
-        let _ = st.agg.save(&path);
-        log_info!("market-data", "candle history flushed on shutdown");
+        let _ = write_market_state(&path, &encode_market_state(&st));
+        log_info!(
+            "market-data",
+            "market history and replay watermarks flushed on shutdown"
+        );
     }
 }
 
@@ -987,6 +1076,55 @@ mod tests {
         );
         // Depth from a feed behind the group is not current.
         assert!(!st.current(3, 12) && st.current(3, 13) && st.current(9, 0));
+    }
+
+    #[test]
+    fn candle_history_and_replay_watermarks_restart_atomically() {
+        let mut state = State {
+            agg: KlineAggregator::new(10),
+            depth: DepthStore::default(),
+            trades: HashMap::new(),
+            applied: HashMap::from([(3, (42, 7)), (9, (11, 2))]),
+            last_ts: 1_700_000_123,
+        };
+        state
+            .agg
+            .on_trade(InstrumentId(17), state.last_ts, 1_005, 9);
+
+        let bytes = encode_market_state(&state);
+        let (agg, applied, last_ts) = decode_market_state(&bytes).unwrap();
+        assert_eq!(applied, state.applied);
+        assert_eq!(last_ts, state.last_ts);
+        assert_eq!(
+            agg.candles(InstrumentId(17), "1s", 10),
+            state.agg.candles(InstrumentId(17), "1s", 10)
+        );
+
+        let mut restarted = State {
+            agg,
+            depth: DepthStore::default(),
+            trades: HashMap::new(),
+            applied,
+            last_ts,
+        };
+        assert!(!restarted.take(3, 42, 7), "saved event is not recounted");
+        assert!(
+            restarted.take(3, 42, 8),
+            "the next event remains admissible"
+        );
+    }
+
+    #[test]
+    fn legacy_candle_snapshot_is_read_and_upgraded_without_a_watermark() {
+        let mut agg = KlineAggregator::new(10);
+        agg.on_trade(InstrumentId(1), 1_700_000_000, 99, 2);
+        let (decoded, applied, last_ts) = decode_market_state(&agg.encode()).unwrap();
+        assert_eq!(
+            decoded.candles(InstrumentId(1), "1s", 10),
+            agg.candles(InstrumentId(1), "1s", 10)
+        );
+        assert!(applied.is_empty());
+        assert_eq!(last_ts, 0);
     }
 
     #[test]
