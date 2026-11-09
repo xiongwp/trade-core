@@ -705,6 +705,17 @@ fn main() {
                                 if stored > node.applied_index() {
                                     return Ok(()); // newer than applied: next pass
                                 }
+                                // Never fold entries whose events are not all on
+                                // Kafka: a follower that installs this snapshot
+                                // has no outbox records for them, so if it took
+                                // over it could never publish them. The pending
+                                // gauge alone was a stale, once-per-pass reading.
+                                let drained = runtime_metrics
+                                    .execution_outbox_drained_through
+                                    .load(Ordering::Acquire);
+                                if stored > drained {
+                                    return Ok(()); // not yet published that far
+                                }
                                 node.compact(stored, bytes).map(|_| ())
                             }) {
                                 Ok(()) => log_info!(
@@ -972,6 +983,10 @@ fn spawn_execution_outbox_publisher(
                     .unwrap_or(1),
             );
             while running.load(Ordering::Acquire) {
+                // Read before looking at the outbox: the records of every entry
+                // at or below this index were appended before it was applied,
+                // so if nothing is pending below, all of them are published.
+                let applied_before_pass = metrics.raft_applied_index.load(Ordering::Acquire);
                 let mut published_any = false;
                 // Any publish, checkpoint or cursor failure in this pass.
                 let mut pass_failed = false;
@@ -1069,6 +1084,13 @@ fn spawn_execution_outbox_publisher(
                 metrics
                     .execution_outbox_pending
                     .store(pending_before_publish, Ordering::Release);
+                // A follower's pending count is measured against the leader's
+                // broker-acknowledged position, so zero means published there too.
+                if pending_before_publish == 0 {
+                    metrics
+                        .execution_outbox_drained_through
+                        .fetch_max(applied_before_pass, Ordering::AcqRel);
+                }
                 let segments = readers
                     .iter()
                     .map(|(path, reader)| {

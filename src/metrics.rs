@@ -76,6 +76,9 @@ pub struct Metrics {
     pub match_ns_max: AtomicU64,
     pub match_samples: AtomicU64,
     pub execution_outbox_pending: AtomicU64,
+    /// Every outbox record of Raft entries at or below this index is
+    /// broker-acknowledged (set by the publisher; gates log compaction).
+    pub execution_outbox_drained_through: AtomicU64,
     pub execution_outbox_published: AtomicU64,
     pub execution_outbox_publish_failures: AtomicU64,
     pub execution_outbox_publish_healthy: AtomicU64,
