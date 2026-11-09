@@ -528,7 +528,13 @@ pub struct RaftNode {
     /// Repeating it during a multi-message transfer resets progress and can
     /// livelock a replacement after the first chunk.
     rejoin_probe_sent: bool,
+    /// Leader commit cut that the replacement must durably reach before its
+    /// persistent rejoin marker may be cleared.
+    rejoin_target_commit: u64,
 }
+
+const REJOIN_RESET_CONTEXT: &[u8] = b"trade-core/rejoin-reset/v1";
+const REJOIN_TARGET_CONTEXT: &[u8] = b"trade-core/rejoin-target/v1";
 
 impl RaftNode {
     pub fn new(cluster: ClusterConfig) -> Result<Self, raft::Error> {
@@ -626,6 +632,7 @@ impl RaftNode {
             installed_snapshot: None,
             rejoining: false,
             rejoin_probe_sent: false,
+            rejoin_target_commit: 0,
         })
     }
 
@@ -707,6 +714,7 @@ impl RaftNode {
     pub fn begin_rejoin(&mut self) {
         self.rejoining = true;
         self.rejoin_probe_sent = false;
+        self.rejoin_target_commit = self.commit_index();
     }
 
     #[inline]
@@ -848,23 +856,63 @@ impl RaftNode {
 
     /// Deliver one peer message received from the cluster transport.
     pub fn step(&mut self, message: Message) -> Result<(), raft::Error> {
+        // Raft's Progress.matched is intentionally monotonic because a voter
+        // is assumed never to lose stable storage while retaining its id. An
+        // explicitly marked replacement breaks that assumption. Handle its
+        // authenticated-by-protocol reset request before raft-rs can discard
+        // the lower append response as stale.
+        if self.is_leader()
+            && message.get_msg_type() == MessageType::MsgAppendResponse
+            && message.term == self.term()
+            && message.reject
+            && message.index == u64::MAX
+            && message.context.as_ref() == REJOIN_RESET_CONTEXT
+        {
+            let peer = message.from;
+            let hint = message.reject_hint;
+            let recognized = if let Some(progress) = self.node.raft.mut_prs().get_mut(peer) {
+                if hint <= progress.matched {
+                    progress.matched = hint;
+                    progress.committed_index = progress.committed_index.min(hint);
+                    progress.pending_request_snapshot = raft::INVALID_INDEX;
+                    progress.become_probe();
+                    progress.recent_active = true;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if recognized {
+                let target = self.commit_index();
+                self.node.raft.send_append(peer);
+                self.drive();
+                let mut target_message = Message::default();
+                target_message.set_msg_type(MessageType::MsgHeartbeat);
+                target_message.from = self.id();
+                target_message.to = peer;
+                target_message.term = self.term();
+                target_message.commit = target;
+                target_message.context = REJOIN_TARGET_CONTEXT.to_vec().into();
+                self.outbound.push(target_message);
+            }
+            return Ok(());
+        }
+        if self.rejoining
+            && message.get_msg_type() == MessageType::MsgHeartbeat
+            && message.context.as_ref() == REJOIN_TARGET_CONTEXT
+            && message.term >= self.term()
+        {
+            self.rejoin_target_commit = self.rejoin_target_commit.max(message.commit);
+            return Ok(());
+        }
         if self.rejoining
             && message.get_msg_type() == MessageType::MsgHeartbeat
             && message.term >= self.term()
         {
-            if message.commit > self.last_index() {
-                if self.rejoin_probe_sent {
-                    // The leader is already probing/transferring the missing
-                    // prefix. Ignore optimistic heartbeats until the local end
-                    // catches up; another rejection would restart the transfer.
-                    return Ok(());
-                }
-                // The leader can still remember this member as fully matched
-                // from before its disk was replaced. A rejection index above
-                // every real log index is deliberate: in replicate mode it is
-                // guaranteed not to look stale, so raft-rs moves the peer to
-                // probe mode. Its first normal append then receives the exact
-                // local reject_hint and replication resumes from there.
+            self.rejoin_target_commit = self.rejoin_target_commit.max(message.commit);
+            if !self.rejoin_probe_sent {
                 let mut rejection = Message::default();
                 rejection.set_msg_type(MessageType::MsgAppendResponse);
                 rejection.from = self.id();
@@ -874,8 +922,15 @@ impl RaftNode {
                 rejection.index = u64::MAX;
                 rejection.reject_hint = self.last_index();
                 rejection.commit = self.commit_index();
+                rejection.context = REJOIN_RESET_CONTEXT.to_vec().into();
                 self.outbound.push(rejection);
                 self.rejoin_probe_sent = true;
+                return Ok(());
+            }
+            if message.commit > self.last_index() {
+                // The leader is already probing/transferring the missing
+                // prefix. Ignore optimistic heartbeats until the local end
+                // catches up; another reset would restart the transfer.
                 return Ok(());
             }
             // A heartbeat at or below our durable end proves the leader no
@@ -883,7 +938,9 @@ impl RaftNode {
             // the runtime remove its persistent rejoin marker.
             self.node.step(message)?;
             self.drive();
-            self.rejoining = false;
+            if self.commit_index() >= self.rejoin_target_commit {
+                self.rejoining = false;
+            }
             return Ok(());
         }
         self.node.step(message)?;
@@ -1167,6 +1224,33 @@ mod tests {
             recovered,
             [b"one".to_vec(), b"two".to_vec(), b"three".to_vec()]
         );
+    }
+
+    #[test]
+    fn replacement_catches_up_a_log_larger_than_one_append_message() {
+        let mut nodes = (1..=5).map(node).collect::<Vec<_>>();
+        elect(&mut nodes, 0);
+        // max_size_per_msg is 1 MiB. The old implementation appeared correct
+        // for tiny tests but stopped after the first chunk because raft-rs
+        // correctly refused to decrease Progress.matched for the same voter.
+        for ordinal in 0..24u8 {
+            nodes[0].propose(vec![ordinal; 64 * 1024]).unwrap();
+            pump(&mut nodes);
+        }
+        let leader_last = nodes[0].last_index();
+
+        nodes[1] = node(2);
+        nodes[1].begin_rejoin();
+        nodes[0].tick();
+        nodes[0].tick();
+        pump(&mut nodes);
+        nodes[0].tick();
+        nodes[0].tick();
+        pump(&mut nodes);
+
+        assert_eq!(nodes[1].last_index(), leader_last);
+        assert_eq!(nodes[1].commit_index(), nodes[0].commit_index());
+        assert!(!nodes[1].is_rejoining());
     }
 
     #[test]
