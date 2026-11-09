@@ -29,12 +29,6 @@
 //! | 32  | 8    | user id (u64) — **cmd_id for Modify**                    |
 //! | 40  | 8    | trigger price (u64) for conditional orders; 0 = none      |
 //!
-//! Frames were 40 bytes before the trigger-price tail existed. Every persisted
-//! or queued copy of an older frame (Raft batch v1, journal v2, Kafka
-//! envelopes) decodes through [`widen_v1_frame`]: the first 40 bytes are
-//! unchanged and a zero tail means "ordinary order", so old data replays
-//! exactly as before.
-//!
 //! Every command carries a unique increasing id: New = order id; Cancel/Modify
 //! = `cmd_id` from the same Leaf-style series. Combined with the journal seq
 //! this makes cancels and modifies first-class sequenced commands — crash
@@ -47,8 +41,6 @@ use std::fmt;
 
 /// Fixed wire frame length in bytes.
 pub const MSG_LEN: usize = 48;
-/// Length of a frame written before the trigger-price tail (bytes 40..48).
-pub const MSG_LEN_V1: usize = 40;
 pub const RAFT_BATCH_HEADER_LEN: usize = 12;
 /// High-throughput Raft application batch.  At 48 bytes per command the
 /// maximum entry is about 480 KiB, small enough for replication while
@@ -60,9 +52,6 @@ const RAFT_BATCH_MAGIC: [u8; 4] = *b"RB01";
 /// Encode multiple command frames into one Raft application entry. Consensus
 /// persists and replicates this byte string atomically, so a batch consumes one
 /// log index and one Ready fsync rather than one of each per command.
-///
-/// Version 2 carries [`MSG_LEN`]-byte frames; version 1 entries (40-byte
-/// frames) already in a WAL still decode via [`decode_raft_entry`].
 pub fn encode_raft_batch(frames: &[[u8; MSG_LEN]]) -> Option<Vec<u8>> {
     if frames.is_empty() || frames.len() > RAFT_BATCH_MAX_COMMANDS {
         return None;
@@ -84,7 +73,7 @@ const RAFT_CONFIG_MAGIC: [u8; 4] = *b"TCCF";
 /// fingerprint (and a readable description of what was hashed). It carries no
 /// commands: every replica that applies it compares the fingerprint with its
 /// own and refuses to go on applying on a mismatch, instead of silently
-/// computing different results. Builds older than this one cannot decode it.
+/// computing different results.
 pub fn encode_raft_config_entry(fingerprint: u64, description: &str) -> Vec<u8> {
     let description = &description.as_bytes()[..description.len().min(4096)];
     let mut out = Vec::with_capacity(20 + description.len());
@@ -112,10 +101,8 @@ const RAFT_MIGRATION_MAGIC: [u8; 4] = *b"TCMG";
 /// A Raft entry carrying one category-migration step
 /// ([`crate::exchange::CategoryOp`]). An install carries the category's
 /// exported state in the snapshot encoding, so it can be large; it travels
-/// as its own entry rather than as command frames.
-///
-/// Version 2 adds the migration epoch (u64 after the header) and the unseal
-/// step; version 1 entries (no epoch) still decode, with epoch 0.
+/// as its own entry rather than as command frames. Layout: magic, version
+/// (2), step kind, category, category size, epoch, then an install's state.
 pub fn encode_raft_migration_entry(op: &crate::exchange::CategoryOp) -> Vec<u8> {
     use crate::exchange::CategoryOp;
     let (kind, category, size, epoch) = match op {
@@ -148,24 +135,25 @@ fn decode_raft_migration_entry(payload: &[u8]) -> Option<crate::exchange::Catego
     if payload.len() < 17 || payload[..4] != RAFT_MIGRATION_MAGIC {
         return None;
     }
-    let version = u32::from_le_bytes(payload[4..8].try_into().ok()?);
+    if u32::from_le_bytes(payload[4..8].try_into().ok()?) != 2 {
+        return None;
+    }
     let category = u32::from_le_bytes(payload[9..13].try_into().ok()?);
     let category_size = u32::from_le_bytes(payload[13..17].try_into().ok()?);
-    let (epoch, body) = match version {
-        1 => (0, &payload[17..]),
-        2 => (u64::from_le_bytes(payload.get(17..25)?.try_into().ok()?), &payload[25..]),
-        _ => return None,
-    };
+    let epoch = u64::from_le_bytes(payload.get(17..25)?.try_into().ok()?);
+    let body = &payload[25..];
     match payload[8] {
         1 => Some(CategoryOp::Seal { category, category_size, epoch }),
         3 => Some(CategoryOp::Drop { category, category_size, epoch }),
-        4 if version >= 2 => Some(CategoryOp::Unseal { category, category_size, epoch }),
+        4 => Some(CategoryOp::Unseal { category, category_size, epoch }),
         2 => {
             let state = crate::snapshot::decode(body).ok()?;
-            let command_ids = match (&state.recent_command_ids, &state.recent_command_instruments) {
-                (Some(ids), Some(instruments)) => ids.iter().copied().zip(instruments.iter().copied()).collect(),
-                _ => Vec::new(),
-            };
+            let command_ids = state
+                .recent_command_ids
+                .iter()
+                .copied()
+                .zip(state.recent_command_instruments.iter().copied())
+                .collect();
             Some(CategoryOp::Install {
                 category,
                 category_size,
@@ -180,71 +168,40 @@ fn decode_raft_migration_entry(payload: &[u8]) -> Option<crate::exchange::Catego
     }
 }
 
-/// Decode a batch entry (version 1 with 40-byte frames, or version 2) or a
-/// legacy one-command Raft entry (a bare 40- or 48-byte frame). A
-/// category-migration entry decodes to one [`Command::Migrate`].
+/// Decode a command batch entry. A category-migration entry decodes to one
+/// [`Command::Migrate`].
 pub fn decode_raft_entry(payload: &[u8]) -> Option<Vec<Command>> {
     if payload.starts_with(&RAFT_MIGRATION_MAGIC) {
         return decode_raft_migration_entry(payload).map(|op| vec![Command::Migrate(Box::new(op))]);
     }
-    if payload.len() == MSG_LEN {
-        return Some(vec![WireView::parse(payload)?.to_command()?]);
-    }
-    if payload.len() == MSG_LEN_V1 {
-        let frame = widen_v1_frame(payload)?;
-        return Some(vec![WireView::parse(&frame)?.to_command()?]);
-    }
-    if payload.len() < RAFT_BATCH_HEADER_LEN || payload[..4] != RAFT_BATCH_MAGIC {
+    if payload.len() < RAFT_BATCH_HEADER_LEN
+        || payload[..4] != RAFT_BATCH_MAGIC
+        || u32::from_le_bytes(payload[4..8].try_into().ok()?) != 2
+    {
         return None;
     }
-    let version = u32::from_le_bytes(payload[4..8].try_into().ok()?);
     let count = u32::from_le_bytes(payload[8..12].try_into().ok()?) as usize;
-    let frame_len = match version {
-        1 => MSG_LEN_V1,
-        2 => MSG_LEN,
-        _ => return None,
-    };
     if count == 0
         || count > RAFT_BATCH_MAX_COMMANDS
-        || payload.len() != RAFT_BATCH_HEADER_LEN + count * frame_len
+        || payload.len() != RAFT_BATCH_HEADER_LEN + count * MSG_LEN
     {
         return None;
     }
     payload[RAFT_BATCH_HEADER_LEN..]
-        .chunks_exact(frame_len)
-        .map(|frame| WireView::parse(&widen_frame(frame)?)?.to_command())
+        .chunks_exact(MSG_LEN)
+        .map(|frame| WireView::parse(frame)?.to_command())
         .collect()
-}
-
-/// Widen a 40-byte frame written before the trigger-price tail existed. The
-/// tail is zero: an ordinary order, decoded exactly as the old build did.
-pub fn widen_v1_frame(old: &[u8]) -> Option<[u8; MSG_LEN]> {
-    let old: &[u8; MSG_LEN_V1] = old.try_into().ok()?;
-    let mut frame = [0u8; MSG_LEN];
-    frame[..MSG_LEN_V1].copy_from_slice(old);
-    Some(frame)
-}
-
-/// A frame of either width as a current-width frame (`None` for any other
-/// length).
-pub fn widen_frame(bytes: &[u8]) -> Option<[u8; MSG_LEN]> {
-    match bytes.len() {
-        MSG_LEN => bytes.try_into().ok(),
-        MSG_LEN_V1 => widen_v1_frame(bytes),
-        _ => None,
-    }
 }
 
 /// Fixed execution-report frame length in bytes (v2: 56 — adds fee fields).
 pub const REPORT_LEN: usize = 56;
-pub const EXECUTION_EVENT_V1_LEN: usize = 88;
-/// Version 2 adds the target order id. A trade is published once for the taker
-/// and once for the maker, each keyed and partitioned by this field.
-pub const EXECUTION_EVENT_V2_LEN: usize = 96;
-/// Version 3 appends the target order's owner (`u64` at 96..104), so a
-/// result can be pushed to its user without any lookup; read it with
-/// [`execution_event_target_user`]. Versions 1 and 2 still decode.
+/// An execution event: magic, version (3), raft group, raft index, ordinal,
+/// the target order id (a trade is published once for the taker and once
+/// for the maker, each keyed and partitioned by it), the report, and the
+/// target order's owner (`u64` at 96..104, so a result can be pushed to its
+/// user without any lookup; see [`execution_event_target_user`]).
 pub const EXECUTION_EVENT_LEN: usize = 104;
+const EXECUTION_EVENT_USER_AT: usize = 96;
 const EXECUTION_EVENT_MAGIC: [u8; 4] = *b"EX01";
 
 const MT_NEW: u8 = 1;
@@ -907,61 +864,34 @@ pub fn encode_execution_event_frame(
     out[24..28].copy_from_slice(&ordinal.to_le_bytes());
     out[32..40].copy_from_slice(&target_order_id.to_le_bytes());
     out[40..40 + REPORT_LEN].copy_from_slice(frame);
-    out[EXECUTION_EVENT_V2_LEN..EXECUTION_EVENT_LEN].copy_from_slice(&target_user.to_le_bytes());
+    out[EXECUTION_EVENT_USER_AT..EXECUTION_EVENT_LEN].copy_from_slice(&target_user.to_le_bytes());
 }
 
-/// Owner of an execution event's target order: the v3 trailer, or 0 for a
-/// v1/v2 event (published before the field existed) or a malformed buffer.
+fn is_execution_event(buf: &[u8]) -> bool {
+    buf.len() >= EXECUTION_EVENT_LEN
+        && buf[..4] == EXECUTION_EVENT_MAGIC
+        && buf[4..8] == 3u32.to_le_bytes()
+}
+
+/// Owner of an execution event's target order (0 for a malformed buffer, or
+/// an event with no owner, such as a command-level reject).
 pub fn execution_event_target_user(buf: &[u8]) -> u64 {
-    if buf.len() < EXECUTION_EVENT_LEN || buf[..4] != EXECUTION_EVENT_MAGIC {
+    if !is_execution_event(buf) {
         return 0;
     }
-    match u32::from_le_bytes(buf[4..8].try_into().unwrap()) {
-        3 => u64::from_le_bytes(
-            buf[EXECUTION_EVENT_V2_LEN..EXECUTION_EVENT_LEN]
-                .try_into()
-                .unwrap(),
-        ),
-        _ => 0,
-    }
+    u64::from_le_bytes(buf[EXECUTION_EVENT_USER_AT..EXECUTION_EVENT_LEN].try_into().unwrap())
 }
 
 pub fn decode_execution_event(buf: &[u8]) -> Option<ExecutionEvent> {
-    if buf.len() >= EXECUTION_EVENT_V1_LEN && buf[..4] == EXECUTION_EVENT_MAGIC {
-        let version = u32::from_le_bytes(buf[4..8].try_into().ok()?);
-        let raft_group = u32::from_le_bytes(buf[8..12].try_into().ok()?);
-        let raft_index = u64::from_le_bytes(buf[16..24].try_into().ok()?);
-        let ordinal = u32::from_le_bytes(buf[24..28].try_into().ok()?);
-        let (target_order_id, report) = match version {
-            1 => {
-                let report = decode_report(&buf[32..32 + REPORT_LEN])?;
-                (report.order_id.0, report)
-            }
-            2 if buf.len() >= EXECUTION_EVENT_V2_LEN => (
-                u64::from_le_bytes(buf[32..40].try_into().ok()?),
-                decode_report(&buf[40..40 + REPORT_LEN])?,
-            ),
-            3 if buf.len() >= EXECUTION_EVENT_LEN => (
-                u64::from_le_bytes(buf[32..40].try_into().ok()?),
-                decode_report(&buf[40..40 + REPORT_LEN])?,
-            ),
-            _ => return None,
-        };
-        return Some(ExecutionEvent {
-            raft_group,
-            raft_index,
-            ordinal,
-            target_order_id,
-            report,
-        });
+    if !is_execution_event(buf) {
+        return None;
     }
-    let report = decode_report(buf)?;
     Some(ExecutionEvent {
-        raft_group: 0,
-        raft_index: 0,
-        ordinal: 0,
-        target_order_id: report.order_id.0,
-        report,
+        raft_group: u32::from_le_bytes(buf[8..12].try_into().ok()?),
+        raft_index: u64::from_le_bytes(buf[16..24].try_into().ok()?),
+        ordinal: u32::from_le_bytes(buf[24..28].try_into().ok()?),
+        target_order_id: u64::from_le_bytes(buf[32..40].try_into().ok()?),
+        report: decode_report(&buf[40..40 + REPORT_LEN])?,
     })
 }
 
@@ -1077,21 +1007,6 @@ mod tests {
     }
 
     #[test]
-    fn a_version_1_migration_entry_still_decodes_unfenced() {
-        use crate::exchange::CategoryOp;
-        // As written before epochs: magic, version 1, kind, category, size.
-        let mut v1 = RAFT_MIGRATION_MAGIC.to_vec();
-        v1.extend_from_slice(&1u32.to_le_bytes());
-        v1.push(3);
-        v1.extend_from_slice(&7u32.to_le_bytes());
-        v1.extend_from_slice(&1000u32.to_le_bytes());
-        assert!(matches!(
-            decode_raft_entry(&v1).unwrap().as_slice(),
-            [Command::Migrate(op)] if matches!(**op, CategoryOp::Drop { category: 7, category_size: 1000, epoch: 0 })
-        ));
-    }
-
-    #[test]
     fn config_entry_round_trips_and_is_never_a_command_batch() {
         let entry = encode_raft_config_entry(0xfeed, "specs=*:tick=1;window=500000");
         assert_eq!(
@@ -1133,7 +1048,7 @@ mod tests {
     }
 
     #[test]
-    fn execution_event_round_trips_and_legacy_report_decodes() {
+    fn execution_event_round_trips() {
         let r = ExecReport::Resting {
             instrument: InstrumentId(42),
             order_id: OrderId(99),
@@ -1149,13 +1064,10 @@ mod tests {
         assert_eq!(event.report.instrument, InstrumentId(42));
         assert_eq!(event.report.order_id, OrderId(99));
 
-        let mut legacy = [0u8; REPORT_LEN];
-        encode_report(&r, &mut legacy);
-        let legacy_event = decode_execution_event(&legacy).unwrap();
-        assert_eq!(legacy_event.raft_group, 0);
-        assert_eq!(legacy_event.raft_index, 0);
-        assert_eq!(legacy_event.ordinal, 0);
-        assert_eq!(legacy_event.report, event.report);
+        // A bare report is not an event.
+        let mut bare = [0u8; REPORT_LEN];
+        encode_report(&r, &mut bare);
+        assert!(decode_execution_event(&bare).is_none());
     }
 
     #[test]
@@ -1241,7 +1153,7 @@ mod tests {
     }
 
     #[test]
-    fn raft_batch_is_one_entry_and_legacy_entries_still_decode() {
+    fn raft_batch_is_one_entry() {
         let orders = [
             Order::limit(OrderId(101), Side::Sell, 100, 5).on(InstrumentId(7)),
             Order::limit(OrderId(102), Side::Buy, 100, 5).on(InstrumentId(7)),
@@ -1258,6 +1170,6 @@ mod tests {
         assert_eq!(commands.len(), 2);
         assert_eq!(commands[0].id(), 101);
         assert_eq!(commands[1].id(), 102);
-        assert_eq!(decode_raft_entry(&frames[0]).unwrap().len(), 1);
+        assert!(decode_raft_entry(&frames[0]).is_none(), "a bare frame is not an entry");
     }
 }

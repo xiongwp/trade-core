@@ -375,9 +375,9 @@ fn resting_post_only_survives_snapshot_and_replay_is_deterministic() {
             suspended: &[],
             positions: &[],
             engines: &engines,
-            recent_command_ids: None,
+            recent_command_ids: &[],
             sealed: &[],
-            recent_command_instruments: None,
+            recent_command_instruments: &[],
             migration_epochs: &[],
         },
     )

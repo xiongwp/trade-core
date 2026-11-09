@@ -496,14 +496,6 @@ pub(crate) fn trade_fill(report: &wire::DecodedReport, target_order_id: u64) -> 
     })
 }
 
-/// SQL list of the report types [`projects_order_state`] accepts.
-pub(crate) fn projected_report_types_sql() -> String {
-    (0..=u8::MAX)
-        .filter(|&code| projects_order_state(code))
-        .map(|code| code.to_string())
-        .collect::<Vec<_>>()
-        .join(",")
-}
 
 pub(crate) fn sweep_pending_execution_shard(store: &OrderStore, shard_db: u32) -> Result<(), String> {
     let db = format!("order_db_{shard_db}");
@@ -592,7 +584,7 @@ pub(crate) fn persist_execution_shard(
         ));
         // A Kafka retry can reinsert an already-processed event into pending;
         // discard it before applying any mutations.
-        statements.push(discard_statements(&db, shard_db, period));
+        statements.push(discard_statements(&db, period));
         // Every touched table was just staged into, so drain them all (an
         // empty drain is a cheap empty range scan).
         statements.extend(touched.into_iter().map(|table| drain_statements(&db, table, period)));
@@ -604,15 +596,14 @@ pub(crate) fn persist_execution_shard(
 }
 
 /// Drop pending events that were already applied (a Kafka or outbox
-/// redelivery), checking the pre-ring table too while it still exists.
+/// redelivery).
 #[cfg(test)]
 pub(crate) fn discard_redelivered_events(
     tx: &mut Transaction<'_>,
     db: &str,
-    shard_db: u32,
     period: u64,
 ) -> Result<(), String> {
-    exec_batch(&mut *tx, &discard_statements(db, shard_db, period))
+    exec_batch(&mut *tx, &discard_statements(db, period))
         .map_err(|error| error.to_string())
 }
 
@@ -620,11 +611,8 @@ pub(crate) fn discard_redelivered_events(
 /// pending, joined with `;`. The current and the previous period's tables
 /// hold every event applied within the last retention period (see
 /// `DEDUPE_TABLES`).
-pub(crate) fn discard_statements(db: &str, shard_db: u32, period: u64) -> String {
-    let mut tables = vec![dedupe_table(period), dedupe_table(period + DEDUPE_TABLES - 1)];
-    if has_legacy_dedupe(shard_db) {
-        tables.push("processed_execution_events_legacy".to_string());
-    }
+pub(crate) fn discard_statements(db: &str, period: u64) -> String {
+    let tables = [dedupe_table(period), dedupe_table(period + DEDUPE_TABLES - 1)];
     tables
         .iter()
         .map(|table| {

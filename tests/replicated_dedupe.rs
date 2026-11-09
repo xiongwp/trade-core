@@ -5,7 +5,7 @@
 //! order was matched again after a restart.
 
 use trade_core::exchange::{ExecReport, Processor};
-use trade_core::snapshot::{self, SnapshotData};
+use trade_core::snapshot;
 use trade_core::strategy::PriceTimePriority;
 use trade_core::{Command, InstrumentId, Order, OrderId, Side};
 
@@ -33,7 +33,6 @@ fn restart(p: &Processor, window: usize, tag: &str) -> Processor {
     let path = dir.join("snapshot.bin");
     p.write_snapshot(&path, 0, 7).unwrap();
     let snap = snapshot::load(&path).unwrap();
-    assert_eq!(snap.format_version, 8);
     let mut restored = processor(window);
     restored.restore_state(&snap);
     std::fs::remove_dir_all(&dir).unwrap();
@@ -83,45 +82,8 @@ fn memory_is_bounded_by_the_window() {
     let path = dir.join("snapshot.bin");
     p.write_snapshot(&path, 0, 1).unwrap();
     let snap = snapshot::load(&path).unwrap();
-    assert_eq!(snap.recent_command_ids.as_ref().unwrap().len(), 100);
-    assert_eq!(snap.recent_command_ids.unwrap().first(), Some(&9_901));
-    std::fs::remove_dir_all(&dir).unwrap();
-}
-
-#[test]
-fn a_pre_window_snapshot_restores_with_the_legacy_seed() {
-    // A v4 snapshot (no window): resting ids plus the ids the node recovered
-    // from its log are treated as seen, as before the upgrade.
-    let mut old = processor(1_000);
-    run(&mut old, new(1, Side::Sell, 100, 5));
-    let dir = std::env::temp_dir().join(format!("tc-dedupe-legacy-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("snapshot.bin");
-    snapshot::write(
-        &path,
-        SnapshotData {
-            journal_seq: 0,
-            raft_applied_index: 3,
-            max_cmd_id: 0,
-            max_admin_id: 0,
-            halted: &[],
-            suspended: &[],
-            positions: &[],
-            engines: &old.export_state(),
-            recent_command_ids: None,
-            sealed: &[],
-            recent_command_instruments: None,
-            migration_epochs: &[],
-        },
-    )
-    .unwrap();
-    let snap = snapshot::load(&path).unwrap();
-    assert_eq!(snap.format_version, 4);
-    let mut restored = processor(1_000).with_legacy_command_ids(vec![7]);
-    restored.restore_state(&snap);
-    assert!(run(&mut restored, new(1, Side::Sell, 100, 5))[0].contains("duplicate"));
-    assert!(run(&mut restored, new(7, Side::Sell, 100, 5))[0].contains("duplicate"));
-    assert!(!run(&mut restored, new(8, Side::Sell, 100, 5))[0].contains("duplicate"));
+    assert_eq!(snap.recent_command_ids.len(), 100);
+    assert_eq!(snap.recent_command_ids.first(), Some(&9_901));
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

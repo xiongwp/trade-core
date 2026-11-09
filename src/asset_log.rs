@@ -680,46 +680,20 @@ fn last_seq(path: &Path) -> io::Result<u64> {
         .unwrap_or(0))
 }
 
-/// Chain hash over one record. A frame whose trigger-price tail is zero is
-/// hashed as its original 40 bytes, so a log written by a build with 40-byte
-/// frames fingerprints identically here — a migration compares the source
-/// machine's fingerprint against this machine's.
+/// Chain hash over one record.
 fn record_hash(previous: u64, seq: u64, ts_nanos: u64, frame: &[u8; MSG_LEN]) -> u64 {
-    let width = if frame[wire::MSG_LEN_V1..].iter().all(|&b| b == 0) {
-        wire::MSG_LEN_V1
-    } else {
-        MSG_LEN
-    };
     let mut bytes = [0u8; 8 + 8 + 8 + MSG_LEN];
     bytes[0..8].copy_from_slice(&previous.to_le_bytes());
     bytes[8..16].copy_from_slice(&seq.to_le_bytes());
     bytes[16..24].copy_from_slice(&ts_nanos.to_le_bytes());
     bytes[24..24 + MSG_LEN].copy_from_slice(frame);
-    journal::fnv1a(&bytes[..24 + width])
+    journal::fnv1a(&bytes)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn record_hash_of_an_ordinary_frame_equals_the_40_byte_hash() {
-        // Logs written with 40-byte frames must fingerprint identically after
-        // the frame grew: a migration compares fingerprints across builds.
-        let mut frame = [0u8; MSG_LEN];
-        frame[0] = 1;
-        frame[8] = 42;
-        let mut legacy = [0u8; 24 + wire::MSG_LEN_V1];
-        legacy[0..8].copy_from_slice(&7u64.to_le_bytes());
-        legacy[8..16].copy_from_slice(&3u64.to_le_bytes());
-        legacy[16..24].copy_from_slice(&99u64.to_le_bytes());
-        legacy[24..].copy_from_slice(&frame[..wire::MSG_LEN_V1]);
-        assert_eq!(record_hash(7, 3, 99, &frame), journal::fnv1a(&legacy));
-
-        // A frame using the tail hashes all of it.
-        frame[MSG_LEN - 1] = 1;
-        assert_ne!(record_hash(7, 3, 99, &frame), journal::fnv1a(&legacy));
-    }
     use crate::order::Order;
     use crate::strategy::PriceTimePriority;
 

@@ -1,13 +1,10 @@
 //! Kafka ingress routing and the fixed binary envelope stored in queue topics.
 
 use crate::types::InstrumentId;
-use crate::wire::{self, WireView, MSG_LEN, MSG_LEN_V1};
+use crate::wire::{WireView, MSG_LEN};
 
 const MAGIC: [u8; 4] = *b"TQ01";
 pub const ENVELOPE_LEN: usize = 16 + MSG_LEN;
-/// Envelopes produced before frames grew to [`MSG_LEN`] bytes; still decoded,
-/// since retained Kafka messages outlive an upgrade.
-const ENVELOPE_LEN_V1: usize = 16 + MSG_LEN_V1;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QueueRoute {
@@ -96,10 +93,10 @@ pub struct QueueEnvelope {
 
 impl QueueEnvelope {
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        if !matches!(bytes.len(), ENVELOPE_LEN | ENVELOPE_LEN_V1) || bytes[..4] != MAGIC {
+        if bytes.len() != ENVELOPE_LEN || bytes[..4] != MAGIC {
             return None;
         }
-        let frame = wire::widen_frame(&bytes[16..])?;
+        let frame: [u8; MSG_LEN] = bytes[16..].try_into().ok()?;
         WireView::parse(&frame)?;
         Some(Self {
             route_version: u32::from_le_bytes(bytes[4..8].try_into().ok()?),
@@ -174,22 +171,5 @@ mod tests {
         assert_eq!(decoded.route_version, 11);
         assert_eq!(decoded.instrument(), InstrumentId(42));
         assert_eq!(decoded.frame, frame);
-    }
-
-    #[test]
-    fn envelope_from_before_the_trigger_tail_still_decodes() {
-        let mut frame = [0; MSG_LEN];
-        wire::encode_new(
-            &Order::limit(OrderId(9), Side::Buy, 100, 2)
-                .on(InstrumentId(42))
-                .by(100_000),
-            &mut frame,
-        );
-        let mut old = encode_envelope(100_000, 11, &frame).to_vec();
-        old.truncate(ENVELOPE_LEN_V1); // a retained 40-byte-frame message
-        let decoded = QueueEnvelope::decode(&old).unwrap();
-        assert_eq!(decoded.frame, frame);
-        assert_eq!(decoded.instrument(), InstrumentId(42));
-        assert!(QueueEnvelope::decode(&old[..ENVELOPE_LEN_V1 - 1]).is_none());
     }
 }

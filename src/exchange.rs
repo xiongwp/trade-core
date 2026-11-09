@@ -429,9 +429,6 @@ pub struct ExchangeConfig {
     /// Exact command-id dedupe window, in ids (replicated state: every
     /// replica of a group must use the same value).
     pub command_id_window: usize,
-    /// Command ids recovered from the consensus log at or below the engine
-    /// snapshot, used only when that snapshot predates the persisted window.
-    pub legacy_command_ids: Vec<u64>,
     /// Durable execution outbox directory. When enabled, every non-depth report
     /// produced from a Raft-committed command is appended before it leaves the
     /// matching shard.
@@ -464,7 +461,6 @@ impl Default for ExchangeConfig {
             fees: crate::fees::FeeSchedule::default(),
             dedup_commands: false,
             command_id_window: DEFAULT_COMMAND_ID_WINDOW,
-            legacy_command_ids: Vec::new(),
             execution_outbox_dir: None,
             raft_group_id: 0,
             execution_outbox_sync_every: 1,
@@ -793,7 +789,6 @@ fn build_inner(
             .with_specs(config.instrument_specs.clone())
             .with_dedup(config.dedup_commands)
             .with_command_id_window(config.command_id_window)
-            .with_legacy_command_ids(config.legacy_command_ids.clone())
             .with_fees(config.fees);
         for &inst in &config.instruments {
             if inst.0 as usize % config.shards == shard_id {
@@ -818,7 +813,7 @@ fn build_inner(
             std::fs::create_dir_all(&proof_root).expect("create Raft application proof dir");
             if config.raft_wal_authoritative {
                 initial_raft_index =
-                    recover_raft_authoritative(&mut processor, &spath, &jpath, &proof_root)
+                    recover_raft_authoritative(&mut processor, &spath)
                         .expect("recover matching snapshot for Raft WAL replay");
                 applied_root = Some(proof_root);
                 snapshot_path = Some(spath);
@@ -979,9 +974,6 @@ pub struct Processor {
     /// Exact retry protection also closes the crash window between replaying
     /// the shard journal and advancing the separate Raft application marker.
     seen_command_ids: RecentCommandIds,
-    /// Ids to seed the window with when restoring a pre-v6 snapshot, which
-    /// has no window (see `ExchangeConfig::legacy_command_ids`).
-    legacy_command_ids: Vec<u64>,
     /// Categories sealed by a migration: category -> category size.
     sealed: std::collections::BTreeMap<u32, u32>,
     /// Epoch of the last migration step applied per category (see
@@ -1032,8 +1024,7 @@ pub(crate) struct RecentCommandIds {
     set: std::collections::HashSet<u64, std::hash::BuildHasherDefault<IdHasher>>,
     ring: Vec<u64>,
     /// Instrument of each `ring` slot: a migration carries a category's
-    /// recent ids to its new group. `u32::MAX` when unknown (restored from
-    /// a snapshot older than v8).
+    /// recent ids to its new group.
     instruments: Vec<u32>,
     /// Slot of the oldest id once the ring is full.
     head: usize,
@@ -1238,7 +1229,6 @@ impl Processor {
             specs: InstrumentSpecs::default(),
             dedup: false,
             seen_command_ids: RecentCommandIds::new(DEFAULT_COMMAND_ID_WINDOW),
-            legacy_command_ids: Vec::new(),
             sealed: std::collections::BTreeMap::new(),
             migration_epochs: std::collections::BTreeMap::new(),
             max_new_id: 0,
@@ -1446,13 +1436,6 @@ impl Processor {
         self
     }
 
-    /// Ids that seed the dedupe window when a pre-v6 snapshot (without one)
-    /// is restored (builder style).
-    pub fn with_legacy_command_ids(mut self, ids: Vec<u64>) -> Self {
-        self.legacy_command_ids = ids;
-        self
-    }
-
     /// Enable idempotent command dedup (builder style).
     pub fn with_dedup(mut self, dedup: bool) -> Self {
         self.dedup = dedup;
@@ -1461,6 +1444,9 @@ impl Processor {
 
     /// Set the fee schedule (builder style).
     pub fn with_fees(mut self, fees: crate::fees::FeeSchedule) -> Self {
+        if let Err(error) = fees.validate() {
+            panic!("{error}");
+        }
         self.fees = fees;
         self
     }
@@ -1533,30 +1519,10 @@ impl Processor {
         self.sealed
             .extend(snap.sealed.iter().map(|&(category, size)| (category, size)));
         self.migration_epochs.extend(snap.migration_epochs.iter().copied());
-        // Exact command-id dedupe. A v6 snapshot carries the window itself.
-        // Older ones do not: fall back to what the previous code used (the
-        // ids of every order the snapshot holds, plus the ids the caller
-        // recovered from its uncompacted log), so the first restart after an
-        // upgrade decides retries exactly as before.
-        if let Some(ids) = &snap.recent_command_ids {
-            self.seen_command_ids.clear();
-            let instruments = snap.recent_command_instruments.as_deref().unwrap_or(&[]);
-            for (k, &id) in ids.iter().enumerate() {
-                self.seen_command_ids
-                    .insert(id, instruments.get(k).copied().unwrap_or(u32::MAX));
-            }
-        } else {
-            for id in std::mem::take(&mut self.legacy_command_ids) {
-                self.seen_command_ids.insert(id, u32::MAX);
-            }
-            for e in &snap.engines {
-                for id in e.orders.iter().map(|order| order.id.0) {
-                    self.seen_command_ids.insert(id, e.instrument.0);
-                }
-                for id in e.stops.iter().map(|stop| stop.order.id.0) {
-                    self.seen_command_ids.insert(id, e.instrument.0);
-                }
-            }
+        // The exact command-id dedupe window.
+        self.seen_command_ids.clear();
+        for (&id, &instrument) in snap.recent_command_ids.iter().zip(&snap.recent_command_instruments) {
+            self.seen_command_ids.insert(id, instrument);
         }
         for e in &snap.engines {
             let engine = self.engine_for(e.instrument);
@@ -3161,9 +3127,9 @@ impl CapturedSnapshot {
                 suspended: &self.suspended,
                 positions: &positions,
                 engines: &engines,
-                recent_command_ids: Some(&self.recent_command_ids),
+                recent_command_ids: &self.recent_command_ids,
                 sealed: &self.sealed,
-                recent_command_instruments: Some(&self.recent_command_instruments),
+                recent_command_instruments: &self.recent_command_instruments,
                 migration_epochs: &self.migration_epochs,
             },
         )
@@ -3213,40 +3179,15 @@ fn persist_processor_snapshot(
     capture_processor_snapshot(processor, journal_seq, raft_applied_index).write(path)
 }
 
-/// Restore a version-4 matching snapshot whose Raft index is explicit. Legacy
-/// snapshot+journal deployments are upgraded once, using their already-durable
-/// application watermark as the exact Raft boundary. The old files are kept
-/// for rollback but are no longer appended after this succeeds.
-fn recover_raft_authoritative(
-    processor: &mut Processor,
-    snapshot_path: &Path,
-    legacy_journal_path: &Path,
-    applied_root: &Path,
-) -> std::io::Result<u64> {
-    if snapshot_path.exists() {
-        let snap = snapshot::load(snapshot_path)?;
-        if snap.format_version >= 4 {
-            let index = snap.raft_applied_index;
-            processor.restore_state(&snap);
-            return Ok(index);
-        }
-    }
-
-    let has_legacy_state = snapshot_path.exists() || legacy_journal_path.exists();
-    if !has_legacy_state {
+/// Restore the matching snapshot (it records the Raft index it covers);
+/// none yet means an empty processor at index 0.
+fn recover_raft_authoritative(processor: &mut Processor, snapshot_path: &Path) -> std::io::Result<u64> {
+    if !snapshot_path.exists() {
         return Ok(0);
     }
-    let (_, last_seq) = recover_stats(processor, snapshot_path, legacy_journal_path)?;
-    let applied = crate::asset_log::load_applied_batches(applied_root)?;
-    let raft_applied_index = applied.iter().max().copied().unwrap_or(0);
-    if last_seq != 0 && raft_applied_index == 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "legacy matching state has no durable Raft application watermark",
-        ));
-    }
-    persist_processor_snapshot(processor, snapshot_path, 0, raft_applied_index)?;
-    Ok(raft_applied_index)
+    let snap = snapshot::load(snapshot_path)?;
+    processor.restore_state(&snap);
+    Ok(snap.raft_applied_index)
 }
 
 /// The outcome of replaying one shard journal.

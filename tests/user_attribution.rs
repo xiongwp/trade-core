@@ -6,9 +6,8 @@ use std::time::Duration;
 
 use trade_core::exchange::{fingerprint_reports, proof_digest, ExecReport, Processor};
 use trade_core::execution_outbox::{
-    segment_paths, ExecutionOutboxReader, ExecutionOutboxWriter, OUTBOX_RECORD_LEN_V1,
+    ExecutionOutboxReader, ExecutionOutboxWriter,
 };
-use trade_core::journal::fnv1a;
 use trade_core::prelude::*;
 use trade_core::types::{Trigger, TriggerKind};
 use trade_core::wire;
@@ -188,92 +187,8 @@ fn outbox_persists_owners_and_publishes_each_side_to_its_own_user() {
 }
 
 /// A format-v1 segment (records without owners), byte for byte.
-fn write_v1_segment(path: &std::path::Path, frames: &[[u8; wire::REPORT_LEN]]) {
-    let mut bytes = b"TCEX\x01\0\0\0".to_vec();
-    for (i, frame) in frames.iter().enumerate() {
-        let mut rec = vec![0u8; OUTBOX_RECORD_LEN_V1];
-        rec[0..4].copy_from_slice(&7u32.to_le_bytes());
-        rec[4..12].copy_from_slice(&(10 + i as u64).to_le_bytes());
-        rec[16..16 + wire::REPORT_LEN].copy_from_slice(frame);
-        let n = rec.len();
-        let sum = fnv1a(&rec[..n - 8]);
-        rec[n - 8..].copy_from_slice(&sum.to_le_bytes());
-        bytes.extend_from_slice(&rec);
-    }
-    std::fs::write(path, bytes).unwrap();
-}
-
 #[test]
-fn v1_outbox_segments_still_publish_and_the_writer_moves_past_them() {
-    let dir = temp_dir("v1");
-    let base = dir.join("outbox-shard-0.bin");
-    let mut frame = [0u8; wire::REPORT_LEN];
-    wire::encode_report(
-        &ExecReport::Accepted {
-            instrument: SYM,
-            order_id: OrderId(1),
-            user: 0,
-        },
-        &mut frame,
-    );
-    write_v1_segment(&base, &[frame, frame]);
-
-    // Read in place: records decode, owners unknown (0).
-    let reader = ExecutionOutboxReader::open(base.clone()).unwrap();
-    assert_eq!(reader.record_len(), OUTBOX_RECORD_LEN_V1);
-    assert_eq!(reader.pending_records().unwrap(), 2);
-    let records = reader.read_batch(10).unwrap();
-    assert_eq!(records.len(), 2);
-    assert_eq!(records[0].users, [0, 0]);
-    let payload = records[0].kafka_payload_for(1);
-    assert_eq!(
-        wire::decode_execution_event(&payload)
-            .unwrap()
-            .target_order_id,
-        1
-    );
-    assert_eq!(wire::execution_event_target_user(&payload), 0);
-
-    // Recovery trimming understands the old layout.
-    trade_core::execution_outbox::truncate_after_applied(&base, Some(10)).unwrap();
-    assert_eq!(
-        ExecutionOutboxReader::open(base.clone())
-            .unwrap()
-            .pending_records()
-            .unwrap(),
-        1
-    );
-
-    // Opening the writer seals the v1 segment and appends to a fresh one.
-    let mut writer = ExecutionOutboxWriter::open(&base, Duration::from_millis(1), 1).unwrap();
-    writer
-        .append(
-            7,
-            20,
-            0,
-            &ExecReport::Accepted {
-                instrument: SYM,
-                order_id: OrderId(3),
-                user: 303,
-            },
-        )
-        .unwrap();
-    writer.sync_data().unwrap();
-    drop(writer);
-    let segments = segment_paths(&base).unwrap();
-    assert_eq!(segments.len(), 2, "{segments:?}");
-    assert_eq!(std::fs::read(&segments[0]).unwrap()[..5], *b"TCEX\x01");
-    let fresh = ExecutionOutboxReader::open(segments[1].clone())
-        .unwrap()
-        .read_batch(10)
-        .unwrap();
-    assert_eq!(fresh.len(), 1);
-    assert_eq!(fresh[0].users, [303, 0]);
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-#[test]
-fn v2_execution_events_still_decode_without_an_owner() {
+fn an_execution_event_carries_its_owner() {
     let report = ExecReport::Filled {
         instrument: SYM,
         order_id: OrderId(8),
@@ -282,13 +197,9 @@ fn v2_execution_events_still_decode_without_an_owner() {
     let mut v3 = [0u8; wire::EXECUTION_EVENT_LEN];
     wire::encode_execution_event(7, 33, 1, &report, &mut v3);
     assert_eq!(wire::execution_event_target_user(&v3), 808);
-
-    // The same event as a v2 producer wrote it: version 2, 96 bytes.
-    let mut v2 = v3[..wire::EXECUTION_EVENT_V2_LEN].to_vec();
-    v2[4..8].copy_from_slice(&2u32.to_le_bytes());
-    let decoded = wire::decode_execution_event(&v2).unwrap();
-    assert_eq!(decoded, wire::decode_execution_event(&v3).unwrap());
-    assert_eq!(wire::execution_event_target_user(&v2), 0);
+    // Anything shorter is not an event.
+    assert!(wire::decode_execution_event(&v3[..96]).is_none());
+    assert_eq!(wire::execution_event_target_user(&v3[..96]), 0);
 }
 
 #[test]

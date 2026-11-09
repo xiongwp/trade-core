@@ -16,20 +16,18 @@ pub(crate) fn route_log_topic() -> String {
 }
 
 /// One route record: the category belongs to a group, or is frozen while it
-/// moves to one (`Freeze { to, from }`; `from` is `None` in records written
-/// before it was recorded).
+/// moves from one group to another.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RouteRecord {
     Pin(usize),
-    Freeze { to: usize, from: Option<usize> },
+    Freeze { to: usize, from: usize },
 }
 
 impl RouteRecord {
     fn encode(self) -> String {
         match self {
             RouteRecord::Pin(group) => format!("pin:{group}"),
-            RouteRecord::Freeze { to, from: Some(from) } => format!("freeze:{to}:{from}"),
-            RouteRecord::Freeze { to, from: None } => format!("freeze:{to}"),
+            RouteRecord::Freeze { to, from } => format!("freeze:{to}:{from}"),
         }
     }
 
@@ -38,11 +36,8 @@ impl RouteRecord {
         match kind {
             "pin" => Some(RouteRecord::Pin(rest.parse().ok()?)),
             "freeze" => {
-                let (to, from) = match rest.split_once(':') {
-                    Some((to, from)) => (to.parse().ok()?, Some(from.parse().ok()?)),
-                    None => (rest.parse().ok()?, None),
-                };
-                Some(RouteRecord::Freeze { to, from })
+                let (to, from) = rest.split_once(':')?;
+                Some(RouteRecord::Freeze { to: to.parse().ok()?, from: from.parse().ok()? })
             }
             _ => None,
         }

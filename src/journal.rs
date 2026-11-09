@@ -22,7 +22,7 @@
 //! * **Time replay.** Records carry a wall-clock nanosecond timestamp, so replay
 //!   can stop at any point in time (`until_ts`).
 //!
-//! ## Record layout (little-endian, 72 bytes; format v3)
+//! ## Record layout (little-endian, 72 bytes)
 //!
 //! | off | size | field                          |
 //! |-----|------|--------------------------------|
@@ -30,10 +30,6 @@
 //! | 8   | 8    | wall-clock timestamp (ns)      |
 //! | 16  | 48   | wire frame ([`wire::MSG_LEN`]) |
 //! | 64  | 8    | FNV-1a-64 over bytes 0..64     |
-//!
-//! Format v2 (64-byte records, 40-byte frames) is still read: its frames are
-//! widened with a zero tail ([`crate::wire::widen_v1_frame`]). Opening a v2
-//! file for append rewrites it as v3 first (see [`migrate_v2_to_v3`]).
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -43,19 +39,15 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::wire::{self, MSG_LEN, MSG_LEN_V1};
+use crate::wire::MSG_LEN;
 
 /// On-disk record size.
 pub const RECORD_LEN: usize = 8 + 8 + MSG_LEN + 8;
-/// Record size of format v2 (40-byte frames).
-const RECORD_LEN_V2: usize = 8 + 8 + MSG_LEN_V1 + 8;
 
 /// File header: magic + format version. Written on create/truncate, verified
 /// on open — future format changes bump the version instead of silently
 /// misparsing old files (migration tooling hooks in here).
 pub const JOURNAL_HEADER: [u8; 8] = *b"TCJR\x03\0\0\0";
-/// Header of format v2 (40-byte frames): read, and migrated on open for append.
-const JOURNAL_HEADER_V2: [u8; 8] = *b"TCJR\x02\0\0\0";
 
 /// FNV-1a 64-bit — tiny, dependency-free, adequate for torn-write detection
 /// (not for adversarial integrity).
@@ -118,13 +110,10 @@ impl JournalWriter {
         } else {
             let mut hdr = [0u8; 8];
             probe.read_exact(&mut hdr)?;
-            if hdr == JOURNAL_HEADER_V2 {
-                drop(probe);
-                migrate_v2_to_v3(path)?;
-            } else if hdr != JOURNAL_HEADER {
+            if hdr != JOURNAL_HEADER {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "journal header/version mismatch (migration required)",
+                    "journal header/version mismatch",
                 ));
             }
         }
@@ -396,26 +385,23 @@ pub struct Record {
 /// checksum-corrupt record (crash tolerance).
 pub struct JournalReader {
     r: BufReader<File>,
-    /// On-disk record size of this file's format version.
-    record_len: usize,
 }
 
 impl JournalReader {
     pub fn open(path: &Path) -> io::Result<JournalReader> {
         let mut r = BufReader::with_capacity(1 << 20, File::open(path)?);
         let mut hdr = [0u8; 8];
-        let record_len = match r.read_exact(&mut hdr) {
-            Ok(()) if hdr == JOURNAL_HEADER => RECORD_LEN,
-            Ok(()) if hdr == JOURNAL_HEADER_V2 => RECORD_LEN_V2,
+        match r.read_exact(&mut hdr) {
+            Ok(()) if hdr == JOURNAL_HEADER => {}
             Ok(()) => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "journal header/version mismatch (migration required)",
+                    "journal header/version mismatch",
                 ))
             }
-            Err(_) => RECORD_LEN, // empty/short file: yields no records
-        };
-        Ok(JournalReader { r, record_len })
+            Err(_) => {} // empty/short file: yields no records
+        }
+        Ok(JournalReader { r })
     }
 }
 
@@ -423,24 +409,22 @@ impl Iterator for JournalReader {
     type Item = Record;
 
     fn next(&mut self) -> Option<Record> {
-        let mut buf = [0u8; RECORD_LEN];
-        let rec = &mut buf[..self.record_len];
+        let mut rec = [0u8; RECORD_LEN];
         // read_exact returns Err on EOF/short read -> stop (truncated tail).
-        self.r.read_exact(rec).ok()?;
-        let n = rec.len();
-        let stored = u64::from_le_bytes(rec[n - 8..].try_into().unwrap());
-        if fnv1a(&rec[..n - 8]) != stored {
+        self.r.read_exact(&mut rec).ok()?;
+        let stored = u64::from_le_bytes(rec[RECORD_LEN - 8..].try_into().unwrap());
+        if fnv1a(&rec[..RECORD_LEN - 8]) != stored {
             return None; // torn/corrupt record: stop at the consistent prefix
         }
         Some(Record {
             seq: u64::from_le_bytes(rec[0..8].try_into().unwrap()),
             ts_nanos: u64::from_le_bytes(rec[8..16].try_into().unwrap()),
-            frame: wire::widen_frame(&rec[16..n - 8])?,
+            frame: rec[16..16 + MSG_LEN].try_into().unwrap(),
         })
     }
 }
 
-/// Last seq and byte length of the consistent prefix of a v3 journal: the
+/// Last seq and byte length of the consistent prefix of a journal: the
 /// header plus every record up to the first truncated or corrupt one.
 fn scan_valid_prefix(path: &Path) -> io::Result<(u64, u64)> {
     let mut r = BufReader::with_capacity(1 << 20, File::open(path)?);
@@ -458,36 +442,6 @@ fn scan_valid_prefix(path: &Path) -> io::Result<(u64, u64)> {
         valid += RECORD_LEN as u64;
     }
     Ok((last_seq, valid))
-}
-
-/// Rewrite a format-v2 journal (40-byte frames) as v3, preserving every
-/// record's seq, timestamp and command; a torn tail is dropped exactly as
-/// replay would drop it. Written to a temp file, fsynced, then renamed over
-/// the original, so a crash mid-migration leaves the v2 file intact.
-pub fn migrate_v2_to_v3(path: &Path) -> io::Result<()> {
-    let tmp = path.with_extension("v3-migrating");
-    {
-        let mut out = BufWriter::new(File::create(&tmp)?);
-        out.write_all(&JOURNAL_HEADER)?;
-        for record in JournalReader::open(path)? {
-            let mut rec = [0u8; RECORD_LEN];
-            rec[0..8].copy_from_slice(&record.seq.to_le_bytes());
-            rec[8..16].copy_from_slice(&record.ts_nanos.to_le_bytes());
-            rec[16..16 + MSG_LEN].copy_from_slice(&record.frame);
-            let h = fnv1a(&rec[..RECORD_LEN - 8]);
-            rec[RECORD_LEN - 8..].copy_from_slice(&h.to_le_bytes());
-            out.write_all(&rec)?;
-        }
-        out.flush()?;
-        out.get_ref().sync_all()?;
-    }
-    std::fs::rename(&tmp, path)?;
-    if let Some(dir) = path.parent() {
-        if let Ok(dir) = File::open(dir) {
-            let _ = dir.sync_all();
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

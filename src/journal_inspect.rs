@@ -42,7 +42,7 @@ impl DumpFilter {
 /// decoded command (or a marker if the frame cannot be decoded — the reader
 /// already guards checksums, so this only happens on a format change).
 pub fn format_record(record: &Record) -> String {
-    match wire::decode_raft_entry(&record.frame).and_then(|mut c| c.pop()) {
+    match wire::WireView::parse(&record.frame).and_then(|view| view.to_command()) {
         Some(command) => format!(
             "seq={} ts_nanos={} {:?}",
             record.seq, record.ts_nanos, command

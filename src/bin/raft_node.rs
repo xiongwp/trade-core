@@ -173,39 +173,11 @@ fn main() {
     } else {
         trade_core::InstrumentSpecs::parse(&instrument_specs_text).expect("valid TC_INSTRUMENT_SPECS")
     };
-    // The committed prefix recovered from the WAL. Taken before the engine is
-    // built: when the engine snapshot predates the persisted dedupe window
-    // (format < 6), the ids of the commands it already covers seed that
-    // window — exactly what the old consensus-side id window held — so the
-    // first restart after an upgrade decides retries as before. From the
-    // next snapshot on, the window is replicated state.
+    // The committed prefix recovered from the WAL, replayed below on top of
+    // the engine snapshot (which records the index it covers).
     let recovered_committed = raft_node.take_committed();
-    let engine_snapshot = trade_core::snapshot::load(&engine_snapshot_path).ok();
-    let engine_snapshot_index = engine_snapshot
-        .as_ref()
+    let engine_snapshot_index = trade_core::snapshot::load(&engine_snapshot_path)
         .map_or(0, |snapshot| snapshot.raft_applied_index);
-    // A pre-v6 engine snapshot: its WAL tail was proved under the old rule,
-    // where retries already in the consensus id window were dropped before
-    // the engine. Recovery replays that tail under the same rule, so the
-    // proofs match; live traffic uses the replicated window from here on.
-    let legacy_snapshot = engine_snapshot
-        .as_ref()
-        .is_some_and(|snapshot| snapshot.recent_command_ids.is_none());
-    let legacy_command_ids = match &engine_snapshot {
-        Some(snapshot) if snapshot.recent_command_ids.is_none() => recovered_committed
-            .iter()
-            .filter(|committed| committed.index <= engine_snapshot_index)
-            .filter(|committed| wire::decode_raft_config_entry(&committed.data).is_none())
-            .flat_map(|committed| {
-                wire::decode_raft_entry(&committed.data)
-                    .expect("durable committed Raft entry is not a valid command batch")
-            })
-            .map(|command| command.id())
-            .filter(|&id| id != 0)
-            .collect(),
-        _ => Vec::new(),
-    };
-    drop(engine_snapshot);
     // Exact command-id dedupe window of the matching state machine. It is
     // replicated state: every replica of a group must use the same value.
     let command_id_window = std::env::var("TC_DEDUP_WINDOW_IDS")
@@ -251,7 +223,6 @@ fn main() {
         // Kafka partitions, so they must not be enabled here.
         dedup_commands: false,
         command_id_window,
-        legacy_command_ids,
         // Ten thousand mostly sparse assets must not each reserve the
         // single-market default. Hot dedicated assets can raise this through
         // TC_MATCH_POOL_PER_ASSET; pools still grow dynamically when needed.
@@ -402,17 +373,10 @@ fn main() {
                 // Every committed command goes to the engine, whose replicated
                 // dedupe window rejects retries identically on every replica.
                 // `committed_ids` only lets a leader skip re-proposing them.
-                // Exception: a tail proved by a pre-window build is replayed
-                // under that build's filter (see `legacy_snapshot`).
-                let mut apply = Vec::with_capacity(commands.len());
-                for command in commands {
-                    let id = command.id();
-                    let dropped_by_old_build = legacy_snapshot && id != 0 && committed_ids.contains(id);
-                    committed_ids.remember(id, index);
-                    if !dropped_by_old_build {
-                        apply.push(command);
-                    }
+                for command in &commands {
+                    committed_ids.remember(command.id(), index);
                 }
+                let apply = commands;
                 if apply.is_empty() {
                     runtime_metrics.set_raft_enqueued_index(index);
                     runtime_metrics.set_raft_applied_index(index);
@@ -1537,10 +1501,12 @@ fn migration_route(
                     ),
                 ));
             }
-            let command_ids = match (&state.recent_command_ids, &state.recent_command_instruments) {
-                (Some(ids), Some(instruments)) => ids.iter().copied().zip(instruments.iter().copied()).collect(),
-                _ => Vec::new(),
-            };
+            let command_ids = state
+                .recent_command_ids
+                .iter()
+                .copied()
+                .zip(state.recent_command_instruments.iter().copied())
+                .collect();
             propose(CategoryOp::Install {
                 category,
                 category_size,

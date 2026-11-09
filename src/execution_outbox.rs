@@ -7,25 +7,15 @@ use crate::exchange::ExecReport;
 use crate::journal::fnv1a;
 use crate::wire::{self, EXECUTION_EVENT_LEN, REPORT_LEN};
 
-/// Segment header, format v2: records carry the order owners (see
-/// [`OutboxRecord::users`]). v1 segments (no users) are still read, trimmed
-/// and published; the writer never appends to one (it rotates instead).
+/// Segment header. Records carry the order owners (see
+/// [`OutboxRecord::users`]).
 pub const OUTBOX_HEADER: [u8; 8] = *b"TCEX\x02\0\0\0";
-const OUTBOX_HEADER_V1: [u8; 8] = *b"TCEX\x01\0\0\0";
-/// Record length of format v2: group, index, ordinal, report, 2 users, checksum.
+/// Record length: group, index, ordinal, report, 2 users, checksum.
 pub const OUTBOX_RECORD_LEN: usize = 4 + 8 + 4 + REPORT_LEN + 16 + 8;
-/// Record length of format v1 (no users).
-pub const OUTBOX_RECORD_LEN_V1: usize = 4 + 8 + 4 + REPORT_LEN + 8;
 
 /// Record length for a segment header, or `None` for an unknown format.
 fn record_len_for(header: &[u8; 8]) -> Option<usize> {
-    if *header == OUTBOX_HEADER {
-        Some(OUTBOX_RECORD_LEN)
-    } else if *header == OUTBOX_HEADER_V1 {
-        Some(OUTBOX_RECORD_LEN_V1)
-    } else {
-        None
-    }
+    (*header == OUTBOX_HEADER).then_some(OUTBOX_RECORD_LEN)
 }
 
 fn header_mismatch(path: &Path) -> io::Error {
@@ -45,15 +35,11 @@ fn decode_record(bytes: &[u8]) -> Option<OutboxRecord> {
     }
     let mut frame = [0u8; REPORT_LEN];
     frame.copy_from_slice(&bytes[16..16 + REPORT_LEN]);
-    let users = if n == OUTBOX_RECORD_LEN {
-        let at = 16 + REPORT_LEN;
-        [
-            u64::from_le_bytes(bytes[at..at + 8].try_into().ok()?),
-            u64::from_le_bytes(bytes[at + 8..at + 16].try_into().ok()?),
-        ]
-    } else {
-        [0, 0]
-    };
+    let at = 16 + REPORT_LEN;
+    let users = [
+        u64::from_le_bytes(bytes.get(at..at + 8)?.try_into().ok()?),
+        u64::from_le_bytes(bytes.get(at + 8..at + 16)?.try_into().ok()?),
+    ];
     Some(OutboxRecord {
         raft_group: u32::from_le_bytes(bytes[0..4].try_into().ok()?),
         raft_index: u64::from_le_bytes(bytes[4..12].try_into().ok()?),
@@ -72,8 +58,7 @@ pub struct OutboxRecord {
     pub ordinal: u32,
     pub report_frame: [u8; REPORT_LEN],
     /// Owners of the report's orders: `[order_id's user, maker's user for a
-    /// trade]` ([`ExecReport::users`]); zeros for records read from a v1
-    /// segment.
+    /// trade]` ([`ExecReport::users`]).
     pub users: [u64; 2],
 }
 
@@ -252,20 +237,9 @@ impl ExecutionOutboxWriter {
             std::fs::create_dir_all(parent)?;
         }
         let base = path.to_path_buf();
-        let mut current = latest_segment(&base)?;
-        let mut current_seq = segment_seq_of(&base, &current).unwrap_or(0);
-        let (mut file, mut len, record_len) = open_segment(&current)?;
-        if record_len != OUTBOX_RECORD_LEN {
-            // The newest segment predates the current record format (an
-            // upgrade). Recovery has already trimmed it to watermark-covered
-            // records, so seal it as-is — the publisher still reads it — and
-            // append to a fresh segment in the current format.
-            current_seq += 1;
-            current = segment_path(&base, current_seq);
-            let (fresh, fresh_len, _) = open_segment(&current)?;
-            file = fresh;
-            len = fresh_len;
-        }
+        let current = latest_segment(&base)?;
+        let current_seq = segment_seq_of(&base, &current).unwrap_or(0);
+        let (file, len, _) = open_segment(&current)?;
         Ok(ExecutionOutboxWriter {
             writer: BufWriter::with_capacity(64 * 1024, file),
             path: current,

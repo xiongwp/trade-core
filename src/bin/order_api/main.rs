@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use mysql::prelude::Queryable;
-use mysql::{params, Pool, Transaction, TxOpts, Value};
+use mysql::{Pool, Transaction, TxOpts, Value};
 use rdkafka::consumer::{BaseConsumer, CommitMode, Consumer};
 use rdkafka::message::Message;
 use rdkafka::producer::{FutureProducer, FutureRecord};

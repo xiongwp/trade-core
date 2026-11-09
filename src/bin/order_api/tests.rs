@@ -1,6 +1,7 @@
 //! order-api unit tests and the MySQL 8 integration tests (`--ignored`).
 
 use super::*;
+use mysql::params;
 
 fn forward_job(frames: std::ops::Range<u64>) -> RaftForwardJob {
     let (reply, _) = std::sync::mpsc::sync_channel(1);
@@ -200,7 +201,6 @@ fn only_order_state_reports_are_staged_for_projection() {
     for code in [wire::RT_NOTFOUND, wire::RT_DEPTH_LEVEL, wire::RT_DEPTH_END, 12, 13, 14, 15, wire::RT_CMD_REJECTED, wire::RT_TRIGGERED] {
         assert!(!projects_order_state(code), "type {code}");
     }
-    assert_eq!(projected_report_types_sql(), "1,2,3,4,5,6,7,8,17");
     // A stop firing is followed by the fired order's own reports; the
     // Triggered marker itself changes no row.
     assert!(projects_order_state(wire::RT_STOP_ACCEPTED));
@@ -499,7 +499,7 @@ fn mysql8_dedupe_rotation_truncates_only_the_stale_table() {
     )
     .unwrap();
     let mut tx = conn.start_transaction(TxOpts::default()).unwrap();
-    discard_redelivered_events(&mut tx, "order_db_0", 0, period).unwrap();
+    discard_redelivered_events(&mut tx, "order_db_0", period).unwrap();
     tx.commit().unwrap();
     let pending: u64 = conn
         .query_first("SELECT COUNT(*) FROM order_db_0.pending_execution_events WHERE raft_group=9")
@@ -514,50 +514,6 @@ fn mysql8_dedupe_rotation_truncates_only_the_stale_table() {
 
 /// Same disposable MySQL 8 as above. A pre-ring dedupe table is renamed,
 /// not rebuilt, and still stops a redelivery of an event it recorded.
-#[test]
-#[ignore = "requires disposable MySQL 8 via TC_TEST_MYSQL_URL"]
-fn mysql8_legacy_dedupe_table_is_renamed_and_still_consulted() {
-    let store = mysql_test_store().expect("TC_TEST_MYSQL_URL must be set");
-    let group = 2_000_000 + (std::process::id() % 1_000_000);
-    let mut conn = store.shard(0).get_conn().unwrap();
-    conn.query_drop("DROP TABLE IF EXISTS order_db_0.processed_execution_events_legacy").unwrap();
-    conn.query_drop("DROP TABLE IF EXISTS order_db_0.processed_execution_events").unwrap();
-    conn.query_drop("CREATE TABLE order_db_0.processed_execution_events (raft_group INT UNSIGNED NOT NULL, raft_index BIGINT UNSIGNED NOT NULL, report_ordinal INT UNSIGNED NOT NULL, target_order_id BIGINT UNSIGNED NOT NULL, shard_table INT UNSIGNED NOT NULL, instrument INT UNSIGNED NOT NULL, report_type TINYINT UNSIGNED NOT NULL, kafka_partition INT NOT NULL, kafka_offset BIGINT UNSIGNED NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(raft_group,raft_index,report_ordinal,target_order_id)) ENGINE=InnoDB")
-        .unwrap();
-    conn.exec_drop(
-        "INSERT INTO order_db_0.processed_execution_events (raft_group,raft_index,report_ordinal,target_order_id,shard_table,instrument,report_type,kafka_partition,kafka_offset) VALUES (?,1,0,9,0,0,12,0,0)",
-        (group,),
-    )
-    .unwrap();
-
-    bootstrap(&store).unwrap();
-    assert!(has_legacy_dedupe(0));
-    let rotating: u64 = conn
-        .query_first("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='order_db_0' AND table_name LIKE 'processed\\_execution\\_events\\__'")
-        .unwrap()
-        .unwrap();
-    assert_eq!(rotating, DEDUPE_TABLES);
-
-    // The same event arrives again: it is recognised through the legacy table.
-    conn.exec_drop(
-        "INSERT INTO order_db_0.pending_execution_events (raft_group,raft_index,report_ordinal,target_order_id,shard_table,instrument,report_type,event_qty,kafka_partition,kafka_offset) VALUES (?,1,0,9,0,0,12,0,0,0)",
-        (group,),
-    )
-    .unwrap();
-    let mut tx = conn.start_transaction(TxOpts::default()).unwrap();
-    let period = dedupe_period(&mut tx).unwrap();
-    discard_redelivered_events(&mut tx, "order_db_0", 0, period).unwrap();
-    tx.commit().unwrap();
-    let pending: u64 = conn
-        .exec_first("SELECT COUNT(*) FROM order_db_0.pending_execution_events WHERE raft_group=?", (group,))
-        .unwrap()
-        .unwrap();
-    assert_eq!(pending, 0);
-
-    conn.query_drop("DROP TABLE order_db_0.processed_execution_events_legacy").unwrap();
-    legacy_dedupe_dbs().lock().unwrap().remove(&0);
-}
-
 #[test]
 #[ignore = "requires disposable MySQL 8 via TC_TEST_MYSQL_URL"]
 fn mysql8_projection_ignores_reports_that_change_no_order() {
@@ -615,16 +571,6 @@ fn mysql8_projection_ignores_reports_that_change_no_order() {
     )
     .unwrap();
     assert_eq!(status(&mut conn).as_deref(), Some("CANCELLED"));
-    assert_eq!(pending(&mut conn), 0);
-
-    // Rows staged by an older build are dropped when bootstrap runs.
-    conn.exec_drop(
-        "INSERT INTO order_db_0.pending_execution_events (raft_group,raft_index,report_ordinal,target_order_id,shard_table,instrument,report_type,event_qty,kafka_partition,kafka_offset) VALUES (7,:idx,0,0,0,:inst,12,0,0,7)",
-        params! {"idx" => seed + 6, "inst" => instrument},
-    )
-    .unwrap();
-    assert_eq!(pending(&mut conn), 1);
-    bootstrap(&store).unwrap();
     assert_eq!(pending(&mut conn), 0);
 }
 
@@ -798,37 +744,6 @@ fn mysql8_cancel_request_never_overwrites_order_status() {
 }
 
 /// Same disposable MySQL 8 as above.
-#[test]
-#[ignore = "requires disposable MySQL 8 via TC_TEST_MYSQL_URL"]
-fn mysql8_bootstrap_drops_indexes_no_query_reads() {
-    let store = mysql_test_store().expect("TC_TEST_MYSQL_URL must be set");
-    let mut conn = store.shard(0).get_conn().unwrap();
-    // Recreate the indexes as an older deployment had them.
-    // (The single processed_execution_events table those two other indexes
-    // lived on is now replaced by rotating tables at bootstrap.)
-    for (table, index, cols) in [
-        ("processed_commands", "idx_partition_offset", "kafka_partition,kafka_offset"),
-    ] {
-        conn.query_drop(format!(
-            "ALTER TABLE order_db_0.{table} ADD INDEX {index} ({cols})"
-        ))
-        .unwrap();
-    }
-    let count = |conn: &mut mysql::PooledConn| -> u64 {
-        conn.query_first(
-            "SELECT COUNT(*) FROM information_schema.statistics WHERE table_schema='order_db_0' \
-             AND index_name IN ('idx_partition_offset','idx_instrument_index','idx_order_event')",
-        )
-        .unwrap()
-        .unwrap()
-    };
-    assert!(count(&mut conn) > 0);
-    bootstrap(&store).unwrap();
-    assert_eq!(count(&mut conn), 0);
-    bootstrap(&store).unwrap(); // idempotent
-    assert_eq!(count(&mut conn), 0);
-}
-
 #[test]
 fn decodes_batch_and_routes_asset_category() {
     let mut body = batch_order(100_000, 1);
@@ -1126,174 +1041,6 @@ fn persist_retry_commits_and_skips_dlq_on_eventual_success() {
     assert_eq!(metrics.dlq_total.load(AtomicOrdering::Relaxed), 0);
     assert!(read_dlq(&path).is_empty(), "no dead-letter on success");
     std::fs::remove_file(&path).ok();
-}
-
-// ---- route-migration cutover auto-verification --------------------------
-
-use trade_core::cluster::RouteControlPlane;
-use trade_core::migration::{fingerprint_response_json, CategoryFingerprint};
-
-/// A one-shot stub of a matching node's `GET /fingerprint?category=N` route.
-/// Returns its address; the thread serves exactly `serves` requests.
-fn stub_fingerprint_node(fp: CategoryFingerprint, serves: usize) -> String {
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
-    std::thread::spawn(move || {
-        for _ in 0..serves {
-            let Ok((mut s, _)) = listener.accept() else {
-                return;
-            };
-            let mut buf = [0u8; 512];
-            let _ = s.read(&mut buf);
-            let body = fingerprint_response_json(0, fp);
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            let _ = s.write_all(response.as_bytes());
-        }
-    });
-    addr
-}
-
-/// Drive a migration to the point where caught-up can be verified: group
-/// count 4, category 1 → from_group 1, migrate to group 2, frozen at index.
-fn begin_and_freeze(frozen_index: u64) -> (RouteControlPlane, u32, usize, usize) {
-    let rc = RouteControlPlane::new(4, HashMap::new());
-    let category = 1u32;
-    let migration = rc.begin(category, 2).unwrap();
-    assert_eq!(migration.from_group, 1, "category 1 % 4 == 1");
-    assert_eq!(migration.to_group, 2);
-    rc.frozen(category, frozen_index).unwrap();
-    (rc, category, migration.from_group, migration.to_group)
-}
-
-/// A one-shot stub of a node's `GET /applied-index` route.
-fn stub_applied_index_node(index: u64) -> String {
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
-    std::thread::spawn(move || {
-        let Ok((mut s, _)) = listener.accept() else {
-            return;
-        };
-        let mut buf = [0u8; 512];
-        let _ = s.read(&mut buf);
-        let body = trade_core::migration::applied_index_response_json(index);
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        let _ = s.write_all(response.as_bytes());
-    });
-    addr
-}
-
-#[test]
-fn frozen_auto_captures_source_applied_index() {
-    let rc = RouteControlPlane::new(4, HashMap::new());
-    let category = 1u32;
-    let migration = rc.begin(category, 2).unwrap();
-    let mut endpoints = HashMap::new();
-    endpoints.insert(migration.from_group, stub_applied_index_node(4_242));
-
-    // No raft_index in the query → auto-capture from the source node.
-    let body = freeze_migration_inner(&rc, &endpoints, category, "", Duration::from_secs(2))
-        .expect("auto-capture freezes at the source's applied index");
-    assert!(body.contains("\"frozen_index\":4242"), "got: {body}");
-    assert!(body.contains("\"captured_from\":\"source-node\""));
-    // The migration advanced to CatchingUp at exactly that index.
-    assert_eq!(rc.active(category).unwrap().frozen_index, 4_242);
-}
-
-#[test]
-fn frozen_honors_explicit_index_over_auto_capture() {
-    let rc = RouteControlPlane::new(4, HashMap::new());
-    let category = 1u32;
-    let migration = rc.begin(category, 2).unwrap();
-    let mut endpoints = HashMap::new();
-    // Endpoint would answer 999, but an explicit index must win.
-    endpoints.insert(migration.from_group, stub_applied_index_node(999));
-
-    let body = freeze_migration_inner(
-        &rc,
-        &endpoints,
-        category,
-        "raft_index=50",
-        Duration::from_secs(2),
-    )
-    .expect("explicit index is accepted");
-    assert!(body.contains("\"frozen_index\":50"));
-    assert!(body.contains("\"captured_from\":\"caller\""));
-    assert_eq!(rc.active(category).unwrap().frozen_index, 50);
-}
-
-#[test]
-fn frozen_without_index_or_endpoint_is_an_error() {
-    let rc = RouteControlPlane::new(4, HashMap::new());
-    let category = 1u32;
-    rc.begin(category, 2).unwrap();
-    let endpoints = HashMap::new(); // no source endpoint
-    assert!(
-        freeze_migration_inner(&rc, &endpoints, category, "", Duration::from_secs(1)).is_err(),
-        "no index and no endpoint must fail rather than freeze at a bogus value"
-    );
-}
-
-#[test]
-fn caught_up_verifies_against_matching_node_fingerprints() {
-    let (rc, category, from_group, to_group) = begin_and_freeze(100);
-    let agreed = CategoryFingerprint {
-        raft_applied_index: 100,
-        fingerprint: 0xabcd_1234,
-    };
-    let mut endpoints = HashMap::new();
-    endpoints.insert(from_group, stub_fingerprint_node(agreed, 1));
-    endpoints.insert(to_group, stub_fingerprint_node(agreed, 1));
-
-    let body = verify_caught_up_inner(&rc, &endpoints, category, "", Duration::from_secs(2))
-        .expect("matching fingerprints at the freeze index verify");
-    assert!(body.contains("\"verified_by\":\"nodes\""));
-    // The state machine advanced to Verified, so activate now succeeds.
-    assert!(rc.activate(category).is_ok());
-}
-
-#[test]
-fn caught_up_rejects_divergent_node_fingerprints() {
-    let (rc, category, from_group, to_group) = begin_and_freeze(100);
-    let source = CategoryFingerprint {
-        raft_applied_index: 100,
-        fingerprint: 1,
-    };
-    let target = CategoryFingerprint {
-        raft_applied_index: 100,
-        fingerprint: 2, // diverged book state
-    };
-    let mut endpoints = HashMap::new();
-    endpoints.insert(from_group, stub_fingerprint_node(source, 1));
-    endpoints.insert(to_group, stub_fingerprint_node(target, 1));
-
-    let error = verify_caught_up_inner(&rc, &endpoints, category, "", Duration::from_secs(2))
-        .expect_err("divergent fingerprints must be rejected");
-    assert!(error.contains("fingerprints differ"), "got: {error}");
-    // Verification failed, so the migration is NOT verified: activate refuses.
-    assert!(rc.activate(category).is_err());
-}
-
-#[test]
-fn caught_up_without_endpoints_falls_back_to_caller_supplied_values() {
-    let (rc, category, _from, _to) = begin_and_freeze(50);
-    // No endpoints configured for these groups → legacy path reads the
-    // fingerprints from the query string.
-    let endpoints = HashMap::new();
-    let query = "raft_index=50&source_fingerprint=7&target_fingerprint=7";
-    let body = verify_caught_up_inner(&rc, &endpoints, category, query, Duration::from_secs(2))
-        .expect("legacy path accepts equal caller fingerprints");
-    assert!(body.contains("\"verified_by\":\"caller\""));
-    assert!(rc.activate(category).is_ok());
 }
 
 #[test]
@@ -1619,37 +1366,6 @@ fn mysql8_order_queries_get_list_open_filter_and_404() {
 }
 
 /// Same disposable MySQL 8 as above.
-#[test]
-#[ignore = "requires disposable MySQL 8 via TC_TEST_MYSQL_URL"]
-fn mysql8_bootstrap_adds_query_columns_to_existing_tables() {
-    let store = mysql_test_store().expect("TC_TEST_MYSQL_URL must be set");
-    let mut conn = store.shard(0).get_conn().unwrap();
-    // A deployment from before the query columns existed.
-    conn.query_drop("ALTER TABLE order_db_0.pending_execution_events DROP COLUMN event_price, DROP COLUMN fill_role")
-        .unwrap();
-    conn.query_drop("ALTER TABLE order_db_0.asset_orders_003 DROP COLUMN filled_notional")
-        .unwrap();
-    bootstrap(&store).unwrap();
-    bootstrap(&store).unwrap(); // idempotent once present
-    let columns: Vec<(String, String)> = conn
-        .query(
-            "SELECT TABLE_NAME, COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='order_db_0' \
-             AND COLUMN_NAME IN ('event_price','event_fee','fill_role','filled_notional') ORDER BY TABLE_NAME, COLUMN_NAME",
-        )
-        .unwrap();
-    let pending: Vec<&str> = columns
-        .iter()
-        .filter(|(table, _)| table == "pending_execution_events")
-        .map(|(_, column)| column.as_str())
-        .collect();
-    assert_eq!(pending, ["event_fee", "event_price", "fill_role"]);
-    let with_notional = columns
-        .iter()
-        .filter(|(table, column)| table.starts_with("asset_orders_") && column == "filled_notional")
-        .count();
-    assert_eq!(with_notional as u64, store.routing.tables_per_db);
-}
-
 #[test]
 fn a_partly_published_batch_is_accepted_with_the_failed_records() {
     assert_eq!(

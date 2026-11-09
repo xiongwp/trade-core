@@ -213,17 +213,14 @@ pub fn export_category(
     let in_category =
         |instrument: u32| asset_category(crate::types::InstrumentId(instrument), category_size) == category;
     let halted = snap.halted.iter().copied().filter(|&instrument| in_category(instrument)).collect();
-    // Recent command ids of the category, oldest first (v8 snapshots know
-    // each id's instrument; older ones cannot tell, and carry none).
-    let command_ids = match (&snap.recent_command_ids, &snap.recent_command_instruments) {
-        (Some(ids), Some(instruments)) => ids
-            .iter()
-            .zip(instruments)
-            .filter(|(_, &instrument)| in_category(instrument))
-            .map(|(&id, &instrument)| (id, instrument))
-            .collect(),
-        _ => Vec::new(),
-    };
+    // Recent command ids of the category, oldest first.
+    let command_ids = snap
+        .recent_command_ids
+        .iter()
+        .zip(&snap.recent_command_instruments)
+        .filter(|(_, &instrument)| in_category(instrument))
+        .map(|(&id, &instrument)| (id, instrument))
+        .collect();
     CategoryExport { engines, positions, halted, command_ids }
 }
 
@@ -257,9 +254,9 @@ pub fn encode_category_state(
         suspended: &[],
         positions,
         engines,
-        recent_command_ids: Some(&ids),
+        recent_command_ids: &ids,
         sealed: &[],
-        recent_command_instruments: Some(&instruments),
+        recent_command_instruments: &instruments,
         migration_epochs: &[],
     })
 }
@@ -467,9 +464,9 @@ mod tests {
             suspended: &[],
             positions: &[],
             engines: &engines,
-            recent_command_ids: None,
+            recent_command_ids: &[],
             sealed: &[],
-            recent_command_instruments: None,
+            recent_command_instruments: &[],
             migration_epochs: &[],
         };
         snapshot::write(path, data).unwrap();

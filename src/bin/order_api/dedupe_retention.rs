@@ -60,22 +60,6 @@ pub(crate) fn dedupe_period(conn: &mut impl Queryable) -> Result<u64, String> {
         .ok_or_else(|| "no clock row".to_string())
 }
 
-/// Databases whose pre-rotation dedupe table was renamed to
-/// `processed_execution_events_legacy` at bootstrap. Redeliveries are
-/// checked against it too until one retention has passed, then it is dropped.
-pub(crate) fn legacy_dedupe_dbs() -> &'static Mutex<std::collections::BTreeSet<u32>> {
-    static DBS: std::sync::OnceLock<Mutex<std::collections::BTreeSet<u32>>> =
-        std::sync::OnceLock::new();
-    DBS.get_or_init(Default::default)
-}
-
-pub(crate) fn has_legacy_dedupe(db: u32) -> bool {
-    legacy_dedupe_dbs()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .contains(&db)
-}
-
 /// Period maintenance of one database's dedupe tables, run by that
 /// database's execution writer between batches — the writer that inserts
 /// into them, so the truncate never waits on its own transactions.
@@ -84,7 +68,6 @@ pub(crate) struct DedupeRing {
     /// process).
     last_period: Option<u64>,
     next_check: std::time::Instant,
-    started: std::time::Instant,
 }
 
 impl DedupeRing {
@@ -93,7 +76,6 @@ impl DedupeRing {
         Self {
             last_period: None,
             next_check: now,
-            started: now,
         }
     }
 
@@ -107,18 +89,7 @@ impl DedupeRing {
         self.next_check = now + Duration::from_secs(10);
         let mut conn = store.shard(db).get_conn().map_err(|error| error.to_string())?;
         let period = dedupe_period(&mut conn)?;
-        let truncated = self.advance(&mut conn, db, period)?;
-        let retention = Duration::from_secs(dedupe_retention_hours() * 3600);
-        if has_legacy_dedupe(db) && self.started.elapsed() >= retention {
-            conn.query_drop(format!("DROP TABLE IF EXISTS order_db_{db}.processed_execution_events_legacy"))
-                .map_err(|error| error.to_string())?;
-            legacy_dedupe_dbs()
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .remove(&db);
-            log_info!("dedupe-retention", db; "event=legacy_dedupe_table_dropped");
-        }
-        Ok(truncated)
+        self.advance(&mut conn, db, period)
     }
 
     /// Empty the next period's table once per `period`, if it holds rows (a

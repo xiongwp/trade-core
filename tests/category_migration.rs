@@ -62,9 +62,8 @@ fn export(p: &Processor, tag: &str, epoch: u64) -> CategoryOp {
     assert_eq!(received.raft_applied_index, 50);
     let command_ids = received
         .recent_command_ids
-        .unwrap_or_default()
         .into_iter()
-        .zip(received.recent_command_instruments.unwrap_or_default())
+        .zip(received.recent_command_instruments)
         .collect();
     CategoryOp::Install {
         category: 0,
@@ -180,7 +179,6 @@ fn the_seal_survives_a_snapshot_restore() {
     let path = dir.join("snapshot.bin");
     source.write_snapshot(&path, 0, 7).unwrap();
     let snap = snapshot::load(&path).unwrap();
-    assert_eq!(snap.format_version, 8);
     assert_eq!(snap.sealed, vec![(0, SIZE)]);
     assert_eq!(snap.migration_epochs, vec![(0, 3)]);
     let mut restored = processor();

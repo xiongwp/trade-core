@@ -138,24 +138,8 @@ pub(crate) fn handle(
         if method == "POST" && path.starts_with("/admin/routes/") {
             let category = required::<u32>(query, "category");
             let result: Result<String, String> = category.and_then(|category| match path {
-                "/admin/routes/begin" => kafka
-                    .route_control
-                    .begin(category, required::<usize>(query, "to_group")?)
-                    .map(|migration| {
-                        format!(
-                            "{{\"accepted\":true,\"route_version\":{},\"state\":\"FREEZING\"}}",
-                            migration.route_version
-                        )
-                    }),
                 "/admin/routes/migrate" => required::<usize>(query, "to")
                     .and_then(|to| migrate_category(&kafka, category, to)),
-                "/admin/routes/frozen" => freeze_migration(&kafka, category, query),
-                "/admin/routes/caught-up" => verify_caught_up(&kafka, category, query),
-                "/admin/routes/activate" => kafka.route_control.activate(category).map(|version| {
-                    format!(
-                        "{{\"accepted\":true,\"route_version\":{version},\"state\":\"ACTIVE\"}}"
-                    )
-                }),
                 "/admin/routes/abort" => abort_migration(&kafka, category),
                 _ => Err("unknown route migration action".into()),
             });
