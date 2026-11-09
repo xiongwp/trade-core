@@ -14,6 +14,13 @@
 # Destroys local test data by design. Never point it at a real deployment.
 set -euo pipefail
 
+# A Mac that sleeps mid-run pauses the Docker VM and the client: Kafka
+# sessions and timers break and the run hangs or reports garbage. Keep the
+# machine awake for the whole run (macOS only; re-exec once).
+if command -v caffeinate >/dev/null 2>&1 && [ -z "${TC_CAFFEINATED:-}" ]; then
+    exec env TC_CAFFEINATED=1 caffeinate -dimsu "$0" "$@"
+fi
+
 cd "$(dirname "$0")/../.."
 COMMANDS="${1:-1000000}"
 RAFT_GROUPS="${TC_RAFT_GROUPS:-4}"
