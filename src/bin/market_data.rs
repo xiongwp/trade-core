@@ -27,7 +27,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -95,6 +95,12 @@ impl State {
         }
         let mark = self.applied.entry(group).or_insert((0, 0));
         if (index, ordinal) <= *mark {
+            // Far below the mark on every delivery is not a lagging replica
+            // but a matching cluster whose Raft logs were wiped while this
+            // state was kept: all its trades would be dropped as replays.
+            if index.saturating_add(REPLAY_SUSPICION_GAP) < mark.0 {
+                warn_far_below_mark(group, index, mark.0);
+            }
             return false;
         }
         *mark = (index, ordinal);
@@ -108,27 +114,77 @@ impl State {
     }
 }
 
+/// A replica this far behind the newest delivered entry is implausible:
+/// the group was more likely rebuilt from empty logs.
+const REPLAY_SUSPICION_GAP: u64 = 10_000_000;
+
+fn warn_far_below_mark(group: u32, index: u64, mark: u64) {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = now_sec();
+    let last = LAST.load(Ordering::Relaxed);
+    if now >= last + 60
+        && LAST
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        log_warn!(
+            "market-data",
+            "event=trades_far_below_watermark group={group} index={index} watermark={mark}: dropped as replays; if the matching cluster was rebuilt from empty Raft logs, stop market-data and delete its klines.bin"
+        );
+    }
+}
+
 const MARKET_STATE_MAGIC: &[u8; 4] = b"TCM1";
+
+/// What a snapshot needs from the shared state: copied under the lock (the
+/// candle encoding is the only real work), framed and checksummed after it
+/// is released so the feed threads do not wait on that.
+struct MarketStateParts {
+    candles: Vec<u8>,
+    applied: Vec<(u32, u64, u32)>,
+    last_ts: u64,
+}
+
+fn market_state_parts(state: &State) -> MarketStateParts {
+    let mut applied: Vec<_> = state
+        .applied
+        .iter()
+        .map(|(&group, &(index, ordinal))| (group, index, ordinal))
+        .collect();
+    applied.sort_unstable();
+    MarketStateParts {
+        candles: state.agg.encode(),
+        applied,
+        last_ts: state.last_ts,
+    }
+}
 
 /// Candle history and its exact replay watermark must cross the durability
 /// boundary together. Otherwise a crash after saving candles but before
 /// saving the watermark counts the same execution again when any Raft replica
 /// replays its tail.
+#[cfg(test)]
 fn encode_market_state(state: &State) -> Vec<u8> {
-    let candles = state.agg.encode();
-    let mut applied: Vec<_> = state.applied.iter().collect();
-    applied.sort_unstable_by_key(|(group, _)| **group);
+    frame_market_state(market_state_parts(state))
+}
+
+fn frame_market_state(parts: MarketStateParts) -> Vec<u8> {
+    let MarketStateParts {
+        candles,
+        applied,
+        last_ts,
+    } = parts;
     let mut out = Vec::with_capacity(24 + candles.len() + applied.len() * 16);
     out.extend_from_slice(MARKET_STATE_MAGIC);
     out.extend_from_slice(&(candles.len() as u64).to_le_bytes());
     out.extend_from_slice(&candles);
     out.extend_from_slice(&(applied.len() as u32).to_le_bytes());
-    for (&group, &(index, ordinal)) in applied {
+    for (group, index, ordinal) in applied {
         out.extend_from_slice(&group.to_le_bytes());
         out.extend_from_slice(&index.to_le_bytes());
         out.extend_from_slice(&ordinal.to_le_bytes());
     }
-    out.extend_from_slice(&state.last_ts.to_le_bytes());
+    out.extend_from_slice(&last_ts.to_le_bytes());
     let checksum = trade_core::journal::fnv1a(&out);
     out.extend_from_slice(&checksum.to_le_bytes());
     out
@@ -139,10 +195,6 @@ fn decode_market_state(
 ) -> std::io::Result<(KlineAggregator, HashMap<u32, (u64, u32)>, u64)> {
     let bad =
         |message: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, message.to_string());
-    // Backwards-compatible one-time upgrade from candle-only TCK2 snapshots.
-    if bytes.starts_with(b"TCK2") {
-        return Ok((KlineAggregator::decode(bytes)?, HashMap::new(), 0));
-    }
     if bytes.len() < 32 || &bytes[..4] != MARKET_STATE_MAGIC {
         return Err(bad("bad market state magic"));
     }
@@ -155,7 +207,7 @@ fn decode_market_state(
     let candle_end = 12usize
         .checked_add(candle_len)
         .ok_or_else(|| bad("market state length overflow"))?;
-    if candle_end + 4 > body_end {
+    if candle_end.checked_add(4).is_none_or(|end| end > body_end) {
         return Err(bad("truncated market candle state"));
     }
     let agg = KlineAggregator::decode(&bytes[12..candle_end])?;
@@ -168,7 +220,7 @@ fn decode_market_state(
                 .ok_or_else(|| bad("market watermark count overflow"))?,
         )
         .ok_or_else(|| bad("market watermark length overflow"))?;
-    if marks_end + 8 != body_end {
+    if marks_end.checked_add(8) != Some(body_end) {
         return Err(bad("truncated or trailing market watermarks"));
     }
     let mut applied = HashMap::with_capacity(count);
@@ -244,10 +296,12 @@ fn feed_one(md_addr: String, state: Arc<Mutex<State>>) {
                 continue;
             }
         };
-        // A quiet market has no frames to publish. Keep a finite read timeout
-        // so the thread remains interruptible, but do not mistake an idle
-        // socket for a failed feed. EOF or a real I/O error still reconnects.
+        // The fanout sends a heartbeat frame every idle second, so a quiet
+        // market still delivers bytes. Two silent read timeouts in a row
+        // mean the link is dead without a FIN (host loss, partition):
+        // reconnect instead of blocking on it forever.
         sock.set_read_timeout(Some(Duration::from_secs(10))).ok();
+        let mut silent_reads = 0u32;
         log_info!("market-data", "subscribed to {md_addr}");
         let mut buf = vec![0u8; EXECUTION_EVENT_LEN * 512];
         let mut filled = 0usize;
@@ -259,10 +313,16 @@ fn feed_one(md_addr: String, state: Arc<Mutex<State>>) {
             match sock.read(&mut buf[filled..]) {
                 Ok(0) => break,
                 Err(error) if idle_feed_read(&error) => {
-                    continue;
+                    silent_reads += 1;
+                    if silent_reads < 2 {
+                        continue;
+                    }
+                    log_warn!("market-data", "event=feed_silent addr={md_addr}; reconnecting");
+                    break;
                 }
                 Err(_) => break,
                 Ok(n) => {
+                    silent_reads = 0;
                     filled += n;
                     let mut off = 0;
                     let mut st = state.lock().unwrap();
@@ -939,7 +999,9 @@ fn main() {
         depth: DepthStore::default(),
         trades: HashMap::new(),
         applied: restored.1,
-        last_ts: restored.2,
+        // A clock that once jumped ahead must not pin every later candle
+        // to that future time across restarts.
+        last_ts: restored.2.min(now_sec() + 60),
     }));
 
     // Feed thread.
@@ -959,7 +1021,8 @@ fn main() {
                 std::thread::sleep(Duration::from_secs(10));
                 // Encode under the lock, write and fsync after releasing it:
                 // the feed threads must not wait on the disk.
-                let bytes = encode_market_state(&save_state.lock().unwrap());
+                let parts = market_state_parts(&save_state.lock().unwrap());
+                let bytes = frame_market_state(parts);
                 if let Err(error) = write_market_state(&path, &bytes) {
                     log_warn!("market-data", "event=history_save_failed error={error}");
                 }
@@ -1022,8 +1085,8 @@ fn main() {
     // Final flush of candle history so a graceful stop keeps the chart's
     // history up to the moment of shutdown (mirrors the periodic snapshot).
     if let Some(path) = persist {
-        let st = state.lock().unwrap();
-        let _ = write_market_state(&path, &encode_market_state(&st));
+        let parts = market_state_parts(&state.lock().unwrap());
+        let _ = write_market_state(&path, &frame_market_state(parts));
         log_info!(
             "market-data",
             "market history and replay watermarks flushed on shutdown"
@@ -1112,19 +1175,6 @@ mod tests {
             restarted.take(3, 42, 8),
             "the next event remains admissible"
         );
-    }
-
-    #[test]
-    fn legacy_candle_snapshot_is_read_and_upgraded_without_a_watermark() {
-        let mut agg = KlineAggregator::new(10);
-        agg.on_trade(InstrumentId(1), 1_700_000_000, 99, 2);
-        let (decoded, applied, last_ts) = decode_market_state(&agg.encode()).unwrap();
-        assert_eq!(
-            decoded.candles(InstrumentId(1), "1s", 10),
-            agg.candles(InstrumentId(1), "1s", 10)
-        );
-        assert!(applied.is_empty());
-        assert_eq!(last_ts, 0);
     }
 
     #[test]

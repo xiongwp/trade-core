@@ -66,11 +66,27 @@ fn md_limit(name: &str, default: usize) -> usize {
         .max(1)
 }
 
+/// Whether the subscriber hung up. Non-blocking: market-data never writes on
+/// this socket, so a blocking peek would wait out its timeout every time.
 fn peer_closed(stream: &std::net::TcpStream) -> bool {
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(1)));
+    if stream.set_nonblocking(true).is_err() {
+        return false;
+    }
     let mut byte = [0u8; 1];
-    matches!(stream.peek(&mut byte), Ok(0))
+    let closed = match stream.peek(&mut byte) {
+        Ok(0) => true,
+        Ok(_) => false,
+        Err(error) => error.kind() != std::io::ErrorKind::WouldBlock,
+    };
+    let _ = stream.set_nonblocking(false);
+    closed
 }
+
+/// Sent to an idle subscriber every second. Its magic is not an execution
+/// event's, so readers skip it; it lets market-data tell a quiet market from
+/// a dead link (no FIN after a host loss or partition), and lets the writer
+/// notice such a link through a failing write.
+const MD_HEARTBEAT: [u8; wire::EXECUTION_EVENT_LEN] = [0; wire::EXECUTION_EVENT_LEN];
 
 impl MdFanout {
     /// Accept subscriber connections on `listener` in a background thread.
@@ -117,11 +133,16 @@ impl MdFanout {
                             match rx.recv_timeout(Duration::from_secs(1)) {
                                 Ok(chunk) if stream.write_all(&chunk).is_err() => break,
                                 Ok(_) => {}
-                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                                // Only when idle: on the hot path a failed
+                                // write already detects a closed peer.
+                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                                    if peer_closed(&stream)
+                                        || stream.write_all(&MD_HEARTBEAT).is_err()
+                                    {
+                                        break;
+                                    }
+                                }
                                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                            }
-                            if peer_closed(&stream) {
-                                break;
                             }
                         }
                         writer_active.store(false, Ordering::Release);
