@@ -59,7 +59,7 @@ fn websocket_session_acknowledges_each_batch_in_order() {
             return Err(("429 Too Many Requests", "backpressure: hard".into()));
         }
         submitted.push(records.len());
-        Ok(records.len())
+        Ok(batch_accepted_json(records.len(), &[]))
     })
     .unwrap();
 
@@ -1649,4 +1649,20 @@ fn mysql8_bootstrap_adds_query_columns_to_existing_tables() {
         .filter(|(table, column)| table.starts_with("asset_orders_") && column == "filled_notional")
         .count();
     assert_eq!(with_notional as u64, store.routing.tables_per_db);
+}
+
+#[test]
+fn a_partly_published_batch_is_accepted_with_the_failed_records() {
+    assert_eq!(
+        batch_accepted_json(3, &[]),
+        r#""accepted":true,"status":"PENDING","count":3"#
+    );
+    let failed = [
+        FailedRecord { index: 1, order_id: 42, error: "Message timed out".into() },
+        FailedRecord { index: 4, order_id: 45, error: "a \"quoted\" error".into() },
+    ];
+    assert_eq!(
+        batch_accepted_json(3, &failed),
+        r#""accepted":true,"status":"PENDING","count":3,"failed":[{"index":1,"order_id":42,"error":"Message timed out"},{"index":4,"order_id":45,"error":"a 'quoted' error"}]"#
+    );
 }

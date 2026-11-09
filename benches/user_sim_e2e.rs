@@ -399,12 +399,15 @@ fn main() {
                             .and_then(|()| stream.write_all(&body))
                             .and_then(|()| read_response(&mut reader))
                     };
+                    // A partly published batch lists the records that did not
+                    // make it; resend the batch (published ones are deduplicated).
+                    let partial = matches!(&result, Ok((202, body)) if body.windows(10).any(|w| w == b"\"failed\":["));
                     match result {
-                        Ok((202, _)) => {
+                        Ok((202, _)) if !partial => {
                             submitted.fetch_add(count, Ordering::Relaxed);
                             break;
                         }
-                        Ok((429 | 503, _)) => {
+                        Ok((202 | 429 | 503, _)) => {
                             // Backpressure: the stack is protecting itself. Back
                             // off exponentially with jitter, like a real client —
                             // a fixed 5 ms retry turned into a storm of ~1.5k

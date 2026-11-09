@@ -292,21 +292,10 @@ pub(crate) fn commit_execution_batch(
 }
 
 pub(crate) fn rewind_execution_batch(consumer: &BaseConsumer, records: &[ExecutionKafkaRecord]) {
-    let mut offsets: HashMap<(&str, i32), i64> = HashMap::new();
-    for record in records {
-        offsets
-            .entry((&record.topic, record.partition))
-            .and_modify(|offset| *offset = (*offset).min(record.offset))
-            .or_insert(record.offset);
-    }
-    for ((topic, partition), offset) in offsets {
-        let _ = consumer.seek(
-            topic,
-            partition,
-            Offset::Offset(offset),
-            Duration::from_secs(1),
-        );
-    }
+    rewind_to_earliest(
+        consumer,
+        records.iter().map(|record| (record.topic.as_str(), record.partition, record.offset)),
+    );
 }
 
 pub(crate) type ExecutionShardTables = HashMap<u32, Vec<(ExecutionKafkaRecord, u64)>>;

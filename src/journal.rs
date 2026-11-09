@@ -85,6 +85,7 @@ pub struct JournalWriter {
     written_since_flush: usize,
     last_flush: Instant,
     flush_interval: Duration,
+    recovered_seq: u64,
 }
 
 impl JournalWriter {
@@ -109,7 +110,9 @@ impl JournalWriter {
             .append(true)
             .open(path)?;
         let len = probe.metadata()?.len();
-        if len == 0 {
+        if len < JOURNAL_HEADER.len() as u64 {
+            // Empty, or a header torn by a crash right after creation.
+            probe.set_len(0)?;
             probe.write_all(&JOURNAL_HEADER)?;
             probe.sync_data()?;
         } else {
@@ -125,7 +128,17 @@ impl JournalWriter {
                 ));
             }
         }
-        let len = std::fs::metadata(path)?.len();
+        // Appending after a torn tail would hide every later record from
+        // replay (the reader stops at the first bad record), so cut the file
+        // back to its last complete record first.
+        let (recovered_seq, valid_len) = scan_valid_prefix(path)?;
+        let mut len = std::fs::metadata(path)?.len();
+        if len > valid_len {
+            let file = OpenOptions::new().write(true).open(path)?;
+            file.set_len(valid_len)?;
+            file.sync_all()?;
+            len = valid_len;
+        }
         let file = OpenOptions::new().append(true).open(path)?;
         if let Some(bytes) = std::env::var("TC_WAL_PREALLOCATE_BYTES")
             .ok()
@@ -140,7 +153,13 @@ impl JournalWriter {
             written_since_flush: 0,
             last_flush: Instant::now(),
             flush_interval,
+            recovered_seq,
         })
+    }
+
+    /// Seq of the last complete record found on disk when the writer opened.
+    pub fn recovered_seq(&self) -> u64 {
+        self.recovered_seq
     }
 
     /// A clone of the underlying file handle, for an fsync thread.
@@ -402,6 +421,26 @@ impl Iterator for JournalReader {
     }
 }
 
+/// Last seq and byte length of the consistent prefix of a v3 journal: the
+/// header plus every record up to the first truncated or corrupt one.
+fn scan_valid_prefix(path: &Path) -> io::Result<(u64, u64)> {
+    let mut r = BufReader::with_capacity(1 << 20, File::open(path)?);
+    let mut hdr = [0u8; 8];
+    r.read_exact(&mut hdr)?;
+    let mut valid = JOURNAL_HEADER.len() as u64;
+    let mut last_seq = 0;
+    let mut rec = [0u8; RECORD_LEN];
+    while r.read_exact(&mut rec).is_ok() {
+        let stored = u64::from_le_bytes(rec[RECORD_LEN - 8..].try_into().unwrap());
+        if fnv1a(&rec[..RECORD_LEN - 8]) != stored {
+            break;
+        }
+        last_seq = u64::from_le_bytes(rec[0..8].try_into().unwrap());
+        valid += RECORD_LEN as u64;
+    }
+    Ok((last_seq, valid))
+}
+
 /// Rewrite a format-v2 journal (40-byte frames) as v3, preserving every
 /// record's seq, timestamp and command; a torn tail is dropped exactly as
 /// replay would drop it. Written to a temp file, fsynced, then renamed over
@@ -468,6 +507,37 @@ mod tests {
         let recs: Vec<Record> = JournalReader::open(&path).unwrap().collect();
         assert_eq!(recs.len(), 9, "truncated tail must be dropped, prefix kept");
 
+        // Reopening for append cuts the torn record off, so what is written
+        // next is readable instead of hidden behind it.
+        let mut w = JournalWriter::open(&path, Duration::from_millis(1)).unwrap();
+        assert_eq!(w.recovered_seq(), 9);
+        w.resume_from(w.recovered_seq());
+        let mut frame = [0u8; MSG_LEN];
+        frame[0] = 1;
+        frame[8] = 77;
+        w.append(2000, &frame).unwrap();
+        w.flush().unwrap();
+        drop(w);
+        let recs: Vec<Record> = JournalReader::open(&path).unwrap().collect();
+        assert_eq!(recs.len(), 10);
+        assert_eq!((recs[9].seq, recs[9].frame[8]), (10, 77));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_header_torn_at_creation_is_rewritten() {
+        let dir = std::env::temp_dir().join(format!("tc-journal-hdr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("j.bin");
+        std::fs::write(&path, &JOURNAL_HEADER[..3]).unwrap();
+        let mut w = JournalWriter::open(&path, Duration::from_millis(1)).unwrap();
+        let mut frame = [0u8; MSG_LEN];
+        frame[0] = 1;
+        w.append(1, &frame).unwrap();
+        w.flush().unwrap();
+        drop(w);
+        assert_eq!(JournalReader::open(&path).unwrap().count(), 1);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

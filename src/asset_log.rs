@@ -114,7 +114,8 @@ impl AssetJournalSet {
             self.flush_interval,
             self.writer_buffer_bytes,
         )?;
-        writer.resume_from(last_seq(&path)?);
+        let recovered = writer.recovered_seq();
+        writer.resume_from(recovered);
         self.writers.insert(
             instrument,
             CachedWriter {
@@ -290,9 +291,8 @@ pub fn mark_applied_batch(
 ) -> io::Result<()> {
     std::fs::create_dir_all(root)?;
     let path = root.join("raft-batches.applied.v2");
-    let new_file = !path.exists();
     let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
-    if new_file {
+    if trim_torn_tail(&file, APPLIED_PROOF_HEADER.len(), APPLIED_PROOF_RECORD_LEN)? {
         file.write_all(&APPLIED_PROOF_HEADER)?;
     }
     let mut record = [0u8; APPLIED_PROOF_RECORD_LEN];
@@ -316,7 +316,12 @@ pub fn load_applied_batch_proofs(root: &Path) -> io::Result<HashMap<u64, Applied
         Err(error) => return Err(error),
     };
     let mut header = [0u8; APPLIED_PROOF_HEADER.len()];
-    file.read_exact(&mut header)?;
+    match file.read_exact(&mut header) {
+        Ok(()) => {}
+        // Crashed while creating the file: no proof was ever written.
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(HashMap::new()),
+        Err(error) => return Err(error),
+    }
     if header != APPLIED_PROOF_HEADER {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -644,8 +649,28 @@ fn append_applied_batch(root: &Path, raft_index: u64) -> io::Result<()> {
         .create(true)
         .append(true)
         .open(root.join("raft-batches.applied"))?;
+    trim_torn_tail(&file, 0, record.len())?;
     file.write_all(&record)?;
     file.sync_data()
+}
+
+/// Cut a fixed-record file back to its last whole record, so a record torn
+/// by a crash mid-append does not shift every later record off the record
+/// grid (which a later load would report as checksum corruption). Returns
+/// true when the file holds no complete header and must have it (re)written.
+/// One fstat per append; the set_len only ever runs after a crash.
+fn trim_torn_tail(file: &File, header_len: usize, record_len: usize) -> io::Result<bool> {
+    let len = file.metadata()?.len();
+    let header_len = header_len as u64;
+    if header_len > 0 && len < header_len {
+        file.set_len(0)?;
+        return Ok(true);
+    }
+    let keep = len - (len - header_len) % record_len as u64;
+    if keep != len {
+        file.set_len(keep)?;
+    }
+    Ok(false)
 }
 
 fn last_seq(path: &Path) -> io::Result<u64> {
@@ -720,6 +745,41 @@ mod tests {
         assert!(verify_applied_batch(proofs[&91], 5, 0xfeed_beef).is_ok());
         assert!(verify_applied_batch(proofs[&91], 4, 0xfeed_beef).is_err());
         assert!(verify_applied_batch(proofs[&91], 5, 7).is_err());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn a_proof_torn_by_a_crash_does_not_corrupt_later_proofs() {
+        let root = std::env::temp_dir().join(format!("tc-torn-proof-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        mark_applied_batch(&root, 1, 1, 11).unwrap();
+        mark_applied_batch(&root, 2, 2, 22).unwrap();
+        // Crash halfway through the third record.
+        let path = root.join("raft-batches.applied.v2");
+        let len = std::fs::metadata(&path).unwrap().len();
+        OpenOptions::new().write(true).open(&path).unwrap().set_len(len - 13).unwrap();
+        let proofs = load_applied_batch_proofs(&root).unwrap();
+        assert_eq!(proofs.len(), 1, "the torn record is ignored");
+        // Restart, re-apply entry 2, carry on: every proof must load.
+        mark_applied_batch(&root, 2, 2, 22).unwrap();
+        mark_applied_batch(&root, 3, 3, 33).unwrap();
+        let proofs = load_applied_batch_proofs(&root).unwrap();
+        assert_eq!(proofs.len(), 3);
+        assert_eq!(proofs[&3].report_fingerprint, 33);
+
+        // Same for the legacy watermark file.
+        append_applied_batch(&root, 7).unwrap();
+        let legacy = root.join("raft-batches.applied");
+        let len = std::fs::metadata(&legacy).unwrap().len();
+        OpenOptions::new().write(true).open(&legacy).unwrap().set_len(len - 5).unwrap();
+        append_applied_batch(&root, 8).unwrap();
+        assert!(load_applied_batches(&root).unwrap().contains(&8));
+
+        // A file torn inside its header holds no proof yet.
+        std::fs::write(&path, &APPLIED_PROOF_HEADER[..4]).unwrap();
+        assert!(load_applied_batch_proofs(&root).unwrap().is_empty());
+        mark_applied_batch(&root, 9, 1, 1).unwrap();
+        assert!(load_applied_batch_proofs(&root).unwrap().contains_key(&9));
         std::fs::remove_dir_all(root).ok();
     }
     use crate::types::{OrderId, Side};

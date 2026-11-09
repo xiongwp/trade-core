@@ -131,20 +131,56 @@ impl IdleCommit {
 }
 
 pub(crate) fn rewind_kafka_batch(consumer: &BaseConsumer, records: &[KafkaRecord]) {
+    rewind_to_earliest(
+        consumer,
+        records.iter().map(|record| (record.topic.as_str(), record.partition, record.offset)),
+    );
+}
+
+/// Seek every partition of a failed batch back to its first record. If a
+/// seek is lost the consumer keeps fetching past the batch, and the next
+/// successful batch commits an offset beyond it: the failed records would be
+/// skipped for good. A partition that is no longer assigned is fine (its new
+/// owner resumes from the committed offset, which is before this batch).
+/// Otherwise, after retrying, stop the process: a restart resumes from the
+/// committed offsets, which never pass an unprocessed batch.
+pub(crate) fn rewind_to_earliest<'a>(
+    consumer: &BaseConsumer,
+    records: impl Iterator<Item = (&'a str, i32, i64)>,
+) {
     let mut offsets: HashMap<(&str, i32), i64> = HashMap::new();
-    for record in records {
+    for (topic, partition, offset) in records {
         offsets
-            .entry((&record.topic, record.partition))
-            .and_modify(|offset| *offset = (*offset).min(record.offset))
-            .or_insert(record.offset);
+            .entry((topic, partition))
+            .and_modify(|first| *first = (*first).min(offset))
+            .or_insert(offset);
     }
     for ((topic, partition), offset) in offsets {
-        let _ = consumer.seek(
-            topic,
-            partition,
-            Offset::Offset(offset),
-            Duration::from_secs(1),
-        );
+        let mut attempt = 0;
+        loop {
+            let Err(error) =
+                consumer.seek(topic, partition, Offset::Offset(offset), Duration::from_secs(1))
+            else {
+                break;
+            };
+            let assigned = consumer.assignment().map(|list| {
+                list.elements()
+                    .iter()
+                    .any(|tp| tp.topic() == topic && tp.partition() == partition)
+            });
+            if assigned == Ok(false) {
+                break;
+            }
+            attempt += 1;
+            if attempt >= 5 {
+                panic!(
+                    "cannot rewind {topic}[{partition}] to offset {offset} after a failed batch \
+                     ({error}); restarting from committed offsets instead of skipping it"
+                );
+            }
+            log_warn!("order-kafka", "event=rewind_retry topic={topic} partition={partition} offset={offset} error={error}");
+            std::thread::sleep(Duration::from_millis(200 * attempt));
+        }
     }
 }
 

@@ -16,7 +16,7 @@ use protobuf::Message as PbMessage;
 use raft::prelude::Message;
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::message::Message as KafkaMessage;
-use rdkafka::producer::{FutureProducer, FutureRecord};
+use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
 use rdkafka::topic_partition_list::{Offset, TopicPartitionList};
 use rdkafka::ClientConfig;
 use trade_core::asset_log;
@@ -818,6 +818,10 @@ fn main() {
             .set("bootstrap.servers", &brokers)
             .set("acks", "all")
             .set("enable.idempotence", "true")
+            // A permanent produce error raises a fatal error instead of
+            // skipping messages and renumbering the rest, which would let
+            // later events of an order reach the topic before earlier ones.
+            .set("enable.gapless.guarantee", "true")
             .set(
                 "max.in.flight.requests.per.connection",
                 std::env::var("TC_EXECUTION_KAFKA_MAX_IN_FLIGHT").unwrap_or_else(|_| "5".into()),
@@ -840,17 +844,20 @@ fn main() {
                 std::env::var("TC_EXECUTION_KAFKA_QUEUE_KBYTES")
                     .unwrap_or_else(|_| "1048576".into()),
             )
+            // A message that times out is skipped (the idempotent producer
+            // bumps its epoch past it) while later ones may still land, so
+            // the resend arrives out of order. Outlast a broker failover.
             .set(
                 "message.timeout.ms",
                 std::env::var("TC_EXECUTION_KAFKA_DELIVERY_TIMEOUT_MS")
-                    .unwrap_or_else(|_| "5000".into()),
+                    .unwrap_or_else(|_| "60000".into()),
             );
         let producer = config
             .create::<FutureProducer>()
             .expect("create execution Kafka producer");
-        (brokers, producer)
+        (brokers, config, producer)
     });
-    if let Some((brokers, producer)) = execution_producer.clone() {
+    if let Some((brokers, producer_config, producer)) = execution_producer {
         let checkpoint_topic = std::env::var("TC_EXECUTION_CURSOR_TOPIC")
             .unwrap_or_else(|_| "trade-execution-outbox-cursors-v1".into());
         let checkpoint_partitions = std::env::var("TC_EXECUTION_CURSOR_PARTITIONS")
@@ -864,6 +871,7 @@ fn main() {
             checkpoint_topic,
             checkpoint_partitions,
             brokers,
+            producer_config,
             producer,
             trade_core::sharding::RouteConfig::from_env(),
             raft_group_id,
@@ -924,7 +932,8 @@ fn spawn_execution_outbox_publisher(
     checkpoint_topic: String,
     checkpoint_partitions: i32,
     brokers: String,
-    producer: FutureProducer,
+    producer_config: ClientConfig,
+    mut producer: FutureProducer,
     routing: trade_core::sharding::RouteConfig,
     raft_group: u32,
     node_id: u64,
@@ -1232,6 +1241,21 @@ fn spawn_execution_outbox_publisher(
                         .execution_outbox_publish_healthy
                         .store(pending_checkpoint.is_none() as u64, Ordering::Release);
                 }
+                // A gapless producer stops for good after a produce error that
+                // would have skipped messages; the unacknowledged batch is
+                // still in the outbox, so a fresh producer resends it in order.
+                if pass_failed {
+                    if let Some((code, reason)) = producer.client().fatal_error() {
+                        log_warn!("execution-kafka", "event=producer_recreated fatal={code:?} reason={reason}");
+                        match producer_config.create::<FutureProducer>() {
+                            Ok(fresh) => producer = fresh,
+                            Err(error) => {
+                                log_error!("execution-kafka", "event=producer_recreate_failed error={error}");
+                                thread::sleep(Duration::from_secs(1));
+                            }
+                        }
+                    }
+                }
                 if !published_any && !idle_sleep.is_zero() {
                     thread::sleep(idle_sleep);
                 }
@@ -1487,7 +1511,7 @@ fn migration_route(
 
 /// Bump when a change alters matching results for the same command log (the
 /// replicas of a group must all run builds with the same value).
-const DETERMINISM_VERSION: u32 = 20_261_108;
+const DETERMINISM_VERSION: u32 = 20_261_109;
 
 /// Fingerprint (and readable description) of everything that must be equal
 /// on every replica of a group for them to compute identical results and

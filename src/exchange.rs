@@ -1847,7 +1847,7 @@ impl Processor {
                         .on(instrument)
                         .by(user);
                     close.tif = TimeInForce::Ioc;
-                    let last_price = self.process_new(close, emit);
+                    let last_price = self.admit_and_match(close, true, emit);
                     if self.pending_stops > 0 {
                         self.fire_stops(instrument, last_price, emit);
                     }
@@ -1861,7 +1861,20 @@ impl Processor {
     /// Returns the lowest and highest trade price this order printed.
     fn process_new(
         &mut self,
+        order: Order,
+        emit: &mut dyn FnMut(ExecReport),
+    ) -> Option<(Price, Price)> {
+        self.admit_and_match(order, false, emit)
+    }
+
+    /// `forced` is a liquidation close: it must flatten the position even for
+    /// a suspended user, a position larger than the per-order caps, or a dust
+    /// remainder below the minimum size, so it skips the user/shape gates.
+    /// A halted instrument and the price band still apply.
+    fn admit_and_match(
+        &mut self,
         mut order: Order,
+        forced: bool,
         emit: &mut dyn FnMut(ExecReport),
     ) -> Option<(Price, Price)> {
         let instrument = order.instrument;
@@ -1879,7 +1892,7 @@ impl Processor {
             });
             return None;
         }
-        if order.user != 0 && self.suspended.contains(&order.user) {
+        if !forced && order.user != 0 && self.suspended.contains(&order.user) {
             emit(ExecReport::Rejected {
                 instrument,
                 order_id: id,
@@ -1912,7 +1925,7 @@ impl Processor {
             });
             return None;
         }
-        if !self.specs.is_empty() {
+        if !forced && !self.specs.is_empty() {
             if let Some(spec) = self.specs.get(instrument) {
                 if let Err(reason) = spec.check(&order) {
                     emit(ExecReport::Rejected {
@@ -1927,7 +1940,7 @@ impl Processor {
         }
         // Synchronous pre-trade risk:
         // 1. static limits (order shape);
-        if let Some(limits) = &self.limits {
+        if let Some(limits) = self.limits.as_ref().filter(|_| !forced) {
             if let Err(reason) = limits.check_static(&order) {
                 emit(ExecReport::Rejected {
                     instrument,
@@ -1953,7 +1966,7 @@ impl Processor {
         }
         // 3. per-user open-order cap (needs book state).
         if let Some(limits) = self.limits {
-            if limits.max_user_orders > 0 && order.user != 0 {
+            if !forced && limits.max_user_orders > 0 && order.user != 0 {
                 let open = self
                     .engine_for(instrument)
                     .book()
@@ -2285,6 +2298,13 @@ impl Shard {
                 // tightly again, and publish depth on cadence.
                 self.idle_streak = 0;
                 self.maybe_publish_depth();
+                // A shard that never goes idle must still snapshot, or Raft
+                // can never compact and the log (and recovery replay) grows
+                // without bound. Every handle() ends on a Raft entry boundary,
+                // so the state captured here is consistent.
+                if self.snapshot_due() {
+                    self.take_snapshot();
+                }
             } else {
                 if !self.running.load(Ordering::Acquire)
                     && self.high_rx.is_empty()

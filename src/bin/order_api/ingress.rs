@@ -15,14 +15,16 @@ pub(crate) fn ws_max_batch() -> usize {
 /// one wire frame); `submit` admits and publishes it exactly like the HTTP
 /// batch path. Every message gets one JSON text acknowledgement, in order,
 /// carrying its 1-based `seq` on this connection so clients may pipeline:
-/// `{"seq":N,"accepted":true,"status":"PENDING","count":C}` or
+/// `{"seq":N,"accepted":true,"status":"PENDING","count":C}` (plus
+/// `"failed":[{"index","order_id","error"}]` when some records of the batch
+/// could not be published; `count` is then the published ones) or
 /// `{"seq":N,"accepted":false,"code":429,"error":"..."}` (codes as HTTP).
 /// A message above the size limit closes the connection (1009).
 pub(crate) fn ws_order_session(
     r: &mut impl Read,
     w: &mut impl Write,
     max_batch: usize,
-    mut submit: impl FnMut(&[u8]) -> Result<usize, (&'static str, String)>,
+    mut submit: impl FnMut(&[u8]) -> Result<String, (&'static str, String)>,
 ) -> std::io::Result<()> {
     use trade_core::websocket::{self, Message};
     let max_len = max_batch * BATCH_RECORD_LEN;
@@ -47,9 +49,7 @@ pub(crate) fn ws_order_session(
             )),
         };
         let ack = match result {
-            Ok(count) => format!(
-                "{{\"seq\":{seq},\"accepted\":true,\"status\":\"PENDING\",\"count\":{count}}}"
-            ),
+            Ok(accepted) => format!("{{\"seq\":{seq},{accepted}}}"),
             Err((status, error)) => {
                 let code = status.split_whitespace().next().unwrap_or("500");
                 format!(
@@ -454,7 +454,12 @@ impl KafkaIngress {
         })
     }
 
-    pub(crate) fn publish_batch(&self, records: &[BatchRecord]) -> Result<(), String> {
+    /// Publish a batch. Each record is delivered on its own, so some may
+    /// fail while the rest are already on their way to matching: the batch is
+    /// then answered as accepted with the records that did not make it, for
+    /// the client to resend (resending one that did land is deduplicated by
+    /// command id). `Err` means nothing was published.
+    pub(crate) fn publish_batch(&self, records: &[BatchRecord]) -> Result<Vec<FailedRecord>, String> {
         self.admit_batch(records)?;
         self.reserve(records.len())?;
         let prepared = records
@@ -479,27 +484,68 @@ impl KafkaIngress {
                 )
             }),
         ));
-        let mut failed = 0u64;
-        let mut first_error = None;
-        for delivery in deliveries {
-            if let Err((error, _)) = delivery {
-                failed += 1;
-                first_error.get_or_insert_with(|| error.to_string());
-            }
+        let failed = deliveries
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, delivery)| {
+                delivery.err().map(|(error, _)| FailedRecord {
+                    index,
+                    order_id: records[index].order_id,
+                    error: error.to_string(),
+                })
+            })
+            .collect::<Vec<_>>();
+        self.metrics.finish_reservation(
+            records.len() as u64,
+            (records.len() - failed.len()) as u64,
+        );
+        if failed.len() == records.len() {
+            return Err(failed
+                .into_iter()
+                .next()
+                .map_or_else(|| "Kafka batch publish failed".into(), |f| f.error));
         }
-        self.metrics
-            .finish_reservation(records.len() as u64, records.len() as u64 - failed);
-        if failed > 0 {
-            return Err(first_error.unwrap_or_else(|| "Kafka batch publish failed".into()));
-        }
-        Ok(())
+        Ok(failed)
     }
+}
+
+/// A batch record that was not published (see [`KafkaIngress::publish_batch`]).
+#[derive(Debug)]
+pub(crate) struct FailedRecord {
+    /// 0-based position in the batch.
+    pub(crate) index: usize,
+    pub(crate) order_id: u64,
+    pub(crate) error: String,
+}
+
+/// Acknowledgement body of a batch that was (at least partly) published:
+/// `"count"` is how many were published; `"failed"` lists the rest, only
+/// when there are any.
+pub(crate) fn batch_accepted_json(published: usize, failed: &[FailedRecord]) -> String {
+    let mut body = format!("\"accepted\":true,\"status\":\"PENDING\",\"count\":{published}");
+    if !failed.is_empty() {
+        body.push_str(",\"failed\":[");
+        for (i, record) in failed.iter().enumerate() {
+            if i > 0 {
+                body.push(',');
+            }
+            body.push_str(&format!(
+                "{{\"index\":{},\"order_id\":{},\"error\":\"{}\"}}",
+                record.index,
+                record.order_id,
+                record.error.replace('"', "'")
+            ));
+        }
+        body.push(']');
+    }
+    body
 }
 
 #[derive(Debug)]
 pub(crate) struct BatchRecord {
     pub(crate) category_id: u32,
     pub(crate) user: u64,
+    pub(crate) order_id: u64,
     pub(crate) frame: [u8; wire::MSG_LEN],
 }
 
@@ -531,6 +577,7 @@ pub(crate) fn decode_batch(body: &[u8], category_size: u32) -> Result<Vec<BatchR
         records.push(BatchRecord {
             category_id: sharding::asset_category(command.instrument(), category_size),
             user,
+            order_id: database_order_id(&command),
             frame,
         });
     }

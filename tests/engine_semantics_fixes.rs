@@ -142,3 +142,44 @@ fn a_huge_sell_budget_does_not_wrap_its_price_floor() {
     let out = run(&mut p, Command::New(order));
     assert_eq!(trades(&out), 0, "a near-u64::MAX proceeds floor must not sell at 100: {out:?}");
 }
+
+fn force_close(close_id: u64, user: u64, side: Side, qty: Qty) -> Command {
+    Command::ForceClose {
+        instrument: SYM,
+        user,
+        close_order_id: OrderId(close_id),
+        close_side: side,
+        close_qty: qty,
+    }
+}
+
+#[test]
+fn a_liquidation_flattens_a_suspended_user_beyond_the_order_caps() {
+    let mut p = Processor::new(|| Box::new(PriceTimePriority), None).with_limits(Some(
+        trade_core::RiskLimits {
+            max_order_qty: 5,
+            max_notional: 0,
+            max_user_orders: 1,
+        },
+    ));
+    // User 20 builds a 10-lot long in two fills; makers 10/11 rest asks.
+    run(&mut p, limit(1, 10, Side::Sell, 100, 5));
+    run(&mut p, limit(2, 20, Side::Buy, 100, 5));
+    run(&mut p, limit(3, 11, Side::Sell, 100, 5));
+    run(&mut p, limit(4, 20, Side::Buy, 100, 5));
+    assert_eq!(p.position(20, SYM), 10);
+    run(&mut p, Command::HaltUser { instrument: SYM, user: 20, cmd_id: 5 });
+    // Bids for the close: 10 lots, more than one order may carry.
+    run(&mut p, limit(6, 30, Side::Buy, 99, 5));
+    run(&mut p, limit(7, 31, Side::Buy, 99, 5));
+
+    // Suspended, close above max-qty: still must go through.
+    let out = run(&mut p, force_close(8, 20, Side::Sell, 10));
+    assert_eq!(rejected_reason(&out), None, "{out:?}");
+    assert_eq!(trades(&out), 2);
+    assert_eq!(p.position(20, SYM), 0);
+
+    // An ordinary order from the suspended user is still refused.
+    let out = run(&mut p, limit(9, 20, Side::Sell, 99, 1));
+    assert_eq!(rejected_reason(&out), Some("user-suspended"));
+}

@@ -201,7 +201,7 @@ pub(crate) fn handle(
             let result = ws_order_session(&mut reader, &mut writer, ws_max_batch(), |body| {
                 match decode_batch(body, category_size) {
                     Ok(records) => match kafka.publish_batch(&records) {
-                        Ok(()) => Ok(records.len()),
+                        Ok(failed) => Ok(batch_accepted_json(records.len() - failed.len(), &failed)),
                         Err(error) => Err((ingress_error_status(&error), error)),
                     },
                     Err(error) => Err(("400 Bad Request", error)),
@@ -228,15 +228,23 @@ pub(crate) fn handle(
         if method == "POST" && path == "/commands/batch" {
             match decode_batch(&body, category_size) {
                 Ok(records) => match kafka.publish_batch(&records) {
-                    Ok(()) => respond(
-                        reader.get_mut(),
-                        "202 Accepted",
-                        &format!(
-                            "{{\"accepted\":true,\"status\":\"PENDING\",\"count\":{}}}",
-                            records.len()
-                        ),
-                        keep_alive,
-                    ),
+                    Ok(failed) => {
+                        if !failed.is_empty() {
+                            log_warn!(
+                                "order-api",
+                                "event=batch_partially_published count={} failed={} error={}",
+                                records.len(),
+                                failed.len(),
+                                failed[0].error
+                            );
+                        }
+                        respond(
+                            reader.get_mut(),
+                            "202 Accepted",
+                            &format!("{{{}}}", batch_accepted_json(records.len() - failed.len(), &failed)),
+                            keep_alive,
+                        )
+                    }
                     Err(error) => {
                         let status = ingress_error_status(&error);
                         // Rejected ingress is an異常 path: keep it correlatable

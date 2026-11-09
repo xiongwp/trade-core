@@ -74,11 +74,27 @@ fn snapshot_plus_journal_tail_equals_continuous_state() {
     };
     let (gw, sink, handle) = build(cfg);
 
-    // Phase A, then snapshot (which also truncates the journal).
+    // Phase A, then snapshot (which also truncates the journal). The shard
+    // snapshots as soon as it is asked, busy or not, so wait until it has
+    // processed all of phase A: as many reports as a direct run produces.
+    let mut expected = 0;
+    let mut reference = Processor::new(|| Box::new(PriceTimePriority), None);
+    for cmd in flow(0xAAAA, 0, 2000) {
+        reference.process(cmd, &mut |r| {
+            if !matches!(r, ExecReport::DepthLevel { .. } | ExecReport::DepthEnd { .. }) {
+                expected += 1;
+            }
+        });
+    }
     for cmd in flow(0xAAAA, 0, 2000) {
         gw.submit(cmd).expect("queue sized for the test");
     }
-    let _ = drain_all(&sink);
+    let mut seen = 0;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while seen < expected && Instant::now() < deadline {
+        seen += drain_all(&sink).len();
+    }
+    assert_eq!(seen, expected, "phase A fully processed before the snapshot");
     handle.snapshot_now();
     std::thread::sleep(Duration::from_millis(100)); // let the shard snapshot
 
@@ -116,6 +132,44 @@ fn snapshot_plus_journal_tail_equals_continuous_state() {
         truth.state_fingerprint(),
         "snapshot + tail must equal continuous execution"
     );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A shard that never goes idle still snapshots; snapshot + journal tail
+/// taken mid-stream must reproduce the continuous state exactly.
+#[test]
+fn a_snapshot_taken_mid_stream_recovers_exactly() {
+    let dir = temp_dir("snap-busy");
+    let cfg = ExchangeConfig {
+        shards: 1,
+        journal_dir: Some(dir.clone()),
+        journal_flush: Duration::from_millis(5),
+        ..ExchangeConfig::default()
+    };
+    let (gw, sink, handle) = build(cfg);
+    let commands = flow(0xC0DE, 0, 3000);
+    for (i, cmd) in flow(0xC0DE, 0, 3000).into_iter().enumerate() {
+        if i == 1000 {
+            handle.snapshot_now(); // requested while the queue is full
+        }
+        gw.submit(cmd).expect("queue sized for the test");
+    }
+    let _ = drain_all(&sink);
+    handle.shutdown();
+
+    let mut truth = Processor::new(|| Box::new(PriceTimePriority), None);
+    for cmd in commands {
+        truth.process(cmd, &mut |_| {});
+    }
+    let mut recovered = Processor::new(|| Box::new(PriceTimePriority), None);
+    let applied = recover_into(
+        &mut recovered,
+        &dir.join("snapshot-shard-0.bin"),
+        &dir.join("journal-shard-0.bin"),
+    )
+    .unwrap();
+    assert!(applied < 3000, "a snapshot was taken ({applied} replayed from the journal)");
+    assert_eq!(recovered.state_fingerprint(), truth.state_fingerprint());
     std::fs::remove_dir_all(&dir).ok();
 }
 

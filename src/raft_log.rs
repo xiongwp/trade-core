@@ -339,6 +339,12 @@ impl DurableRaftLog {
         // Atomic on POSIX: readers see either the old full log or the compacted
         // one. The snapshot is durable in `tmp` before it can become "the" log.
         std::fs::rename(&tmp, &self.path)?;
+        // The rename is only durable once the directory entry is: without
+        // this, power loss can bring back the old log next to an engine
+        // snapshot that was taken against the compacted one.
+        if let Some(parent) = self.path.parent() {
+            File::open(parent)?.sync_all()?;
+        }
         self.file = OpenOptions::new().append(true).open(&self.path)?;
         self.file.sync_all()?;
         Ok(())

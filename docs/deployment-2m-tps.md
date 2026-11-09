@@ -117,7 +117,7 @@ raft-multi-node 1 64 /data
 | `TC_EXECUTION_KAFKA_LINGER_MS` | 2 | 发布成交时 Kafka producer 的攒批时间 |
 | `TC_EXECUTION_KAFKA_BATCH_MESSAGES` | 10000 | 同上，每批最多条数 |
 | `TC_EXECUTION_KAFKA_COMPRESSION` | lz4 | 压缩算法 |
-| `TC_EXECUTION_KAFKA_DELIVERY_TIMEOUT_MS` | 5000 | 发布超时 |
+| `TC_EXECUTION_KAFKA_DELIVERY_TIMEOUT_MS` | 60000 | 发布超时。要长于 broker 切主时间：超时的消息会被跳过而后面的照样写入，重发后同一订单的事件会乱序 |
 | `TC_SUPERVISOR_LIVENESS_GRACE_SECS` | 300 | 子进程启动后多久才开始做存活探测，要大于最长的 WAL 恢复时间 |
 | `TC_SUPERVISOR_LIVENESS_FAILURES` | 6 | 连续这么多次探测失败（每 5 秒一次）就杀掉重启 |
 
