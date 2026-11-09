@@ -13,7 +13,7 @@ health.json:
   "market_data":  ["md01:8080", ...],
   "token":        "...",            # order-api admin token (or env TC_ORDER_API_TOKEN)
   "limits": {"apply_spread": 10000, "outbox_pending": 50000, "consumer_lag": 500000,
-             "snapshot_bytes": 134217728}
+             "snapshot_bytes": 536870912}
 }
 
 Prints one line per finding with what to do about it. Exit code: 0 all
@@ -31,7 +31,7 @@ LOCAL = {
     "market_data": ["localhost:8081"],
 }
 LIMITS = {"apply_spread": 10_000, "outbox_pending": 50_000, "consumer_lag": 500_000,
-          "snapshot_bytes": 128 * 2**20}
+          "snapshot_bytes": 512 * 2**20}
 
 status = 0
 findings = []
@@ -100,8 +100,8 @@ def check_group(group, replicas, limits):
         size = m.get("tc_snapshot_bytes", 0)
         if size > limits["snapshot_bytes"]:
             report("WARN", f"group {group} {addr}", f"engine snapshot {size / 2**20:,.0f} MiB",
-                   "a follower catching up by snapshot needs it in one 256 MiB Raft message: "
-                   "split the group's categories (migrate some away) before it reaches that")
+                   "a follower behind the compaction point needs the whole snapshot within "
+                   "TC_RAFT_MAX_MESSAGE_BYTES (default 1 GiB): migrate categories away or raise the limit")
     pending = lm.get("tc_execution_outbox_pending", 0)
     if pending > limits["outbox_pending"]:
         report("WARN", f"group {group} leader {leader}", f"{pending:,.0f} execution events not on Kafka yet", "Kafka slow or down: runbook §4")

@@ -28,11 +28,27 @@ use trade_core::wire::{self, MSG_LEN};
 use trade_core::{log_error, log_info, log_warn};
 
 const PROPOSAL_BATCH: usize = 512;
-/// Largest Raft frame accepted from a peer. A compaction snapshot travels as
-/// one message and carries every resting order plus the dedupe window, so
-/// the old 16 MiB limit left a lagging follower unable to ever catch up once
-/// the books grew (it reset the link on every attempt).
-const MAX_RAFT_MESSAGE_BYTES: usize = 256 << 20;
+/// Largest Raft message accepted from a peer (`TC_RAFT_MAX_MESSAGE_BYTES`,
+/// default 1 GiB, at most 2 GiB: protobuf sizes are 32-bit). A compaction
+/// snapshot travels as one message and carries every resting order plus the
+/// dedupe window; a follower behind the compaction point can only catch up
+/// if its group's snapshot fits.
+fn max_raft_message_bytes() -> usize {
+    static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("TC_RAFT_MAX_MESSAGE_BYTES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1 << 30)
+            .clamp(1 << 20, (2 << 30) - 1)
+    })
+}
+/// Messages travel in frames of at most this many bytes: a big snapshot is
+/// several frames, so a receiver's buffer grows with the bytes that really
+/// arrived instead of being sized up front from one length field.
+const PEER_FRAME_BYTES: usize = 16 << 20;
+/// Set in a frame's length word when more frames of the same message follow.
+const FRAME_CONTINUES: u32 = 1 << 31;
 /// Operator-created marker for replacing a voter's lost stable storage while
 /// retaining its configured node id. It persists across process crashes and
 /// is removed only after the leader has rediscovered this member's real log
@@ -1528,10 +1544,14 @@ fn migration_route(
         let entry = wire::encode_raft_migration_entry(&op);
         // One Raft message carries the entry: past the limit, followers
         // would refuse it forever and the whole group would stop.
-        if entry.len() > MAX_RAFT_MESSAGE_BYTES / 2 {
+        if entry.len() > max_raft_message_bytes() / 2 {
             return route_reply(
                 "413 Payload Too Large",
-                format!("migration entry of {} bytes exceeds half the {MAX_RAFT_MESSAGE_BYTES}-byte Raft message limit\n", entry.len()),
+                format!(
+                    "migration entry of {} bytes exceeds half the {}-byte Raft message limit\n",
+                    entry.len(),
+                    max_raft_message_bytes()
+                ),
             );
         }
         let (reply, committed) = mpsc::sync_channel(1);
@@ -1840,25 +1860,53 @@ fn spawn_listener(addr: String, tx: mpsc::SyncSender<Message>) {
 }
 
 fn read_peer_frames(mut stream: impl Read, tx: &mpsc::SyncSender<Message>) {
+    let limit = max_raft_message_bytes();
+    let mut message_bytes = Vec::new();
     loop {
-        let mut size = [0u8; 4];
-        if stream.read_exact(&mut size).is_err() {
+        let mut word = [0u8; 4];
+        if stream.read_exact(&mut word).is_err() {
             return;
         }
-        let size = u32::from_be_bytes(size) as usize;
-        if size == 0 || size > MAX_RAFT_MESSAGE_BYTES {
+        let word = u32::from_be_bytes(word);
+        let continues = word & FRAME_CONTINUES != 0;
+        let size = (word & !FRAME_CONTINUES) as usize;
+        if size == 0 || size > PEER_FRAME_BYTES || message_bytes.len() + size > limit {
+            return; // not our framing, or a message beyond the limit
+        }
+        let start = message_bytes.len();
+        message_bytes.resize(start + size, 0);
+        if stream.read_exact(&mut message_bytes[start..]).is_err() {
             return;
         }
-        let mut bytes = vec![0; size];
-        if stream.read_exact(&mut bytes).is_err() {
-            return;
+        if continues {
+            continue;
         }
-        if let Ok(message) = Message::parse_from_bytes(&bytes) {
+        let parsed = Message::parse_from_bytes(&message_bytes);
+        message_bytes = Vec::new();
+        if let Ok(message) = parsed {
             if tx.send(message).is_err() {
                 return;
             }
         }
     }
+}
+
+/// `bytes` as peer frames: each at most [`PEER_FRAME_BYTES`], all but the
+/// last flagged [`FRAME_CONTINUES`].
+fn encode_peer_frames(bytes: &[u8]) -> Vec<u8> {
+    let chunks = bytes.len().div_ceil(PEER_FRAME_BYTES).max(1);
+    let mut frame = Vec::with_capacity(bytes.len() + 4 * chunks);
+    let mut pieces = bytes.chunks(PEER_FRAME_BYTES).peekable();
+    while let Some(piece) = pieces.next() {
+        let flag = if pieces.peek().is_some() {
+            FRAME_CONTINUES
+        } else {
+            0
+        };
+        frame.extend_from_slice(&(piece.len() as u32 | flag).to_be_bytes());
+        frame.extend_from_slice(piece);
+    }
+    frame
 }
 
 struct PeerTransport {
@@ -1911,9 +1959,22 @@ fn run_peer_writer(
         let Ok(bytes) = message.write_to_bytes() else {
             continue;
         };
-        let mut frame = Vec::with_capacity(4 + bytes.len());
-        frame.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
-        frame.extend_from_slice(&bytes);
+        if bytes.is_empty() || bytes.len() > max_raft_message_bytes() {
+            // The receiver would drop the link on it: count it, keep the link.
+            log_warn!(
+                "raft-node",
+                "event=raft_message_too_large type={:?} to={} bytes={} limit={}",
+                message.get_msg_type(),
+                message.to,
+                bytes.len(),
+                max_raft_message_bytes()
+            );
+            metrics
+                .raft_transport_dropped
+                .fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        let frame = encode_peer_frames(&bytes);
         let mut delivered = false;
         for attempt in 0..2 {
             if stream.is_none() {
@@ -2109,9 +2170,37 @@ mod tests {
     fn peer_connection_rejects_oversized_frame() {
         let (tx, rx) = mpsc::sync_channel(16);
         read_peer_frames(
-            Cursor::new(((MAX_RAFT_MESSAGE_BYTES + 1) as u32).to_be_bytes()),
+            Cursor::new(((PEER_FRAME_BYTES + 1) as u32).to_be_bytes()),
             &tx,
         );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_message_larger_than_one_frame_is_reassembled() {
+        // A snapshot several frames long, then an ordinary message.
+        let mut snapshot = Message {
+            from: 1,
+            to: 2,
+            ..Default::default()
+        };
+        snapshot.mut_snapshot().data = (0..(PEER_FRAME_BYTES * 2 + 12_345))
+            .map(|i| (i % 251) as u8)
+            .collect::<Vec<_>>()
+            .into();
+        let small = Message {
+            from: 3,
+            to: 2,
+            ..Default::default()
+        };
+        let mut wire = encode_peer_frames(&snapshot.write_to_bytes().unwrap());
+        assert!(wire.len() > PEER_FRAME_BYTES * 2);
+        wire.extend(encode_peer_frames(&small.write_to_bytes().unwrap()));
+        let (tx, rx) = mpsc::sync_channel(16);
+        read_peer_frames(Cursor::new(wire), &tx);
+        let received = rx.try_recv().unwrap();
+        assert_eq!(received.get_snapshot().data, snapshot.get_snapshot().data);
+        assert_eq!(rx.try_recv().unwrap().from, 3);
         assert!(rx.try_recv().is_err());
     }
 
