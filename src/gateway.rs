@@ -91,7 +91,10 @@ const MD_HEARTBEAT: [u8; wire::EXECUTION_EVENT_LEN] = [0; wire::EXECUTION_EVENT_
 impl MdFanout {
     /// Accept subscriber connections on `listener` in a background thread.
     pub fn accept_on(listener: TcpListener, running: Arc<AtomicBool>, group: u32) -> MdFanout {
-        let fanout = MdFanout { group, ..MdFanout::default() };
+        let fanout = MdFanout {
+            group,
+            ..MdFanout::default()
+        };
         let subs = fanout.subs.clone();
         let max_subscribers = md_limit("TC_MD_MAX_SUBSCRIBERS", 64);
         let queue_capacity = md_limit("TC_MD_SUBSCRIBER_QUEUE", 4096);
@@ -159,9 +162,21 @@ impl MdFanout {
     }
 
     /// Append one report as a fanout frame to `out`.
-    fn encode(&self, raft_index: Option<u64>, ordinal: u32, report: &crate::exchange::ExecReport, out: &mut Vec<u8>) {
+    fn encode(
+        &self,
+        raft_index: Option<u64>,
+        ordinal: u32,
+        report: &crate::exchange::ExecReport,
+        out: &mut Vec<u8>,
+    ) {
         let mut frame = [0u8; wire::EXECUTION_EVENT_LEN];
-        wire::encode_execution_event(self.group, raft_index.unwrap_or(0), ordinal, report, &mut frame);
+        wire::encode_execution_event(
+            self.group,
+            raft_index.unwrap_or(0),
+            ordinal,
+            report,
+            &mut frame,
+        );
         out.extend_from_slice(&frame);
     }
 
@@ -339,9 +354,8 @@ where
     crate::log_info!("gateway", "committed ingress listening on {local}");
     let sessions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let max_sessions = md_limit("TC_COMMITTED_MAX_SESSIONS", 256);
-    let session_idle_timeout = Duration::from_millis(
-        md_limit("TC_COMMITTED_SESSION_IDLE_TIMEOUT_MS", 300_000) as u64,
-    );
+    let session_idle_timeout =
+        Duration::from_millis(md_limit("TC_COMMITTED_SESSION_IDLE_TIMEOUT_MS", 300_000) as u64);
     while running.load(Ordering::Acquire) {
         // A failed accept (out of fds, an aborted handshake) is transient:
         // it must not take the matching node down.
@@ -368,18 +382,20 @@ where
         let session_submit = submit.clone();
         let done = sessions.clone();
         sessions.fetch_add(1, Ordering::AcqRel);
-        let spawned = thread::Builder::new().name("committed-session".into()).spawn(move || {
-            crate::log_info!("gateway", "committed client connected from {peer}");
-            if let Err(error) = read_loop_ack(
-                stream,
-                session_submit.as_ref(),
-                &session_running,
-                max_cmds_per_sec,
-            ) {
-                crate::log_warn!("gateway", "committed client {peer} disconnected: {error}");
-            }
-            done.fetch_sub(1, Ordering::AcqRel);
-        });
+        let spawned = thread::Builder::new()
+            .name("committed-session".into())
+            .spawn(move || {
+                crate::log_info!("gateway", "committed client connected from {peer}");
+                if let Err(error) = read_loop_ack(
+                    stream,
+                    session_submit.as_ref(),
+                    &session_running,
+                    max_cmds_per_sec,
+                ) {
+                    crate::log_warn!("gateway", "committed client {peer} disconnected: {error}");
+                }
+                done.fetch_sub(1, Ordering::AcqRel);
+            });
         if spawned.is_err() {
             sessions.fetch_sub(1, Ordering::AcqRel);
         }

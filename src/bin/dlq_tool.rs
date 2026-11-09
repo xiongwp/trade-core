@@ -45,16 +45,26 @@ fn read(path: &str) -> io::Result<Vec<Record>> {
     let mut bytes = Vec::new();
     std::fs::File::open(path)?.read_to_end(&mut bytes)?;
     if bytes.len() < 8 || bytes[..8] != DLQ_HEADER {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "not a TCDLQ02 dead-letter file"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "not a TCDLQ02 dead-letter file",
+        ));
     }
     let mut records = Vec::new();
     let mut at = 8;
     loop {
-        let Some(len) = bytes.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize) else {
+        let Some(len) = bytes
+            .get(at..at + 4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize)
+        else {
             break;
         };
-        let Some(body) = bytes.get(at + 4..at + 4 + len) else { break };
-        let Some(sum) = bytes.get(at + 4 + len..at + 12 + len) else { break };
+        let Some(body) = bytes.get(at + 4..at + 4 + len) else {
+            break;
+        };
+        let Some(sum) = bytes.get(at + 4 + len..at + 12 + len) else {
+            break;
+        };
         if fnv1a(body) != u64::from_le_bytes(sum.try_into().unwrap()) {
             eprintln!("record at byte {at}: checksum mismatch; stopping here");
             break;
@@ -77,7 +87,14 @@ fn read(path: &str) -> io::Result<Vec<Record>> {
         let reason = String::from_utf8_lossy(take(reason_len)?).into_owned();
         let payload_len = u32::from_le_bytes(take(4)?.try_into().unwrap()) as usize;
         let payload = take(payload_len)?.to_vec();
-        records.push(Record { at_nanos, topic, partition, offset, reason, payload });
+        records.push(Record {
+            at_nanos,
+            topic,
+            partition,
+            offset,
+            reason,
+            payload,
+        });
     }
     Ok(records)
 }
@@ -134,9 +151,15 @@ fn main() {
             }
             if !confirmed {
                 for record in &records {
-                    println!("would replay {}[{}] (from offset {})", record.topic, record.partition, record.offset);
+                    println!(
+                        "would replay {}[{}] (from offset {})",
+                        record.topic, record.partition, record.offset
+                    );
                 }
-                println!("{} record(s); dry run — add --yes to publish", records.len());
+                println!(
+                    "{} record(s); dry run — add --yes to publish",
+                    records.len()
+                );
                 return;
             }
             let producer: FutureProducer = ClientConfig::new()
@@ -147,25 +170,35 @@ fn main() {
                 .expect("create producer");
             let mut replayed = 0usize;
             for record in &records {
-                let sent = futures::executor::block_on(producer.send(
-                    FutureRecord::<(), _>::to(&record.topic)
-                        .partition(record.partition)
-                        .payload(&record.payload),
-                    Duration::from_secs(10),
-                ));
+                let sent = futures::executor::block_on(
+                    producer.send(
+                        FutureRecord::<(), _>::to(&record.topic)
+                            .partition(record.partition)
+                            .payload(&record.payload),
+                        Duration::from_secs(10),
+                    ),
+                );
                 match sent {
                     Ok(delivery) => {
                         replayed += 1;
-                        println!("replayed {}[{}]@{} -> @{}", record.topic, record.partition, record.offset, delivery.offset);
+                        println!(
+                            "replayed {}[{}]@{} -> @{}",
+                            record.topic, record.partition, record.offset, delivery.offset
+                        );
                     }
                     Err((error, _)) => {
-                        eprintln!("failed at record {replayed}: {error}; nothing after it was sent");
+                        eprintln!(
+                            "failed at record {replayed}: {error}; nothing after it was sent"
+                        );
                         break;
                     }
                 }
             }
-            std::fs::write(&marker, format!("{replayed} of {} records replayed\n", records.len()))
-                .expect("write replay marker");
+            std::fs::write(
+                &marker,
+                format!("{replayed} of {} records replayed\n", records.len()),
+            )
+            .expect("write replay marker");
             println!("{replayed} of {} record(s) replayed", records.len());
             if replayed != records.len() {
                 std::process::exit(1);

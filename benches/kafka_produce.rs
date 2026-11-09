@@ -18,9 +18,18 @@ use rdkafka::ClientConfig;
 const MESSAGE_BYTES: usize = 104;
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).filter(|a| a != "--bench").collect();
-    let brokers = args.first().cloned().unwrap_or_else(|| "127.0.0.1:19092".into());
-    let topic = args.get(1).cloned().unwrap_or_else(|| "trade-executions-v1".into());
+    let args: Vec<String> = std::env::args()
+        .skip(1)
+        .filter(|a| a != "--bench")
+        .collect();
+    let brokers = args
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "127.0.0.1:19092".into());
+    let topic = args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(|| "trade-executions-v1".into());
     let seconds: u64 = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(60);
     let threads: usize = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(8);
     let batch: usize = args.get(4).and_then(|v| v.parse().ok()).unwrap_or(4096);
@@ -54,7 +63,12 @@ fn main() {
     let deadline = Instant::now() + Duration::from_secs(seconds);
     let workers: Vec<_> = (0..threads)
         .map(|thread| {
-            let (producer, topic, acked, failed) = (producer.clone(), topic.clone(), acked.clone(), failed.clone());
+            let (producer, topic, acked, failed) = (
+                producer.clone(),
+                topic.clone(),
+                acked.clone(),
+                failed.clone(),
+            );
             std::thread::spawn(move || {
                 // Realistic but incompressible-ish payloads: ids and prices vary.
                 let mut seed = 0x9e37_79b9_7f4a_7c15u64 ^ thread as u64;
@@ -73,17 +87,23 @@ fn main() {
                         }
                         payloads.push(payload);
                     }
-                    let keys: Vec<[u8; 8]> = (0..batch as u64).map(|k| (sent + k).to_be_bytes()).collect();
+                    let keys: Vec<[u8; 8]> = (0..batch as u64)
+                        .map(|k| (sent + k).to_be_bytes())
+                        .collect();
                     let results = futures::executor::block_on(futures::future::join_all(
-                        payloads.iter().zip(&keys).enumerate().map(|(k, (payload, key))| {
-                            producer.send(
-                                FutureRecord::to(&topic)
-                                    .partition(((sent + k as u64) % partitions as u64) as i32)
-                                    .key(key)
-                                    .payload(&payload[..]),
-                                Duration::from_secs(10),
-                            )
-                        }),
+                        payloads
+                            .iter()
+                            .zip(&keys)
+                            .enumerate()
+                            .map(|(k, (payload, key))| {
+                                producer.send(
+                                    FutureRecord::to(&topic)
+                                        .partition(((sent + k as u64) % partitions as u64) as i32)
+                                        .key(key)
+                                        .payload(&payload[..]),
+                                    Duration::from_secs(10),
+                                )
+                            }),
                     ));
                     let ok = results.iter().filter(|r| r.is_ok()).count() as u64;
                     acked.fetch_add(ok, Ordering::Relaxed);

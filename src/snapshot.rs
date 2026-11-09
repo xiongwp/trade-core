@@ -388,7 +388,12 @@ impl<'a> Cursor<'a> {
         usize::try_from(n)
             .ok()
             .filter(|n| *n <= left)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "snapshot count exceeds its data"))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "snapshot count exceeds its data",
+                )
+            })
     }
 }
 
@@ -402,7 +407,10 @@ pub fn decode(buf: &[u8]) -> io::Result<Snapshot> {
     if fnv1a(&buf[..body_len]) != u64::from_le_bytes(buf[body_len..].try_into().unwrap()) {
         return Err(corrupt("checksum mismatch"));
     }
-    let mut c = Cursor { buf: &buf[..body_len], pos: 4 };
+    let mut c = Cursor {
+        buf: &buf[..body_len],
+        pos: 4,
+    };
     if c.u32()? != VERSION {
         return Err(corrupt("unsupported version"));
     }
@@ -411,9 +419,13 @@ pub fn decode(buf: &[u8]) -> io::Result<Snapshot> {
     let max_cmd_id = c.u64()?;
     let max_admin_id = c.u64()?;
     let n = c.u32()?;
-    let halted = (0..c.count(n as u64, 4)?).map(|_| c.u32()).collect::<io::Result<_>>()?;
+    let halted = (0..c.count(n as u64, 4)?)
+        .map(|_| c.u32())
+        .collect::<io::Result<_>>()?;
     let n = c.u32()?;
-    let suspended = (0..c.count(n as u64, 8)?).map(|_| c.u64()).collect::<io::Result<_>>()?;
+    let suspended = (0..c.count(n as u64, 8)?)
+        .map(|_| c.u64())
+        .collect::<io::Result<_>>()?;
     let n = c.u32()?;
     let positions = (0..c.count(n as u64, 20)?)
         .map(|_| Ok((c.u64()?, c.u32()?, c.i64()?)))
@@ -431,7 +443,12 @@ pub fn decode(buf: &[u8]) -> io::Result<Snapshot> {
         let stops = (0..c.count(n as u64, STOP_ENC)?)
             .map(|_| Ok(decode_stop(c.take(STOP_ENC)?.try_into().unwrap())))
             .collect::<io::Result<_>>()?;
-        engines.push(EngineState { instrument, engine_seq, orders, stops });
+        engines.push(EngineState {
+            instrument,
+            engine_seq,
+            orders,
+            stops,
+        });
     }
     let n = c.u64()?;
     let n = c.count(n, 12)?;

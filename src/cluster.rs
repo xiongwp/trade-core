@@ -281,7 +281,11 @@ impl RouteControlPlane {
     /// Unlike [`caught_up`](Self::caught_up) this compares no Raft indexes:
     /// the two groups number their logs independently, so the source's seal
     /// index says nothing about the target's.
-    pub fn verified(&self, category_id: u32, fingerprint: u64) -> Result<CategoryMigration, String> {
+    pub fn verified(
+        &self,
+        category_id: u32,
+        fingerprint: u64,
+    ) -> Result<CategoryMigration, String> {
         let mut migrations = self.migrations.write().unwrap();
         let migration = migrations
             .get_mut(&category_id)

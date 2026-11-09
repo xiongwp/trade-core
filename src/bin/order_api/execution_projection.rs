@@ -262,8 +262,16 @@ pub(crate) fn push_execution_record(
     let payload = message.payload().unwrap_or(&[]);
     dlq.lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .append(message.topic(), partition, offset, "invalid execution report", payload)
-        .unwrap_or_else(|error| panic!("execution DLQ append failed ({error}); refusing to skip offset {offset}"));
+        .append(
+            message.topic(),
+            partition,
+            offset,
+            "invalid execution report",
+            payload,
+        )
+        .unwrap_or_else(|error| {
+            panic!("execution DLQ append failed ({error}); refusing to skip offset {offset}")
+        });
     metrics.dlq_total.fetch_add(1, AtomicOrdering::Relaxed);
     dead_lettered.push((message.topic().to_string(), partition, offset));
     log_warn!("execution-mysql", worker; "event=dead_lettered reason=undecodable partition={partition} offset={offset}");

@@ -93,7 +93,10 @@ pub fn decode_raft_config_entry(payload: &[u8]) -> Option<(u64, String)> {
     let fingerprint = u64::from_le_bytes(payload[8..16].try_into().ok()?);
     let len = u32::from_le_bytes(payload[16..20].try_into().ok()?) as usize;
     let description = payload.get(20..20 + len)?;
-    Some((fingerprint, String::from_utf8_lossy(description).into_owned()))
+    Some((
+        fingerprint,
+        String::from_utf8_lossy(description).into_owned(),
+    ))
 }
 
 const RAFT_MIGRATION_MAGIC: [u8; 4] = *b"TCMG";
@@ -106,10 +109,27 @@ const RAFT_MIGRATION_MAGIC: [u8; 4] = *b"TCMG";
 pub fn encode_raft_migration_entry(op: &crate::exchange::CategoryOp) -> Vec<u8> {
     use crate::exchange::CategoryOp;
     let (kind, category, size, epoch) = match op {
-        CategoryOp::Seal { category, category_size, epoch } => (1u8, *category, *category_size, *epoch),
-        CategoryOp::Install { category, category_size, epoch, .. } => (2u8, *category, *category_size, *epoch),
-        CategoryOp::Drop { category, category_size, epoch } => (3u8, *category, *category_size, *epoch),
-        CategoryOp::Unseal { category, category_size, epoch } => (4u8, *category, *category_size, *epoch),
+        CategoryOp::Seal {
+            category,
+            category_size,
+            epoch,
+        } => (1u8, *category, *category_size, *epoch),
+        CategoryOp::Install {
+            category,
+            category_size,
+            epoch,
+            ..
+        } => (2u8, *category, *category_size, *epoch),
+        CategoryOp::Drop {
+            category,
+            category_size,
+            epoch,
+        } => (3u8, *category, *category_size, *epoch),
+        CategoryOp::Unseal {
+            category,
+            category_size,
+            epoch,
+        } => (4u8, *category, *category_size, *epoch),
     };
     let mut out = Vec::with_capacity(25);
     out.extend_from_slice(&RAFT_MIGRATION_MAGIC);
@@ -118,7 +138,14 @@ pub fn encode_raft_migration_entry(op: &crate::exchange::CategoryOp) -> Vec<u8> 
     out.extend_from_slice(&category.to_le_bytes());
     out.extend_from_slice(&size.to_le_bytes());
     out.extend_from_slice(&epoch.to_le_bytes());
-    if let CategoryOp::Install { engines, positions, halted, command_ids, .. } = op {
+    if let CategoryOp::Install {
+        engines,
+        positions,
+        halted,
+        command_ids,
+        ..
+    } = op
+    {
         out.extend_from_slice(&crate::migration::encode_category_state(
             0,
             engines,
@@ -143,9 +170,21 @@ fn decode_raft_migration_entry(payload: &[u8]) -> Option<crate::exchange::Catego
     let epoch = u64::from_le_bytes(payload.get(17..25)?.try_into().ok()?);
     let body = &payload[25..];
     match payload[8] {
-        1 => Some(CategoryOp::Seal { category, category_size, epoch }),
-        3 => Some(CategoryOp::Drop { category, category_size, epoch }),
-        4 => Some(CategoryOp::Unseal { category, category_size, epoch }),
+        1 => Some(CategoryOp::Seal {
+            category,
+            category_size,
+            epoch,
+        }),
+        3 => Some(CategoryOp::Drop {
+            category,
+            category_size,
+            epoch,
+        }),
+        4 => Some(CategoryOp::Unseal {
+            category,
+            category_size,
+            epoch,
+        }),
         2 => {
             let state = crate::snapshot::decode(body).ok()?;
             let command_ids = state
@@ -882,7 +921,11 @@ pub fn execution_event_target_user(buf: &[u8]) -> u64 {
     if !is_execution_event(buf) {
         return 0;
     }
-    u64::from_le_bytes(buf[EXECUTION_EVENT_USER_AT..EXECUTION_EVENT_LEN].try_into().unwrap())
+    u64::from_le_bytes(
+        buf[EXECUTION_EVENT_USER_AT..EXECUTION_EVENT_LEN]
+            .try_into()
+            .unwrap(),
+    )
 }
 
 pub fn decode_execution_event(buf: &[u8]) -> Option<ExecutionEvent> {
@@ -966,14 +1009,29 @@ mod tests {
     #[test]
     fn migration_entries_round_trip_including_the_installed_state() {
         use crate::exchange::CategoryOp;
-        let seal = encode_raft_migration_entry(&CategoryOp::Seal { category: 7, category_size: 1000, epoch: 42 });
+        let seal = encode_raft_migration_entry(&CategoryOp::Seal {
+            category: 7,
+            category_size: 1000,
+            epoch: 42,
+        });
         match decode_raft_entry(&seal).unwrap().as_slice() {
             [Command::Migrate(op)] => {
-                assert!(matches!(**op, CategoryOp::Seal { category: 7, category_size: 1000, epoch: 42 }))
+                assert!(matches!(
+                    **op,
+                    CategoryOp::Seal {
+                        category: 7,
+                        category_size: 1000,
+                        epoch: 42
+                    }
+                ))
             }
             other => panic!("{other:?}"),
         }
-        let unseal = encode_raft_migration_entry(&CategoryOp::Unseal { category: 7, category_size: 1000, epoch: 42 });
+        let unseal = encode_raft_migration_entry(&CategoryOp::Unseal {
+            category: 7,
+            category_size: 1000,
+            epoch: 42,
+        });
         assert!(matches!(
             decode_raft_entry(&unseal).unwrap().as_slice(),
             [Command::Migrate(op)] if matches!(**op, CategoryOp::Unseal { epoch: 42, .. })
@@ -995,7 +1053,14 @@ mod tests {
         });
         match decode_raft_entry(&install).unwrap().as_slice() {
             [Command::Migrate(op)] => match &**op {
-                CategoryOp::Install { engines, positions, halted, command_ids, epoch, .. } => {
+                CategoryOp::Install {
+                    engines,
+                    positions,
+                    halted,
+                    command_ids,
+                    epoch,
+                    ..
+                } => {
                     assert_eq!(engines[0].orders[0].id, OrderId(9));
                     assert_eq!(positions, &vec![(5, 7_001, -2)]);
                     assert_eq!(halted, &vec![7_001]);
@@ -1173,6 +1238,9 @@ mod tests {
         assert_eq!(commands.len(), 2);
         assert_eq!(commands[0].id(), 101);
         assert_eq!(commands[1].id(), 102);
-        assert!(decode_raft_entry(&frames[0]).is_none(), "a bare frame is not an entry");
+        assert!(
+            decode_raft_entry(&frames[0]).is_none(),
+            "a bare frame is not an entry"
+        );
     }
 }

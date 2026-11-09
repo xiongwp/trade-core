@@ -315,7 +315,11 @@ pub(crate) fn decode_db_kafka_record(
 ///   down), and restarting from the earliest message would re-run commands
 ///   beyond the matching dedupe window.
 /// `TC_KAFKA_OFFSET_PREFLIGHT=warn` only logs (for a deliberate reset).
-pub(crate) fn preflight_offsets(consumer: &BaseConsumer, group: &str, partitions: &[(String, i32)]) {
+pub(crate) fn preflight_offsets(
+    consumer: &BaseConsumer,
+    group: &str,
+    partitions: &[(String, i32)],
+) {
     if partitions.is_empty() {
         return;
     }
@@ -328,7 +332,10 @@ pub(crate) fn preflight_offsets(consumer: &BaseConsumer, group: &str, partitions
         match consumer.committed_offsets(list.clone(), Duration::from_secs(10)) {
             Ok(committed) => break committed,
             Err(error) => {
-                log_warn!("order-kafka", "event=offset_preflight_retry group={group} error={error}");
+                log_warn!(
+                    "order-kafka",
+                    "event=offset_preflight_retry group={group} error={error}"
+                );
                 std::thread::sleep(Duration::from_secs(1));
             }
         }
@@ -340,7 +347,10 @@ pub(crate) fn preflight_offsets(consumer: &BaseConsumer, group: &str, partitions
             match consumer.fetch_watermarks(topic, partition, Duration::from_secs(10)) {
                 Ok((low, _high)) => break low,
                 Err(error) => {
-                    log_warn!("order-kafka", "event=offset_preflight_retry group={group} error={error}");
+                    log_warn!(
+                        "order-kafka",
+                        "event=offset_preflight_retry group={group} error={error}"
+                    );
                     std::thread::sleep(Duration::from_secs(1));
                 }
             }
@@ -361,7 +371,10 @@ pub(crate) fn preflight_offsets(consumer: &BaseConsumer, group: &str, partitions
         return;
     }
     for problem in &problems {
-        log_error!("order-kafka", "event=offset_preflight_failed group={group} {problem}");
+        log_error!(
+            "order-kafka",
+            "event=offset_preflight_failed group={group} {problem}"
+        );
     }
     if enforce {
         panic!(
@@ -380,7 +393,10 @@ pub(crate) fn topic_partitions(consumer: &BaseConsumer, topics: &[&str]) -> Vec<
             match consumer.fetch_metadata(Some(topic), Duration::from_secs(10)) {
                 Ok(metadata) => break metadata,
                 Err(error) => {
-                    log_warn!("order-kafka", "event=metadata_retry topic={topic} error={error}");
+                    log_warn!(
+                        "order-kafka",
+                        "event=metadata_retry topic={topic} error={error}"
+                    );
                     std::thread::sleep(Duration::from_secs(1));
                 }
             }
@@ -426,7 +442,11 @@ pub(crate) fn run_db_kafka_stage(
                 .expect("assign routed command DB partition");
         }
     }
-    preflight_offsets(&consumer, &kafka.db_group, &assigned_partitions(&assignment));
+    preflight_offsets(
+        &consumer,
+        &kafka.db_group,
+        &assigned_partitions(&assignment),
+    );
     consumer
         .assign(&assignment)
         .expect("assign routed command DB ownership");

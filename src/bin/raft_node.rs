@@ -1582,22 +1582,21 @@ fn migration_route(
         // checks that its steps applied, not just committed).
         "/migration/status" => match category() {
             Err(response) => response,
-            Ok(category) => match trade_core::migration::snapshot_migration_status(
-                snapshot_path,
-                category,
-            ) {
-                Ok(Some((index, sealed, epoch))) => route_reply(
-                    "200 OK",
-                    format!(
+            Ok(category) => {
+                match trade_core::migration::snapshot_migration_status(snapshot_path, category) {
+                    Ok(Some((index, sealed, epoch))) => route_reply(
+                        "200 OK",
+                        format!(
                         "{{\"raft_applied_index\":{index},\"sealed\":{sealed},\"epoch\":{epoch}}}"
                     ),
-                ),
-                Ok(None) => route_reply(
-                    "503 Service Unavailable",
-                    "no durable snapshot yet\n".into(),
-                ),
-                Err(error) => route_reply("500 Internal Server Error", format!("{error}\n")),
-            },
+                    ),
+                    Ok(None) => route_reply(
+                        "503 Service Unavailable",
+                        "no durable snapshot yet\n".into(),
+                    ),
+                    Err(error) => route_reply("500 Internal Server Error", format!("{error}\n")),
+                }
+            }
         },
         "/category-state" => match category() {
             Err(response) => response,
@@ -1697,7 +1696,10 @@ fn migration_route(
                 category,
                 category_size,
             ) {
-                return Some(route_reply("422 Unprocessable Entity", format!("refusing to install: {reason}\n")));
+                return Some(route_reply(
+                    "422 Unprocessable Entity",
+                    format!("refusing to install: {reason}\n"),
+                ));
             }
             let command_ids = state
                 .recent_command_ids
@@ -1824,10 +1826,12 @@ fn spawn_listener(addr: String, tx: mpsc::SyncSender<Message>) {
             stream.set_read_timeout(Some(PEER_READ_TIMEOUT)).ok();
             let (tx, done) = (tx.clone(), active.clone());
             active.fetch_add(1, Ordering::AcqRel);
-            let spawned = thread::Builder::new().name("raft-peer-in".into()).spawn(move || {
-                read_peer_frames(stream, &tx);
-                done.fetch_sub(1, Ordering::AcqRel);
-            });
+            let spawned = thread::Builder::new()
+                .name("raft-peer-in".into())
+                .spawn(move || {
+                    read_peer_frames(stream, &tx);
+                    done.fetch_sub(1, Ordering::AcqRel);
+                });
             if spawned.is_err() {
                 active.fetch_sub(1, Ordering::AcqRel);
             }

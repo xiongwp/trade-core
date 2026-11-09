@@ -15,7 +15,12 @@ fn should_log_ingress_rejection() -> bool {
     let next = NEXT_LOG_SEC.load(AtomicOrdering::Relaxed);
     now >= next
         && NEXT_LOG_SEC
-            .compare_exchange(next, now + 5, AtomicOrdering::Relaxed, AtomicOrdering::Relaxed)
+            .compare_exchange(
+                next,
+                now + 5,
+                AtomicOrdering::Relaxed,
+                AtomicOrdering::Relaxed,
+            )
             .is_ok()
 }
 
@@ -57,7 +62,10 @@ const MAX_HEADERS: usize = 100;
 fn read_head_line(reader: &mut BufReader<TcpStream>, line: &mut String) -> io::Result<usize> {
     let read = reader.by_ref().take(MAX_HEAD_LINE).read_line(line)?;
     if read > 0 && !line.ends_with('\n') {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "request line too long"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "request line too long",
+        ));
     }
     Ok(read)
 }

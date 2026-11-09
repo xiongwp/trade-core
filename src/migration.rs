@@ -62,7 +62,9 @@ pub fn snapshot_category_fingerprint(
                 .positions
                 .iter()
                 .copied()
-                .filter(|&(_, instrument, quantity)| quantity != 0 && in_category(crate::types::InstrumentId(instrument)))
+                .filter(|&(_, instrument, quantity)| {
+                    quantity != 0 && in_category(crate::types::InstrumentId(instrument))
+                })
                 .collect();
             positions.sort_unstable();
             let fingerprint = if positions.is_empty() {
@@ -95,7 +97,9 @@ pub fn snapshot_migration_status(
     match snapshot::load(snapshot_path) {
         Ok(snap) => Ok(Some((
             snap.raft_applied_index,
-            snap.sealed.iter().any(|(category, _)| *category == category_id),
+            snap.sealed
+                .iter()
+                .any(|(category, _)| *category == category_id),
             snap.migration_epochs
                 .iter()
                 .find(|(category, _)| *category == category_id)
@@ -210,9 +214,15 @@ pub fn export_category(
         })
         .copied()
         .collect();
-    let in_category =
-        |instrument: u32| asset_category(crate::types::InstrumentId(instrument), category_size) == category;
-    let halted = snap.halted.iter().copied().filter(|&instrument| in_category(instrument)).collect();
+    let in_category = |instrument: u32| {
+        asset_category(crate::types::InstrumentId(instrument), category_size) == category
+    };
+    let halted = snap
+        .halted
+        .iter()
+        .copied()
+        .filter(|&instrument| in_category(instrument))
+        .collect();
     // Recent command ids of the category, oldest first.
     let command_ids = snap
         .recent_command_ids
@@ -221,7 +231,12 @@ pub fn export_category(
         .filter(|(_, &instrument)| in_category(instrument))
         .map(|(&id, &instrument)| (id, instrument))
         .collect();
-    CategoryExport { engines, positions, halted, command_ids }
+    CategoryExport {
+        engines,
+        positions,
+        halted,
+        command_ids,
+    }
 }
 
 /// Whether an exported category state is safe to install: every instrument
@@ -238,24 +253,36 @@ pub fn validate_category_state(
     category_size: u32,
 ) -> Result<(), String> {
     use crate::exchange::MAX_ORDER_QTY;
-    let in_category = |instrument: InstrumentId| asset_category(instrument, category_size) == category;
+    let in_category =
+        |instrument: InstrumentId| asset_category(instrument, category_size) == category;
     let mut instruments = std::collections::HashSet::new();
     let mut ids = std::collections::HashSet::new();
-    let check = |order: &crate::order::Order, engine: InstrumentId, ids: &mut std::collections::HashSet<u64>| {
+    let check = |order: &crate::order::Order,
+                 engine: InstrumentId,
+                 ids: &mut std::collections::HashSet<u64>| {
         if order.id.0 == 0 || !ids.insert(order.id.0) {
             return Err(format!("order id {} is zero or repeated", order.id.0));
         }
         if order.instrument != engine {
-            return Err(format!("order {} is on {} inside {}'s book", order.id.0, order.instrument.0, engine.0));
+            return Err(format!(
+                "order {} is on {} inside {}'s book",
+                order.id.0, order.instrument.0, engine.0
+            ));
         }
-        if order.remaining == 0 || order.remaining > order.quantity || order.quantity > MAX_ORDER_QTY {
+        if order.remaining == 0
+            || order.remaining > order.quantity
+            || order.quantity > MAX_ORDER_QTY
+        {
             return Err(format!("order {} has an invalid quantity", order.id.0));
         }
         Ok(())
     };
     for state in engines {
         if !in_category(state.instrument) || !instruments.insert(state.instrument) {
-            return Err(format!("instrument {} is outside the category or repeated", state.instrument.0));
+            return Err(format!(
+                "instrument {} is outside the category or repeated",
+                state.instrument.0
+            ));
         }
         for order in &state.orders {
             check(order, state.instrument, &mut ids)?;
@@ -267,7 +294,9 @@ pub fn validate_category_state(
     let bound = (MAX_ORDER_QTY as i64).saturating_mul(1 << 20);
     for &(_, instrument, quantity) in positions {
         if !in_category(InstrumentId(instrument)) || quantity.unsigned_abs() > bound as u64 {
-            return Err(format!("position on {instrument} is outside the category or out of range"));
+            return Err(format!(
+                "position on {instrument} is outside the category or out of range"
+            ));
         }
     }
     Ok(())
@@ -293,7 +322,10 @@ pub fn encode_category_state(
     command_ids: &[(u64, u32)],
 ) -> Vec<u8> {
     let ids: Vec<u64> = command_ids.iter().map(|(id, _)| *id).collect();
-    let instruments: Vec<u32> = command_ids.iter().map(|(_, instrument)| *instrument).collect();
+    let instruments: Vec<u32> = command_ids
+        .iter()
+        .map(|(_, instrument)| *instrument)
+        .collect();
     crate::snapshot::encode(crate::snapshot::SnapshotData {
         journal_seq: 0,
         raft_applied_index,
@@ -351,7 +383,11 @@ pub fn fetch_category_fingerprint(
     category_id: u32,
     timeout: Duration,
 ) -> io::Result<Option<CategoryFingerprint>> {
-    let (status, body) = http_get(addr, &format!("/fingerprint?category={category_id}"), timeout)?;
+    let (status, body) = http_get(
+        addr,
+        &format!("/fingerprint?category={category_id}"),
+        timeout,
+    )?;
     // 503: no durable snapshot yet — caller must wait, not treat as agreement.
     if status == 503 {
         return Ok(None);
@@ -580,7 +616,10 @@ mod tests {
     fn missing_snapshot_is_none_not_error() {
         let dir = tmp("missing");
         let path = dir.join("does-not-exist.bin");
-        assert_eq!(snapshot_category_fingerprint(&path, 0, CAT_SIZE).unwrap(), None);
+        assert_eq!(
+            snapshot_category_fingerprint(&path, 0, CAT_SIZE).unwrap(),
+            None
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -588,7 +627,9 @@ mod tests {
     fn applied_index_request_and_response_round_trip() {
         assert!(is_applied_index_request("GET /applied-index HTTP/1.1"));
         assert!(is_applied_index_request("GET /applied-index?x=1 HTTP/1.1"));
-        assert!(!is_applied_index_request("GET /fingerprint?category=1 HTTP/1.1"));
+        assert!(!is_applied_index_request(
+            "GET /fingerprint?category=1 HTTP/1.1"
+        ));
         let body = applied_index_response_json(9_876);
         assert_eq!(parse_applied_index_response(&body), Some(9_876));
         assert_eq!(parse_applied_index_response("garbage"), None);
@@ -625,7 +666,10 @@ mod tests {
         assert_eq!(map.get(&1).map(String::as_str), Some("host-b:9102"));
         assert!(parse_group_endpoints("").is_err());
         assert!(parse_group_endpoints("garbage").is_err());
-        assert!(parse_group_endpoints("0=a:1,0=b:2").is_err(), "duplicate group rejected");
+        assert!(
+            parse_group_endpoints("0=a:1,0=b:2").is_err(),
+            "duplicate group rejected"
+        );
     }
 
     #[test]

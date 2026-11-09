@@ -247,7 +247,13 @@ impl History {
         let seq = self.next_seq;
         self.next_seq += 1;
         let entry = self.users.entry(user).or_default();
-        entry.events.push_back(Kept { seq, ts, partition, offset, json: json.clone() });
+        entry.events.push_back(Kept {
+            seq,
+            ts,
+            partition,
+            offset,
+            json: json.clone(),
+        });
         self.kept += 1;
         while entry.events.len() > per_user {
             let old = entry.events.pop_front().expect("over the limit");
@@ -318,7 +324,9 @@ impl History {
                 from <= self.floor_ts || entry.is_some_and(|e| from <= e.lost_ts)
             }
             Resume::After { cursor, partition } => {
-                self.floor_offset.get(&partition).is_none_or(|floor| cursor < *floor)
+                self.floor_offset
+                    .get(&partition)
+                    .is_none_or(|floor| cursor < *floor)
                     || entry.is_some_and(|e| cursor < e.lost_offset)
             }
         }
@@ -349,7 +357,12 @@ impl Registry {
     }
 
     #[cfg(test)]
-    fn subscribe(&self, user: u64, conn: (mpsc::Sender<Outgoing>, usize), max_per_user: usize) -> Option<u64> {
+    fn subscribe(
+        &self,
+        user: u64,
+        conn: (mpsc::Sender<Outgoing>, usize),
+        max_per_user: usize,
+    ) -> Option<u64> {
         self.subscribe_from(user, conn, max_per_user, None)
     }
 
@@ -381,7 +394,9 @@ impl Registry {
                     .events
                     .iter()
                     .filter(|kept| match resume {
-                        Resume::Since(since) => kept.ts >= since.saturating_sub(self.since_grace_ms),
+                        Resume::Since(since) => {
+                            kept.ts >= since.saturating_sub(self.since_grace_ms)
+                        }
                         Resume::After { cursor, .. } => kept.offset > cursor,
                     })
                     .map(|kept| &kept.json)
@@ -412,7 +427,15 @@ impl Registry {
     ) -> usize {
         let mut history = self.history.lock().unwrap();
         if self.replay_events > 0 && self.replay_total > 0 {
-            history.record(user, ts, partition, offset, json, self.replay_events, self.replay_total);
+            history.record(
+                user,
+                ts,
+                partition,
+                offset,
+                json,
+                self.replay_events,
+                self.replay_total,
+            );
         }
         let reached = self.push(user, json, metrics);
         drop(history);
@@ -562,8 +585,17 @@ fn consume(
     // instance (re)starts; the tail when replay is off.
     let start_ms = now_ms() - registry.replay_ms;
     let assignment = loop {
-        let owned = |partition: i32| shard.as_ref().is_none_or(|shard| shard.owns_partition(partition));
-        match start_positions(&consumer, &topic, (registry.replay_events > 0).then_some(start_ms), owned) {
+        let owned = |partition: i32| {
+            shard
+                .as_ref()
+                .is_none_or(|shard| shard.owns_partition(partition))
+        };
+        match start_positions(
+            &consumer,
+            &topic,
+            (registry.replay_events > 0).then_some(start_ms),
+            owned,
+        ) {
             Ok(assignment) => break assignment,
             Err(error) => {
                 log_warn!("user-stream", "event=assign_failed error={error}");
@@ -586,7 +618,9 @@ fn consume(
         })
         .collect();
     registry.set_floor(start_ms, &start_offsets);
-    consumer.assign(&assignment).expect("assign execution partitions");
+    consumer
+        .assign(&assignment)
+        .expect("assign execution partitions");
     let partitions = topic_partitions(&consumer, &topic).unwrap_or(0);
     log_info!(
         "user-stream",
@@ -622,7 +656,9 @@ fn consume(
             Some(Ok(message)) => {
                 metrics.events_consumed.fetch_add(1, Ordering::Relaxed);
                 let ts = message.timestamp().to_millis().unwrap_or_else(now_ms);
-                let Some((user, mut json)) = message.payload().and_then(|payload| event_json_at(payload, ts))
+                let Some((user, mut json)) = message
+                    .payload()
+                    .and_then(|payload| event_json_at(payload, ts))
                 else {
                     continue;
                 };
@@ -748,13 +784,21 @@ fn route(brokers: String, source: String, target: String, group: String, metrics
         match topic_partitions(&consumer, &target) {
             Ok(partitions) => break partitions,
             Err(error) => {
-                log_warn!("user-stream", "event=user_topic_unavailable topic={target} error={error}");
+                log_warn!(
+                    "user-stream",
+                    "event=user_topic_unavailable topic={target} error={error}"
+                );
                 std::thread::sleep(Duration::from_secs(1));
             }
         }
     };
-    consumer.subscribe(&[&source]).expect("subscribe execution topic");
-    log_info!("user-stream", "routing {source} -> {target} ({partitions} partitions), group {group}");
+    consumer
+        .subscribe(&[&source])
+        .expect("subscribe execution topic");
+    log_info!(
+        "user-stream",
+        "routing {source} -> {target} ({partitions} partitions), group {group}"
+    );
     let batch_max = 10_000;
     let mut last_partition_check = std::time::Instant::now();
     loop {
@@ -799,29 +843,39 @@ fn route(brokers: String, source: String, target: String, group: String, metrics
             .map(|(_, _, _, payload)| wire::execution_event_target_user(payload).to_be_bytes())
             .collect();
         let deliveries = futures::executor::block_on(futures::future::join_all(
-            batch.iter().zip(&keys).filter_map(|((_, _, ts, payload), key)| {
-                let user = u64::from_be_bytes(*key);
-                if user == 0 {
-                    return None;
-                }
-                let mut record = FutureRecord::to(&target)
-                    .partition(user_partition(user, partitions))
-                    .key(key)
-                    .payload(payload.as_slice());
-                if let Some(ts) = ts {
-                    record = record.timestamp(*ts); // keeps `ts` / `since` stable
-                }
-                Some(producer.send(record, Duration::from_secs(5)))
-            }),
+            batch
+                .iter()
+                .zip(&keys)
+                .filter_map(|((_, _, ts, payload), key)| {
+                    let user = u64::from_be_bytes(*key);
+                    if user == 0 {
+                        return None;
+                    }
+                    let mut record = FutureRecord::to(&target)
+                        .partition(user_partition(user, partitions))
+                        .key(key)
+                        .payload(payload.as_slice());
+                    if let Some(ts) = ts {
+                        record = record.timestamp(*ts); // keeps `ts` / `since` stable
+                    }
+                    Some(producer.send(record, Duration::from_secs(5)))
+                }),
         ));
         let mut first: HashMap<i32, i64> = HashMap::new();
         let mut next: HashMap<i32, i64> = HashMap::new();
         for (partition, offset, _, _) in &batch {
-            first.entry(*partition).and_modify(|o| *o = (*o).min(*offset)).or_insert(*offset);
-            next.entry(*partition).and_modify(|o| *o = (*o).max(offset + 1)).or_insert(offset + 1);
+            first
+                .entry(*partition)
+                .and_modify(|o| *o = (*o).min(*offset))
+                .or_insert(*offset);
+            next.entry(*partition)
+                .and_modify(|o| *o = (*o).max(offset + 1))
+                .or_insert(offset + 1);
         }
         if deliveries.iter().all(Result::is_ok) {
-            metrics.events_routed.fetch_add(deliveries.len() as u64, Ordering::Relaxed);
+            metrics
+                .events_routed
+                .fetch_add(deliveries.len() as u64, Ordering::Relaxed);
             let mut list = TopicPartitionList::new();
             for (partition, offset) in next {
                 let _ = list.add_partition_offset(&source, partition, Offset::Offset(offset));
@@ -831,14 +885,23 @@ fn route(brokers: String, source: String, target: String, group: String, metrics
             }
             continue;
         }
-        log_warn!("user-stream", "event=router_batch_retry records={}", batch.len());
+        log_warn!(
+            "user-stream",
+            "event=router_batch_retry records={}",
+            batch.len()
+        );
         for (partition, offset) in first {
             let mut attempt = 0;
-            while let Err(error) =
-                consumer.seek(&source, partition, Offset::Offset(offset), Duration::from_secs(1))
-            {
+            while let Err(error) = consumer.seek(
+                &source,
+                partition,
+                Offset::Offset(offset),
+                Duration::from_secs(1),
+            ) {
                 let assigned = consumer.assignment().map(|list| {
-                    list.elements().iter().any(|tp| tp.topic() == source && tp.partition() == partition)
+                    list.elements()
+                        .iter()
+                        .any(|tp| tp.topic() == source && tp.partition() == partition)
                 });
                 if assigned == Ok(false) {
                     break; // its new owner resumes from the committed offset
@@ -974,7 +1037,11 @@ fn handle(stream: TcpStream, config: &Config, registry: &Registry, metrics: &Met
             partition: user_partition(user, shard.partitions),
         }),
         (None, Some(_)) => {
-            respond(&mut writer, "400 Bad Request", "after= needs a sharded (pusher) instance; use since=");
+            respond(
+                &mut writer,
+                "400 Bad Request",
+                "after= needs a sharded (pusher) instance; use since=",
+            );
             return;
         }
         (_, None) => query_param(query, "since")
@@ -982,7 +1049,12 @@ fn handle(stream: TcpStream, config: &Config, registry: &Registry, metrics: &Met
             .map(Resume::Since),
     };
     let (tx, rx) = mpsc::channel::<Outgoing>();
-    let Some(conn) = registry.subscribe_from(user, (tx.clone(), config.queue), config.max_per_user, resume) else {
+    let Some(conn) = registry.subscribe_from(
+        user,
+        (tx.clone(), config.queue),
+        config.max_per_user,
+        resume,
+    ) else {
         respond(
             &mut writer,
             "429 Too Many Requests",
@@ -1004,27 +1076,29 @@ fn handle(stream: TcpStream, config: &Config, registry: &Registry, metrics: &Met
 
     // Reader: client pings/closes become frames for the writer to send.
     let control = tx;
-    let spawned = std::thread::Builder::new().name("ws-reader".into()).spawn(move || {
-        let mut events = EventReader::new();
-        loop {
-            match events.next(&mut reader, 4096) {
-                Ok(Some(ClientEvent::Ping(payload))) => {
-                    if control.send(Outgoing::Pong(payload)).is_err() {
+    let spawned = std::thread::Builder::new()
+        .name("ws-reader".into())
+        .spawn(move || {
+            let mut events = EventReader::new();
+            loop {
+                match events.next(&mut reader, 4096) {
+                    Ok(Some(ClientEvent::Ping(payload))) => {
+                        if control.send(Outgoing::Pong(payload)).is_err() {
+                            return;
+                        }
+                    }
+                    Ok(Some(ClientEvent::Message(_))) => {} // nothing to receive
+                    Ok(Some(ClientEvent::Close(code))) => {
+                        let _ = control.send(Outgoing::Close(code));
+                        return;
+                    }
+                    Ok(None) | Err(_) => {
+                        let _ = control.send(Outgoing::Close(Vec::new()));
                         return;
                     }
                 }
-                Ok(Some(ClientEvent::Message(_))) => {} // nothing to receive
-                Ok(Some(ClientEvent::Close(code))) => {
-                    let _ = control.send(Outgoing::Close(code));
-                    return;
-                }
-                Ok(None) | Err(_) => {
-                    let _ = control.send(Outgoing::Close(Vec::new()));
-                    return;
-                }
             }
-        }
-    });
+        });
     let Ok(reader_thread) = spawned else {
         registry.unsubscribe(user, conn);
         metrics.connections.fetch_sub(1, Ordering::Relaxed);
@@ -1126,9 +1200,16 @@ fn main() {
     let role = env("TC_USER_STREAM_ROLE", "all");
     let user_topic = env("TC_USER_STREAM_TOPIC", "trade-user-events-v1");
     let shard = (role == "pusher").then(|| {
-        let count: u32 = env("TC_USER_STREAM_SHARDS", "1").parse().expect("TC_USER_STREAM_SHARDS");
-        let index: u32 = env("TC_USER_STREAM_SHARD", "0").parse().expect("TC_USER_STREAM_SHARD");
-        assert!(count >= 1 && index < count, "TC_USER_STREAM_SHARD must be below TC_USER_STREAM_SHARDS");
+        let count: u32 = env("TC_USER_STREAM_SHARDS", "1")
+            .parse()
+            .expect("TC_USER_STREAM_SHARDS");
+        let index: u32 = env("TC_USER_STREAM_SHARD", "0")
+            .parse()
+            .expect("TC_USER_STREAM_SHARD");
+        assert!(
+            count >= 1 && index < count,
+            "TC_USER_STREAM_SHARD must be below TC_USER_STREAM_SHARDS"
+        );
         let peers: Vec<String> = env("TC_USER_STREAM_PEERS", "")
             .split(',')
             .map(str::trim)
@@ -1147,13 +1228,24 @@ fn main() {
             match topic_partitions(&probe, &user_topic) {
                 Ok(partitions) => break partitions,
                 Err(error) => {
-                    log_warn!("user-stream", "event=user_topic_unavailable topic={user_topic} error={error}");
+                    log_warn!(
+                        "user-stream",
+                        "event=user_topic_unavailable topic={user_topic} error={error}"
+                    );
                     std::thread::sleep(Duration::from_secs(1));
                 }
             }
         };
-        assert!(partitions >= count, "{user_topic} has {partitions} partitions, fewer than {count} shards");
-        Shard { index, count, partitions, peers }
+        assert!(
+            partitions >= count,
+            "{user_topic} has {partitions} partitions, fewer than {count} shards"
+        );
+        Shard {
+            index,
+            count,
+            partitions,
+            peers,
+        }
     });
     assert!(
         matches!(role.as_str(), "all" | "router" | "pusher"),
@@ -1173,16 +1265,25 @@ fn main() {
             .max(1),
     });
     let mut registry = Registry::with_replay(
-        env("TC_USER_STREAM_REPLAY_EVENTS", "512").parse().unwrap_or(512),
-        env("TC_USER_STREAM_REPLAY_SECS", "300").parse().unwrap_or(300),
-        env("TC_USER_STREAM_REPLAY_MAX_TOTAL", "2000000").parse().unwrap_or(2_000_000),
+        env("TC_USER_STREAM_REPLAY_EVENTS", "512")
+            .parse()
+            .unwrap_or(512),
+        env("TC_USER_STREAM_REPLAY_SECS", "300")
+            .parse()
+            .unwrap_or(300),
+        env("TC_USER_STREAM_REPLAY_MAX_TOTAL", "2000000")
+            .parse()
+            .unwrap_or(2_000_000),
     );
-    registry.since_grace_ms = env("TC_USER_STREAM_SINCE_GRACE_MS", "10000").parse().unwrap_or(10_000);
+    registry.since_grace_ms = env("TC_USER_STREAM_SINCE_GRACE_MS", "10000")
+        .parse()
+        .unwrap_or(10_000);
     let registry = Arc::new(registry);
     let metrics = Arc::new(Metrics::default());
     if role == "router" {
         let metrics = metrics.clone();
-        let group = std::env::var("TC_USER_STREAM_GROUP").unwrap_or_else(|_| "user-stream-router".into());
+        let group =
+            std::env::var("TC_USER_STREAM_GROUP").unwrap_or_else(|_| "user-stream-router".into());
         std::thread::Builder::new()
             .name("user-router".into())
             .spawn(move || route(brokers, topic, user_topic, group, metrics))
@@ -1199,19 +1300,27 @@ fn main() {
     log_info!("user-stream", "listening on {addr}");
     // Every connection costs two threads; past the limit (or when the OS
     // refuses a thread) new ones are closed at once instead of aborting.
-    let max_connections: usize = env("TC_USER_STREAM_MAX_CONNECTIONS", "50000").parse().unwrap_or(50_000);
+    let max_connections: usize = env("TC_USER_STREAM_MAX_CONNECTIONS", "50000")
+        .parse()
+        .unwrap_or(50_000);
     let active = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming().flatten() {
         if active.load(Ordering::Acquire) >= max_connections {
             continue; // dropping `stream` closes it
         }
         active.fetch_add(1, Ordering::AcqRel);
-        let (config, registry, metrics, done) =
-            (config.clone(), registry.clone(), metrics.clone(), active.clone());
-        let spawned = std::thread::Builder::new().name("ws-conn".into()).spawn(move || {
-            handle(stream, &config, &registry, &metrics);
-            done.fetch_sub(1, Ordering::AcqRel);
-        });
+        let (config, registry, metrics, done) = (
+            config.clone(),
+            registry.clone(),
+            metrics.clone(),
+            active.clone(),
+        );
+        let spawned = std::thread::Builder::new()
+            .name("ws-conn".into())
+            .spawn(move || {
+                handle(stream, &config, &registry, &metrics);
+                done.fetch_sub(1, Ordering::AcqRel);
+            });
         if spawned.is_err() {
             active.fetch_sub(1, Ordering::AcqRel);
         }
@@ -1330,7 +1439,15 @@ mod tests {
         };
         let (_, taker) = event_json(&payload(&trade, 1)).unwrap();
         let (_, maker) = event_json(&payload(&trade, 2)).unwrap();
-        let id = |json: &str| json.split("\"event_id\":\"").nth(1).unwrap().split('"').next().unwrap().to_string();
+        let id = |json: &str| {
+            json.split("\"event_id\":\"")
+                .nth(1)
+                .unwrap()
+                .split('"')
+                .next()
+                .unwrap()
+                .to_string()
+        };
         assert_ne!(id(&taker), id(&maker));
         let (_, stamped) = event_json_at(&payload(&trade, 1), 1_700_000_000_123).unwrap();
         assert!(stamped.ends_with(r#","ts":1700000000123}"#), "{stamped}");
@@ -1361,9 +1478,15 @@ mod tests {
         }
         // Only the last 3 are kept; `since` picks those at or after it.
         let (tx, rx) = mpsc::channel();
-        registry.subscribe_from(7, (tx, 16), 4, Some(Resume::Since(3_000))).unwrap();
+        registry
+            .subscribe_from(7, (tx, 16), 4, Some(Resume::Since(3_000)))
+            .unwrap();
         registry.record_and_push(7, at(5_000, 5), &text(5), &metrics);
-        assert_eq!(texts(&rx), ["e3", "e4", "e5"], "replay, then live, in order");
+        assert_eq!(
+            texts(&rx),
+            ["e3", "e4", "e5"],
+            "replay, then live, in order"
+        );
         // Events older than the window are forgotten.
         registry.prune(5_000 + 61_000);
         let history = registry.history.lock().unwrap();
@@ -1380,8 +1503,14 @@ mod tests {
         registry.record_and_push(7, at(20_000, 1), &"B".into(), &metrics);
         registry.record_and_push(7, at(15_000, 2), &"A".into(), &metrics);
         let (tx, rx) = mpsc::channel();
-        registry.subscribe_from(7, (tx, 16), 4, Some(Resume::Since(20_000))).unwrap();
-        assert_eq!(texts(&rx), ["B", "A"], "A is replayed; B again is deduped by event_id");
+        registry
+            .subscribe_from(7, (tx, 16), 4, Some(Resume::Since(20_000)))
+            .unwrap();
+        assert_eq!(
+            texts(&rx),
+            ["B", "A"],
+            "A is replayed; B again is deduped by event_id"
+        );
     }
 
     #[test]
@@ -1390,13 +1519,26 @@ mod tests {
         registry.set_floor(0, &[(0, 10)]); // loading began at offset 10
         let metrics = Metrics::default();
         for offset in 10..15 {
-            registry.record_and_push(7, at(1_000 + offset, offset), &format!("o{offset}").into(), &metrics);
+            registry.record_and_push(
+                7,
+                at(1_000 + offset, offset),
+                &format!("o{offset}").into(),
+                &metrics,
+            );
         }
         // Kept: 12, 13, 14 (per-user limit 3); 10 and 11 were evicted.
         let resume = |cursor| {
             let (tx, rx) = mpsc::channel();
             registry
-                .subscribe_from(7, (tx, 16), 64, Some(Resume::After { cursor, partition: 0 }))
+                .subscribe_from(
+                    7,
+                    (tx, 16),
+                    64,
+                    Some(Resume::After {
+                        cursor,
+                        partition: 0,
+                    }),
+                )
                 .unwrap();
             texts(&rx)
         };
@@ -1413,7 +1555,15 @@ mod tests {
         // More to replay than the queue holds: resync instead of a partial replay.
         let (tx, rx) = mpsc::channel();
         registry
-            .subscribe_from(7, (tx, 2), 64, Some(Resume::After { cursor: 11, partition: 0 }))
+            .subscribe_from(
+                7,
+                (tx, 2),
+                64,
+                Some(Resume::After {
+                    cursor: 11,
+                    partition: 0,
+                }),
+            )
             .unwrap();
         let got = texts(&rx);
         assert_eq!(got.len(), 1);
@@ -1436,7 +1586,10 @@ mod tests {
         assert_eq!(history.kept, 4);
         assert!(history.order.len() <= 8);
         let kept = |user| -> Vec<i64> {
-            history.users.get(&user).map_or(vec![], |e| e.events.iter().map(|k| k.ts).collect())
+            history
+                .users
+                .get(&user)
+                .map_or(vec![], |e| e.events.iter().map(|k| k.ts).collect())
         };
         // Over the total: user 1's oldest kept event (4) went first.
         assert_eq!(kept(1), [5]);
@@ -1448,7 +1601,12 @@ mod tests {
             registry.record_and_push(9, at(ts, ts), &text(ts), &metrics);
         }
         let history = registry.history.lock().unwrap();
-        assert!(history.kept <= 4 && history.order.len() <= 8, "{} {}", history.kept, history.order.len());
+        assert!(
+            history.kept <= 4 && history.order.len() <= 8,
+            "{} {}",
+            history.kept,
+            history.order.len()
+        );
     }
 
     #[test]
@@ -1458,15 +1616,26 @@ mod tests {
         for user in 1_000_000..1_064_000u64 {
             per_partition[user_partition(user, partitions) as usize] += 1;
         }
-        let (min, max) = (*per_partition.iter().min().unwrap(), *per_partition.iter().max().unwrap());
+        let (min, max) = (
+            *per_partition.iter().min().unwrap(),
+            *per_partition.iter().max().unwrap(),
+        );
         assert!(min > 850 && max < 1150, "skewed: {min}..{max}");
         let shards: Vec<Shard> = (0..3)
-            .map(|index| Shard { index, count: 3, partitions, peers: vec![] })
+            .map(|index| Shard {
+                index,
+                count: 3,
+                partitions,
+                peers: vec![],
+            })
             .collect();
         for user in [1u64, 42, 1_000_003, u64::MAX] {
             let partition = user_partition(user, partitions);
-            let owners: Vec<u32> =
-                shards.iter().filter(|s| s.owns_partition(partition)).map(|s| s.index).collect();
+            let owners: Vec<u32> = shards
+                .iter()
+                .filter(|s| s.owns_partition(partition))
+                .map(|s| s.index)
+                .collect();
             assert_eq!(owners, [shards[0].owner(user)], "user {user}");
         }
     }

@@ -5,9 +5,7 @@
 use std::time::Duration;
 
 use trade_core::exchange::{fingerprint_reports, proof_digest, ExecReport, Processor};
-use trade_core::execution_outbox::{
-    ExecutionOutboxReader, ExecutionOutboxWriter,
-};
+use trade_core::execution_outbox::{ExecutionOutboxReader, ExecutionOutboxWriter};
 use trade_core::prelude::*;
 use trade_core::types::{Trigger, TriggerKind};
 use trade_core::wire;

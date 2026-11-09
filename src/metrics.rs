@@ -766,7 +766,11 @@ mod tests {
 
     #[test]
     fn a_slow_admin_route_does_not_hold_up_the_health_probe() {
-        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
         let addr = format!("127.0.0.1:{port}");
         let slow: ExtraRoute = Box::new(|line: &str| {
             line.starts_with("GET /slow ").then(|| {
@@ -782,26 +786,35 @@ mod tests {
                     Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
                 }
             };
-            stream.write_all(format!("GET {path} HTTP/1.1\r\n\r\n").as_bytes()).unwrap();
+            stream
+                .write_all(format!("GET {path} HTTP/1.1\r\n\r\n").as_bytes())
+                .unwrap();
             let mut response = String::new();
             stream.read_to_string(&mut response).unwrap();
             response
         };
         let slow_request = {
-            let get_slow = { let addr = addr.clone(); move || {
-                let mut stream = std::net::TcpStream::connect(&addr).unwrap();
-                stream.write_all(b"GET /slow HTTP/1.1\r\n\r\n").unwrap();
-                let mut response = String::new();
-                stream.read_to_string(&mut response).unwrap();
-                response
-            }};
+            let get_slow = {
+                let addr = addr.clone();
+                move || {
+                    let mut stream = std::net::TcpStream::connect(&addr).unwrap();
+                    stream.write_all(b"GET /slow HTTP/1.1\r\n\r\n").unwrap();
+                    let mut response = String::new();
+                    stream.read_to_string(&mut response).unwrap();
+                    response
+                }
+            };
             get("/healthz"); // server is up
             std::thread::spawn(get_slow)
         };
         std::thread::sleep(std::time::Duration::from_millis(100));
         let started = std::time::Instant::now();
         assert!(get("/healthz").ends_with("ok\n"));
-        assert!(started.elapsed() < std::time::Duration::from_secs(1), "{:?}", started.elapsed());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
         assert!(slow_request.join().unwrap().ends_with("done\n"));
     }
 

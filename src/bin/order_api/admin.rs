@@ -219,7 +219,10 @@ pub(crate) fn migrate_category(
         let source = group_leader(endpoints, from_group)?;
         seal_attempted = true;
         let seal_index = json_number(
-            &admin_call(&source, &format!("/migration/seal?category={category}&epoch={epoch}&size={size}"))?,
+            &admin_call(
+                &source,
+                &format!("/migration/seal?category={category}&epoch={epoch}&size={size}"),
+            )?,
             "index",
         )
         .ok_or("seal answered no index")?;
@@ -366,10 +369,20 @@ fn roll_back(
     let size = category_size();
     let wait = Duration::from_secs(env_number("TC_MIGRATION_STEP_TIMEOUT_SECS", 60u64));
     if install_attempted {
-        propose_until_committed(endpoints, to_group, &format!("/migration/drop?category={category}&epoch={epoch}&size={size}"), wait)?;
+        propose_until_committed(
+            endpoints,
+            to_group,
+            &format!("/migration/drop?category={category}&epoch={epoch}&size={size}"),
+            wait,
+        )?;
     }
     if seal_attempted {
-        propose_until_committed(endpoints, from_group, &format!("/migration/unseal?category={category}&epoch={epoch}&size={size}"), wait)?;
+        propose_until_committed(
+            endpoints,
+            from_group,
+            &format!("/migration/unseal?category={category}&epoch={epoch}&size={size}"),
+            wait,
+        )?;
     }
     match route_log::latest_after(category, freeze_offset, Duration::from_secs(10))? {
         Some((offset, _)) if offset == freeze_offset => {

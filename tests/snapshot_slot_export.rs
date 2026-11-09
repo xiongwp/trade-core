@@ -19,7 +19,11 @@ fn slot_copy_exports_exactly_the_live_orders_in_time_order() {
     for step in 1..=20_000u64 {
         let roll = next() % 10;
         if roll < 6 || live.is_empty() {
-            let side = if next() % 2 == 0 { Side::Buy } else { Side::Sell };
+            let side = if next() % 2 == 0 {
+                Side::Buy
+            } else {
+                Side::Sell
+            };
             let price = 1_000 + next() % 16;
             let mut order = Order::limit(OrderId(step), side, price, 1 + next() % 5);
             order.timestamp = step;

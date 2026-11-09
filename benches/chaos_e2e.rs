@@ -100,7 +100,8 @@ fn http_get(addr: &str, path: &str) -> Option<String> {
     stream.write_all(request.as_bytes()).ok()?;
     let mut text = String::new();
     stream.read_to_string(&mut text).ok()?;
-    text.split_once("\r\n\r\n").map(|(_, body)| body.to_string())
+    text.split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_string())
 }
 
 fn json_u64(body: &str, key: &str) -> Option<u64> {
@@ -114,7 +115,10 @@ fn json_u64(body: &str, key: &str) -> Option<u64> {
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).filter(|a| a != "--bench").collect();
+    let args: Vec<String> = std::env::args()
+        .skip(1)
+        .filter(|a| a != "--bench")
+        .collect();
     // One or more order-api addresses (comma-separated): workers spread
     // over them, and a worker whose instance is down retries the next one.
     let addrs: Vec<String> = args
@@ -125,17 +129,23 @@ fn main() {
         .map(|addr| addr.trim().to_string())
         .filter(|addr| !addr.is_empty())
         .collect();
-    let token = args.get(1).cloned().unwrap_or_else(|| "local-order-api-token".into());
+    let token = args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(|| "local-order-api-token".into());
     let commands: u64 = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(300_000);
     let users: u64 = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(10_000);
     let instruments: u32 = args.get(4).and_then(|v| v.parse().ok()).unwrap_or(100);
     let concurrency: usize = args.get(5).and_then(|v| v.parse().ok()).unwrap_or(16);
     let batch: u64 = args.get(6).and_then(|v| v.parse().ok()).unwrap_or(500);
-    let groups: u32 = std::env::var("TC_RAFT_GROUPS").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+    let groups: u32 = std::env::var("TC_RAFT_GROUPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4);
     let brokers = std::env::var("TC_CHAOS_BROKERS")
         .unwrap_or_else(|_| "localhost:19092,localhost:19093,localhost:19094".into());
     let stride = 1_000u32; // one instrument per asset category
-    // Unique per run so ids never collide with an earlier run's.
+                           // Unique per run so ids never collide with an earlier run's.
     let id_base = (std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -245,7 +255,9 @@ fn main() {
         .set("enable.auto.commit", "false")
         .create()
         .expect("kafka consumer");
-    consumer.subscribe(&["trade-executions-v1"]).expect("subscribe");
+    consumer
+        .subscribe(&["trade-executions-v1"])
+        .expect("subscribe");
     let mut seen_keys = HashSet::<(u32, u64, u32, u64)>::new();
     let mut has_result = HashSet::<u64>::new();
     let mut accepted_at = HashMap::<u64, HashSet<(u32, u64)>>::new();
@@ -269,7 +281,12 @@ fn main() {
                 let Some(event) = message.payload().and_then(wire::decode_execution_event) else {
                     continue;
                 };
-                let key = (event.raft_group, event.raft_index, event.ordinal, event.target_order_id);
+                let key = (
+                    event.raft_group,
+                    event.raft_index,
+                    event.ordinal,
+                    event.target_order_id,
+                );
                 if !seen_keys.insert(key) {
                     republished += 1;
                     continue;
@@ -281,7 +298,10 @@ fn main() {
                     found(event.report.order_id.0, &mut has_result, &mut missing);
                 }
                 if event.report.type_code == wire::RT_ACCEPTED {
-                    accepted_at.entry(target).or_default().insert((event.raft_group, event.raft_index));
+                    accepted_at
+                        .entry(target)
+                        .or_default()
+                        .insert((event.raft_group, event.raft_index));
                 }
                 if event.report.type_code == wire::RT_TRADE {
                     *traded.entry(target).or_default() += event.report.qty;
@@ -297,7 +317,11 @@ fn main() {
             break;
         }
     }
-    let lost: Vec<u64> = orders.keys().filter(|id| !has_result.contains(id)).copied().collect();
+    let lost: Vec<u64> = orders
+        .keys()
+        .filter(|id| !has_result.contains(id))
+        .copied()
+        .collect();
     let double: Vec<u64> = accepted_at
         .iter()
         .filter(|(id, at)| orders.contains_key(id) && at.len() > 1)
@@ -308,10 +332,24 @@ fn main() {
         .filter(|(id, qty)| orders.get(id).is_some_and(|limit| **qty > *limit))
         .map(|(id, _)| *id)
         .collect();
-    println!("execution topic: {events} distinct events, {republished} republished copies (deduped)");
-    println!("lost orders (accepted, no result): {}  {:?}", lost.len(), &lost[..lost.len().min(5)]);
-    println!("double-applied orders: {}  {:?}", double.len(), &double[..double.len().min(5)]);
-    println!("over-filled orders: {}  {:?}", overfill.len(), &overfill[..overfill.len().min(5)]);
+    println!(
+        "execution topic: {events} distinct events, {republished} republished copies (deduped)"
+    );
+    println!(
+        "lost orders (accepted, no result): {}  {:?}",
+        lost.len(),
+        &lost[..lost.len().min(5)]
+    );
+    println!(
+        "double-applied orders: {}  {:?}",
+        double.len(),
+        &double[..double.len().min(5)]
+    );
+    println!(
+        "over-filled orders: {}  {:?}",
+        overfill.len(),
+        &overfill[..overfill.len().min(5)]
+    );
 
     // ---- replicas ---------------------------------------------------------
     // Snapshots are taken when a node is idle (every TC_SNAPSHOT_EVERY_SECS),
@@ -326,8 +364,16 @@ fn main() {
                 let mut answers = Vec::new();
                 for node in 1..=5u32 {
                     let port = 9200 + group * 10 + node;
-                    let body = http_get(&format!("127.0.0.1:{port}"), &format!("/fingerprint?category={category}"));
-                    answers.push(body.and_then(|b| Some((json_u64(&b, "raft_applied_index")?, json_u64(&b, "fingerprint")?))));
+                    let body = http_get(
+                        &format!("127.0.0.1:{port}"),
+                        &format!("/fingerprint?category={category}"),
+                    );
+                    answers.push(body.and_then(|b| {
+                        Some((
+                            json_u64(&b, "raft_applied_index")?,
+                            json_u64(&b, "fingerprint")?,
+                        ))
+                    }));
                 }
                 let reached: Vec<_> = answers.iter().flatten().collect();
                 if reached.len() < 5 || reached.iter().any(|a| a.0 != reached[0].0) {
@@ -338,7 +384,11 @@ fn main() {
             }
         }
         if !diverged.is_empty() {
-            verdict = format!("DIVERGED in {} (group, category): {:?}", diverged.len(), &diverged[..diverged.len().min(5)]);
+            verdict = format!(
+                "DIVERGED in {} (group, category): {:?}",
+                diverged.len(),
+                &diverged[..diverged.len().min(5)]
+            );
             break;
         }
         verdict = if unsettled == 0 {
@@ -351,7 +401,10 @@ fn main() {
         }
     }
     println!("replicas: {verdict}");
-    let ok = lost.is_empty() && double.is_empty() && overfill.is_empty() && verdict == "all replicas identical";
+    let ok = lost.is_empty()
+        && double.is_empty()
+        && overfill.is_empty()
+        && verdict == "all replicas identical";
     println!("CHAOS VERDICT: {}", if ok { "PASS" } else { "FAIL" });
     std::process::exit(if ok { 0 } else { 1 });
 }

@@ -23,7 +23,8 @@ impl FeeSchedule {
         // Saturate rather than wrap: `as u64` used to truncate a fee above
         // u64::MAX to its low bits (a tiny fee for a giant trade), and a
         // rate times a near-u128 notional could wrap the product itself.
-        let fee = |bps: u64| (notional.saturating_mul(bps as u128) / 10_000).min(u64::MAX as u128) as u64;
+        let fee =
+            |bps: u64| (notional.saturating_mul(bps as u128) / 10_000).min(u64::MAX as u128) as u64;
         (fee(self.maker_bps), fee(self.taker_bps))
     }
 
@@ -63,9 +64,17 @@ mod tests {
 
     #[test]
     fn a_fee_beyond_u64_saturates_instead_of_wrapping() {
-        let f = FeeSchedule { maker_bps: 10_000, taker_bps: 10_000 };
+        let f = FeeSchedule {
+            maker_bps: 10_000,
+            taker_bps: 10_000,
+        };
         assert_eq!(f.fees(u64::MAX, u64::MAX), (u64::MAX, u64::MAX));
-        assert!(FeeSchedule { maker_bps: 10_001, taker_bps: 0 }.validate().is_err());
+        assert!(FeeSchedule {
+            maker_bps: 10_001,
+            taker_bps: 0
+        }
+        .validate()
+        .is_err());
         assert!(f.validate().is_ok());
     }
 }

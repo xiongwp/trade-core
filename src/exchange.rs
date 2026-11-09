@@ -134,7 +134,11 @@ pub enum CategoryOp {
     /// On the source: from here on reject the category's commands with
     /// "category-moved" (persisted in snapshots). Its state is exported from
     /// a snapshot taken after this point, so nothing applied later is lost.
-    Seal { category: u32, category_size: u32, epoch: u64 },
+    Seal {
+        category: u32,
+        category_size: u32,
+        epoch: u64,
+    },
     /// On the target: install the exported books, untriggered stops,
     /// positions and halts, plus the category's recent command ids (so a
     /// command redelivered after the move is still recognised), and accept
@@ -151,11 +155,19 @@ pub enum CategoryOp {
     },
     /// On the source, when a migration is rolled back: accept the
     /// category's commands again.
-    Unseal { category: u32, category_size: u32, epoch: u64 },
+    Unseal {
+        category: u32,
+        category_size: u32,
+        epoch: u64,
+    },
     /// On the source, once traffic has moved (or on the target, when a
     /// migration is rolled back): forget the category's state (it stays
     /// sealed, so a stray late command is still rejected).
-    Drop { category: u32, category_size: u32, epoch: u64 },
+    Drop {
+        category: u32,
+        category_size: u32,
+        epoch: u64,
+    },
 }
 
 /// Intake metadata carried alongside a command. Raft entries retain their
@@ -812,9 +824,8 @@ fn build_inner(
             let proof_root = dir.join("assets");
             std::fs::create_dir_all(&proof_root).expect("create Raft application proof dir");
             if config.raft_wal_authoritative {
-                initial_raft_index =
-                    recover_raft_authoritative(&mut processor, &spath)
-                        .expect("recover matching snapshot for Raft WAL replay");
+                initial_raft_index = recover_raft_authoritative(&mut processor, &spath)
+                    .expect("recover matching snapshot for Raft WAL replay");
                 applied_root = Some(proof_root);
                 snapshot_path = Some(spath);
             } else {
@@ -1213,7 +1224,11 @@ impl TriggerBook {
     /// Canonical export order: rising book, then falling book, each in key
     /// order (so restore can renumber arrivals and keep tie order).
     fn export(&self) -> Vec<StopOrder> {
-        self.rises.values().chain(self.falls.values()).copied().collect()
+        self.rises
+            .values()
+            .chain(self.falls.values())
+            .copied()
+            .collect()
     }
 
     fn is_empty(&self) -> bool {
@@ -1276,10 +1291,18 @@ impl Processor {
             crate::sharding::asset_category(instrument, size) == category
         };
         let (category, epoch) = match &op {
-            CategoryOp::Seal { category, epoch, .. }
-            | CategoryOp::Install { category, epoch, .. }
-            | CategoryOp::Unseal { category, epoch, .. }
-            | CategoryOp::Drop { category, epoch, .. } => (*category, *epoch),
+            CategoryOp::Seal {
+                category, epoch, ..
+            }
+            | CategoryOp::Install {
+                category, epoch, ..
+            }
+            | CategoryOp::Unseal {
+                category, epoch, ..
+            }
+            | CategoryOp::Drop {
+                category, epoch, ..
+            } => (*category, *epoch),
         };
         let current = self.migration_epochs.get(&category).copied().unwrap_or(0);
         // Epoch 0: a step logged before epochs existed; applies unfenced.
@@ -1287,7 +1310,9 @@ impl Processor {
         let stale = match &op {
             // Never over another migration's seal, never older than the last step.
             CategoryOp::Seal { .. } => {
-                fenced && (epoch < current || (self.sealed.contains_key(&category) && current != epoch))
+                fenced
+                    && (epoch < current
+                        || (self.sealed.contains_key(&category) && current != epoch))
             }
             CategoryOp::Install { .. } => fenced && epoch < current,
             // Only the migration that sealed / installed it here.
@@ -1302,7 +1327,11 @@ impl Processor {
             return;
         }
         match op {
-            CategoryOp::Seal { category, category_size, .. } => {
+            CategoryOp::Seal {
+                category,
+                category_size,
+                ..
+            } => {
                 self.sealed.insert(category, category_size);
             }
             CategoryOp::Unseal { category, .. } => {
@@ -1327,9 +1356,12 @@ impl Processor {
                         .is_some_and(|engine| !engine.book().is_empty())
                         || self.stops.contains_key(&instrument)
                 };
-                if let Err(reason) =
-                    crate::migration::validate_category_state(&engines, &positions, category, category_size)
-                {
+                if let Err(reason) = crate::migration::validate_category_state(
+                    &engines,
+                    &positions,
+                    category,
+                    category_size,
+                ) {
                     crate::log_error!("migration", category; "event=install_rejected reason={reason}");
                     emit(ExecReport::CommandRejected {
                         instrument: InstrumentId(0),
@@ -1341,13 +1373,18 @@ impl Processor {
                 let occupied = engines
                     .iter()
                     .map(|state| state.instrument)
-                    .find(|&instrument| !in_category(instrument, category, category_size) || holds_state(instrument))
+                    .find(|&instrument| {
+                        !in_category(instrument, category, category_size) || holds_state(instrument)
+                    })
                     .or_else(|| {
                         self.engines
                             .keys()
                             .chain(self.stops.keys())
                             .copied()
-                            .find(|&instrument| in_category(instrument, category, category_size) && holds_state(instrument))
+                            .find(|&instrument| {
+                                in_category(instrument, category, category_size)
+                                    && holds_state(instrument)
+                            })
                     })
                     .or_else(|| {
                         self.positions
@@ -1380,7 +1417,10 @@ impl Processor {
                 }
                 for (user, instrument, quantity) in positions {
                     if in_category(InstrumentId(instrument), category, category_size) {
-                        let position = self.positions.entry((user, InstrumentId(instrument))).or_insert(0);
+                        let position = self
+                            .positions
+                            .entry((user, InstrumentId(instrument)))
+                            .or_insert(0);
                         *position = position.saturating_add(quantity);
                     }
                 }
@@ -1397,7 +1437,11 @@ impl Processor {
                     }
                 }
             }
-            CategoryOp::Drop { category, category_size, .. } => {
+            CategoryOp::Drop {
+                category,
+                category_size,
+                ..
+            } => {
                 self.sealed.insert(category, category_size);
                 self.engines
                     .retain(|&instrument, _| !in_category(instrument, category, category_size));
@@ -1410,8 +1454,9 @@ impl Processor {
                     keep
                 });
                 self.pending_stops -= removed_stops;
-                self.positions
-                    .retain(|&(_, instrument), _| !in_category(instrument, category, category_size));
+                self.positions.retain(|&(_, instrument), _| {
+                    !in_category(instrument, category, category_size)
+                });
                 self.halted
                     .retain(|&instrument| !in_category(instrument, category, category_size));
             }
@@ -1539,10 +1584,15 @@ impl Processor {
         }
         self.sealed
             .extend(snap.sealed.iter().map(|&(category, size)| (category, size)));
-        self.migration_epochs.extend(snap.migration_epochs.iter().copied());
+        self.migration_epochs
+            .extend(snap.migration_epochs.iter().copied());
         // The exact command-id dedupe window.
         self.seen_command_ids.clear();
-        for (&id, &instrument) in snap.recent_command_ids.iter().zip(&snap.recent_command_instruments) {
+        for (&id, &instrument) in snap
+            .recent_command_ids
+            .iter()
+            .zip(&snap.recent_command_instruments)
+        {
             self.seen_command_ids.insert(id, instrument);
         }
         for e in &snap.engines {
@@ -1617,7 +1667,8 @@ impl Processor {
             }
         }
         if exact_id != 0
-            && (!self.seen_command_ids.insert(exact_id, cmd.instrument().0) || self.would_duplicate_live(&cmd))
+            && (!self.seen_command_ids.insert(exact_id, cmd.instrument().0)
+                || self.would_duplicate_live(&cmd))
         {
             emit(ExecReport::CommandRejected {
                 instrument: cmd.instrument(),
@@ -1634,9 +1685,7 @@ impl Processor {
         if self.dedup {
             // (id, instrument, is_admin_stream)
             let (id, inst, admin) = match &cmd {
-                Command::New(o) | Command::NewConditional(o, _) => {
-                    (o.id.0, o.instrument, false)
-                }
+                Command::New(o) | Command::NewConditional(o, _) => (o.id.0, o.instrument, false),
                 Command::Cancel {
                     cmd_id, instrument, ..
                 } => (*cmd_id, *instrument, true),
@@ -1817,7 +1866,9 @@ impl Processor {
                                 .as_ref()
                                 .and_then(|limits| limits.check_static(&probe).err())
                                 .or_else(|| {
-                                    self.guard.as_ref().and_then(|guard| guard.vet(&mut probe).err())
+                                    self.guard
+                                        .as_ref()
+                                        .and_then(|guard| guard.vet(&mut probe).err())
                                 })
                         };
                         if let Some(reason) = reason {
@@ -1831,7 +1882,10 @@ impl Processor {
                     }
                 }
                 let Some(engine) = self.engines.get_mut(&instrument) else {
-                    emit(ExecReport::NotFound { instrument, order_id });
+                    emit(ExecReport::NotFound {
+                        instrument,
+                        order_id,
+                    });
                     return;
                 };
                 let user = engine.book().get(order_id).map_or(0, |order| order.user);
@@ -1876,10 +1930,16 @@ impl Processor {
                                 Side::Sell => (t.maker_user, t.taker_user),
                             };
                             if buyer != 0 {
-                                { let p = self.positions.entry((buyer, instrument)).or_insert(0); *p = p.saturating_add(q); }
+                                {
+                                    let p = self.positions.entry((buyer, instrument)).or_insert(0);
+                                    *p = p.saturating_add(q);
+                                }
                             }
                             if seller != 0 {
-                                { let p = self.positions.entry((seller, instrument)).or_insert(0); *p = p.saturating_sub(q); }
+                                {
+                                    let p = self.positions.entry((seller, instrument)).or_insert(0);
+                                    *p = p.saturating_sub(q);
+                                }
                             }
                             let (maker_fee, taker_fee) = self.fees.fees(t.price, t.quantity);
                             emit(ExecReport::Trade {
@@ -2163,10 +2223,16 @@ impl Processor {
                 Side::Sell => (t.maker_user, t.taker_user),
             };
             if buyer != 0 {
-                { let p = self.positions.entry((buyer, instrument)).or_insert(0); *p = p.saturating_add(q); }
+                {
+                    let p = self.positions.entry((buyer, instrument)).or_insert(0);
+                    *p = p.saturating_add(q);
+                }
             }
             if seller != 0 {
-                { let p = self.positions.entry((seller, instrument)).or_insert(0); *p = p.saturating_sub(q); }
+                {
+                    let p = self.positions.entry((seller, instrument)).or_insert(0);
+                    *p = p.saturating_sub(q);
+                }
             }
             emit(ExecReport::Trade {
                 instrument,
@@ -2315,7 +2381,11 @@ impl Processor {
                 return;
             };
             self.pending_stops -= 1;
-            if self.stops.get(&instrument).is_some_and(TriggerBook::is_empty) {
+            if self
+                .stops
+                .get(&instrument)
+                .is_some_and(TriggerBook::is_empty)
+            {
                 self.stops.remove(&instrument);
             }
             emit(ExecReport::Triggered {
@@ -2624,8 +2694,12 @@ impl Shard {
         let captured = capture_processor_snapshot(&self.processor, 0, self.last_raft_index);
         let paused_ns = started.elapsed().as_nanos() as u64;
         self.metrics.snapshots.fetch_add(1, Ordering::Relaxed);
-        self.metrics.snapshot_ns_last.store(paused_ns, Ordering::Relaxed);
-        self.metrics.snapshot_ns_max.fetch_max(paused_ns, Ordering::Relaxed);
+        self.metrics
+            .snapshot_ns_last
+            .store(paused_ns, Ordering::Relaxed);
+        self.metrics
+            .snapshot_ns_max
+            .fetch_max(paused_ns, Ordering::Relaxed);
         self.last_snapshot = Instant::now();
         let metrics = self.metrics.clone();
         self.snapshot_writer = Some(
@@ -2674,10 +2748,16 @@ impl Shard {
         let took = started.elapsed();
         let took_ns = took.as_nanos() as u64;
         self.metrics.snapshots.fetch_add(1, Ordering::Relaxed);
-        self.metrics.snapshot_ns_last.store(took_ns, Ordering::Relaxed);
-        self.metrics.snapshot_ns_max.fetch_max(took_ns, Ordering::Relaxed);
+        self.metrics
+            .snapshot_ns_last
+            .store(took_ns, Ordering::Relaxed);
+        self.metrics
+            .snapshot_ns_max
+            .fetch_max(took_ns, Ordering::Relaxed);
         if let Ok(meta) = std::fs::metadata(path) {
-            self.metrics.snapshot_bytes.store(meta.len(), Ordering::Relaxed);
+            self.metrics
+                .snapshot_bytes
+                .store(meta.len(), Ordering::Relaxed);
         }
         if took > Duration::from_millis(100) {
             crate::log_warn!(
@@ -3223,13 +3303,25 @@ fn capture_processor_snapshot(
         raft_applied_index,
         max_cmd_id: processor.max_new_id,
         max_admin_id: processor.max_admin_id,
-        halted: processor.halted.iter().map(|instrument| instrument.0).collect(),
+        halted: processor
+            .halted
+            .iter()
+            .map(|instrument| instrument.0)
+            .collect(),
         suspended: processor.suspended.iter().copied().collect(),
         positions: processor.positions.clone(),
         recent_command_ids: processor.seen_command_ids.to_vec(),
         recent_command_instruments: processor.seen_command_ids.instruments_vec(),
-        sealed: processor.sealed.iter().map(|(&category, &size)| (category, size)).collect(),
-        migration_epochs: processor.migration_epochs.iter().map(|(&c, &e)| (c, e)).collect(),
+        sealed: processor
+            .sealed
+            .iter()
+            .map(|(&category, &size)| (category, size))
+            .collect(),
+        migration_epochs: processor
+            .migration_epochs
+            .iter()
+            .map(|(&c, &e)| (c, e))
+            .collect(),
         engines: processor
             .engines
             .iter()
@@ -3258,7 +3350,10 @@ fn persist_processor_snapshot(
 
 /// Restore the matching snapshot (it records the Raft index it covers);
 /// none yet means an empty processor at index 0.
-fn recover_raft_authoritative(processor: &mut Processor, snapshot_path: &Path) -> std::io::Result<u64> {
+fn recover_raft_authoritative(
+    processor: &mut Processor,
+    snapshot_path: &Path,
+) -> std::io::Result<u64> {
     if !snapshot_path.exists() {
         return Ok(0);
     }

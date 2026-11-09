@@ -120,8 +120,8 @@ fn committed_batch_is_durable_in_outbox_before_watermark_and_survives_restart() 
 /// published; the logical position lands on the same record everywhere.
 #[test]
 fn replicas_follow_the_publish_position_not_the_byte_offset() {
-    use trade_core::execution_outbox::{ExecutionOutboxReader, ExecutionOutboxWriter};
     use trade_core::exchange::ExecReport;
+    use trade_core::execution_outbox::{ExecutionOutboxReader, ExecutionOutboxWriter};
     let dir = std::env::temp_dir().join(format!("tc-outbox-logical-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -136,7 +136,9 @@ fn replicas_follow_the_publish_position_not_the_byte_offset() {
         let mut writer = ExecutionOutboxWriter::open(path, Duration::from_secs(60), 1_000).unwrap();
         for index in from..=10 {
             for ordinal in 0..2 {
-                writer.append(0, index, ordinal, &report(index * 10 + ordinal as u64)).unwrap();
+                writer
+                    .append(0, index, ordinal, &report(index * 10 + ordinal as u64))
+                    .unwrap();
             }
         }
         writer.sync_data().unwrap();
@@ -156,7 +158,11 @@ fn replicas_follow_the_publish_position_not_the_byte_offset() {
         (record.raft_index, record.ordinal)
     };
     assert_eq!(next(&leader), (8, 0));
-    assert_eq!(next(&follower), (8, 0), "follower skipped unpublished records");
+    assert_eq!(
+        next(&follower),
+        (8, 0),
+        "follower skipped unpublished records"
+    );
     assert_eq!(leader.pending_records().unwrap(), 6);
     assert_eq!(follower.pending_records().unwrap(), 6);
 

@@ -1014,8 +1014,8 @@ fn backpressure_is_isolated_per_category_and_takes_group_max() {
     assert_eq!(bp.tier_for_category(0), BackpressureTier::Hard);
     assert_eq!(bp.tier_for_category(1), BackpressureTier::Normal);
     assert_eq!(bp.tier_for_category(4), BackpressureTier::Hard); // 4 -> partition 0
-    // A slow database does not stop trading: matching is unaffected, the
-    // projection's backlog waits in Kafka (the global pipeline limit bounds it).
+                                                                 // A slow database does not stop trading: matching is unaffected, the
+                                                                 // projection's backlog waits in Kafka (the global pipeline limit bounds it).
     bp.set_partition_lags("match", &[0, 0, 0, 0]);
     bp.set_partition_lags("mysql", &[0, 0, 800, 0, 0, 0]);
     for category in 0..4 {
@@ -1123,8 +1123,7 @@ fn read_dlq(path: &Path) -> Vec<(i32, i64, String, Vec<u8>)> {
         let reason_len = u32::from_le_bytes(body[at..at + 4].try_into().unwrap()) as usize;
         let reason = String::from_utf8(body[at + 4..at + 4 + reason_len].to_vec()).unwrap();
         let mut cursor = at + 4 + reason_len;
-        let payload_len =
-            u32::from_le_bytes(body[cursor..cursor + 4].try_into().unwrap()) as usize;
+        let payload_len = u32::from_le_bytes(body[cursor..cursor + 4].try_into().unwrap()) as usize;
         cursor += 4;
         let payload = body[cursor..cursor + payload_len].to_vec();
         out.push((partition, offset, reason, payload));

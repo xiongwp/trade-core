@@ -81,7 +81,10 @@ fn snapshot_plus_journal_tail_equals_continuous_state() {
     let mut reference = Processor::new(|| Box::new(PriceTimePriority), None);
     for cmd in flow(0xAAAA, 0, 2000) {
         reference.process(cmd, &mut |r| {
-            if !matches!(r, ExecReport::DepthLevel { .. } | ExecReport::DepthEnd { .. }) {
+            if !matches!(
+                r,
+                ExecReport::DepthLevel { .. } | ExecReport::DepthEnd { .. }
+            ) {
                 expected += 1;
             }
         });
@@ -94,7 +97,10 @@ fn snapshot_plus_journal_tail_equals_continuous_state() {
     while seen < expected && Instant::now() < deadline {
         seen += drain_all(&sink).len();
     }
-    assert_eq!(seen, expected, "phase A fully processed before the snapshot");
+    assert_eq!(
+        seen, expected,
+        "phase A fully processed before the snapshot"
+    );
     handle.snapshot_now();
     std::thread::sleep(Duration::from_millis(100)); // let the shard snapshot
 
@@ -168,7 +174,10 @@ fn a_snapshot_taken_mid_stream_recovers_exactly() {
         &dir.join("journal-shard-0.bin"),
     )
     .unwrap();
-    assert!(applied < 3000, "a snapshot was taken ({applied} replayed from the journal)");
+    assert!(
+        applied < 3000,
+        "a snapshot was taken ({applied} replayed from the journal)"
+    );
     assert_eq!(recovered.state_fingerprint(), truth.state_fingerprint());
     std::fs::remove_dir_all(&dir).ok();
 }

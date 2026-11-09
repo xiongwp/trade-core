@@ -389,7 +389,10 @@ mod tests {
         assert!(read_message(&mut &big[..], &mut Vec::new(), 100).is_err());
 
         // A clean end of stream between messages is not an error.
-        assert_eq!(read_message(&mut &[][..], &mut Vec::new(), 100).unwrap(), None);
+        assert_eq!(
+            read_message(&mut &[][..], &mut Vec::new(), 100).unwrap(),
+            None
+        );
     }
 }
 

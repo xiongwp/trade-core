@@ -201,7 +201,10 @@ impl Slot {
         {
             Ok(child) => self.child = Some(child),
             Err(error) => {
-                log_error!("raft-multi-node", "group={group} event=spawn_failed error={error}");
+                log_error!(
+                    "raft-multi-node",
+                    "group={group} event=spawn_failed error={error}"
+                );
                 self.restart_at = Some(Instant::now() + Duration::from_secs(5));
             }
         }
@@ -373,7 +376,10 @@ fn main() -> ExitCode {
                         }
                     }
                     Err(error) => {
-                        log_error!("raft-multi-node", "group={group} event=inspect_failed error={error}");
+                        log_error!(
+                            "raft-multi-node",
+                            "group={group} event=inspect_failed error={error}"
+                        );
                     }
                 }
             } else if slot.restart_at.is_some_and(|at| now >= at) {
@@ -457,9 +463,15 @@ mod tests {
         let mut all = std::collections::HashSet::new();
         for group in 0..2_553u16 {
             let (order, md, metrics) = service_ports(group).unwrap();
-            assert!(all.insert(order) && all.insert(md) && all.insert(metrics), "group {group}");
+            assert!(
+                all.insert(order) && all.insert(md) && all.insert(metrics),
+                "group {group}"
+            );
             for node in 1..=9 {
-                assert!(all.insert(raft_port(group, node).unwrap()), "group {group} node {node}");
+                assert!(
+                    all.insert(raft_port(group, node).unwrap()),
+                    "group {group} node {node}"
+                );
             }
         }
     }
@@ -483,13 +495,23 @@ mod tests {
     fn restarts_back_off_and_a_clean_exit_comes_back_at_once() {
         let short = Duration::from_secs(1);
         assert_eq!(restart_delay(Some(0), short, 0), Duration::from_millis(100));
-        assert_eq!(restart_delay(Some(0), short, 9), Duration::from_secs(30), "a clean-exit loop backs off");
-        assert_eq!(restart_delay(Some(0), Duration::from_secs(90), 9), Duration::from_millis(100));
+        assert_eq!(
+            restart_delay(Some(0), short, 9),
+            Duration::from_secs(30),
+            "a clean-exit loop backs off"
+        );
+        assert_eq!(
+            restart_delay(Some(0), Duration::from_secs(90), 9),
+            Duration::from_millis(100)
+        );
         assert_eq!(restart_delay(Some(101), short, 0), Duration::from_secs(1));
         assert_eq!(restart_delay(Some(101), short, 3), Duration::from_secs(8));
         assert_eq!(restart_delay(None, short, 20), Duration::from_secs(30));
         assert_eq!(restart_delay(Some(78), short, 0), Duration::from_secs(30));
-        assert_eq!(restart_delay(Some(101), Duration::from_secs(90), 7), Duration::from_secs(1));
+        assert_eq!(
+            restart_delay(Some(101), Duration::from_secs(90), 7),
+            Duration::from_secs(1)
+        );
     }
 
     #[test]

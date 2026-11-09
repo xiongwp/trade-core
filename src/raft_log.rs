@@ -1256,7 +1256,11 @@ mod tests {
                 "{msg_type:?} must not be answered while rejoining"
             );
         }
-        assert_eq!(replacement.term(), 0, "a vote request must not even bump the term");
+        assert_eq!(
+            replacement.term(),
+            0,
+            "a vote request must not even bump the term"
+        );
     }
 
     #[test]

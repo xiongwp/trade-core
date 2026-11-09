@@ -250,8 +250,10 @@ impl MatcherConnection {
             {
                 continue;
             }
-            let connect = Duration::from_millis(env_number("TC_RAFT_LEADER_PROBE_TIMEOUT_MS", 1_000u64));
-            let Ok(stream) = trade_core::migration::connect_timeout(&target.order_addr, connect) else {
+            let connect =
+                Duration::from_millis(env_number("TC_RAFT_LEADER_PROBE_TIMEOUT_MS", 1_000u64));
+            let Ok(stream) = trade_core::migration::connect_timeout(&target.order_addr, connect)
+            else {
                 continue;
             };
             stream.set_nodelay(true)?;

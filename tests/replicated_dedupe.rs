@@ -16,12 +16,18 @@ fn processor(window: usize) -> Processor {
 }
 
 fn new(id: u64, side: Side, price: u64, qty: u64) -> Command {
-    Command::New(Order::limit(OrderId(id), side, price, qty).on(INSTRUMENT).by(id))
+    Command::New(
+        Order::limit(OrderId(id), side, price, qty)
+            .on(INSTRUMENT)
+            .by(id),
+    )
 }
 
 fn run(p: &mut Processor, cmd: Command) -> Vec<String> {
     let mut out = Vec::new();
-    p.process(cmd, &mut |report: ExecReport| out.push(format!("{report:?}")));
+    p.process(cmd, &mut |report: ExecReport| {
+        out.push(format!("{report:?}"))
+    });
     out
 }
 
@@ -93,7 +99,14 @@ fn force_close_cancels_in_the_same_order_on_every_replica() {
     // process, so the cancel report order used to differ between replicas.
     let mut a = processor(1_000);
     for id in 1..=40 {
-        run(&mut a, Command::New(Order::limit(OrderId(id), Side::Buy, 50 + id % 7, 1).on(INSTRUMENT).by(9)));
+        run(
+            &mut a,
+            Command::New(
+                Order::limit(OrderId(id), Side::Buy, 50 + id % 7, 1)
+                    .on(INSTRUMENT)
+                    .by(9),
+            ),
+        );
     }
     let mut b = restart(&a, 1_000, "forceclose");
     let close = || Command::ForceClose {

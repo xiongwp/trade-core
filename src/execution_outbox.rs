@@ -21,7 +21,10 @@ fn record_len_for(header: &[u8; 8]) -> Option<usize> {
 fn header_mismatch(path: &Path) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
-        format!("execution outbox header/version mismatch in {}", path.display()),
+        format!(
+            "execution outbox header/version mismatch in {}",
+            path.display()
+        ),
     )
 }
 
@@ -809,8 +812,7 @@ mod tests {
             raft_index: 55,
             ordinal: 3,
             report_frame: frame,
-            users: [0,
-            0],
+            users: [0, 0],
         };
         assert_eq!(record.target_order_ids(), vec![101, 202]);
         for target in [101, 202] {

@@ -110,7 +110,9 @@ fn ws_connect(
     let mut line = String::new();
     reader.read_line(&mut line)?;
     if !line.contains(" 101 ") {
-        return Err(std::io::Error::other(format!("websocket upgrade refused: {line}")));
+        return Err(std::io::Error::other(format!(
+            "websocket upgrade refused: {line}"
+        )));
     }
     loop {
         line.clear();
@@ -295,7 +297,11 @@ fn main() {
         .split(',')
         .map(str::to_string)
         .collect();
-    let stride: u32 = args.next().and_then(|v| v.parse().ok()).unwrap_or(1000).max(1);
+    let stride: u32 = args
+        .next()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1000)
+        .max(1);
     let metrics_addrs = addrs.clone();
 
     // Ids: one globally unique increasing space for orders and cancel cmd_ids.

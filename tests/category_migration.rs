@@ -25,8 +25,19 @@ fn run(p: &mut Processor, cmd: Command) -> Vec<ExecReport> {
     out
 }
 
-fn limit(id: u64, user: u64, instrument: InstrumentId, side: Side, price: Price, qty: Qty) -> Command {
-    Command::New(Order::limit(OrderId(id), side, price, qty).on(instrument).by(user))
+fn limit(
+    id: u64,
+    user: u64,
+    instrument: InstrumentId,
+    side: Side,
+    price: Price,
+    qty: Qty,
+) -> Command {
+    Command::New(
+        Order::limit(OrderId(id), side, price, qty)
+            .on(instrument)
+            .by(user),
+    )
 }
 
 fn op(p: &mut Processor, op: CategoryOp) -> Vec<ExecReport> {
@@ -77,15 +88,27 @@ fn export(p: &Processor, tag: &str, epoch: u64) -> CategoryOp {
 }
 
 fn seal(epoch: u64) -> CategoryOp {
-    CategoryOp::Seal { category: 0, category_size: SIZE, epoch }
+    CategoryOp::Seal {
+        category: 0,
+        category_size: SIZE,
+        epoch,
+    }
 }
 
 fn drop_(epoch: u64) -> CategoryOp {
-    CategoryOp::Drop { category: 0, category_size: SIZE, epoch }
+    CategoryOp::Drop {
+        category: 0,
+        category_size: SIZE,
+        epoch,
+    }
 }
 
 fn unseal(epoch: u64) -> CategoryOp {
-    CategoryOp::Unseal { category: 0, category_size: SIZE, epoch }
+    CategoryOp::Unseal {
+        category: 0,
+        category_size: SIZE,
+        epoch,
+    }
 }
 
 #[test]
@@ -98,7 +121,10 @@ fn a_category_moves_with_its_book_stops_and_positions() {
         &mut source,
         Command::NewConditional(
             Order::market(OrderId(4), Side::Sell, 1).on(MOVING).by(40),
-            Trigger { price: 95, kind: TriggerKind::StopLoss },
+            Trigger {
+                price: 95,
+                kind: TriggerKind::StopLoss,
+            },
         ),
     );
     run(&mut source, limit(5, 50, STAYING, Side::Buy, 10, 1));
@@ -115,27 +141,69 @@ fn a_category_moves_with_its_book_stops_and_positions() {
     let mut target = processor();
     let installed = op(&mut target, install);
     assert!(rejected(&installed).is_none(), "{installed:?}");
-    assert_eq!(target.category_fingerprint(0, SIZE), before, "book moved exactly");
+    assert_eq!(
+        target.category_fingerprint(0, SIZE),
+        before,
+        "book moved exactly"
+    );
     assert_eq!(target.position(30, MOVING), 2);
     assert_eq!(target.position(10, MOVING), -2);
 
     // The moved book trades and cancels on the target; the stop came along.
     let out = run(&mut target, limit(8, 80, MOVING, Side::Buy, 101, 3));
-    assert!(out.iter().any(|r| matches!(r, ExecReport::Trade { maker: OrderId(1), qty: 3, .. })), "{out:?}");
-    let out = run(&mut target, Command::Cancel { instrument: MOVING, order_id: OrderId(2), cmd_id: 9 });
-    assert!(out.iter().any(|r| matches!(r, ExecReport::Cancelled { order_id: OrderId(2), .. })), "{out:?}");
+    assert!(
+        out.iter().any(|r| matches!(
+            r,
+            ExecReport::Trade {
+                maker: OrderId(1),
+                qty: 3,
+                ..
+            }
+        )),
+        "{out:?}"
+    );
+    let out = run(
+        &mut target,
+        Command::Cancel {
+            instrument: MOVING,
+            order_id: OrderId(2),
+            cmd_id: 9,
+        },
+    );
+    assert!(
+        out.iter().any(|r| matches!(
+            r,
+            ExecReport::Cancelled {
+                order_id: OrderId(2),
+                ..
+            }
+        )),
+        "{out:?}"
+    );
     let out = run(&mut target, limit(10, 100, MOVING, Side::Buy, 90, 1));
     let out2 = run(&mut target, limit(11, 110, MOVING, Side::Sell, 90, 1)); // prints 90: fires the stop
     assert!(
-        out.iter().chain(&out2).any(|r| matches!(r, ExecReport::Triggered { order_id: OrderId(4), .. })),
+        out.iter().chain(&out2).any(|r| matches!(
+            r,
+            ExecReport::Triggered {
+                order_id: OrderId(4),
+                ..
+            }
+        )),
         "{out2:?}"
     );
 
     // 4. Drop on the source: the state is gone and the category stays sealed.
     op(&mut source, drop_(1));
-    assert_eq!(source.category_fingerprint(0, SIZE), processor().category_fingerprint(0, SIZE));
+    assert_eq!(
+        source.category_fingerprint(0, SIZE),
+        processor().category_fingerprint(0, SIZE)
+    );
     assert_eq!(source.position(30, MOVING), 0);
-    assert_eq!(rejected(&run(&mut source, limit(12, 120, MOVING, Side::Buy, 99, 1))), Some("category-moved"));
+    assert_eq!(
+        rejected(&run(&mut source, limit(12, 120, MOVING, Side::Buy, 99, 1))),
+        Some("category-moved")
+    );
 }
 
 #[test]
@@ -156,7 +224,13 @@ fn a_command_redelivered_after_the_move_is_still_a_duplicate() {
 fn a_halted_instrument_stays_halted_after_the_move() {
     let mut source = processor();
     run(&mut source, limit(1, 10, MOVING, Side::Sell, 100, 5));
-    run(&mut source, Command::Halt { instrument: MOVING, cmd_id: 2 });
+    run(
+        &mut source,
+        Command::Halt {
+            instrument: MOVING,
+            cmd_id: 2,
+        },
+    );
     op(&mut source, seal(1));
     let mut target = processor();
     op(&mut target, export(&source, "halt", 1));
@@ -183,9 +257,15 @@ fn the_seal_survives_a_snapshot_restore() {
     assert_eq!(snap.migration_epochs, vec![(0, 3)]);
     let mut restored = processor();
     restored.restore_state(&snap);
-    assert_eq!(rejected(&run(&mut restored, limit(1, 10, MOVING, Side::Buy, 99, 1))), Some("category-moved"));
+    assert_eq!(
+        rejected(&run(&mut restored, limit(1, 10, MOVING, Side::Buy, 99, 1))),
+        Some("category-moved")
+    );
     // The epoch came back too: an older migration's unseal is ignored.
-    assert_eq!(rejected(&op(&mut restored, unseal(2))), Some("stale-migration"));
+    assert_eq!(
+        rejected(&op(&mut restored, unseal(2))),
+        Some("stale-migration")
+    );
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -199,7 +279,11 @@ fn install_is_refused_whole_when_the_target_already_holds_the_category() {
     let before = target.category_fingerprint(0, SIZE);
     let out = op(&mut target, install);
     assert_eq!(rejected(&out), Some("category-not-empty"));
-    assert_eq!(target.category_fingerprint(0, SIZE), before, "nothing installed");
+    assert_eq!(
+        target.category_fingerprint(0, SIZE),
+        before,
+        "nothing installed"
+    );
 }
 
 #[test]
@@ -212,7 +296,11 @@ fn leftover_positions_alone_refuse_an_install() {
     run(&mut target, limit(3, 30, MOVING, Side::Sell, 100, 1));
     run(&mut target, limit(4, 40, MOVING, Side::Buy, 100, 1)); // empty book, positions left
     let out = op(&mut target, install);
-    assert_eq!(rejected(&out), Some("category-not-empty"), "positions would have been added up");
+    assert_eq!(
+        rejected(&out),
+        Some("category-not-empty"),
+        "positions would have been added up"
+    );
     assert_eq!(target.position(20, MOVING), 0);
 }
 
@@ -231,7 +319,16 @@ fn a_category_can_move_back_to_a_group_that_sealed_it() {
     let out = op(&mut a, install);
     assert!(rejected(&out).is_none(), "{out:?}");
     let out = run(&mut a, limit(2, 20, MOVING, Side::Buy, 101, 1));
-    assert!(out.iter().any(|r| matches!(r, ExecReport::Trade { maker: OrderId(1), .. })), "{out:?}");
+    assert!(
+        out.iter().any(|r| matches!(
+            r,
+            ExecReport::Trade {
+                maker: OrderId(1),
+                ..
+            }
+        )),
+        "{out:?}"
+    );
     // A delayed drop of the first migration must not wipe the books now here.
     assert_eq!(rejected(&op(&mut a, drop_(1))), Some("stale-migration"));
     assert_eq!(a.position(20, MOVING), 1);
@@ -255,11 +352,17 @@ fn steps_of_a_stale_or_concurrent_migration_cannot_undo_a_newer_one() {
     assert_eq!(rejected(&op(&mut b, drop_(9))), Some("stale-migration"));
     assert_eq!(b.category_fingerprint(0, SIZE), live);
     assert_eq!(rejected(&op(&mut a, unseal(9))), Some("stale-migration"));
-    assert_eq!(rejected(&run(&mut a, limit(2, 20, MOVING, Side::Buy, 101, 1))), Some("category-moved"));
+    assert_eq!(
+        rejected(&run(&mut a, limit(2, 20, MOVING, Side::Buy, 101, 1))),
+        Some("category-moved")
+    );
     // An install older than the category's last step here is refused too.
     let mut c = processor();
     op(&mut c, seal(7));
-    assert_eq!(rejected(&op(&mut c, export(&a, "fence2", 6))), Some("stale-migration"));
+    assert_eq!(
+        rejected(&op(&mut c, export(&a, "fence2", 6))),
+        Some("stale-migration")
+    );
 }
 
 #[test]
@@ -275,7 +378,10 @@ fn a_failed_migration_rolls_back_cleanly_whether_or_not_its_steps_applied() {
     assert!(rejected(&op(&mut b, drop_(4))).is_none());
     assert!(rejected(&op(&mut a, unseal(4))).is_none());
     assert_eq!(a.category_fingerprint(0, SIZE), before);
-    assert!(rejected(&run(&mut a, limit(2, 20, MOVING, Side::Buy, 100, 1))).is_none(), "trading again");
+    assert!(
+        rejected(&run(&mut a, limit(2, 20, MOVING, Side::Buy, 100, 1))).is_none(),
+        "trading again"
+    );
     // Rolling back a target that never got the install changes nothing.
     let mut c = processor();
     assert_eq!(rejected(&op(&mut c, drop_(4))), Some("stale-migration"));
@@ -284,7 +390,9 @@ fn a_failed_migration_rolls_back_cleanly_whether_or_not_its_steps_applied() {
 #[test]
 fn a_malformed_install_is_rejected_on_every_replica_instead_of_crashing() {
     let mut target = processor();
-    let order = Order::limit(OrderId(1), Side::Sell, 101, 5).on(MOVING).by(10);
+    let order = Order::limit(OrderId(1), Side::Sell, 101, 5)
+        .on(MOVING)
+        .by(10);
     let mut duplicate = order;
     duplicate.remaining = 2; // same id twice in one book
     let bad = CategoryOp::Install {
@@ -311,8 +419,18 @@ fn cancels_for_unknown_instruments_leave_no_state_behind() {
     let mut p = processor();
     let before = p.state_fingerprint();
     for instrument in 50_000..50_100u32 {
-        let out = run(&mut p, Command::Cancel { instrument: InstrumentId(instrument), order_id: OrderId(9), cmd_id: instrument as u64 });
-        assert!(out.iter().any(|r| matches!(r, ExecReport::NotFound { .. })), "{out:?}");
+        let out = run(
+            &mut p,
+            Command::Cancel {
+                instrument: InstrumentId(instrument),
+                order_id: OrderId(9),
+                cmd_id: instrument as u64,
+            },
+        );
+        assert!(
+            out.iter().any(|r| matches!(r, ExecReport::NotFound { .. })),
+            "{out:?}"
+        );
         assert!(p.engine(InstrumentId(instrument)).is_none());
     }
     assert_eq!(p.state_fingerprint(), before);

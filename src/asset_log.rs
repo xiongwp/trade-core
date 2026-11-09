@@ -789,10 +789,17 @@ mod tests {
         // Compacted through span + 3: only segment 0 is wholly below it.
         assert_eq!(prune_applied_proofs(&root, span + 3).unwrap(), 1);
         let left = load_applied_batch_proofs(&root).unwrap();
-        assert!(left.contains_key(&(span + 3)) && left.contains_key(&(2 * span + 7)) && !left.contains_key(&5));
+        assert!(
+            left.contains_key(&(span + 3))
+                && left.contains_key(&(2 * span + 7))
+                && !left.contains_key(&5)
+        );
         // Everything compacted: the newest segment (the recovery boundary) stays.
         assert_eq!(prune_applied_proofs(&root, u64::MAX - 1).unwrap(), 1);
-        assert_eq!(load_applied_batches(&root).unwrap().into_iter().max(), Some(2 * span + 7));
+        assert_eq!(
+            load_applied_batches(&root).unwrap().into_iter().max(),
+            Some(2 * span + 7)
+        );
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -805,7 +812,12 @@ mod tests {
         // Crash halfway through the third record.
         let path = proof_segment_path(&root, 0);
         let len = std::fs::metadata(&path).unwrap().len();
-        OpenOptions::new().write(true).open(&path).unwrap().set_len(len - 13).unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(len - 13)
+            .unwrap();
         let proofs = load_applied_batch_proofs(&root).unwrap();
         assert_eq!(proofs.len(), 1, "the torn record is ignored");
         // Restart, re-apply entry 2, carry on: every proof must load.
@@ -819,7 +831,12 @@ mod tests {
         append_applied_batch(&root, 7).unwrap();
         let legacy = root.join("raft-batches.applied");
         let len = std::fs::metadata(&legacy).unwrap().len();
-        OpenOptions::new().write(true).open(&legacy).unwrap().set_len(len - 5).unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(&legacy)
+            .unwrap()
+            .set_len(len - 5)
+            .unwrap();
         append_applied_batch(&root, 8).unwrap();
         assert!(load_applied_batches(&root).unwrap().contains(&8));
 

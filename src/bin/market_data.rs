@@ -317,7 +317,10 @@ fn feed_one(md_addr: String, state: Arc<Mutex<State>>) {
                     if silent_reads < 2 {
                         continue;
                     }
-                    log_warn!("market-data", "event=feed_silent addr={md_addr}; reconnecting");
+                    log_warn!(
+                        "market-data",
+                        "event=feed_silent addr={md_addr}; reconnecting"
+                    );
                     break;
                 }
                 Err(_) => break,
