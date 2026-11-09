@@ -431,7 +431,7 @@ fn mysql8_projection_is_race_safe_and_idempotent() {
     }
     let targets: u64 = conn
         .exec_first(
-            "SELECT COUNT(*) FROM order_db_0.processed_execution_events WHERE raft_group=7 AND raft_index=:idx AND report_ordinal=0",
+            "SELECT (SELECT COUNT(*) FROM order_db_0.processed_execution_events_0 WHERE raft_group=7 AND raft_index=:idx AND report_ordinal=0) + (SELECT COUNT(*) FROM order_db_0.processed_execution_events_1 WHERE raft_group=7 AND raft_index=:idx AND report_ordinal=0) + (SELECT COUNT(*) FROM order_db_0.processed_execution_events_2 WHERE raft_group=7 AND raft_index=:idx AND report_ordinal=0)",
             params! {"idx" => seed + 1},
         )
         .unwrap()
@@ -445,45 +445,45 @@ fn mysql8_projection_is_race_safe_and_idempotent() {
 }
 
 #[test]
-fn dedupe_ring_clears_only_the_partition_after_the_current_one() {
-    for period in [0u64, 1, 2, 3, 1_000_000] {
-        let current = period % DEDUPE_PARTITIONS;
-        let previous = (period + DEDUPE_PARTITIONS - 1) % DEDUPE_PARTITIONS;
-        let cleared = bucket_to_clear(period);
-        assert_ne!(cleared, current, "period {period}");
-        assert_ne!(cleared, previous, "period {period}");
+fn dedupe_tables_rotate_through_three_names() {
+    assert_eq!(dedupe_table(0), "processed_execution_events_0");
+    assert_eq!(dedupe_table(4), "processed_execution_events_1");
+    // The table emptied during a period is never the current or previous one.
+    for period in [1u64, 2, 3, 1_000_000] {
+        let next = dedupe_table(period + 1);
+        assert_ne!(next, dedupe_table(period));
+        assert_ne!(next, dedupe_table(period - 1));
     }
 }
 
 /// Same disposable MySQL 8 as above. Rows land in the current period's
-/// partition; only the next period's partition (two periods old) is cleared.
+/// table; only the next period's table (two periods old) is emptied.
 #[test]
 #[ignore = "requires disposable MySQL 8 via TC_TEST_MYSQL_URL"]
-fn mysql8_dedupe_ring_truncates_only_the_stale_partition() {
+fn mysql8_dedupe_rotation_truncates_only_the_stale_table() {
     let store = mysql_test_store().expect("TC_TEST_MYSQL_URL must be set");
-    // A raft group no other test uses, so concurrent tests keep their rows.
-    let group = 1_000_000 + (std::process::id() % 1_000_000);
     let mut conn = store.shard(0).get_conn().unwrap();
-    let period: u64 = conn
-        .query_first(format!("SELECT UNIX_TIMESTAMP() DIV {}", dedupe_retention_hours() * 3600))
-        .unwrap()
-        .unwrap();
-    let bucket_of = |age: u64| (period + DEDUPE_PARTITIONS - age) % DEDUPE_PARTITIONS;
+    let period = dedupe_period(&mut conn).unwrap();
+    for table in 0..DEDUPE_TABLES {
+        conn.query_drop(format!("TRUNCATE TABLE order_db_0.processed_execution_events_{table}"))
+            .unwrap();
+    }
     // (raft_index, age in periods): current, previous, and two periods old.
     for (index, age) in [(1u64, 0u64), (2, 1), (3, 2)] {
         conn.exec_drop(
-            "INSERT INTO order_db_0.processed_execution_events (raft_group,raft_index,report_ordinal,target_order_id,shard_table,instrument,report_type,kafka_partition,kafka_offset,bucket) VALUES (?,?,0,1,0,0,12,0,0,?)",
-            (group, index, bucket_of(age)),
+            format!(
+                "INSERT INTO order_db_0.{} (raft_group,raft_index,report_ordinal,target_order_id,shard_table,instrument,report_type,kafka_partition,kafka_offset) VALUES (9,?,0,1,0,0,12,0,0)",
+                dedupe_table(period + DEDUPE_TABLES - age)
+            ),
+            (index,),
         )
         .unwrap();
     }
-    // The bucket the projection computes is the current period's.
-    let computed: u64 = conn.query_first(format!("SELECT {}", dedupe_bucket_sql())).unwrap().unwrap();
-    assert_eq!(computed, bucket_of(0));
-
     let left = |conn: &mut mysql::PooledConn| -> Vec<u64> {
-        conn.exec("SELECT raft_index FROM order_db_0.processed_execution_events WHERE raft_group=? ORDER BY raft_index", (group,))
-            .unwrap()
+        conn.query(
+            "SELECT raft_index FROM order_db_0.processed_execution_events_0 UNION ALL SELECT raft_index FROM order_db_0.processed_execution_events_1 UNION ALL SELECT raft_index FROM order_db_0.processed_execution_events_2 ORDER BY 1",
+        )
+        .unwrap()
     };
     let mut ring = DedupeRing::new();
     assert_eq!(ring.advance(&mut conn, 0, period).unwrap(), 1);
@@ -492,8 +492,24 @@ fn mysql8_dedupe_ring_truncates_only_the_stale_partition() {
     assert_eq!(ring.advance(&mut conn, 0, period).unwrap(), 0);
     assert_eq!(ring.advance(&mut conn, 0, period - 1).unwrap(), 0);
     assert_eq!(left(&mut conn), vec![1, 2]);
-    conn.exec_drop("DELETE FROM order_db_0.processed_execution_events WHERE raft_group=?", (group,))
+
+    // A redelivery of an event applied in the previous period is discarded.
+    conn.query_drop(
+        "INSERT INTO order_db_0.pending_execution_events (raft_group,raft_index,report_ordinal,target_order_id,shard_table,instrument,report_type,event_qty,kafka_partition,kafka_offset) VALUES (9,2,0,1,0,0,12,0,0,0)",
+    )
+    .unwrap();
+    let mut tx = conn.start_transaction(TxOpts::default()).unwrap();
+    discard_redelivered_events(&mut tx, "order_db_0", 0, period).unwrap();
+    tx.commit().unwrap();
+    let pending: u64 = conn
+        .query_first("SELECT COUNT(*) FROM order_db_0.pending_execution_events WHERE raft_group=9")
+        .unwrap()
         .unwrap();
+    assert_eq!(pending, 0);
+    for table in 0..DEDUPE_TABLES {
+        conn.query_drop(format!("TRUNCATE TABLE order_db_0.processed_execution_events_{table}"))
+            .unwrap();
+    }
 }
 
 /// Same disposable MySQL 8 as above. A pre-ring dedupe table is renamed,
@@ -505,7 +521,7 @@ fn mysql8_legacy_dedupe_table_is_renamed_and_still_consulted() {
     let group = 2_000_000 + (std::process::id() % 1_000_000);
     let mut conn = store.shard(0).get_conn().unwrap();
     conn.query_drop("DROP TABLE IF EXISTS order_db_0.processed_execution_events_legacy").unwrap();
-    conn.query_drop("DROP TABLE order_db_0.processed_execution_events").unwrap();
+    conn.query_drop("DROP TABLE IF EXISTS order_db_0.processed_execution_events").unwrap();
     conn.query_drop("CREATE TABLE order_db_0.processed_execution_events (raft_group INT UNSIGNED NOT NULL, raft_index BIGINT UNSIGNED NOT NULL, report_ordinal INT UNSIGNED NOT NULL, target_order_id BIGINT UNSIGNED NOT NULL, shard_table INT UNSIGNED NOT NULL, instrument INT UNSIGNED NOT NULL, report_type TINYINT UNSIGNED NOT NULL, kafka_partition INT NOT NULL, kafka_offset BIGINT UNSIGNED NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(raft_group,raft_index,report_ordinal,target_order_id)) ENGINE=InnoDB")
         .unwrap();
     conn.exec_drop(
@@ -516,11 +532,11 @@ fn mysql8_legacy_dedupe_table_is_renamed_and_still_consulted() {
 
     bootstrap(&store).unwrap();
     assert!(has_legacy_dedupe(0));
-    let partitions: u64 = conn
-        .query_first("SELECT COUNT(*) FROM information_schema.partitions WHERE table_schema='order_db_0' AND table_name='processed_execution_events'")
+    let rotating: u64 = conn
+        .query_first("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='order_db_0' AND table_name LIKE 'processed\\_execution\\_events\\__'")
         .unwrap()
         .unwrap();
-    assert_eq!(partitions, DEDUPE_PARTITIONS);
+    assert_eq!(rotating, DEDUPE_TABLES);
 
     // The same event arrives again: it is recognised through the legacy table.
     conn.exec_drop(
@@ -529,7 +545,8 @@ fn mysql8_legacy_dedupe_table_is_renamed_and_still_consulted() {
     )
     .unwrap();
     let mut tx = conn.start_transaction(TxOpts::default()).unwrap();
-    discard_redelivered_events(&mut tx, "order_db_0", 0).unwrap();
+    let period = dedupe_period(&mut tx).unwrap();
+    discard_redelivered_events(&mut tx, "order_db_0", 0, period).unwrap();
     tx.commit().unwrap();
     let pending: u64 = conn
         .exec_first("SELECT COUNT(*) FROM order_db_0.pending_execution_events WHERE raft_group=?", (group,))
@@ -787,10 +804,10 @@ fn mysql8_bootstrap_drops_indexes_no_query_reads() {
     let store = mysql_test_store().expect("TC_TEST_MYSQL_URL must be set");
     let mut conn = store.shard(0).get_conn().unwrap();
     // Recreate the indexes as an older deployment had them.
+    // (The single processed_execution_events table those two other indexes
+    // lived on is now replaced by rotating tables at bootstrap.)
     for (table, index, cols) in [
         ("processed_commands", "idx_partition_offset", "kafka_partition,kafka_offset"),
-        ("processed_execution_events", "idx_instrument_index", "instrument,raft_index"),
-        ("processed_execution_events", "idx_order_event", "target_order_id,raft_index"),
     ] {
         conn.query_drop(format!(
             "ALTER TABLE order_db_0.{table} ADD INDEX {index} ({cols})"

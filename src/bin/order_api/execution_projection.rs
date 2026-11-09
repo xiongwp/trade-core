@@ -57,6 +57,7 @@ pub(crate) fn drain_marked_tables(
     let mut tx = conn
         .start_transaction(TxOpts::default())
         .map_err(|error| error.to_string())?;
+    let period = dedupe_period(&mut tx)?;
     for &table in tables {
         let has_pending: Option<u8> = tx
             .query_first(format!(
@@ -64,7 +65,7 @@ pub(crate) fn drain_marked_tables(
             ))
             .map_err(|error| error.to_string())?;
         if has_pending.is_some() {
-            apply_pending_execution_table(&mut tx, &db, table)?;
+            apply_pending_execution_table(&mut tx, &db, table, period)?;
         }
     }
     tx.commit().map_err(|error| error.to_string())
@@ -521,8 +522,9 @@ pub(crate) fn sweep_pending_execution_shard(store: &OrderStore, shard_db: u32) -
     let mut tx = conn
         .start_transaction(TxOpts::default())
         .map_err(|error| error.to_string())?;
+    let period = dedupe_period(&mut tx)?;
     for table in tables {
-        apply_pending_execution_table(&mut tx, &db, table)?;
+        apply_pending_execution_table(&mut tx, &db, table, period)?;
     }
     tx.commit().map_err(|error| error.to_string())
 }
@@ -587,7 +589,8 @@ pub(crate) fn persist_execution_shard(
         .map_err(|error| error.to_string())?;
         // A Kafka retry can reinsert an already-processed event into pending;
         // discard it before applying any mutations.
-        discard_redelivered_events(&mut tx, &db, shard_db)?;
+        let period = dedupe_period(&mut tx)?;
+        discard_redelivered_events(&mut tx, &db, shard_db, period)?;
         // When every inserted event for a table was an already-processed retry
         // (ignored above, then deleted), that table has no pending rows and the
         // three-query drain would match nothing. Same behaviour-preserving skip
@@ -599,7 +602,7 @@ pub(crate) fn persist_execution_shard(
                 ))
                 .map_err(|error| error.to_string())?;
             if has_pending.is_some() {
-                apply_pending_execution_table(&mut tx, &db, table)?;
+                apply_pending_execution_table(&mut tx, &db, table, period)?;
             }
         }
         tx.commit().map_err(|error| error.to_string())?;
@@ -613,10 +616,13 @@ pub(crate) fn discard_redelivered_events(
     tx: &mut Transaction<'_>,
     db: &str,
     shard_db: u32,
+    period: u64,
 ) -> Result<(), String> {
-    let mut tables = vec!["processed_execution_events"];
+    // The current and the previous period's tables hold every event applied
+    // within the last retention period (see `DEDUPE_TABLES`).
+    let mut tables = vec![dedupe_table(period), dedupe_table(period + DEDUPE_TABLES - 1)];
     if has_legacy_dedupe(shard_db) {
-        tables.push("processed_execution_events_legacy");
+        tables.push("processed_execution_events_legacy".to_string());
     }
     for table in tables {
         tx.query_drop(format!(
@@ -631,7 +637,9 @@ pub(crate) fn apply_pending_execution_table(
     tx: &mut Transaction<'_>,
     db: &str,
     shard_table: u32,
+    period: u64,
 ) -> Result<(), String> {
+    let processed = dedupe_table(period);
     let table = format!("asset_orders_{shard_table:03}");
     // MySQL 8 window functions select the last event per order while the
     // aggregate folds all trades into one set-based row mutation.
@@ -670,10 +678,9 @@ pub(crate) fn apply_pending_execution_table(
     ))
     .map_err(|error| error.to_string())?;
     tx.query_drop(format!(
-        "INSERT IGNORE INTO {db}.processed_execution_events (raft_group,raft_index,report_ordinal,target_order_id,shard_table,instrument,report_type,kafka_partition,kafka_offset,bucket) \
-         SELECT p.raft_group,p.raft_index,p.report_ordinal,p.target_order_id,p.shard_table,p.instrument,p.report_type,p.kafka_partition,p.kafka_offset,{bucket} \
+        "INSERT IGNORE INTO {db}.{processed} (raft_group,raft_index,report_ordinal,target_order_id,shard_table,instrument,report_type,kafka_partition,kafka_offset) \
+         SELECT p.raft_group,p.raft_index,p.report_ordinal,p.target_order_id,p.shard_table,p.instrument,p.report_type,p.kafka_partition,p.kafka_offset \
          FROM {db}.pending_execution_events p INNER JOIN {db}.{table} o ON o.order_id=p.target_order_id WHERE p.shard_table={shard_table}",
-        bucket = dedupe_bucket_sql(),
     ))
     .map_err(|error| error.to_string())?;
     // Same join as the promotion above, so a fill lands exactly when its event
@@ -688,7 +695,7 @@ pub(crate) fn apply_pending_execution_table(
     ))
     .map_err(|error| error.to_string())?;
     tx.query_drop(format!(
-        "DELETE p FROM {db}.pending_execution_events p INNER JOIN {db}.processed_execution_events e ON e.raft_group=p.raft_group AND e.raft_index=p.raft_index AND e.report_ordinal=p.report_ordinal AND e.target_order_id=p.target_order_id WHERE p.shard_table={shard_table}"
+        "DELETE p FROM {db}.pending_execution_events p INNER JOIN {db}.{processed} e ON e.raft_group=p.raft_group AND e.raft_index=p.raft_index AND e.report_ordinal=p.report_ordinal AND e.target_order_id=p.target_order_id WHERE p.shard_table={shard_table}"
     ))
     .map_err(|error| error.to_string())?;
     Ok(())

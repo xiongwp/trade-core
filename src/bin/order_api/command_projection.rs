@@ -295,7 +295,8 @@ pub(crate) fn persist_mysql_shard_with(
             ))
             .map_err(|error| error.to_string())?;
         if has_pending.is_some() {
-            apply_pending_execution_table(&mut tx, &db, table)?;
+            let period = dedupe_period(&mut tx)?;
+            apply_pending_execution_table(&mut tx, &db, table, period)?;
         }
     }
     tx.commit().map_err(|error| error.to_string())?;

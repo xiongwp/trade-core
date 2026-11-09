@@ -13,7 +13,9 @@ pub(crate) fn bootstrap(store: &OrderStore) -> mysql::Result<()> {
         conn.query_drop(format!("CREATE TABLE IF NOT EXISTS {db_name}.processed_commands (category_id INT UNSIGNED NOT NULL, kafka_partition INT NOT NULL, kafka_offset BIGINT UNSIGNED NOT NULL, command_id BIGINT UNSIGNED NOT NULL UNIQUE, user_id BIGINT UNSIGNED NOT NULL, shard_table INT UNSIGNED NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(category_id,kafka_offset)) ENGINE=InnoDB"))?;
         conn.query_drop(format!("CREATE TABLE IF NOT EXISTS {db_name}.processed_executions (kafka_partition INT NOT NULL, kafka_offset BIGINT UNSIGNED NOT NULL, instrument INT UNSIGNED NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(kafka_partition,kafka_offset), KEY idx_instrument_offset (instrument,kafka_offset)) ENGINE=InnoDB"))?;
         migrate_legacy_dedupe_table(&mut conn, &db_name, db as u32)?;
-        conn.query_drop(format!("CREATE TABLE IF NOT EXISTS {db_name}.processed_execution_events (raft_group INT UNSIGNED NOT NULL, raft_index BIGINT UNSIGNED NOT NULL, report_ordinal INT UNSIGNED NOT NULL, target_order_id BIGINT UNSIGNED NOT NULL, shard_table INT UNSIGNED NOT NULL, instrument INT UNSIGNED NOT NULL, report_type TINYINT UNSIGNED NOT NULL, kafka_partition INT NOT NULL, kafka_offset BIGINT UNSIGNED NOT NULL, bucket TINYINT UNSIGNED NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(raft_group,raft_index,report_ordinal,target_order_id,bucket)) ENGINE=InnoDB PARTITION BY HASH(bucket) PARTITIONS {DEDUPE_PARTITIONS}"))?;
+        for table in 0..DEDUPE_TABLES {
+            conn.query_drop(format!("CREATE TABLE IF NOT EXISTS {db_name}.processed_execution_events_{table} (raft_group INT UNSIGNED NOT NULL, raft_index BIGINT UNSIGNED NOT NULL, report_ordinal INT UNSIGNED NOT NULL, target_order_id BIGINT UNSIGNED NOT NULL, shard_table INT UNSIGNED NOT NULL, instrument INT UNSIGNED NOT NULL, report_type TINYINT UNSIGNED NOT NULL, kafka_partition INT NOT NULL, kafka_offset BIGINT UNSIGNED NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(raft_group,raft_index,report_ordinal,target_order_id)) ENGINE=InnoDB"))?;
+        }
         conn.query_drop(format!("CREATE TABLE IF NOT EXISTS {db_name}.pending_execution_events (raft_group INT UNSIGNED NOT NULL, raft_index BIGINT UNSIGNED NOT NULL, report_ordinal INT UNSIGNED NOT NULL, target_order_id BIGINT UNSIGNED NOT NULL, shard_table INT UNSIGNED NOT NULL, instrument INT UNSIGNED NOT NULL, report_type TINYINT UNSIGNED NOT NULL, event_qty BIGINT UNSIGNED NOT NULL, event_price BIGINT UNSIGNED NOT NULL DEFAULT 0, event_fee BIGINT UNSIGNED NOT NULL DEFAULT 0, fill_role TINYINT UNSIGNED NOT NULL DEFAULT 0, kafka_partition INT NOT NULL, kafka_offset BIGINT UNSIGNED NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(raft_group,raft_index,report_ordinal,target_order_id), KEY idx_pending_table_order (shard_table,target_order_id,raft_index,report_ordinal)) ENGINE=InnoDB"))?;
         // One row per (fill, side): a Trade is materialized once for the taker
         // and once for the maker, keyed exactly like processed_execution_events.
@@ -97,38 +99,27 @@ pub(crate) fn add_missing_columns(
     Ok(())
 }
 
-/// The dedupe table became an hourly partition ring (see
-/// [`DEDUPE_PARTITIONS`]). A table from before that has no `bucket` column,
-/// or another partition count (the short-lived 48-hourly layout); it
-/// is renamed to `processed_execution_events_legacy` (instant) instead of
-/// being rebuilt at startup, and stays consulted for redeliveries until
-/// [`DedupeRing`] drops it one retention later. A legacy table left by an
-/// earlier start that did not live that long is picked up again.
+/// Execution-event dedupe history moved to three rotating tables (see
+/// [`DEDUPE_TABLES`]). A single `processed_execution_events` table from
+/// before (any layout) is renamed to `processed_execution_events_legacy`
+/// (instant) rather than copied, or folded into an existing legacy table,
+/// and stays consulted for redeliveries until [`DedupeRing`] drops it one
+/// retention later. A legacy table left by an earlier start that did not
+/// live that long is picked up again.
 pub(crate) fn migrate_legacy_dedupe_table(
     conn: &mut mysql::PooledConn,
     db_name: &str,
     db: u32,
 ) -> mysql::Result<()> {
-    let column = |conn: &mut mysql::PooledConn, table: &str, column: &str| -> mysql::Result<bool> {
+    let exists = |conn: &mut mysql::PooledConn, table: &str| -> mysql::Result<bool> {
         let found: Option<u8> = conn.exec_first(
-            "SELECT 1 FROM information_schema.columns WHERE table_schema=:db AND table_name=:t AND column_name=:c LIMIT 1",
-            params! {"db" => db_name, "t" => table, "c" => column},
+            "SELECT 1 FROM information_schema.tables WHERE table_schema=:db AND table_name=:t LIMIT 1",
+            params! {"db" => db_name, "t" => table},
         )?;
         Ok(found.is_some())
     };
-    let current_exists = column(conn, "processed_execution_events", "raft_group")?;
-    let partitions: u64 = conn
-        .exec_first(
-            "SELECT COUNT(*) FROM information_schema.partitions WHERE table_schema=:db AND table_name='processed_execution_events' AND partition_name IS NOT NULL",
-            params! {"db" => db_name},
-        )?
-        .unwrap_or(0);
-    let outdated = !column(conn, "processed_execution_events", "bucket")?
-        || partitions != DEDUPE_PARTITIONS;
-    if current_exists && outdated {
-        if column(conn, "processed_execution_events_legacy", "raft_group")? {
-            // A legacy table is already being consulted: fold this one into
-            // it rather than lose its dedupe history.
+    if exists(conn, "processed_execution_events")? {
+        if exists(conn, "processed_execution_events_legacy")? {
             conn.query_drop(format!(
                 "INSERT IGNORE INTO {db_name}.processed_execution_events_legacy (raft_group,raft_index,report_ordinal,target_order_id,shard_table,instrument,report_type,kafka_partition,kafka_offset) \
                  SELECT raft_group,raft_index,report_ordinal,target_order_id,shard_table,instrument,report_type,kafka_partition,kafka_offset FROM {db_name}.processed_execution_events"
@@ -141,7 +132,7 @@ pub(crate) fn migrate_legacy_dedupe_table(
         }
         log_info!("dedupe-retention", db; "event=legacy_dedupe_table_renamed");
     }
-    if column(conn, "processed_execution_events_legacy", "raft_group")? {
+    if exists(conn, "processed_execution_events_legacy")? {
         legacy_dedupe_dbs()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
