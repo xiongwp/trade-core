@@ -20,11 +20,25 @@
 //!
 //! Reconnects resume: each user's recent events (TC_USER_STREAM_REPLAY_EVENTS,
 //! default 512, and at most TC_USER_STREAM_REPLAY_SECS, default 300 s) are
-//! kept, and `since=<ts>` on reconnect replays the ones at or after it before
-//! the live stream continues, with no gap or reordering between the two. An
-//! instance rebuilds that window from Kafka when it starts, so a restart of
-//! the service does not lose it either. Beyond the window, reconcile through
-//! the order query API.
+//! kept, and replayed before the live stream continues, with no gap or
+//! reordering between the two:
+//!   after=<cursor>  (pusher shards) every event carries `cursor`, its offset
+//!                   in the user's partition of the user topic: an exact
+//!                   position that also survives restarts. Preferred.
+//!   since=<ts ms>   events at or after `ts`, reaching back
+//!                   TC_USER_STREAM_SINCE_GRACE_MS (10 s): one user's events
+//!                   do not arrive in timestamp order, so a few are replayed
+//!                   twice (dedupe on `event_id`) rather than skipped.
+//! When events after the resume point are no longer all kept (window, total
+//! limit, per-user limit, not loaded since a restart) or more than the
+//! connection queue holds, the first frame is {"e":"RESYNC",...}: reconcile
+//! through the order query API. An instance rebuilds its window from Kafka
+//! when it starts.
+//!
+//! Connections: the request must arrive within 10 s and 16 KiB; idle
+//! connections are pinged every 30 s and closed after 75 s without any
+//! frame from the client; a write blocked for 10 s drops the connection;
+//! at most TC_USER_STREAM_MAX_CONNECTIONS (50,000) at once.
 //!
 //! Scaling (TC_USER_STREAM_ROLE):
 //!   all     (default) one instance reads the whole execution topic.
@@ -42,7 +56,7 @@
 //! The replay buffer is bounded per user and in total
 //! (TC_USER_STREAM_REPLAY_MAX_TOTAL events, default 2,000,000).
 //!
-//!   GET /ws/user?user=U[&since=<ts ms>]   (Authorization: Bearer <TC_USER_STREAM_TOKEN>)
+//!   GET /ws/user?user=U[&after=<cursor>|&since=<ts ms>]   (Authorization: Bearer <TC_USER_STREAM_TOKEN>)
 //!   GET /metrics
 //!
 //! Env: TC_USER_STREAM_ADDR (0.0.0.0:9300), TC_USER_STREAM_TOKEN (falls back
@@ -51,10 +65,10 @@
 //! slow client is dropped, 10000), TC_USER_STREAM_MAX_CONNECTIONS_PER_USER (16).
 
 use std::collections::{HashMap, VecDeque};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, SyncSender, TrySendError};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -99,11 +113,56 @@ impl Metrics {
     }
 }
 
-/// user -> that user's live connections (id, outbound queue), plus each
-/// user's recent events for resuming after a reconnect.
+/// One connection's outbound queue. An unbounded channel plus a depth
+/// counter, not a bounded `sync_channel`: that preallocates every slot
+/// (~400 KB per connection at the default depth) before anything is sent.
+struct Conn {
+    id: u64,
+    tx: mpsc::Sender<Outgoing>,
+    depth: Arc<AtomicUsize>,
+    cap: usize,
+}
+
+enum Offer {
+    Queued,
+    Full,
+    Gone,
+}
+
+impl Conn {
+    fn offer(&self, json: &Arc<str>) -> Offer {
+        if self.depth.fetch_add(1, Ordering::AcqRel) >= self.cap {
+            self.depth.fetch_sub(1, Ordering::AcqRel);
+            return Offer::Full;
+        }
+        match self.tx.send(Outgoing::Text(json.clone())) {
+            Ok(()) => Offer::Queued,
+            Err(_) => {
+                self.depth.fetch_sub(1, Ordering::AcqRel);
+                Offer::Gone
+            }
+        }
+    }
+}
+
+/// Where a reconnecting client resumes.
+#[derive(Clone, Copy, Debug)]
+enum Resume {
+    /// `since=<ts ms>`: events with a timestamp at or after it, reaching
+    /// back a grace period, because one user's events do not arrive in
+    /// timestamp order (different partitions, routers, producer clocks).
+    Since(i64),
+    /// `after=<cursor>` (pusher shards): the `cursor` of the last event the
+    /// client has. A user's events all sit in one partition of the user
+    /// topic, so its offset is an exact, restart-proof position.
+    After { cursor: i64, partition: i32 },
+}
+
+/// user -> that user's live connections, plus each user's recent events
+/// for resuming after a reconnect.
 #[derive(Default)]
 struct Registry {
-    users: RwLock<HashMap<u64, Vec<(u64, SyncSender<Outgoing>)>>>,
+    users: RwLock<HashMap<u64, Vec<Conn>>>,
     next_id: AtomicU64,
     /// Lock order: `history`, then `users`. Appending an event and pushing it
     /// happen under `history`, and so do subscribing and queuing a replay:
@@ -114,67 +173,159 @@ struct Registry {
     /// Events kept across all users: with millions of users the per-user
     /// limit alone does not bound memory. The oldest go first.
     replay_total: usize,
+    /// How far before `since` a replay reaches (see [`Resume::Since`]).
+    since_grace_ms: i64,
+}
+
+struct Kept {
+    seq: u64,
+    ts: i64,
+    partition: i32,
+    offset: i64,
+    json: Arc<str>,
+}
+
+struct UserEvents {
+    events: VecDeque<Kept>,
+    /// Newest timestamp / offset evicted by the per-user limit.
+    lost_ts: i64,
+    lost_offset: i64,
+}
+
+impl Default for UserEvents {
+    fn default() -> Self {
+        Self {
+            events: VecDeque::new(),
+            lost_ts: i64::MIN,
+            lost_offset: i64::MIN,
+        }
+    }
 }
 
 /// Kept events: per user, plus every event's insertion order so the oldest
-/// can be evicted when the total limit is reached.
-#[derive(Default)]
+/// can be evicted, by age or by the total limit, from the front.
 struct History {
-    /// user -> (seq, ts, json), oldest first.
-    users: HashMap<u64, VecDeque<(u64, i64, Arc<str>)>>,
+    users: HashMap<u64, UserEvents>,
     /// (seq, user) in insertion order. Entries whose event is already gone
-    /// (evicted by the per-user limit or by time) are skipped when reached.
+    /// (evicted by the per-user limit) are skipped when reached.
     order: VecDeque<(u64, u64)>,
     next_seq: u64,
     /// Events currently kept.
     kept: usize,
+    /// Events at or before these were dropped for everyone (age, total
+    /// limit) or never loaded (before the startup rebuild): a client
+    /// resuming from before them is told to resync.
+    floor_ts: i64,
+    floor_offset: HashMap<i32, i64>,
+}
+
+impl Default for History {
+    fn default() -> Self {
+        Self {
+            users: HashMap::new(),
+            order: VecDeque::new(),
+            next_seq: 0,
+            kept: 0,
+            floor_ts: i64::MIN,
+            floor_offset: HashMap::new(),
+        }
+    }
 }
 
 impl History {
-    fn record(&mut self, user: u64, ts: i64, json: &Arc<str>, per_user: usize, horizon: i64, total: usize) {
+    #[allow(clippy::too_many_arguments)]
+    fn record(
+        &mut self,
+        user: u64,
+        ts: i64,
+        partition: i32,
+        offset: i64,
+        json: &Arc<str>,
+        per_user: usize,
+        total: usize,
+    ) {
         let seq = self.next_seq;
         self.next_seq += 1;
-        let events = self.users.entry(user).or_default();
-        events.push_back((seq, ts, json.clone()));
+        let entry = self.users.entry(user).or_default();
+        entry.events.push_back(Kept { seq, ts, partition, offset, json: json.clone() });
         self.kept += 1;
-        while events.len() > per_user || events.front().is_some_and(|(_, oldest, _)| *oldest < horizon) {
-            events.pop_front();
+        while entry.events.len() > per_user {
+            let old = entry.events.pop_front().expect("over the limit");
+            entry.lost_ts = entry.lost_ts.max(old.ts);
+            entry.lost_offset = entry.lost_offset.max(old.offset);
             self.kept -= 1;
         }
         self.order.push_back((seq, user));
         // `order` also holds entries of already evicted events; cap it too.
         while self.kept > total || self.order.len() > total.saturating_mul(2).max(1) {
-            let Some((seq, user)) = self.order.pop_front() else { break };
-            if let Some(events) = self.users.get_mut(&user) {
-                if events.front().is_some_and(|(front, _, _)| *front == seq) {
-                    events.pop_front();
-                    self.kept -= 1;
-                    if events.is_empty() {
-                        self.users.remove(&user);
-                    }
-                }
+            if !self.evict_front(|_| true) {
+                break;
             }
         }
     }
 
-    fn prune(&mut self, horizon: i64) {
-        let mut dropped = 0;
-        self.users.retain(|_, events| {
-            while events.front().is_some_and(|(_, ts, _)| *ts < horizon) {
-                events.pop_front();
-                dropped += 1;
+    /// Pop the oldest `order` entry: skipped if its event is already gone,
+    /// evicted for everyone if `evict` agrees. False when nothing was popped.
+    fn evict_front(&mut self, evict: impl Fn(&Kept) -> bool) -> bool {
+        let Some(&(seq, user)) = self.order.front() else {
+            return false;
+        };
+        let Some(entry) = self.users.get_mut(&user) else {
+            self.order.pop_front();
+            return true;
+        };
+        match entry.events.front() {
+            // The oldest entry still kept is always its user's oldest event.
+            Some(front) if front.seq == seq => {
+                if !evict(front) {
+                    return false;
+                }
+                let old = entry.events.pop_front().expect("front");
+                self.floor_ts = self.floor_ts.max(old.ts);
+                let floor = self.floor_offset.entry(old.partition).or_insert(i64::MIN);
+                *floor = (*floor).max(old.offset);
+                self.kept -= 1;
+                if entry.events.is_empty() && entry.lost_ts <= self.floor_ts {
+                    self.users.remove(&user);
+                }
             }
-            !events.is_empty()
-        });
-        self.kept -= dropped;
-        let users = &self.users;
-        self.order.retain(|(seq, user)| {
-            users
-                .get(user)
-                .is_some_and(|events| events.front().is_some_and(|(front, _, _)| front <= seq))
-        });
+            _ => {} // already evicted by the per-user limit
+        }
+        self.order.pop_front();
+        true
+    }
+
+    /// Evict events older than `horizon`, oldest first; stops at the first
+    /// kept event inside the window. Proportional to what it evicts.
+    fn prune(&mut self, horizon: i64) {
+        while self.evict_front(|kept| kept.ts < horizon) {}
+    }
+
+    /// Drop users holding nothing but a per-user loss mark that the global
+    /// floor has caught up with (rare; run every few minutes).
+    fn sweep(&mut self) {
+        let floor = self.floor_ts;
+        self.users
+            .retain(|_, entry| !entry.events.is_empty() || entry.lost_ts > floor);
+    }
+
+    /// Whether events between `resume` and the oldest kept one may be gone.
+    fn incomplete(&self, user: u64, resume: Resume, grace_ms: i64) -> bool {
+        let entry = self.users.get(&user);
+        match resume {
+            Resume::Since(since) => {
+                let from = since.saturating_sub(grace_ms);
+                from <= self.floor_ts || entry.is_some_and(|e| from <= e.lost_ts)
+            }
+            Resume::After { cursor, partition } => {
+                self.floor_offset.get(&partition).is_none_or(|floor| cursor < *floor)
+                    || entry.is_some_and(|e| cursor < e.lost_offset)
+            }
+        }
     }
 }
+
+const RESYNC: &str = "{\"e\":\"RESYNC\",\"reason\":\"events since the resume point are no longer all kept; reconcile through the order query API\"}";
 
 impl Registry {
     fn with_replay(events: usize, secs: u64, total: usize) -> Self {
@@ -182,22 +333,35 @@ impl Registry {
             replay_events: events,
             replay_ms: secs as i64 * 1000,
             replay_total: total,
+            since_grace_ms: 10_000,
             ..Self::default()
         }
     }
 
-    #[cfg(test)]
-    fn subscribe(&self, user: u64, tx: SyncSender<Outgoing>, max_per_user: usize) -> Option<u64> {
-        self.subscribe_since(user, tx, max_per_user, None)
+    /// Before consuming: everything older than `start_ms`, and below each
+    /// partition's start offset, was never loaded.
+    fn set_floor(&self, start_ms: i64, start_offsets: &[(i32, i64)]) {
+        let mut history = self.history.lock().unwrap();
+        history.floor_ts = start_ms;
+        for (partition, offset) in start_offsets {
+            history.floor_offset.insert(*partition, offset - 1);
+        }
     }
 
-    /// Subscribe, first queuing the user's kept events at or after `since`.
-    fn subscribe_since(
+    #[cfg(test)]
+    fn subscribe(&self, user: u64, conn: (mpsc::Sender<Outgoing>, usize), max_per_user: usize) -> Option<u64> {
+        self.subscribe_from(user, conn, max_per_user, None)
+    }
+
+    /// Subscribe, first queuing the user's kept events after `resume` — or a
+    /// RESYNC notice when they are not all kept, or more than the queue
+    /// holds.
+    fn subscribe_from(
         &self,
         user: u64,
-        tx: SyncSender<Outgoing>,
+        (tx, cap): (mpsc::Sender<Outgoing>, usize),
         max_per_user: usize,
-        since: Option<i64>,
+        resume: Option<Resume>,
     ) -> Option<u64> {
         let history = self.history.lock().unwrap();
         let mut users = self.users.write().unwrap();
@@ -205,24 +369,50 @@ impl Registry {
         if conns.len() >= max_per_user {
             return None;
         }
-        if let (Some(since), Some(events)) = (since, history.users.get(&user)) {
-            for (_, _, json) in events.iter().filter(|(_, ts, _)| *ts >= since) {
-                if tx.try_send(Outgoing::Text(json.clone())).is_err() {
-                    break; // more than the queue holds: the client reconciles
+        let conn = Conn {
+            id: self.next_id.fetch_add(1, Ordering::Relaxed),
+            tx,
+            depth: Arc::new(AtomicUsize::new(0)),
+            cap,
+        };
+        if let Some(resume) = resume {
+            let replay: Vec<&Arc<str>> = history.users.get(&user).map_or(Vec::new(), |entry| {
+                entry
+                    .events
+                    .iter()
+                    .filter(|kept| match resume {
+                        Resume::Since(since) => kept.ts >= since.saturating_sub(self.since_grace_ms),
+                        Resume::After { cursor, .. } => kept.offset > cursor,
+                    })
+                    .map(|kept| &kept.json)
+                    .collect()
+            });
+            if history.incomplete(user, resume, self.since_grace_ms) || replay.len() >= cap {
+                conn.offer(&Arc::from(RESYNC));
+            }
+            if replay.len() < cap {
+                for json in replay {
+                    conn.offer(json);
                 }
             }
         }
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        conns.push((id, tx));
+        let id = conn.id;
+        conns.push(conn);
         Some(id)
     }
 
-    /// Keep `json` (timestamp `ts`) for `user`'s reconnects and push it to
-    /// the user's live connections. Returns connections reached.
-    fn record_and_push(&self, user: u64, ts: i64, json: &Arc<str>, metrics: &Metrics) -> usize {
+    /// Keep `json` for `user`'s reconnects and push it to the user's live
+    /// connections. Returns connections reached.
+    fn record_and_push(
+        &self,
+        user: u64,
+        (ts, partition, offset): (i64, i32, i64),
+        json: &Arc<str>,
+        metrics: &Metrics,
+    ) -> usize {
         let mut history = self.history.lock().unwrap();
         if self.replay_events > 0 && self.replay_total > 0 {
-            history.record(user, ts, json, self.replay_events, ts - self.replay_ms, self.replay_total);
+            history.record(user, ts, partition, offset, json, self.replay_events, self.replay_total);
         }
         let reached = self.push(user, json, metrics);
         drop(history);
@@ -234,10 +424,25 @@ impl Registry {
         self.history.lock().unwrap().prune(now_ms - self.replay_ms);
     }
 
+    fn sweep(&self) {
+        self.history.lock().unwrap().sweep();
+    }
+
+    /// The queue-depth counter of one connection, for its writer.
+    fn depth_of(&self, user: u64, id: u64) -> Option<Arc<AtomicUsize>> {
+        self.users
+            .read()
+            .unwrap()
+            .get(&user)?
+            .iter()
+            .find(|conn| conn.id == id)
+            .map(|conn| conn.depth.clone())
+    }
+
     fn unsubscribe(&self, user: u64, id: u64) {
         let mut users = self.users.write().unwrap();
         if let Some(conns) = users.get_mut(&user) {
-            conns.retain(|(conn, _)| *conn != id);
+            conns.retain(|conn| conn.id != id);
             if conns.is_empty() {
                 users.remove(&user);
             }
@@ -251,11 +456,11 @@ impl Registry {
         let mut slow = Vec::new();
         let mut reached = 0;
         if let Some(conns) = self.users.read().unwrap().get(&user) {
-            for (id, tx) in conns {
-                match tx.try_send(Outgoing::Text(json.clone())) {
-                    Ok(()) => reached += 1,
-                    Err(TrySendError::Full(_)) => slow.push(*id),
-                    Err(TrySendError::Disconnected(_)) => {}
+            for conn in conns {
+                match conn.offer(json) {
+                    Offer::Queued => reached += 1,
+                    Offer::Full => slow.push(conn.id),
+                    Offer::Gone => {}
                 }
             }
         }
@@ -366,29 +571,70 @@ fn consume(
             }
         }
     };
+    // Where loading starts, per partition: nothing before it is kept.
+    let start_offsets: Vec<(i32, i64)> = assignment
+        .elements()
+        .iter()
+        .map(|element| {
+            let offset = match element.offset() {
+                Offset::Offset(offset) => offset,
+                _ => consumer
+                    .fetch_watermarks(&topic, element.partition(), Duration::from_secs(10))
+                    .map_or(i64::MAX, |(_, high)| high),
+            };
+            (element.partition(), offset)
+        })
+        .collect();
+    registry.set_floor(start_ms, &start_offsets);
     consumer.assign(&assignment).expect("assign execution partitions");
+    let partitions = topic_partitions(&consumer, &topic).unwrap_or(0);
     log_info!(
         "user-stream",
-        "consuming {topic} from {brokers}, {} partitions, replay window {} s",
+        "consuming {topic} from {brokers}, {} of {partitions} partitions, replay window {} s",
         assignment.count(),
         registry.replay_ms / 1000
     );
     let mut last_prune = std::time::Instant::now();
+    let mut last_sweep = std::time::Instant::now();
+    let mut last_partition_check = std::time::Instant::now();
     loop {
         if last_prune.elapsed() >= Duration::from_secs(10) {
             registry.prune(now_ms());
             last_prune = std::time::Instant::now();
         }
+        if last_sweep.elapsed() >= Duration::from_secs(300) {
+            registry.sweep();
+            last_sweep = std::time::Instant::now();
+        }
+        // Partitions are assigned once, and a pusher's users are mapped by
+        // the partition count: a changed count means new partitions nobody
+        // reads and users routed to the wrong shard. Restart to pick it up.
+        if last_partition_check.elapsed() >= Duration::from_secs(30) {
+            last_partition_check = std::time::Instant::now();
+            if let Ok(now) = topic_partitions(&consumer, &topic) {
+                assert_eq!(
+                    now, partitions,
+                    "{topic} went from {partitions} to {now} partitions; restarting to reassign"
+                );
+            }
+        }
         match consumer.poll(Duration::from_millis(100)) {
             Some(Ok(message)) => {
                 metrics.events_consumed.fetch_add(1, Ordering::Relaxed);
                 let ts = message.timestamp().to_millis().unwrap_or_else(now_ms);
-                let Some((user, json)) = message.payload().and_then(|payload| event_json_at(payload, ts))
+                let Some((user, mut json)) = message.payload().and_then(|payload| event_json_at(payload, ts))
                 else {
                     continue;
                 };
+                if shard.is_some() {
+                    // The resume position (`after=`): one user's events are
+                    // all in this partition, in this order.
+                    json.pop();
+                    json.push_str(&format!(",\"cursor\":{}}}", message.offset()));
+                }
                 let json: Arc<str> = json.into();
-                if registry.record_and_push(user, ts, &json, &metrics) > 0 {
+                let position = (ts, message.partition(), message.offset());
+                if registry.record_and_push(user, position, &json, &metrics) > 0 {
                     metrics.events_pushed.fetch_add(1, Ordering::Relaxed);
                 } else {
                     metrics
@@ -510,7 +756,17 @@ fn route(brokers: String, source: String, target: String, group: String, metrics
     consumer.subscribe(&[&source]).expect("subscribe execution topic");
     log_info!("user-stream", "routing {source} -> {target} ({partitions} partitions), group {group}");
     let batch_max = 10_000;
+    let mut last_partition_check = std::time::Instant::now();
     loop {
+        if last_partition_check.elapsed() >= Duration::from_secs(30) {
+            last_partition_check = std::time::Instant::now();
+            if let Ok(now) = topic_partitions(&consumer, &target) {
+                assert_eq!(
+                    now, partitions,
+                    "{target} went from {partitions} to {now} partitions; restarting to re-key users"
+                );
+            }
+        }
         // (partition, offset, timestamp, payload) of one micro-batch.
         let mut batch: Vec<(i32, i64, Option<i64>, Vec<u8>)> = Vec::new();
         let deadline = std::time::Instant::now() + Duration::from_millis(5);
@@ -628,12 +884,18 @@ struct Config {
 
 fn handle(stream: TcpStream, config: &Config, registry: &Registry, metrics: &Metrics) {
     stream.set_nodelay(true).ok();
+    // The request must arrive promptly and stay small: a client trickling
+    // or streaming header bytes would otherwise hold a thread (and memory)
+    // forever.
+    stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT)).ok();
+    stream.set_write_timeout(Some(WRITE_TIMEOUT)).ok();
     let Ok(mut writer) = stream.try_clone() else {
         return;
     };
     let mut reader = BufReader::new(stream);
+    let mut head = (&mut reader).take(MAX_REQUEST_HEAD);
     let mut first = String::new();
-    if reader.read_line(&mut first).is_err() {
+    if head.read_line(&mut first).is_err() || !first.ends_with('\n') {
         return;
     }
     let mut parts = first.split_whitespace();
@@ -643,8 +905,9 @@ fn handle(stream: TcpStream, config: &Config, registry: &Registry, metrics: &Met
     let (mut authorized, mut upgrade, mut key) = (false, false, None);
     loop {
         let mut header = String::new();
-        match reader.read_line(&mut header) {
-            Ok(0) | Err(_) => return,
+        match head.read_line(&mut header) {
+            Ok(0) | Err(_) => return, // closed, timed out, or too long
+            Ok(_) if !header.ends_with('\n') => return,
             Ok(_) if header.trim().is_empty() => break,
             Ok(_) => {}
         }
@@ -704,9 +967,22 @@ fn handle(stream: TcpStream, config: &Config, registry: &Registry, metrics: &Met
         respond(&mut writer, "400 Bad Request", "websocket upgrade required");
         return;
     };
-    let since = query_param(query, "since").and_then(|v| v.parse::<i64>().ok());
-    let (tx, rx) = mpsc::sync_channel::<Outgoing>(config.queue);
-    let Some(conn) = registry.subscribe_since(user, tx.clone(), config.max_per_user, since) else {
+    let after = query_param(query, "after").and_then(|v| v.parse::<i64>().ok());
+    let resume = match (&config.shard, after) {
+        (Some(shard), Some(cursor)) => Some(Resume::After {
+            cursor,
+            partition: user_partition(user, shard.partitions),
+        }),
+        (None, Some(_)) => {
+            respond(&mut writer, "400 Bad Request", "after= needs a sharded (pusher) instance; use since=");
+            return;
+        }
+        (_, None) => query_param(query, "since")
+            .and_then(|v| v.parse::<i64>().ok())
+            .map(Resume::Since),
+    };
+    let (tx, rx) = mpsc::channel::<Outgoing>();
+    let Some(conn) = registry.subscribe_from(user, (tx.clone(), config.queue), config.max_per_user, resume) else {
         respond(
             &mut writer,
             "429 Too Many Requests",
@@ -722,10 +998,13 @@ fn handle(stream: TcpStream, config: &Config, registry: &Registry, metrics: &Met
         return;
     }
     metrics.connections.fetch_add(1, Ordering::Relaxed);
+    // From here a silent peer is a dead one: the writer pings every
+    // PING_EVERY, so a live client always has something to answer.
+    reader.get_ref().set_read_timeout(Some(IDLE_TIMEOUT)).ok();
 
     // Reader: client pings/closes become frames for the writer to send.
     let control = tx;
-    let reader_thread = std::thread::spawn(move || {
+    let spawned = std::thread::Builder::new().name("ws-reader".into()).spawn(move || {
         let mut events = EventReader::new();
         loop {
             match events.next(&mut reader, 4096) {
@@ -746,6 +1025,13 @@ fn handle(stream: TcpStream, config: &Config, registry: &Registry, metrics: &Met
             }
         }
     });
+    let Ok(reader_thread) = spawned else {
+        registry.unsubscribe(user, conn);
+        metrics.connections.fetch_sub(1, Ordering::Relaxed);
+        return;
+    };
+    let depth = registry.depth_of(user, conn);
+    let mut last_sent = std::time::Instant::now();
     // Writer: the only thread that writes this socket. Ends when the client
     // closes, the socket fails, or the registry drops a slow connection
     // (then every sender is gone and `recv` fails).
@@ -756,12 +1042,22 @@ fn handle(stream: TcpStream, config: &Config, registry: &Registry, metrics: &Met
                 if reader_thread.is_finished() {
                     break;
                 }
+                if last_sent.elapsed() >= PING_EVERY {
+                    if websocket::write_frame(&mut writer, websocket::OP_PING, b"").is_err() {
+                        break;
+                    }
+                    last_sent = std::time::Instant::now();
+                }
                 continue;
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
+        last_sent = std::time::Instant::now();
         let result = match frame {
             Outgoing::Text(json) => {
+                if let Some(depth) = &depth {
+                    depth.fetch_sub(1, Ordering::AcqRel);
+                }
                 websocket::write_frame(&mut writer, websocket::OP_TEXT, json.as_bytes())
             }
             Outgoing::Pong(payload) => {
@@ -793,8 +1089,21 @@ fn registry_has(registry: &Registry, user: u64, conn: u64) -> bool {
         .read()
         .unwrap()
         .get(&user)
-        .is_some_and(|conns| conns.iter().any(|(id, _)| *id == conn))
+        .is_some_and(|conns| conns.iter().any(|c| c.id == conn))
 }
+
+/// Request line plus headers of a connection, at most.
+const MAX_REQUEST_HEAD: u64 = 16 * 1024;
+/// Time allowed for the whole HTTP request (per read).
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// A frame that cannot be written in this long means a peer that stopped
+/// reading: drop it rather than pin the writer thread.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+/// The writer pings an otherwise idle connection this often...
+const PING_EVERY: Duration = Duration::from_secs(30);
+/// ...and a connection the client has sent nothing on (not even the pong)
+/// for this long is dead (vanished mobile network, dropped NAT flow).
+const IDLE_TIMEOUT: Duration = Duration::from_secs(75);
 
 fn main() {
     trade_core::oblog::init_from_env();
@@ -863,11 +1172,13 @@ fn main() {
             .unwrap_or(16)
             .max(1),
     });
-    let registry = Arc::new(Registry::with_replay(
+    let mut registry = Registry::with_replay(
         env("TC_USER_STREAM_REPLAY_EVENTS", "512").parse().unwrap_or(512),
         env("TC_USER_STREAM_REPLAY_SECS", "300").parse().unwrap_or(300),
         env("TC_USER_STREAM_REPLAY_MAX_TOTAL", "2000000").parse().unwrap_or(2_000_000),
-    ));
+    );
+    registry.since_grace_ms = env("TC_USER_STREAM_SINCE_GRACE_MS", "10000").parse().unwrap_or(10_000);
+    let registry = Arc::new(registry);
     let metrics = Arc::new(Metrics::default());
     if role == "router" {
         let metrics = metrics.clone();
@@ -886,9 +1197,24 @@ fn main() {
     }
     let listener = TcpListener::bind(&addr).expect("bind user-stream");
     log_info!("user-stream", "listening on {addr}");
+    // Every connection costs two threads; past the limit (or when the OS
+    // refuses a thread) new ones are closed at once instead of aborting.
+    let max_connections: usize = env("TC_USER_STREAM_MAX_CONNECTIONS", "50000").parse().unwrap_or(50_000);
+    let active = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming().flatten() {
-        let (config, registry, metrics) = (config.clone(), registry.clone(), metrics.clone());
-        std::thread::spawn(move || handle(stream, &config, &registry, &metrics));
+        if active.load(Ordering::Acquire) >= max_connections {
+            continue; // dropping `stream` closes it
+        }
+        active.fetch_add(1, Ordering::AcqRel);
+        let (config, registry, metrics, done) =
+            (config.clone(), registry.clone(), metrics.clone(), active.clone());
+        let spawned = std::thread::Builder::new().name("ws-conn".into()).spawn(move || {
+            handle(stream, &config, &registry, &metrics);
+            done.fetch_sub(1, Ordering::AcqRel);
+        });
+        if spawned.is_err() {
+            active.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 }
 
@@ -1010,30 +1336,88 @@ mod tests {
         assert!(stamped.ends_with(r#","ts":1700000000123}"#), "{stamped}");
     }
 
-    #[test]
-    fn a_reconnect_replays_events_since_its_last_timestamp_then_goes_live() {
-        let registry = Registry::with_replay(3, 60, 1_000);
-        let metrics = Metrics::default();
-        let text = |n: i64| -> Arc<str> { format!("e{n}").into() };
-        for ts in 1..=4 {
-            registry.record_and_push(7, ts * 1000, &text(ts), &metrics);
-        }
-        // Only the last 3 are kept; `since` picks those at or after it.
-        let (tx, rx) = mpsc::sync_channel(16);
-        registry.subscribe_since(7, tx, 4, Some(3_000)).unwrap();
-        registry.record_and_push(7, 5_000, &text(5), &metrics);
-        let got: Vec<String> = rx
-            .try_iter()
+    fn texts(rx: &mpsc::Receiver<Outgoing>) -> Vec<String> {
+        rx.try_iter()
             .map(|frame| match frame {
                 Outgoing::Text(json) => json.to_string(),
                 _ => unreachable!(),
             })
-            .collect();
-        assert_eq!(got, ["e3", "e4", "e5"], "replay, then live, in order");
+            .collect()
+    }
+
+    fn at(ts: i64, offset: i64) -> (i64, i32, i64) {
+        (ts, 0, offset)
+    }
+
+    #[test]
+    fn a_reconnect_replays_events_since_its_last_timestamp_then_goes_live() {
+        let mut registry = Registry::with_replay(3, 60, 1_000);
+        registry.since_grace_ms = 0;
+        registry.set_floor(0, &[(0, 0)]);
+        let metrics = Metrics::default();
+        let text = |n: i64| -> Arc<str> { format!("e{n}").into() };
+        for ts in 1..=4 {
+            registry.record_and_push(7, at(ts * 1000, ts), &text(ts), &metrics);
+        }
+        // Only the last 3 are kept; `since` picks those at or after it.
+        let (tx, rx) = mpsc::channel();
+        registry.subscribe_from(7, (tx, 16), 4, Some(Resume::Since(3_000))).unwrap();
+        registry.record_and_push(7, at(5_000, 5), &text(5), &metrics);
+        assert_eq!(texts(&rx), ["e3", "e4", "e5"], "replay, then live, in order");
         // Events older than the window are forgotten.
         registry.prune(5_000 + 61_000);
         let history = registry.history.lock().unwrap();
-        assert!(history.users.is_empty() && history.order.is_empty() && history.kept == 0);
+        assert!(history.order.is_empty() && history.kept == 0);
+        assert!(history.users.values().all(|entry| entry.events.is_empty()));
+    }
+
+    #[test]
+    fn since_reaches_back_a_grace_period_for_late_arrivals() {
+        let registry = Registry::with_replay(100, 600, 1_000); // grace 10 s
+        registry.set_floor(0, &[(0, 0)]);
+        let metrics = Metrics::default();
+        // The client saw B (ts 20 s); A (ts 15 s) arrived only afterwards.
+        registry.record_and_push(7, at(20_000, 1), &"B".into(), &metrics);
+        registry.record_and_push(7, at(15_000, 2), &"A".into(), &metrics);
+        let (tx, rx) = mpsc::channel();
+        registry.subscribe_from(7, (tx, 16), 4, Some(Resume::Since(20_000))).unwrap();
+        assert_eq!(texts(&rx), ["B", "A"], "A is replayed; B again is deduped by event_id");
+    }
+
+    #[test]
+    fn a_cursor_resumes_exactly_and_a_lost_range_says_resync() {
+        let registry = Registry::with_replay(3, 600, 1_000);
+        registry.set_floor(0, &[(0, 10)]); // loading began at offset 10
+        let metrics = Metrics::default();
+        for offset in 10..15 {
+            registry.record_and_push(7, at(1_000 + offset, offset), &format!("o{offset}").into(), &metrics);
+        }
+        // Kept: 12, 13, 14 (per-user limit 3); 10 and 11 were evicted.
+        let resume = |cursor| {
+            let (tx, rx) = mpsc::channel();
+            registry
+                .subscribe_from(7, (tx, 16), 64, Some(Resume::After { cursor, partition: 0 }))
+                .unwrap();
+            texts(&rx)
+        };
+        assert_eq!(resume(12), ["o13", "o14"], "exactly after the cursor");
+        assert_eq!(resume(11), ["o12", "o13", "o14"]);
+        let resync = resume(10);
+        assert!(resync[0].contains("RESYNC"), "11 was evicted: {resync:?}");
+        assert_eq!(&resync[1..], ["o12", "o13", "o14"]);
+        // Before the startup load: never had them.
+        let mut history = registry.history.lock().unwrap();
+        history.users.get_mut(&7).unwrap().lost_offset = i64::MIN;
+        drop(history);
+        assert!(resume(5)[0].contains("RESYNC"));
+        // More to replay than the queue holds: resync instead of a partial replay.
+        let (tx, rx) = mpsc::channel();
+        registry
+            .subscribe_from(7, (tx, 2), 64, Some(Resume::After { cursor: 11, partition: 0 }))
+            .unwrap();
+        let got = texts(&rx);
+        assert_eq!(got.len(), 1);
+        assert!(got[0].contains("RESYNC"));
     }
 
     #[test]
@@ -1043,24 +1427,25 @@ mod tests {
         let text = |n: i64| -> Arc<str> { format!("e{n}").into() };
         // User 1 is chatty (per-user limit 2), users 2..4 add one each.
         for ts in 1..=5 {
-            registry.record_and_push(1, ts, &text(ts), &metrics);
+            registry.record_and_push(1, at(ts, ts), &text(ts), &metrics);
         }
         for (user, ts) in [(2, 6), (3, 7), (4, 8)] {
-            registry.record_and_push(user, ts, &text(ts), &metrics);
+            registry.record_and_push(user, at(ts, ts), &text(ts), &metrics);
         }
         let history = registry.history.lock().unwrap();
         assert_eq!(history.kept, 4);
         assert!(history.order.len() <= 8);
         let kept = |user| -> Vec<i64> {
-            history.users.get(&user).map_or(vec![], |q| q.iter().map(|(_, ts, _)| *ts).collect())
+            history.users.get(&user).map_or(vec![], |e| e.events.iter().map(|k| k.ts).collect())
         };
         // Over the total: user 1's oldest kept event (4) went first.
         assert_eq!(kept(1), [5]);
         assert_eq!((kept(2), kept(3), kept(4)), (vec![6], vec![7], vec![8]));
+        assert_eq!(history.floor_ts, 4, "evicted for everyone up to ts 4");
         drop(history);
         // Bounded under a long stream from one user, too.
         for ts in 10..10_000 {
-            registry.record_and_push(9, ts, &text(ts), &metrics);
+            registry.record_and_push(9, at(ts, ts), &text(ts), &metrics);
         }
         let history = registry.history.lock().unwrap();
         assert!(history.kept <= 4 && history.order.len() <= 8, "{} {}", history.kept, history.order.len());
@@ -1090,12 +1475,11 @@ mod tests {
     fn registry_routes_to_the_user_and_drops_slow_connections() {
         let registry = Registry::default();
         let metrics = Metrics::default();
-        let (fast_tx, fast_rx) = mpsc::sync_channel(8);
-        let (slow_tx, _slow_rx) = mpsc::sync_channel(1);
-        let fast = registry.subscribe(1, fast_tx, 4).unwrap();
-        let slow = registry.subscribe(1, slow_tx, 4).unwrap();
-        let other_tx = mpsc::sync_channel(8).0;
-        registry.subscribe(2, other_tx, 4).unwrap();
+        let (fast_tx, fast_rx) = mpsc::channel();
+        let (slow_tx, _slow_rx) = mpsc::channel();
+        let fast = registry.subscribe(1, (fast_tx, 8), 4).unwrap();
+        let slow = registry.subscribe(1, (slow_tx, 1), 4).unwrap();
+        registry.subscribe(2, (mpsc::channel().0, 8), 4).unwrap();
 
         let json: Arc<str> = "{}".into();
         assert_eq!(registry.push(1, &json, &metrics), 2);
@@ -1106,10 +1490,13 @@ mod tests {
         assert!(!registry_has(&registry, 1, slow));
         assert_eq!(fast_rx.try_iter().count(), 2);
         assert_eq!(registry.push(3, &json, &metrics), 0, "no subscribers");
+        // The writer's dequeue frees a slot.
+        let depth = registry.depth_of(1, fast).unwrap();
+        assert_eq!(depth.load(Ordering::Acquire), 2);
 
         // Per-user connection cap.
         let limited = Registry::default();
-        assert!(limited.subscribe(5, mpsc::sync_channel(1).0, 1).is_some());
-        assert!(limited.subscribe(5, mpsc::sync_channel(1).0, 1).is_none());
+        assert!(limited.subscribe(5, (mpsc::channel().0, 1), 1).is_some());
+        assert!(limited.subscribe(5, (mpsc::channel().0, 1), 1).is_none());
     }
 }

@@ -219,6 +219,10 @@ rpl_semi_sync_source_enabled   = 1         # 一主一从，半同步
 | `TC_USER_STREAM_REPLAY_EVENTS` | 512 | 每个用户保留的事件数，供断线重连补发 |
 | `TC_USER_STREAM_REPLAY_SECS` | 300 | 补发窗口 |
 | `TC_USER_STREAM_REPLAY_MAX_TOTAL` | 20,000,000 | 单个 pusher 保留的事件总数上限，按每条约 350 字节估算约 7 GB；超过时先淘汰最早的事件 |
+| `TC_USER_STREAM_MAX_CONNECTIONS` | 50,000 | 单个 pusher 的连接数上限（每个连接 2 个线程），超过时新连接直接关闭 |
+| `TC_USER_STREAM_SINCE_GRACE_MS` | 10000 | 用 `since=` 续传时多往前回放的时间 |
+
+**断线续传**：pusher 推送的每条事件都带 `cursor`（该用户分区内的位点）。客户端重连时带 `after=<最后收到的 cursor>`，精确续传，pusher 重启后也有效。如果续传点之后的事件已经不全（超出窗口、总量淘汰、刚重启还没加载到），第一帧会是 `{"e":"RESYNC"}`，客户端要通过订单查询接口对账。服务端每 30 秒发一次 ping，75 秒收不到客户端任何数据就断开。
 
 **改分片数**：分片数和 user topic 的分区数都不能在线修改，要整体重新部署推送层。router 和 pusher 必须使用同一个分区数（启动时都从 Kafka 读取，不需要单独配置）。
 

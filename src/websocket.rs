@@ -14,7 +14,7 @@ const OP_CONTINUATION: u8 = 0x0;
 pub const OP_TEXT: u8 = 0x1;
 pub const OP_BINARY: u8 = 0x2;
 pub const OP_CLOSE: u8 = 0x8;
-const OP_PING: u8 = 0x9;
+pub const OP_PING: u8 = 0x9;
 pub const OP_PONG: u8 = 0xA;
 
 /// A complete client data message.
