@@ -26,6 +26,15 @@ COMMANDS="${1:-1000000}"
 RAFT_GROUPS="${TC_RAFT_GROUPS:-4}"
 NODES=5
 COMPOSE=(docker compose -p trade-core -f docker-compose.yml -f docker-compose.raft.yml)
+# MULTI=1: three order-api instances (docker-compose.multi.yml); the client
+# spreads over all of them and keeps going while one is down.
+ORDER_ADDRS=127.0.0.1:9200
+ORDERS=(trade-core-order-1)
+if [ -n "${MULTI:-}" ]; then
+    COMPOSE+=(-f docker-compose.multi.yml)
+    ORDER_ADDRS=127.0.0.1:9200,127.0.0.1:9250,127.0.0.1:9260
+    ORDERS=(trade-core-order-1 trade-core-order-2-1 trade-core-order-3-1)
+fi
 
 [ -n "${IMAGE:-}" ] && docker tag "$IMAGE" trade-core-node:latest
 echo "== wiping the local stack (volumes included)"
@@ -48,16 +57,18 @@ until [ "$(ready_replicas)" = "$((NODES * RAFT_GROUPS))" ]; do
     [ "$SECONDS" -lt "$deadline" ] || { echo "replicas not ready" >&2; exit 1; }
     sleep 3
 done
-until docker ps --format '{{.Names}} {{.Status}}' | grep -q 'trade-core-order-1 .*(healthy)'; do
-    [ "$SECONDS" -lt "$deadline" ] || { echo "order not healthy" >&2; exit 1; }
-    sleep 2
+for order in "${ORDERS[@]}"; do
+    until docker ps --format '{{.Names}} {{.Status}}' | grep -q "$order .*(healthy)"; do
+        [ "$SECONDS" -lt "$deadline" ] || { echo "$order not healthy" >&2; exit 1; }
+        sleep 2
+    done
 done
 sleep 10
 echo "== ready, image $(docker inspect trade-core-order-1 --format '{{.Image}}' | cut -c8-19)"
 
 # shellcheck disable=SC1091
 [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
-cargo bench --bench chaos_e2e -q -- 127.0.0.1:9200 "${TC_ORDER_API_TOKEN:-local-order-api-token}" \
+cargo bench --bench chaos_e2e -q -- "$ORDER_ADDRS" "${TC_ORDER_API_TOKEN:-local-order-api-token}" \
     "$COMMANDS" 2>&1 | sed -l 's/^/   /' &
 CLIENT=$!
 

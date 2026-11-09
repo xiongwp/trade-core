@@ -81,6 +81,11 @@ name = "user_sim_e2e"
 path = "benches/user_sim_e2e.rs"
 harness = false
 
+[[bench]]
+name = "kafka_produce"
+path = "benches/kafka_produce.rs"
+harness = false
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

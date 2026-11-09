@@ -1,0 +1,27 @@
+# Three order-api instances side by side (scripts/bench/*.sh with MULTI=1):
+# all take orders and forward to matching (the match consumer group splits
+# the order topics between them), and each projects its own share of the
+# MySQL databases (static ownership: disjoint TC_MYSQL_OWNED_DBS). Route
+# changes reach every instance through the shared route-control topic.
+services:
+  order:
+    environment:
+      TC_MYSQL_OWNED_DBS: 0-3
+
+  order-2:
+    extends:
+      file: docker-compose.yml
+      service: order
+    ports: !override
+      - "9250:9200"
+    environment:
+      TC_MYSQL_OWNED_DBS: 4-6
+
+  order-3:
+    extends:
+      file: docker-compose.yml
+      service: order
+    ports: !override
+      - "9260:9200"
+    environment:
+      TC_MYSQL_OWNED_DBS: 7-9

@@ -269,6 +269,8 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
 | 9.3 单台 Kafka 的写入带宽 | 3 台 broker | 约 300 MB/s（留 50% 余量） |
 | 9.4 单台接入机的受理速度 | 1 台接入机，用 WebSocket 批量发单 | 约 15 万笔/秒 |
 
+具体步骤、命令和测量方法见 [`scripts/calibrate/README.md`](../scripts/calibrate/README.md)。
+
 **台数换算方法**：各层台数 = 目标负载 ÷（实测值 × 0.7）。以 MySQL 为例，假设实测单库只有 5,000 笔/秒：库数 = 200 万 ÷（5,000 × 0.7）≈ 570，向上取整到每台 8 个库的整数倍，即 576 个库（72 台主库）。
 
 ## 10. 上线前必须完成的代码改动

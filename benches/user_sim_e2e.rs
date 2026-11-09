@@ -155,6 +155,23 @@ fn ws_send_batch(
 
 /// Scrape a Prometheus text endpoint, summing samples that share a name
 /// (labels dropped).
+/// [`scrape`] summed over several instances. A consumer-group lag is the
+/// group's, reported alike by every instance: take its largest reading.
+fn scrape_all(addrs: &[String]) -> HashMap<String, f64> {
+    let mut out: HashMap<String, f64> = HashMap::new();
+    for addr in addrs {
+        for (name, value) in scrape(addr) {
+            let entry = out.entry(name.clone()).or_insert(0.0);
+            if name.ends_with("_lag") {
+                *entry = entry.max(value);
+            } else {
+                *entry += value;
+            }
+        }
+    }
+    out
+}
+
 fn scrape(addr: &str) -> HashMap<String, f64> {
     let mut out = HashMap::new();
     let Ok(stream) = TcpStream::connect(addr) else {
@@ -236,7 +253,15 @@ fn pct(values: &mut [Duration], p: f64) -> Duration {
 
 fn main() {
     let mut args = std::env::args().skip(1).filter(|a| a != "--bench");
-    let addr = args.next().unwrap_or_else(|| "127.0.0.1:9200".into());
+    // One or more order-api instances (comma-separated): workers spread
+    // over them and the stage counters are summed across them.
+    let addrs: Vec<String> = args
+        .next()
+        .unwrap_or_else(|| "127.0.0.1:9200".into())
+        .split(',')
+        .map(|addr| addr.trim().to_string())
+        .filter(|addr| !addr.is_empty())
+        .collect();
     let token = args
         .next()
         .unwrap_or_else(|| "local-order-api-token".into());
@@ -271,7 +296,7 @@ fn main() {
         .map(str::to_string)
         .collect();
     let stride: u32 = args.next().and_then(|v| v.parse().ok()).unwrap_or(1000).max(1);
-    let metrics_addr = addr.clone();
+    let metrics_addrs = addrs.clone();
 
     // Ids: one globally unique increasing space for orders and cancel cmd_ids.
     let id_base = SystemTime::now()
@@ -289,7 +314,7 @@ fn main() {
     let errors = Arc::new(Mutex::new(Vec::<String>::new()));
     let barrier = Arc::new(Barrier::new(concurrency + 1));
 
-    let before = scrape(&metrics_addr);
+    let before = scrape_all(&metrics_addrs);
     let engine_before: Vec<_> = engine_metrics.iter().map(|a| scrape(a)).collect();
     let base_published = metric(&before, "tc_order_published_commands");
     let base_matched = metric(&before, "tc_order_match_completed_commands");
@@ -298,7 +323,7 @@ fn main() {
 
     let mut workers = Vec::with_capacity(concurrency);
     for worker_id in 0..concurrency {
-        let (addr, token) = (addr.clone(), token.clone());
+        let (addr, token) = (addrs[worker_id % addrs.len()].clone(), token.clone());
         let (next_id, cursor, submitted, failed, throttled) = (
             next_id.clone(),
             cursor.clone(),
@@ -454,7 +479,7 @@ fn main() {
             while !stop.load(Ordering::Relaxed) {
                 let at = started.elapsed();
                 let sub = submitted.load(Ordering::Relaxed);
-                let m = scrape(&metrics_addr);
+                let m = scrape_all(&metrics_addrs);
                 samples.lock().unwrap().push(Sample {
                     at,
                     submitted: sub,

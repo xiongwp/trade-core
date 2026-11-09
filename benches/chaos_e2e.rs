@@ -78,13 +78,17 @@ fn read_status(reader: &mut BufReader<TcpStream>) -> std::io::Result<u16> {
     Ok(status)
 }
 
-fn connect(addr: &str) -> (TcpStream, BufReader<TcpStream>) {
+/// Connect to `addrs[*which]`, moving on to the next address while one is
+/// down (a killed order-api instance).
+fn connect(addrs: &[String], which: &mut usize) -> (TcpStream, BufReader<TcpStream>) {
     loop {
+        let addr = &addrs[*which % addrs.len()];
         if let Ok(stream) = TcpStream::connect(addr) {
             let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
             let reader = BufReader::new(stream.try_clone().expect("clone socket"));
             return (stream, reader);
         }
+        *which += 1;
         std::thread::sleep(Duration::from_millis(200));
     }
 }
@@ -111,7 +115,16 @@ fn json_u64(body: &str, key: &str) -> Option<u64> {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).filter(|a| a != "--bench").collect();
-    let addr = args.first().cloned().unwrap_or_else(|| "127.0.0.1:9200".into());
+    // One or more order-api addresses (comma-separated): workers spread
+    // over them, and a worker whose instance is down retries the next one.
+    let addrs: Vec<String> = args
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "127.0.0.1:9200".into())
+        .split(',')
+        .map(|addr| addr.trim().to_string())
+        .filter(|addr| !addr.is_empty())
+        .collect();
     let token = args.get(1).cloned().unwrap_or_else(|| "local-order-api-token".into());
     let commands: u64 = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(300_000);
     let users: u64 = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(10_000);
@@ -137,11 +150,12 @@ fn main() {
     let started = Instant::now();
     let mut workers = Vec::new();
     for worker in 0..concurrency {
-        let (addr, token) = (addr.clone(), token.clone());
+        let (addrs, token) = (addrs.clone(), token.clone());
+        let mut which = worker;
         let (cursor, resent, orders) = (cursor.clone(), resent.clone(), orders.clone());
         workers.push(std::thread::spawn(move || {
             let mut rng = Rng(0x9e37_79b9 ^ (worker as u64 + 1) * 0x1234_5678_9abc);
-            let (mut stream, mut reader) = connect(&addr);
+            let (mut stream, mut reader) = connect(&addrs, &mut which);
             let mut recent: Vec<(u64, u32, u64)> = Vec::new();
             let mut body = Vec::new();
             loop {
@@ -203,7 +217,8 @@ fn main() {
                             attempts += 1;
                             resent.fetch_add(1, Ordering::Relaxed);
                             std::thread::sleep(Duration::from_millis((50 * attempts as u64).min(1_000)));
-                            (stream, reader) = connect(&addr);
+                            which += 1;
+                            (stream, reader) = connect(&addrs, &mut which);
                         }
                     }
                 }

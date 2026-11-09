@@ -36,6 +36,15 @@ BATCH="${5:-500}"
 RAFT_GROUPS="${TC_RAFT_GROUPS:-4}"
 NODES=5
 COMPOSE=(docker compose -p trade-core -f docker-compose.yml -f docker-compose.raft.yml)
+# MULTI=1: three order-api instances (docker-compose.multi.yml), each taking
+# orders and projecting its share of the databases.
+ORDER_ADDRS=127.0.0.1:9200
+ORDERS=(trade-core-order-1)
+if [ -n "${MULTI:-}" ]; then
+    COMPOSE+=(-f docker-compose.multi.yml)
+    ORDER_ADDRS=127.0.0.1:9200,127.0.0.1:9250,127.0.0.1:9260
+    ORDERS=(trade-core-order-1 trade-core-order-2-1 trade-core-order-3-1)
+fi
 
 if [ -n "${IMAGE:-}" ]; then
     docker tag "$IMAGE" trade-core-node:latest
@@ -64,9 +73,11 @@ until [ "$(ready_replicas)" = "$want" ]; do
     [ "$SECONDS" -lt "$deadline" ] || { echo "Raft replicas not ready after 300 s" >&2; exit 1; }
     sleep 3
 done
-until docker ps --format '{{.Names}} {{.Status}}' | grep -q 'trade-core-order-1 .*(healthy)'; do
-    [ "$SECONDS" -lt "$deadline" ] || { echo "order not healthy after 300 s" >&2; exit 1; }
-    sleep 2
+for order in "${ORDERS[@]}"; do
+    until docker ps --format '{{.Names}} {{.Status}}' | grep -q "$order .*(healthy)"; do
+        [ "$SECONDS" -lt "$deadline" ] || { echo "$order not healthy after 300 s" >&2; exit 1; }
+        sleep 2
+    done
 done
 # Let the Kafka consumer groups finish their first assignment.
 sleep 10
@@ -75,6 +86,6 @@ echo "== ready: $want/$want replicas, image $(docker inspect trade-core-order-1 
 # shellcheck disable=SC1091
 [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
 cargo bench --bench user_sim_e2e -q -- \
-    127.0.0.1:9200 "${TC_ORDER_API_TOKEN:-local-order-api-token}" \
+    "$ORDER_ADDRS" "${TC_ORDER_API_TOKEN:-local-order-api-token}" \
     "$COMMANDS" "$USERS" "$INSTRUMENTS" "$CONCURRENCY" "$BATCH" 2>&1 \
     | grep -E 'transport=|accepted=|HTTP accept|end-to-end|batch HTTP|matched|order -> MySQL|peak lag'
