@@ -321,7 +321,9 @@ fn main() {
     let running = Arc::new(AtomicBool::new(true));
     let accepting = Arc::new(AtomicBool::new(false));
     let leadership = Arc::new(AtomicBool::new(false));
-    let (message_tx, message_rx) = mpsc::channel();
+    // Bounded: a runtime that falls behind slows the peers down (TCP
+    // backpressure) instead of queueing their messages without limit.
+    let (message_tx, message_rx) = mpsc::sync_channel(65_536);
     let (proposal_tx, proposal_rx) = mpsc::sync_channel::<ProposalRequest>(1 << 16);
     spawn_listener(raft_addr, message_tx);
 
@@ -346,6 +348,7 @@ fn main() {
     let asset_root = data_dir.join("journal").join("assets");
     let runtime_snapshot_path = engine_snapshot_path.clone();
     let runtime_rejoin_marker_path = rejoin_marker_path.clone();
+    let runtime_asset_root = asset_root.clone();
     // Migration steps proposed by the admin routes below: (entry, reply with
     // the committed index). Only a leader proposes; elsewhere the reply
     // channel is dropped and the caller is told to ask the leader.
@@ -474,8 +477,14 @@ fn main() {
                     // peer frame carrying one would put arbitrary bytes in
                     // the log. Anything raft refuses (a stray or local
                     // message type, an unknown peer) is dropped, not fatal.
-                    if message.get_msg_type() == raft::eraftpb::MessageType::MsgPropose {
-                        log_warn!("raft-node", "event=peer_proposal_dropped from={}", message.from);
+                    // Leadership transfer is never initiated by this system;
+                    // from the wire it would only make the leader drop
+                    // proposals mid-transfer.
+                    if matches!(
+                        message.get_msg_type(),
+                        raft::eraftpb::MessageType::MsgPropose | raft::eraftpb::MessageType::MsgTransferLeader
+                    ) {
+                        log_warn!("raft-node", "event=peer_message_dropped type={:?} from={}", message.get_msg_type(), message.from);
                         continue;
                     }
                     let was_rejoining = node.is_rejoining();
@@ -641,11 +650,15 @@ fn main() {
                         waiters.push(request.committed);
                     }
                     if !entries.is_empty() {
-                        node.propose_batch(entries)
-                            .expect("leader category-batch proposal");
-                        let first_index = node.last_index() + 1 - waiters.len() as u64;
-                        for (offset, waiter) in waiters.into_iter().enumerate() {
-                            let index = first_index + offset as u64;
+                        // Raft may refuse proposals while still leader (a
+                        // leadership transfer): the refused requests' waiters
+                        // are dropped, which fails their callers (they rewind
+                        // and resend), instead of aborting the leader.
+                        let (indexes, refused) = node.propose_each(entries);
+                        if let Some(error) = refused {
+                            log_warn!("raft-node", "event=proposal_refused accepted={} refused={} error={error:?}", indexes.len(), waiters.len() - indexes.len());
+                        }
+                        for (index, waiter) in indexes.into_iter().zip(waiters) {
                             commit_waiters.entry(index).or_default().push(waiter);
                             commit_started.insert(index, Instant::now());
                         }
@@ -775,7 +788,11 @@ fn main() {
                                 if stored > drained {
                                     return Ok(()); // not yet published that far
                                 }
-                                node.compact(stored, bytes).map(|_| ())
+                                node.compact(stored, bytes)?;
+                                // Replay never goes below the compacted
+                                // snapshot: its application proofs are done.
+                                trade_core::asset_log::prune_applied_proofs(&runtime_asset_root, stored)
+                                    .map(|_| ())
                             }) {
                                 Ok(()) => log_info!(
                                     "raft-node",
@@ -1489,6 +1506,16 @@ fn migration_route(
             .and_then(|value| value.parse().ok())
             .ok_or_else(|| route_reply("400 Bad Request", "category=<id> required\n".into()))
     };
+    // The caller's category size must be ours: with another size it would
+    // move a different set of instruments than it routes.
+    if let Some(size) = param("size").and_then(|value| value.parse::<u32>().ok()) {
+        if size != category_size && path.starts_with("/migration/") {
+            return Some(route_reply(
+                "409 Conflict",
+                format!("category size {size} differs from this node's {category_size} (TC_ORDER_CATEGORY_SIZE)\n"),
+            ));
+        }
+    }
     // The migration's epoch (its freeze record's route-log position);
     // required: an unfenced step could undo a newer migration.
     let epoch = || -> Result<u64, RouteResponse> {
@@ -1664,6 +1691,14 @@ fn migration_route(
                     ),
                 ));
             }
+            if let Err(reason) = trade_core::migration::validate_category_state(
+                &state.engines,
+                &state.positions,
+                category,
+                category_size,
+            ) {
+                return Some(route_reply("422 Unprocessable Entity", format!("refusing to install: {reason}\n")));
+            }
             let command_ids = state
                 .recent_command_ids
                 .iter()
@@ -1767,17 +1802,40 @@ fn parse_peers(input: &str) -> HashMap<u64, String> {
         .collect()
 }
 
-fn spawn_listener(addr: String, tx: mpsc::Sender<Message>) {
+/// Inbound peer connections at once: a few per peer; more is a misbehaving
+/// or hostile client, refused rather than given threads and buffers.
+const MAX_PEER_CONNECTIONS: usize = 64;
+/// A peer connection silent this long is dead (the leader heartbeats every
+/// tick): partitions without a FIN used to leave a reader blocked forever.
+const PEER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn spawn_listener(addr: String, tx: mpsc::SyncSender<Message>) {
     thread::spawn(move || {
         let listener = TcpListener::bind(&addr).expect("bind raft listener");
-        for stream in listener.incoming().flatten() {
-            let tx = tx.clone();
-            thread::spawn(move || read_peer_frames(stream, &tx));
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else {
+                thread::sleep(Duration::from_millis(50)); // e.g. out of fds
+                continue;
+            };
+            if active.load(Ordering::Acquire) >= MAX_PEER_CONNECTIONS {
+                continue;
+            }
+            stream.set_read_timeout(Some(PEER_READ_TIMEOUT)).ok();
+            let (tx, done) = (tx.clone(), active.clone());
+            active.fetch_add(1, Ordering::AcqRel);
+            let spawned = thread::Builder::new().name("raft-peer-in".into()).spawn(move || {
+                read_peer_frames(stream, &tx);
+                done.fetch_sub(1, Ordering::AcqRel);
+            });
+            if spawned.is_err() {
+                active.fetch_sub(1, Ordering::AcqRel);
+            }
         }
     });
 }
 
-fn read_peer_frames(mut stream: impl Read, tx: &mpsc::Sender<Message>) {
+fn read_peer_frames(mut stream: impl Read, tx: &mpsc::SyncSender<Message>) {
     loop {
         let mut size = [0u8; 4];
         if stream.read_exact(&mut size).is_err() {
@@ -1855,7 +1913,7 @@ fn run_peer_writer(
         let mut delivered = false;
         for attempt in 0..2 {
             if stream.is_none() {
-                match TcpStream::connect(&addr) {
+                match trade_core::migration::connect_timeout(&addr, Duration::from_millis(500)) {
                     Ok(connected) => {
                         connected.set_nodelay(true).ok();
                         connected
@@ -2036,7 +2094,7 @@ mod tests {
             wire.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
             wire.extend_from_slice(&bytes);
         }
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(16);
         read_peer_frames(Cursor::new(wire), &tx);
         assert_eq!(rx.try_recv().unwrap().from, 1);
         assert_eq!(rx.try_recv().unwrap().from, 2);
@@ -2045,7 +2103,7 @@ mod tests {
 
     #[test]
     fn peer_connection_rejects_oversized_frame() {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(16);
         read_peer_frames(
             Cursor::new(((MAX_RAFT_MESSAGE_BYTES + 1) as u32).to_be_bytes()),
             &tx,

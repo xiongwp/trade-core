@@ -177,6 +177,8 @@ pub(crate) fn migrate_category(
     to_group: usize,
 ) -> Result<String, String> {
     let started = std::time::Instant::now();
+    // Sent with every step: a group with another category size refuses it.
+    let size = category_size();
     let endpoints = &kafka.migration_endpoints;
     let control = &kafka.route_control;
     let wait = Duration::from_secs(env_number("TC_MIGRATION_STEP_TIMEOUT_SECS", 60u64));
@@ -217,10 +219,7 @@ pub(crate) fn migrate_category(
         let source = group_leader(endpoints, from_group)?;
         seal_attempted = true;
         let seal_index = json_number(
-            &admin_call(
-                &source,
-                &format!("/migration/seal?category={category}&epoch={epoch}"),
-            )?,
+            &admin_call(&source, &format!("/migration/seal?category={category}&epoch={epoch}&size={size}"))?,
             "index",
         )
         .ok_or("seal answered no index")?;
@@ -255,7 +254,7 @@ pub(crate) fn migrate_category(
         let install_index = json_number(
             &admin_call_within(
                 &target,
-                &format!("/migration/install?category={category}&epoch={epoch}&from={source}&min_index={seal_index}"),
+                &format!("/migration/install?category={category}&epoch={epoch}&size={size}&from={source}&min_index={seal_index}"),
                 Duration::from_secs(60),
             )?,
             "index",
@@ -331,7 +330,7 @@ pub(crate) fn migrate_category(
     let dropped = propose_until_committed(
         endpoints,
         from_group,
-        &format!("/migration/drop?category={category}&epoch={epoch}"),
+        &format!("/migration/drop?category={category}&epoch={epoch}&size={size}"),
         wait,
     );
     if let Err(error) = &dropped {
@@ -364,22 +363,13 @@ fn roll_back(
     install_attempted: bool,
 ) -> Result<(), String> {
     let endpoints = &kafka.migration_endpoints;
+    let size = category_size();
     let wait = Duration::from_secs(env_number("TC_MIGRATION_STEP_TIMEOUT_SECS", 60u64));
     if install_attempted {
-        propose_until_committed(
-            endpoints,
-            to_group,
-            &format!("/migration/drop?category={category}&epoch={epoch}"),
-            wait,
-        )?;
+        propose_until_committed(endpoints, to_group, &format!("/migration/drop?category={category}&epoch={epoch}&size={size}"), wait)?;
     }
     if seal_attempted {
-        propose_until_committed(
-            endpoints,
-            from_group,
-            &format!("/migration/unseal?category={category}&epoch={epoch}"),
-            wait,
-        )?;
+        propose_until_committed(endpoints, from_group, &format!("/migration/unseal?category={category}&epoch={epoch}&size={size}"), wait)?;
     }
     match route_log::latest_after(category, freeze_offset, Duration::from_secs(10))? {
         Some((offset, _)) if offset == freeze_offset => {
@@ -418,19 +408,19 @@ pub(crate) fn unfinished_migrations_json() -> String {
 pub(crate) fn unfinished_migrations_json_from(
     frozen: Vec<(u32, i64, route_log::RouteRecord)>,
 ) -> String {
-    let mut body = format!("{{\"count\":{},\"migrations\":[", frozen.len());
-    for (position, (category, offset, record)) in frozen.into_iter().enumerate() {
-        if position > 0 {
-            body.push(',');
-        }
-        let route_log::RouteRecord::Freeze { to, from } = record else {
-            continue;
-        };
-        body.push_str(&format!(
-            "{{\"category\":{category},\"from\":{from},\"to\":{to},\"epoch\":{},\"freeze_offset\":{offset}}}",
-            offset + 1
-        ));
-    }
-    body.push_str("]}");
-    body
+    let rows = frozen
+        .into_iter()
+        .filter_map(|(category, offset, record)| match record {
+            route_log::RouteRecord::Freeze { to, from } => Some(format!(
+                "{{\"category\":{category},\"from\":{from},\"to\":{to},\"epoch\":{},\"freeze_offset\":{offset}}}",
+                offset + 1
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    format!(
+        "{{\"count\":{},\"migrations\":[{}]}}",
+        rows.len(),
+        rows.join(",")
+    )
 }

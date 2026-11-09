@@ -310,13 +310,10 @@ fn main() -> ExitCode {
         .into_iter()
         .map(|placement| {
             let group = placement.group;
-            // Keep the existing single-group directory compatible. Every added
-            // group gets a fully isolated state, journal and per-asset WAL tree.
-            let data_dir = if group == 0 {
-                data_root.clone()
-            } else {
-                data_root.join(format!("group-{group}"))
-            };
+            // One isolated directory per group (state, journal, per-asset WAL
+            // tree), side by side, so a replica can be rebuilt by moving just
+            // its own directory aside (scripts/ops/rebuild-replica.sh).
+            let data_dir = data_root.join(format!("group-{group}"));
             std::fs::create_dir_all(&data_dir).expect("create Raft group data directory");
             Slot {
                 ports: service_ports(group).expect("checked above"),

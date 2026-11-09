@@ -280,3 +280,40 @@ fn a_failed_migration_rolls_back_cleanly_whether_or_not_its_steps_applied() {
     let mut c = processor();
     assert_eq!(rejected(&op(&mut c, drop_(4))), Some("stale-migration"));
 }
+
+#[test]
+fn a_malformed_install_is_rejected_on_every_replica_instead_of_crashing() {
+    let mut target = processor();
+    let order = Order::limit(OrderId(1), Side::Sell, 101, 5).on(MOVING).by(10);
+    let mut duplicate = order;
+    duplicate.remaining = 2; // same id twice in one book
+    let bad = CategoryOp::Install {
+        category: 0,
+        category_size: SIZE,
+        epoch: 1,
+        engines: vec![snapshot::EngineState {
+            instrument: MOVING,
+            engine_seq: 3,
+            orders: vec![order, duplicate],
+            stops: Vec::new(),
+        }],
+        positions: Vec::new(),
+        halted: Vec::new(),
+        command_ids: Vec::new(),
+    };
+    assert_eq!(rejected(&op(&mut target, bad)), Some("invalid-install"));
+    // Nothing was installed and the processor still works.
+    assert!(rejected(&run(&mut target, limit(2, 20, MOVING, Side::Buy, 90, 1))).is_none());
+}
+
+#[test]
+fn cancels_for_unknown_instruments_leave_no_state_behind() {
+    let mut p = processor();
+    let before = p.state_fingerprint();
+    for instrument in 50_000..50_100u32 {
+        let out = run(&mut p, Command::Cancel { instrument: InstrumentId(instrument), order_id: OrderId(9), cmd_id: instrument as u64 });
+        assert!(out.iter().any(|r| matches!(r, ExecReport::NotFound { .. })), "{out:?}");
+        assert!(p.engine(InstrumentId(instrument)).is_none());
+    }
+    assert_eq!(p.state_fingerprint(), before);
+}

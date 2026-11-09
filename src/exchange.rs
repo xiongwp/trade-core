@@ -850,10 +850,14 @@ fn build_inner(
             // duplicated. Records are ordered by ascending raft_index and
             // segments rotate only after a watermark advance, so only the
             // newest segment can hold unwatermarked records.
+            // An unreadable proof set must stop recovery here: read as "none
+            // applied", it would trim proved-but-unpublished events from the
+            // outbox, and they are never produced again.
             let max_applied = config.journal_dir.as_ref().and_then(|journal_dir| {
                 crate::asset_log::load_applied_batches(&journal_dir.join("assets"))
-                    .ok()
-                    .and_then(|batches| batches.into_iter().max())
+                    .unwrap_or_else(|error| panic!("load Raft application proofs: {error}"))
+                    .into_iter()
+                    .max()
             });
             let newest =
                 crate::execution_outbox::latest_segment(&outbox_path).unwrap_or_else(|error| {
@@ -1323,6 +1327,17 @@ impl Processor {
                         .is_some_and(|engine| !engine.book().is_empty())
                         || self.stops.contains_key(&instrument)
                 };
+                if let Err(reason) =
+                    crate::migration::validate_category_state(&engines, &positions, category, category_size)
+                {
+                    crate::log_error!("migration", category; "event=install_rejected reason={reason}");
+                    emit(ExecReport::CommandRejected {
+                        instrument: InstrumentId(0),
+                        command_id: epoch,
+                        reason: "invalid-install",
+                    });
+                    return;
+                }
                 let occupied = engines
                     .iter()
                     .map(|state| state.instrument)
@@ -1365,7 +1380,8 @@ impl Processor {
                 }
                 for (user, instrument, quantity) in positions {
                     if in_category(InstrumentId(instrument), category, category_size) {
-                        *self.positions.entry((user, InstrumentId(instrument))).or_insert(0) += quantity;
+                        let position = self.positions.entry((user, InstrumentId(instrument))).or_insert(0);
+                        *position = position.saturating_add(quantity);
                     }
                 }
                 for instrument in halted {
@@ -1518,7 +1534,8 @@ impl Processor {
             .extend(snap.halted.iter().map(|&i| InstrumentId(i)));
         self.suspended.extend(snap.suspended.iter().copied());
         for &(u, i, q) in &snap.positions {
-            *self.positions.entry((u, InstrumentId(i))).or_insert(0) += q;
+            let position = self.positions.entry((u, InstrumentId(i))).or_insert(0);
+            *position = position.saturating_add(q);
         }
         self.sealed
             .extend(snap.sealed.iter().map(|&(category, size)| (category, size)));
@@ -1701,7 +1718,14 @@ impl Processor {
                 order_id,
                 ..
             } => {
-                if let Some(cancelled) = self.engine_for(instrument).cancel_order(order_id) {
+                // Never create an engine to cancel in: an unknown instrument
+                // id would otherwise leave an empty book behind on every
+                // replica (and in every snapshot), one per id a client sends.
+                if let Some(cancelled) = self
+                    .engines
+                    .get_mut(&instrument)
+                    .and_then(|engine| engine.cancel_order(order_id))
+                {
                     emit(ExecReport::Cancelled {
                         instrument,
                         order_id,
@@ -1806,7 +1830,10 @@ impl Processor {
                         }
                     }
                 }
-                let engine = self.engine_for(instrument);
+                let Some(engine) = self.engines.get_mut(&instrument) else {
+                    emit(ExecReport::NotFound { instrument, order_id });
+                    return;
+                };
                 let user = engine.book().get(order_id).map_or(0, |order| order.user);
                 match engine.modify(order_id, new_price, new_qty) {
                     ModifyOutcome::NotFound => emit(ExecReport::NotFound {
@@ -1849,10 +1876,10 @@ impl Processor {
                                 Side::Sell => (t.maker_user, t.taker_user),
                             };
                             if buyer != 0 {
-                                *self.positions.entry((buyer, instrument)).or_insert(0) += q;
+                                { let p = self.positions.entry((buyer, instrument)).or_insert(0); *p = p.saturating_add(q); }
                             }
                             if seller != 0 {
-                                *self.positions.entry((seller, instrument)).or_insert(0) -= q;
+                                { let p = self.positions.entry((seller, instrument)).or_insert(0); *p = p.saturating_sub(q); }
                             }
                             let (maker_fee, taker_fee) = self.fees.fees(t.price, t.quantity);
                             emit(ExecReport::Trade {
@@ -1915,7 +1942,10 @@ impl Processor {
             } => {
                 // 1. Pull every resting order of the user, and every
                 //    untriggered conditional one (it would re-open exposure).
-                let mut cancelled = self.engine_for(instrument).cancel_all_for_user(user);
+                let mut cancelled = self
+                    .engines
+                    .get_mut(&instrument)
+                    .map_or_else(Vec::new, |engine| engine.cancel_all_for_user(user));
                 if self.pending_stops > 0 {
                     if let Some(book) = self.stops.get_mut(&instrument) {
                         let pulled = book.remove_user(user);
@@ -2133,10 +2163,10 @@ impl Processor {
                 Side::Sell => (t.maker_user, t.taker_user),
             };
             if buyer != 0 {
-                *self.positions.entry((buyer, instrument)).or_insert(0) += q;
+                { let p = self.positions.entry((buyer, instrument)).or_insert(0); *p = p.saturating_add(q); }
             }
             if seller != 0 {
-                *self.positions.entry((seller, instrument)).or_insert(0) -= q;
+                { let p = self.positions.entry((seller, instrument)).or_insert(0); *p = p.saturating_sub(q); }
             }
             emit(ExecReport::Trade {
                 instrument,

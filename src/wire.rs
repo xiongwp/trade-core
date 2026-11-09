@@ -767,6 +767,7 @@ pub const REJECT_REASONS: &[&str] = &[
     "stale-migration",
     "invalid-order-id",
     "invalid-tif",
+    "invalid-install",
 ];
 
 /// Wire code of a reject reason (0 if it is not in [`REJECT_REASONS`]).

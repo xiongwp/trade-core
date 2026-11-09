@@ -97,7 +97,11 @@ impl QueueEnvelope {
             return None;
         }
         let frame: [u8; MSG_LEN] = bytes[16..].try_into().ok()?;
-        WireView::parse(&frame)?;
+        // A frame must decode to a command here, where a bad message is
+        // dead-lettered: every later stage takes that for granted (an unknown
+        // message type used to pass and then panic a consumer on every
+        // redelivery).
+        WireView::parse(&frame)?.to_command()?;
         Some(Self {
             route_version: u32::from_le_bytes(bytes[4..8].try_into().ok()?),
             user: u64::from_le_bytes(bytes[8..16].try_into().ok()?),

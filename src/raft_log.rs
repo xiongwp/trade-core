@@ -763,6 +763,33 @@ impl RaftNode {
         Ok(())
     }
 
+    /// Like [`Self::propose_batch`], but stops at the first refusal instead of
+    /// failing the whole call: returns the log index of every entry that was
+    /// appended (in order), and the refusal if one came. Raft can refuse a
+    /// proposal while the node stays leader (a leadership transfer in
+    /// progress), so a caller must not treat that as fatal.
+    pub fn propose_each<I>(&mut self, commands: I) -> (Vec<u64>, Option<ProposeError>)
+    where
+        I: IntoIterator<Item = Vec<u8>>,
+    {
+        if !self.is_leader() {
+            return (Vec::new(), Some(ProposeError::NotLeader));
+        }
+        let mut indexes = Vec::new();
+        let mut refused = None;
+        for command in commands {
+            if self.node.propose(Vec::new(), command).is_err() {
+                refused = Some(ProposeError::Raft);
+                break;
+            }
+            indexes.push(self.last_index());
+        }
+        if !indexes.is_empty() {
+            self.drive();
+        }
+        (indexes, refused)
+    }
+
     /// Propose adding a voter to the cluster. Committed and applied through the
     /// normal log path, so it is quorum-durable before it takes effect.
     pub fn add_node(&mut self, node_id: u64) -> Result<(), ProposeError> {
@@ -856,6 +883,21 @@ impl RaftNode {
 
     /// Deliver one peer message received from the cluster transport.
     pub fn step(&mut self, message: Message) -> Result<(), raft::Error> {
+        // A replacement forgot its vote and every entry it acknowledged
+        // before losing its disk. Granting a vote (or a pre-vote, or taking
+        // over leadership) on that empty log could elect a leader missing
+        // entries committed with the old instance's acknowledgement. Stay
+        // silent, exactly like a down voter, until the rejoin completes.
+        if self.rejoining
+            && matches!(
+                message.get_msg_type(),
+                MessageType::MsgRequestVote
+                    | MessageType::MsgRequestPreVote
+                    | MessageType::MsgTimeoutNow
+            )
+        {
+            return Ok(());
+        }
         // Raft's Progress.matched is intentionally monotonic because a voter
         // is assumed never to lose stable storage while retaining its id. An
         // explicitly marked replacement breaks that assumption. Handle its
@@ -1194,6 +1236,27 @@ mod tests {
         replacement.step(heartbeat).unwrap();
         assert!(replacement.take_outbound().is_empty());
         assert!(replacement.is_rejoining());
+    }
+
+    #[test]
+    fn replacement_grants_no_votes_until_it_has_caught_up() {
+        let mut replacement = node(2);
+        replacement.begin_rejoin();
+        for msg_type in [MessageType::MsgRequestVote, MessageType::MsgRequestPreVote] {
+            let mut request = Message::default();
+            request.set_msg_type(msg_type);
+            request.from = 3;
+            request.to = 2;
+            request.term = 5;
+            request.log_term = 1;
+            request.index = 1;
+            replacement.step(request).unwrap();
+            assert!(
+                replacement.take_outbound().is_empty(),
+                "{msg_type:?} must not be answered while rejoining"
+            );
+        }
+        assert_eq!(replacement.term(), 0, "a vote request must not even bump the term");
     }
 
     #[test]

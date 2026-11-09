@@ -290,7 +290,7 @@ pub fn mark_applied_batch(
     report_fingerprint: u64,
 ) -> io::Result<()> {
     std::fs::create_dir_all(root)?;
-    let path = root.join("raft-batches.applied.v2");
+    let path = proof_segment_path(root, raft_index / PROOF_SEGMENT_ENTRIES);
     let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
     if trim_torn_tail(&file, APPLIED_PROOF_HEADER.len(), APPLIED_PROOF_RECORD_LEN)? {
         file.write_all(&APPLIED_PROOF_HEADER)?;
@@ -305,21 +305,77 @@ pub fn mark_applied_batch(
     file.sync_data()
 }
 
+/// Proofs live in segments of this many Raft indexes
+/// (`raft-batches.applied.v2.<segment>`), so the ones a compaction made
+/// unnecessary can be deleted whole: the writer only ever appends to the
+/// segment of the newest index, never to an older one. (One file grew by
+/// 32 bytes per committed entry forever, and was read whole at every start.)
+pub const PROOF_SEGMENT_ENTRIES: u64 = 1_000_000;
+
+fn proof_segment_path(root: &Path, segment: u64) -> PathBuf {
+    root.join(format!("raft-batches.applied.v2.{segment:012}"))
+}
+
+/// The proof segments present, oldest first: (segment number, path).
+fn proof_segments(root: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
+    let mut segments = Vec::new();
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(segments),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let path = entry?.path();
+        let segment = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix("raft-batches.applied.v2."))
+            .and_then(|number| number.parse::<u64>().ok());
+        if let Some(segment) = segment {
+            segments.push((segment, path));
+        }
+    }
+    segments.sort();
+    Ok(segments)
+}
+
+/// Delete the proof segments whose every index is at or below `through`
+/// (replay never goes below a compacted snapshot). The newest segment always
+/// stays: recovery takes the highest proof as the outbox's durable boundary.
+pub fn prune_applied_proofs(root: &Path, through: u64) -> io::Result<usize> {
+    let segments = proof_segments(root)?;
+    let mut removed = 0;
+    for (segment, path) in segments.iter().take(segments.len().saturating_sub(1)) {
+        if (segment + 1) * PROOF_SEGMENT_ENTRIES <= through.saturating_add(1) {
+            std::fs::remove_file(path)?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
 /// Load and validate every exact replay proof. A torn final record is ignored
 /// because its batch has no durable application proof and will be replayed as
 /// a normal committed Raft entry. Corruption in a complete record is fatal.
 pub fn load_applied_batch_proofs(root: &Path) -> io::Result<HashMap<u64, AppliedBatchProof>> {
-    let path = root.join("raft-batches.applied.v2");
+    let mut proofs = HashMap::new();
+    for (_, path) in proof_segments(root)? {
+        load_proof_segment(&path, &mut proofs)?;
+    }
+    Ok(proofs)
+}
+
+fn load_proof_segment(path: &Path, proofs: &mut HashMap<u64, AppliedBatchProof>) -> io::Result<()> {
     let mut file = match File::open(path) {
         Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
     };
     let mut header = [0u8; APPLIED_PROOF_HEADER.len()];
     match file.read_exact(&mut header) {
         Ok(()) => {}
         // Crashed while creating the file: no proof was ever written.
-        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(HashMap::new()),
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
         Err(error) => return Err(error),
     }
     if header != APPLIED_PROOF_HEADER {
@@ -328,7 +384,6 @@ pub fn load_applied_batch_proofs(root: &Path) -> io::Result<HashMap<u64, Applied
             "applied Raft proof header/version mismatch",
         ));
     }
-    let mut proofs = HashMap::new();
     let mut record = [0u8; APPLIED_PROOF_RECORD_LEN];
     loop {
         match file.read_exact(&mut record) {
@@ -358,7 +413,7 @@ pub fn load_applied_batch_proofs(root: &Path) -> io::Result<HashMap<u64, Applied
             Err(error) => return Err(error),
         }
     }
-    Ok(proofs)
+    Ok(())
 }
 
 /// Validate deterministic replay against the durable proof. Callers must stop
@@ -723,13 +778,32 @@ mod tests {
     }
 
     #[test]
+    fn compaction_prunes_whole_proof_segments_but_keeps_the_newest() {
+        let root = std::env::temp_dir().join(format!("tc-proof-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let span = PROOF_SEGMENT_ENTRIES;
+        for index in [5, span - 1, span + 3, 2 * span + 7] {
+            mark_applied_batch(&root, index, 1, index).unwrap();
+        }
+        assert_eq!(load_applied_batch_proofs(&root).unwrap().len(), 4);
+        // Compacted through span + 3: only segment 0 is wholly below it.
+        assert_eq!(prune_applied_proofs(&root, span + 3).unwrap(), 1);
+        let left = load_applied_batch_proofs(&root).unwrap();
+        assert!(left.contains_key(&(span + 3)) && left.contains_key(&(2 * span + 7)) && !left.contains_key(&5));
+        // Everything compacted: the newest segment (the recovery boundary) stays.
+        assert_eq!(prune_applied_proofs(&root, u64::MAX - 1).unwrap(), 1);
+        assert_eq!(load_applied_batches(&root).unwrap().into_iter().max(), Some(2 * span + 7));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn a_proof_torn_by_a_crash_does_not_corrupt_later_proofs() {
         let root = std::env::temp_dir().join(format!("tc-torn-proof-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         mark_applied_batch(&root, 1, 1, 11).unwrap();
         mark_applied_batch(&root, 2, 2, 22).unwrap();
         // Crash halfway through the third record.
-        let path = root.join("raft-batches.applied.v2");
+        let path = proof_segment_path(&root, 0);
         let len = std::fs::metadata(&path).unwrap().len();
         OpenOptions::new().write(true).open(&path).unwrap().set_len(len - 13).unwrap();
         let proofs = load_applied_batch_proofs(&root).unwrap();

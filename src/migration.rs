@@ -224,6 +224,55 @@ pub fn export_category(
     CategoryExport { engines, positions, halted, command_ids }
 }
 
+/// Whether an exported category state is safe to install: every instrument
+/// in `category` and listed once; every order and stop with a non-zero id
+/// unique across the category, on its engine's instrument, and with
+/// `0 < remaining <= quantity <= MAX_ORDER_QTY`; positions within the
+/// category and bounded. The engine asserts these when it rebuilds a book,
+/// and an install is a committed entry: a bad one would crash every replica
+/// on every replay.
+pub fn validate_category_state(
+    engines: &[crate::snapshot::EngineState],
+    positions: &[(u64, u32, i64)],
+    category: u32,
+    category_size: u32,
+) -> Result<(), String> {
+    use crate::exchange::MAX_ORDER_QTY;
+    let in_category = |instrument: InstrumentId| asset_category(instrument, category_size) == category;
+    let mut instruments = std::collections::HashSet::new();
+    let mut ids = std::collections::HashSet::new();
+    let check = |order: &crate::order::Order, engine: InstrumentId, ids: &mut std::collections::HashSet<u64>| {
+        if order.id.0 == 0 || !ids.insert(order.id.0) {
+            return Err(format!("order id {} is zero or repeated", order.id.0));
+        }
+        if order.instrument != engine {
+            return Err(format!("order {} is on {} inside {}'s book", order.id.0, order.instrument.0, engine.0));
+        }
+        if order.remaining == 0 || order.remaining > order.quantity || order.quantity > MAX_ORDER_QTY {
+            return Err(format!("order {} has an invalid quantity", order.id.0));
+        }
+        Ok(())
+    };
+    for state in engines {
+        if !in_category(state.instrument) || !instruments.insert(state.instrument) {
+            return Err(format!("instrument {} is outside the category or repeated", state.instrument.0));
+        }
+        for order in &state.orders {
+            check(order, state.instrument, &mut ids)?;
+        }
+        for stop in &state.stops {
+            check(&stop.order, state.instrument, &mut ids)?;
+        }
+    }
+    let bound = (MAX_ORDER_QTY as i64).saturating_mul(1 << 20);
+    for &(_, instrument, quantity) in positions {
+        if !in_category(InstrumentId(instrument)) || quantity.unsigned_abs() > bound as u64 {
+            return Err(format!("position on {instrument} is outside the category or out of range"));
+        }
+    }
+    Ok(())
+}
+
 /// What a migration moves: see [`export_category`].
 pub struct CategoryExport {
     pub engines: Vec<crate::snapshot::EngineState>,
@@ -321,6 +370,21 @@ pub fn fetch_category_fingerprint(
     })
 }
 
+/// `TcpStream::connect` with a timeout, for a `host:port`: a powered-off or
+/// blackholed host otherwise holds the caller for the kernel's SYN retries
+/// (about two minutes on Linux) per attempt.
+pub fn connect_timeout(addr: &str, timeout: Duration) -> io::Result<TcpStream> {
+    use std::net::ToSocketAddrs;
+    let mut last = io::Error::new(io::ErrorKind::NotFound, format!("{addr}: no address"));
+    for resolved in addr.to_socket_addrs()? {
+        match TcpStream::connect_timeout(&resolved, timeout) {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last = error,
+        }
+    }
+    Err(last)
+}
+
 /// Minimal dependency-free HTTP/1.1 GET returning `(status_code, body)`.
 ///
 /// Tolerates a connection reset *after* bytes arrive: a `Connection: close`
@@ -329,7 +393,7 @@ pub fn fetch_category_fingerprint(
 /// response is already in hand. Only an error with no bytes received is fatal.
 /// Minimal blocking `GET` returning (status, body), for node-to-node admin calls.
 pub fn http_get(addr: &str, path: &str, timeout: Duration) -> io::Result<(u16, String)> {
-    let mut stream = TcpStream::connect(addr)?;
+    let mut stream = connect_timeout(addr, timeout)?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
     // One write: `write!` on an unbuffered stream issues a write per
