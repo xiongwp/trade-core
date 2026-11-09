@@ -824,9 +824,9 @@ fn test_backpressure(
         topic_count: 1,
         partitions_per_topic: partitions as u32,
         routes: trade_core::cluster::RouteControlPlane::new(groups.max(1), HashMap::new()),
-        mysql_lag: (0..partitions).map(|_| AtomicU64::new(0)).collect(),
+        mysql_lag: AtomicU64::new(0),
         match_lag: (0..partitions).map(|_| AtomicU64::new(0)).collect(),
-        group_unhealthy: (0..groups).map(|_| AtomicBool::new(false)).collect(),
+        group_unhealthy: (0..groups).map(|_| AtomicU64::new(0)).collect(),
         soft_events: AtomicU64::new(0),
         hard_events: AtomicU64::new(0),
         emergency_events: AtomicU64::new(0),
@@ -854,19 +854,23 @@ fn backpressure_tiers_climb_by_threshold_and_recover() {
 
 #[test]
 fn backpressure_is_isolated_per_category_and_takes_group_max() {
-    // 4 partitions; category N maps to partition N (topic_count 1).
+    // 4 order partitions; category N maps to partition N (topic_count 1).
     let bp = test_backpressure(100, 250, 750, 4, 2);
-    // A hot partition 0 only throttles categories on it.
-    bp.set_partition_lags("mysql", &[300, 0, 0, 0]);
+    // A hot order partition only throttles the categories on it.
+    bp.set_partition_lags("match", &[300, 0, 0, 0]);
     assert_eq!(bp.tier_for_category(0), BackpressureTier::Hard);
     assert_eq!(bp.tier_for_category(1), BackpressureTier::Normal);
     assert_eq!(bp.tier_for_category(4), BackpressureTier::Hard); // 4 -> partition 0
-                                                                 // Match-group lag on partition 1 dominates via max().
-    bp.set_partition_lags("match", &[0, 800, 0, 0]);
-    assert_eq!(bp.tier_for_category(1), BackpressureTier::Emergency);
-    // Drain both groups -> everything recovers to normal.
-    bp.set_partition_lags("mysql", &[0, 0, 0, 0]);
+    // MySQL lag is per database, and every category writes to every
+    // database: one slow database throttles every category.
     bp.set_partition_lags("match", &[0, 0, 0, 0]);
+    bp.set_partition_lags("mysql", &[0, 0, 800, 0, 0, 0]);
+    for category in 0..4 {
+        assert_eq!(bp.tier_for_category(category), BackpressureTier::Emergency);
+    }
+    assert_eq!(bp.max_partition_lag(), 800);
+    // Drain both -> everything recovers to normal.
+    bp.set_partition_lags("mysql", &[0, 0, 0, 0, 0, 0]);
     assert_eq!(bp.tier_for_category(0), BackpressureTier::Normal);
     assert_eq!(bp.tier_for_category(1), BackpressureTier::Normal);
 }

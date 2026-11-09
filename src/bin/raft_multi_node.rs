@@ -142,11 +142,17 @@ extern "C" fn on_signal(_sig: libc::c_int) {
 /// Delay before restarting a child that exited with `code` after running for
 /// `ran`, given `restarts` recent consecutive restarts. A clean exit (0) is a
 /// deliberate restart — e.g. after installing a Raft snapshot — and comes back
-/// at once; a crash backs off 1 s, 2 s, 4 s ... up to 30 s, and the streak
+/// at once unless it keeps repeating; a crash backs off 1 s, 2 s, 4 s ... up to 30 s, and the streak
 /// resets once a child has stayed up for a minute. A config mismatch (78)
 /// waits the maximum: it will not fix itself.
 fn restart_delay(code: Option<i32>, ran: Duration, restarts: u32) -> Duration {
     match code {
+        // A clean exit that keeps repeating (a follower that is sent a new
+        // snapshot on every start, or a child stopped from outside) backs off
+        // like a crash instead of respawning ten times a second.
+        Some(0) if ran < Duration::from_secs(60) && restarts >= 3 => {
+            Duration::from_secs(1u64 << (restarts - 2).min(5)).min(Duration::from_secs(30))
+        }
         Some(0) => Duration::from_millis(100),
         Some(78) => Duration::from_secs(30),
         _ if ran >= Duration::from_secs(60) => Duration::from_secs(1),
@@ -479,7 +485,9 @@ mod tests {
     #[test]
     fn restarts_back_off_and_a_clean_exit_comes_back_at_once() {
         let short = Duration::from_secs(1);
-        assert_eq!(restart_delay(Some(0), short, 9), Duration::from_millis(100));
+        assert_eq!(restart_delay(Some(0), short, 0), Duration::from_millis(100));
+        assert_eq!(restart_delay(Some(0), short, 9), Duration::from_secs(30), "a clean-exit loop backs off");
+        assert_eq!(restart_delay(Some(0), Duration::from_secs(90), 9), Duration::from_millis(100));
         assert_eq!(restart_delay(Some(101), short, 0), Duration::from_secs(1));
         assert_eq!(restart_delay(Some(101), short, 3), Duration::from_secs(8));
         assert_eq!(restart_delay(None, short, 20), Duration::from_secs(30));

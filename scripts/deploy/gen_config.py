@@ -18,6 +18,8 @@ inventory.json:
   "projection_hosts": ["pj01", ...],               # order-api DB workers
   "ingress_hosts":    ["in01", ...],               # order-api intake
   "push_hosts":       ["ps01", ...],               # user-stream (optional)
+  "route_version":    1,                           # bump with any change below
+  "virtual_db_count": 400000,                      # fixed for the life of the data
   "kafka_brokers":    ["kf01:9092", ...]
 }
 
@@ -60,6 +62,24 @@ def main(inventory_path, out_dir):
     brokers = ",".join(inv["kafka_brokers"])
     pw = "${" + inv.get("mysql_password_env", "MYSQL_PASSWORD") + "}"
 
+    # The order -> DB/table mapping depends on these; changing any of them
+    # (or the DB count) moves orders between databases, so it needs a new
+    # route version. Keep the virtual space fixed across expansions: set it
+    # once in the inventory (>= 1000 x the largest DB count planned).
+    route_version = inv.get("route_version", 1)
+    virtual_dbs = inv.get("virtual_db_count", db_count * 1000)
+    assert virtual_dbs >= db_count * 1000, "virtual_db_count must be >= 1000 x the DB count"
+    state_path = os.path.join(out_dir, "routing.json")
+    if os.path.exists(state_path):
+        previous = json.load(open(state_path))
+        changed = (previous["db_count"], previous["virtual_db_count"]) != (db_count, virtual_dbs)
+        assert not changed or previous["route_version"] != route_version, (
+            f"routing changed ({previous} -> db_count={db_count}, virtual_db_count={virtual_dbs}) "
+            "without a new route_version in the inventory"
+        )
+    json.dump({"db_count": db_count, "virtual_db_count": virtual_dbs, "route_version": route_version},
+              open(state_path, "w"))
+
     # Globally identical routing/determinism parameters.
     common = {
         "TC_DB_COUNT": db_count,
@@ -67,9 +87,9 @@ def main(inventory_path, out_dir):
         # >= 1000 virtual DBs per physical DB keeps the hottest DB within ~10%
         # of the average (1000 total for 400 DBs left some DBs empty and one
         # at 2.8x the average).
-        "TC_VIRTUAL_DB_COUNT": db_count * 1000,
-        "TC_VIRTUAL_TABLE_COUNT": db_count * 10000,
-        "TC_SHARD_ROUTE_VERSION": 1,
+        "TC_VIRTUAL_DB_COUNT": virtual_dbs,
+        "TC_VIRTUAL_TABLE_COUNT": virtual_dbs * 10,
+        "TC_SHARD_ROUTE_VERSION": route_version,
         "TC_ORDER_CATEGORY_SIZE": 1,
         "TC_EXECUTION_KAFKA_PARTITIONS": db_count,
         "TC_ORDER_DB_KAFKA_PARTITIONS": db_count,
@@ -165,6 +185,14 @@ def main(inventory_path, out_dir):
         "TC_ORDER_QUERY_ENABLED": "true",
     }
 
+    # Raft ports of groups >= 10 (40000 + 10g + n) sit inside Linux's default
+    # ephemeral range: reserve them, or an outbound socket can take one and a
+    # restarted raft-node fails to bind. Install on every matching host:
+    #   cp out/sysctl-raft.conf /etc/sysctl.d/90-trade-core.conf && sysctl --system
+    if groups > 10:
+        top = raft_port(groups - 1, replicas)
+        with open(os.path.join(out_dir, "sysctl-raft.conf"), "w") as f:
+            f.write(f"net.ipv4.ip_local_reserved_ports = 40000-{top}\n")
     for host in raft_hosts:
         write(host, {
             **raft_defaults,

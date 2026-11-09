@@ -63,7 +63,7 @@ python3 scripts/deploy/gen_config.py inventory.json out/
 | `TC_TABLES_PER_DB` | 100 | 每个库的订单分表数 |
 | `TC_VIRTUAL_DB_COUNT` | **400000** | **每个物理库至少 1,000 个逻辑库**，见下表 |
 | `TC_VIRTUAL_TABLE_COUNT` | 4000000 | 必须是 `TC_VIRTUAL_DB_COUNT` 的整数倍 |
-| `TC_SHARD_ROUTE_VERSION` | 1 | 路由版本 |
+| `TC_SHARD_ROUTE_VERSION` | 1 | 路由版本。库数或逻辑库数一变，订单所在的库就变了，必须同时升级这个版本号；配置脚本发现库数变了而版本号没变会直接报错（在 `inventory.json` 里设 `route_version`、`virtual_db_count`） |
 | `TC_ORDER_CATEGORY_SIZE` | **1** | 每个交易对单独成为一个品种，路由、迁移、负载均衡都以它为单位；order-api 和 raft-node 必须相同 |
 | `TC_EXECUTION_KAFKA_PARTITIONS` | **400** | 等于 `TC_DB_COUNT`，每个库对应一个分区 |
 | `TC_ORDER_DB_KAFKA_PARTITIONS` | **400** | 同上 |
@@ -83,6 +83,12 @@ python3 scripts/deploy/gen_config.py inventory.json out/
 ## 6. 撮合层（16 台）
 
 ### 6.1 启动
+
+**先预留端口**：10 号以后的组用 `40000+10g+n` 端口，落在 Linux 默认的临时端口范围内，可能被别的出站连接占用，导致 raft-node 重启时绑定失败。每台撮合机安装配置脚本生成的 `out/sysctl-raft.conf`：
+
+```bash
+cp out/sysctl-raft.conf /etc/sysctl.d/90-trade-core.conf && sysctl --system
+```
 
 ```bash
 # 每台撮合机：加载 out/<主机名>.env，然后
@@ -136,7 +142,7 @@ raft-multi-node 1 64 /data
 | `TC_RAFT_GROUP_MATCHERS` | 由脚本生成 | 每组所有副本的"收单地址@管理地址" |
 | `TC_RAFT_PACK_SIZE` | 5000 | 每个 Raft 条目最多打包的指令数 |
 | `TC_RAFT_FORWARD_QUEUE` | 64 | 每组转发队列长度，满了会对 Kafka 消费形成背压 |
-| `TC_RAFT_MATCHER_IO_TIMEOUT_MS` | 5000 | 转发超时 |
+| `TC_RAFT_MATCHER_IO_TIMEOUT_MS` | 5000 | 转发超时。必须大于撮合节点的等待时间之和（等 leader 1 秒 + 等提交 3.5 秒），否则接入机会在撮合节点答复前放弃并重发同一批指令 |
 | `TC_WS_MAX_BATCH` | 5000 | WebSocket 每条消息最多订单数 |
 | `TC_ORDER_KAFKA_LINGER_MS` | 1 | 写指令 topic 时 producer 的攒批时间 |
 | `TC_ORDER_KAFKA_BATCH_MESSAGES` | 10000 | 每批最多条数 |

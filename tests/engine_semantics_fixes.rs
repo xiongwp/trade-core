@@ -183,3 +183,22 @@ fn a_liquidation_flattens_a_suspended_user_beyond_the_order_caps() {
     let out = run(&mut p, limit(9, 20, Side::Sell, 99, 1));
     assert_eq!(rejected_reason(&out), Some("user-suspended"));
 }
+
+#[test]
+fn malformed_orders_are_rejected_not_panicked_on() {
+    let mut p = processor();
+    // Order id 0 twice: used to bypass the duplicate checks and then trip the
+    // book's uniqueness assertion.
+    assert_eq!(rejected_reason(&run(&mut p, limit(0, 10, Side::Buy, 90, 1))), Some("invalid-order-id"));
+    assert_eq!(rejected_reason(&run(&mut p, limit(0, 10, Side::Buy, 91, 1))), Some("invalid-order-id"));
+    // A quantity whose level total would overflow.
+    assert_eq!(rejected_reason(&run(&mut p, limit(1, 10, Side::Sell, 100, u64::MAX))), Some("max-qty"));
+    run(&mut p, limit(2, 10, Side::Sell, 100, trade_core::exchange::MAX_ORDER_QTY));
+    run(&mut p, limit(3, 11, Side::Sell, 100, trade_core::exchange::MAX_ORDER_QTY));
+    let out = run(&mut p, modify(4, 3, 100, u64::MAX));
+    assert_eq!(rejected_reason(&out), Some("max-qty"));
+    // A market order cannot carry a budget.
+    let mut budget = Order::market(OrderId(5), Side::Buy, 5).on(SYM).by(12);
+    budget.tif = TimeInForce::IocBudget;
+    assert_eq!(rejected_reason(&run(&mut p, Command::New(budget))), Some("invalid-tif"));
+}

@@ -21,7 +21,7 @@
 //! change, only where the bytes come from.
 
 use std::io::{self, Read, Write};
-use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{TcpListener, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -34,16 +34,36 @@ const COMMITTED_BATCH_MAGIC: [u8; 4] = *b"TCB1";
 
 /// Market-data fanout: subscribers connected on a side port each receive a copy
 /// of every execution-report frame (write-only feed — e.g. a candle/K-line
-/// service). Dead subscribers are dropped on first failed write.
+/// service).
+///
+/// The drain thread that broadcasts is the only consumer of the matching
+/// shards' result rings, so it must never wait on a subscriber: a blocking
+/// write to one that stopped reading (paused, partitioned, or simply a peer
+/// that connected and never reads) filled the rings and parked matching on
+/// every shard. Each subscriber therefore gets its own bounded queue and
+/// writer thread; one that falls a queue behind is disconnected.
+///
+/// Frames are execution events ([`wire::EXECUTION_EVENT_LEN`] bytes) naming
+/// the Raft group, index and ordinal, so a subscriber reading every replica
+/// of a group can keep each report once (index 0: not from a Raft entry,
+/// e.g. depth, or a standalone exchange).
 #[derive(Clone, Default)]
 pub struct MdFanout {
-    subs: Arc<Mutex<Vec<TcpStream>>>,
+    subs: Arc<Mutex<Vec<std::sync::mpsc::SyncSender<Arc<[u8]>>>>>,
+    group: u32,
 }
+
+/// Broadcast chunks a subscriber may lag behind before it is dropped.
+const MD_SUBSCRIBER_QUEUE: usize = 4096;
+/// Most market-data subscribers per node.
+const MD_MAX_SUBSCRIBERS: usize = 64;
+/// A write that makes no progress for this long means a dead subscriber.
+const MD_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl MdFanout {
     /// Accept subscriber connections on `listener` in a background thread.
-    pub fn accept_on(listener: TcpListener, running: Arc<AtomicBool>) -> MdFanout {
-        let fanout = MdFanout::default();
+    pub fn accept_on(listener: TcpListener, running: Arc<AtomicBool>, group: u32) -> MdFanout {
+        let fanout = MdFanout { group, ..MdFanout::default() };
         let subs = fanout.subs.clone();
         thread::Builder::new()
             .name("md-accept".into())
@@ -52,10 +72,28 @@ impl MdFanout {
                     if !running.load(Ordering::Acquire) {
                         break;
                     }
-                    if let Ok(s) = stream {
-                        s.set_nodelay(true).ok();
+                    let Ok(mut stream) = stream else {
+                        thread::sleep(Duration::from_millis(50)); // e.g. out of fds
+                        continue;
+                    };
+                    if subs.lock().unwrap().len() >= MD_MAX_SUBSCRIBERS {
+                        crate::log_warn!("gateway", "event=md_subscriber_refused reason=limit");
+                        continue;
+                    }
+                    stream.set_nodelay(true).ok();
+                    stream.set_write_timeout(Some(MD_WRITE_TIMEOUT)).ok();
+                    let (tx, rx) = std::sync::mpsc::sync_channel::<Arc<[u8]>>(MD_SUBSCRIBER_QUEUE);
+                    let spawned = thread::Builder::new().name("md-subscriber".into()).spawn(move || {
+                        for chunk in rx {
+                            if stream.write_all(&chunk).is_err() {
+                                break;
+                            }
+                        }
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                    });
+                    if spawned.is_ok() {
                         crate::log_info!("gateway", "market-data subscriber connected");
-                        subs.lock().unwrap().push(s);
+                        subs.lock().unwrap().push(tx);
                     }
                 }
             })
@@ -63,10 +101,28 @@ impl MdFanout {
         fanout
     }
 
-    /// Broadcast a batch of report frames to every subscriber.
+    /// Append one report as a fanout frame to `out`.
+    fn encode(&self, raft_index: Option<u64>, ordinal: u32, report: &crate::exchange::ExecReport, out: &mut Vec<u8>) {
+        let mut frame = [0u8; wire::EXECUTION_EVENT_LEN];
+        wire::encode_execution_event(self.group, raft_index.unwrap_or(0), ordinal, report, &mut frame);
+        out.extend_from_slice(&frame);
+    }
+
+    /// Queue a batch of fanout frames for every subscriber; never blocks.
     fn broadcast(&self, bytes: &[u8]) {
         let mut subs = self.subs.lock().unwrap();
-        subs.retain_mut(|s| s.write_all(bytes).is_ok());
+        if subs.is_empty() {
+            return;
+        }
+        let chunk: Arc<[u8]> = bytes.into();
+        subs.retain(|tx| match tx.try_send(chunk.clone()) {
+            Ok(()) => true,
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                crate::log_warn!("gateway", "event=md_subscriber_dropped reason=slow");
+                false // dropping the sender ends its writer thread
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
+        });
     }
 }
 
@@ -144,6 +200,7 @@ pub fn serve_forever(
     serve_committed_forever(
         listener,
         md_listener,
+        0,
         sink,
         running,
         max_cmds_per_sec,
@@ -189,6 +246,7 @@ where
 pub fn serve_committed_forever<F, R>(
     listener: TcpListener,
     md_listener: Option<TcpListener>,
+    md_group: u32,
     sink: ResultSink,
     running: Arc<AtomicBool>,
     max_cmds_per_sec: u64,
@@ -205,7 +263,7 @@ where
             "market-data fanout on {}",
             l.local_addr().unwrap()
         );
-        MdFanout::accept_on(l, running.clone())
+        MdFanout::accept_on(l, running.clone(), md_group)
     });
     let report_running = running.clone();
     let report_callback = Arc::new(report_callback);
@@ -216,12 +274,31 @@ where
     let submit = Arc::new(submit);
     let local = listener.local_addr()?;
     crate::log_info!("gateway", "committed ingress listening on {local}");
+    let sessions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     while running.load(Ordering::Acquire) {
-        let (stream, peer) = listener.accept()?;
+        // A failed accept (out of fds, an aborted handshake) is transient:
+        // it must not take the matching node down.
+        let (stream, peer) = match listener.accept() {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                crate::log_warn!("gateway", "event=accept_failed error={error}");
+                thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+        };
+        if sessions.load(Ordering::Acquire) >= MAX_COMMITTED_SESSIONS {
+            crate::log_warn!("gateway", "event=session_refused peer={peer} reason=limit");
+            continue;
+        }
         stream.set_nodelay(true).ok();
+        // A peer that vanished without a FIN (crashed host, partition) would
+        // otherwise hold its thread and fd forever; live clients reconnect.
+        stream.set_read_timeout(Some(SESSION_IDLE_TIMEOUT)).ok();
         let session_running = running.clone();
         let session_submit = submit.clone();
-        thread::spawn(move || {
+        let done = sessions.clone();
+        sessions.fetch_add(1, Ordering::AcqRel);
+        let spawned = thread::Builder::new().name("committed-session".into()).spawn(move || {
             crate::log_info!("gateway", "committed client connected from {peer}");
             if let Err(error) = read_loop_ack(
                 stream,
@@ -231,7 +308,11 @@ where
             ) {
                 crate::log_warn!("gateway", "committed client {peer} disconnected: {error}");
             }
+            done.fetch_sub(1, Ordering::AcqRel);
         });
+        if spawned.is_err() {
+            sessions.fetch_sub(1, Ordering::AcqRel);
+        }
     }
     Ok(())
 }
@@ -276,7 +357,7 @@ where
             "market-data fanout on {}",
             l.local_addr().unwrap()
         );
-        MdFanout::accept_on(l, running.clone())
+        MdFanout::accept_on(l, running.clone(), 0)
     });
     serve_one_with_fanout(listener, fanout, sink, running, max_cmds_per_sec, submit)
 }
@@ -466,12 +547,17 @@ fn report_writer<S: Write>(
     running: Arc<AtomicBool>,
 ) -> ResultSink {
     let mut out: Vec<u8> = Vec::with_capacity(REPORT_LEN * 256);
+    let mut md: Vec<u8> = Vec::new();
     loop {
         out.clear();
+        md.clear();
         sink.poll(|report| {
             let mut frame = [0u8; REPORT_LEN];
             wire::encode_report(&report, &mut frame);
             out.extend_from_slice(&frame);
+            if let Some(f) = &fanout {
+                f.encode(None, 0, &report, &mut md);
+            }
         });
 
         if out.is_empty() {
@@ -483,7 +569,7 @@ fn report_writer<S: Write>(
             continue;
         }
         if let Some(f) = &fanout {
-            f.broadcast(&out);
+            f.broadcast(&md);
         }
         if stream.write_all(&out).is_err() {
             break;
@@ -493,6 +579,11 @@ fn report_writer<S: Write>(
     sink
 }
 
+/// Most concurrent committed-ingress sessions (order-api forwarders).
+const MAX_COMMITTED_SESSIONS: usize = 256;
+/// A session silent for this long is closed (its client reconnects).
+const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
 fn report_fanout_drain(
     sink: ResultSink,
     fanout: Option<MdFanout>,
@@ -500,22 +591,30 @@ fn report_fanout_drain(
     report_callback: Arc<dyn Fn(&crate::exchange::ExecutionReportEvent) + Send + Sync>,
 ) -> ResultSink {
     let mut out: Vec<u8> = Vec::with_capacity(REPORT_LEN * 256);
+    // Once stopping, keep draining until the shards have gone quiet: they
+    // finish their queued batches during shutdown, and with nobody emptying
+    // the result rings they would park forever and the join would hang.
+    let mut quiet_since: Option<std::time::Instant> = None;
     loop {
         out.clear();
         sink.poll_events(|event| {
             report_callback(&event);
-            let mut frame = [0u8; REPORT_LEN];
-            wire::encode_report(&event.report, &mut frame);
-            out.extend_from_slice(&frame);
+            if let Some(f) = &fanout {
+                f.encode(event.raft_index, event.ordinal, &event.report, &mut out);
+            }
         });
 
         if out.is_empty() {
             if !running.load(Ordering::Acquire) {
-                break;
+                let since = *quiet_since.get_or_insert_with(std::time::Instant::now);
+                if since.elapsed() >= Duration::from_secs(2) {
+                    break;
+                }
             }
             thread::sleep(Duration::from_micros(100));
             continue;
         }
+        quiet_since = None;
         if let Some(f) = &fanout {
             f.broadcast(&out);
         }

@@ -91,6 +91,12 @@ pub(crate) fn order_from_query(query: &str) -> Result<Order, String> {
     };
     let order_id = OrderId(required(query, "order_id")?);
     let qty = required(query, "qty")?;
+    if order_id.0 == 0 {
+        return Err("order_id must be non-zero".into());
+    }
+    if qty == 0 || qty > trade_core::exchange::MAX_ORDER_QTY {
+        return Err(format!("qty must be 1..={}", trade_core::exchange::MAX_ORDER_QTY));
+    }
     let mut order = match query_param(query, "type") {
         None | Some("limit") => Order::limit(order_id, side, required(query, "price")?, qty),
         Some("market") => Order::market(order_id, side, qty),
@@ -286,6 +292,12 @@ impl KafkaIngress {
             .set(
                 "queue.buffering.max.kbytes",
                 env_number("TC_ORDER_KAFKA_QUEUE_KBYTES", 1_048_576usize).to_string(),
+            )
+            // librdkafka's default (100k messages) is reached by 20 in-flight
+            // 5,000-order batches long before the byte limit above.
+            .set(
+                "queue.buffering.max.messages",
+                env_number("TC_ORDER_KAFKA_QUEUE_MESSAGES", 2_000_000usize).to_string(),
             );
         let producer = producer_config
             .create::<FutureProducer>()
@@ -580,6 +592,13 @@ pub(crate) fn decode_batch(body: &[u8], category_size: u32) -> Result<Vec<BatchR
         if let trade_core::Command::New(order) | trade_core::Command::NewConditional(order, _) =
             &command
         {
+            if order.id.0 == 0 || order.quantity == 0 || order.quantity > trade_core::exchange::MAX_ORDER_QTY {
+                return Err(format!(
+                    "{INVALID_REQUEST}order {} needs a non-zero id and a qty of 1..={}",
+                    order.id.0,
+                    trade_core::exchange::MAX_ORDER_QTY
+                ));
+            }
             if order.user != user {
                 return Err(format!(
                     "batch user {user} does not match order {} user {}",

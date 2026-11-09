@@ -93,7 +93,10 @@ protobuf = "2.28"
 # protocol feature set is compiled into deployed binaries.
 mysql = { version = "25", default-features = false, features = ["minimal"] }
 futures = "0.3"
-rdkafka = "0.39"
+# No tokio: every send is driven by futures::executor::block_on, and with
+# the default tokio runtime a full producer queue retried through
+# tokio::time::sleep, which panics outside a tokio runtime (abort in release).
+rdkafka = { version = "0.39", default-features = false, features = ["libz", "naive-runtime"] }
 libc = "0.2"
 
 [[bin]]

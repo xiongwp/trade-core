@@ -23,7 +23,7 @@
 //!   GET /api/depth?symbol=1 {"bids":[[p,q],…],"asks":[[p,q],…]}
 //!   GET /ws?symbol=1&interval=1s   WebSocket: {"candles":…,"depth":…} pushes
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -32,7 +32,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use trade_core::kline::KlineAggregator;
-use trade_core::wire::{self, REPORT_LEN, RT_DEPTH_END, RT_DEPTH_LEVEL};
+use trade_core::wire::{self, EXECUTION_EVENT_LEN, RT_DEPTH_END, RT_DEPTH_LEVEL};
 use trade_core::{log_info, log_warn, InstrumentId, Order, OrderId, Price, Qty, Side};
 
 const CHART_HTML: &str = include_str!("../../assets/kline.html");
@@ -64,9 +64,9 @@ struct Depth {
 
 #[derive(Default)]
 struct DepthStore {
-    /// Snapshot being assembled from DepthLevel frames (per instrument).
-    pending: HashMap<InstrumentId, Depth>,
-    /// Last complete snapshot (published on DepthEnd).
+    /// Last complete snapshot (published on DepthEnd). Snapshots are
+    /// assembled per feed connection: frames of two replicas' snapshots
+    /// must not mix.
     live: HashMap<InstrumentId, Depth>,
 }
 
@@ -76,51 +76,35 @@ struct State {
     /// Recent trades per instrument (newest last), bounded ring:
     /// (ts, price, qty, maker_fee, taker_fee).
     trades: HashMap<InstrumentId, TradeRing>,
-    seen_reports: ReportDeduper,
+    /// Per Raft group, the newest (raft index, ordinal) taken. Every replica
+    /// of a group sends the same reports in the same order, and a restarted
+    /// node replays its log tail: anything at or below the mark was already
+    /// counted.
+    applied: HashMap<u32, (u64, u32)>,
+    /// Newest timestamp given to a trade: candle time never goes backwards
+    /// (feed threads race for the lock; wall clocks step back).
+    last_ts: u64,
 }
 
-#[derive(Default)]
-struct ReportDeduper {
-    set: HashSet<ReportKey>,
-    order: VecDeque<ReportKey>,
-}
-
-#[derive(Clone, Copy, Hash, PartialEq, Eq)]
-struct ReportKey {
-    type_code: u8,
-    side: u8,
-    instrument: u32,
-    order_id: u64,
-    aux_id: u64,
-    price: u64,
-    qty: u64,
-    maker_fee: u64,
-    taker_fee: u64,
-}
-
-impl ReportDeduper {
-    fn insert(&mut self, r: wire::DecodedReport) -> bool {
-        let key = ReportKey {
-            type_code: r.type_code,
-            side: if r.side == Side::Buy { 0 } else { 1 },
-            instrument: r.instrument.0,
-            order_id: r.order_id.0,
-            aux_id: r.aux_id,
-            price: r.price,
-            qty: r.qty,
-            maker_fee: r.maker_fee,
-            taker_fee: r.taker_fee,
-        };
-        if !self.set.insert(key) {
+impl State {
+    /// Whether a report of `group` at (`index`, `ordinal`) is new. Index 0:
+    /// not from a Raft entry (a standalone exchange): always taken.
+    fn take(&mut self, group: u32, index: u64, ordinal: u32) -> bool {
+        if index == 0 {
+            return true;
+        }
+        let mark = self.applied.entry(group).or_insert((0, 0));
+        if (index, ordinal) <= *mark {
             return false;
         }
-        self.order.push_back(key);
-        while self.order.len() > 100_000 {
-            if let Some(old) = self.order.pop_front() {
-                self.set.remove(&old);
-            }
-        }
+        *mark = (index, ordinal);
         true
+    }
+
+    /// Whether a feed that last saw `index` of `group` is caught up with the
+    /// group (so its depth is current, not a lagging replica's).
+    fn current(&self, group: u32, index: u64) -> bool {
+        self.applied.get(&group).is_none_or(|mark| index >= mark.0)
     }
 }
 
@@ -147,6 +131,14 @@ fn feed_loop(md_addrs: String, state: Arc<Mutex<State>>) {
     }
 }
 
+/// Request line plus headers, at most.
+const MAX_REQUEST_HEAD: u64 = 16 * 1024;
+/// Concurrent HTTP/WebSocket connections.
+const MAX_CONNECTIONS: usize = 4096;
+
+/// Highest depth level accepted from a frame (the engine publishes 5).
+const MAX_DEPTH_LEVELS: usize = 64;
+
 fn feed_one(md_addr: String, state: Arc<Mutex<State>>) {
     loop {
         let mut sock = match TcpStream::connect(&md_addr) {
@@ -160,56 +152,74 @@ fn feed_one(md_addr: String, state: Arc<Mutex<State>>) {
                 continue;
             }
         };
+        // Depth arrives every 200 ms from a live node: silence means a dead
+        // connection (host gone without a FIN), so reconnect.
+        sock.set_read_timeout(Some(Duration::from_secs(10))).ok();
         log_info!("market-data", "subscribed to {md_addr}");
-        let mut buf = vec![0u8; REPORT_LEN * 512];
+        let mut buf = vec![0u8; EXECUTION_EVENT_LEN * 512];
         let mut filled = 0usize;
+        // This connection's depth snapshots in progress, and the newest Raft
+        // index it delivered (to tell whether its depth is current).
+        let mut pending: HashMap<InstrumentId, Depth> = HashMap::new();
+        let mut last_index = 0u64;
         loop {
             match sock.read(&mut buf[filled..]) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     filled += n;
                     let mut off = 0;
-                    let ts = now_sec();
                     let mut st = state.lock().unwrap();
-                    while filled - off >= REPORT_LEN {
-                        if let Some(r) = wire::decode_report(&buf[off..off + REPORT_LEN]) {
-                            if r.type_code == RT_TRADE && !st.seen_reports.insert(r) {
-                                off += REPORT_LEN;
-                                continue;
+                    let ts = now_sec().max(st.last_ts);
+                    st.last_ts = ts;
+                    while filled - off >= EXECUTION_EVENT_LEN {
+                        let frame = &buf[off..off + EXECUTION_EVENT_LEN];
+                        off += EXECUTION_EVENT_LEN;
+                        let Some(event) = wire::decode_execution_event(frame) else {
+                            continue;
+                        };
+                        let r = event.report;
+                        if event.raft_index != 0 {
+                            last_index = last_index.max(event.raft_index);
+                        }
+                        match r.type_code {
+                            RT_TRADE => {
+                                if !st.take(event.raft_group, event.raft_index, event.ordinal) {
+                                    continue;
+                                }
+                                st.agg.on_trade(r.instrument, ts, r.price, r.qty);
+                                let dq = st.trades.entry(r.instrument).or_default();
+                                dq.push_back((ts, r.price, r.qty, r.maker_fee, r.taker_fee));
+                                if dq.len() > 1000 {
+                                    dq.pop_front();
+                                }
                             }
-                            match r.type_code {
-                                RT_TRADE => {
-                                    st.agg.on_trade(r.instrument, ts, r.price, r.qty);
-                                    let dq = st.trades.entry(r.instrument).or_default();
-                                    dq.push_back((ts, r.price, r.qty, r.maker_fee, r.taker_fee));
-                                    if dq.len() > 1000 {
-                                        dq.pop_front();
-                                    }
+                            RT_DEPTH_LEVEL => {
+                                let lvl = r.aux_id as usize;
+                                if lvl >= MAX_DEPTH_LEVELS {
+                                    continue; // malformed: never index or allocate by it
                                 }
-                                RT_DEPTH_LEVEL => {
-                                    let d = st.depth.pending.entry(r.instrument).or_default();
-                                    let side = if r.side == trade_core::Side::Buy {
-                                        &mut d.bids
-                                    } else {
-                                        &mut d.asks
-                                    };
-                                    let lvl = r.aux_id as usize;
-                                    if side.len() <= lvl {
-                                        side.resize(lvl + 1, (0, 0));
-                                    }
-                                    side[lvl] = (r.price, r.qty);
+                                let d = pending.entry(r.instrument).or_default();
+                                let side = if r.side == trade_core::Side::Buy {
+                                    &mut d.bids
+                                } else {
+                                    &mut d.asks
+                                };
+                                if side.len() <= lvl {
+                                    side.resize(lvl + 1, (0, 0));
                                 }
-                                RT_DEPTH_END => {
-                                    if let Some(mut d) = st.depth.pending.remove(&r.instrument) {
+                                side[lvl] = (r.price, r.qty);
+                            }
+                            RT_DEPTH_END => {
+                                if let Some(mut d) = pending.remove(&r.instrument) {
+                                    if st.current(event.raft_group, last_index) {
                                         d.bids.truncate(r.aux_id as usize & 0xFF);
                                         d.asks.truncate((r.aux_id as usize >> 8) & 0xFF);
                                         st.depth.live.insert(r.instrument, d);
                                     }
                                 }
-                                _ => {}
                             }
+                            _ => {}
                         }
-                        off += REPORT_LEN;
                     }
                     drop(st);
                     if off > 0 {
@@ -219,7 +229,7 @@ fn feed_one(md_addr: String, state: Arc<Mutex<State>>) {
                 }
             }
         }
-        log_warn!("market-data", "feed disconnected, retrying…");
+        log_warn!("market-data", "feed {md_addr} disconnected, retrying");
     }
 }
 
@@ -368,11 +378,20 @@ fn ws_session(
         .unwrap_or(InstrumentId(1));
     let interval = query_param(query, "interval").unwrap_or("1s").to_string();
     stream.set_read_timeout(Some(Duration::from_millis(250)))?;
+    // A client that stops reading is dropped instead of pinning this thread.
+    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
 
+    let mut last_push: Option<std::time::Instant> = None;
     loop {
         if !ws_drain_client(&mut stream)? {
             return Ok(()); // client closed
         }
+        // One push per 250 ms however many frames the client sends: frames
+        // used to each trigger a full candles+depth render under the lock.
+        if last_push.is_some_and(|at| at.elapsed() < Duration::from_millis(250)) {
+            continue;
+        }
+        last_push = Some(std::time::Instant::now());
         let msg = {
             let st = state.lock().unwrap();
             format!(
@@ -407,9 +426,15 @@ fn handle_http(
     order_api: &OrderApiPool,
 ) {
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
-    let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+    stream.set_write_timeout(Some(Duration::from_secs(10))).ok();
+    let Ok(read_half) = stream.try_clone() else {
+        return; // out of file descriptors: drop this connection, not the process
+    };
+    // The request line and headers together are bounded: a client streaming
+    // bytes without a newline must not grow a buffer until allocation fails.
+    let mut reader = BufReader::new(read_half).take(MAX_REQUEST_HEAD);
     let mut line = String::new();
-    if reader.read_line(&mut line).is_err() {
+    if reader.read_line(&mut line).is_err() || !line.ends_with('\n') {
         return;
     }
     let method = line.split_whitespace().next().unwrap_or("GET");
@@ -422,7 +447,7 @@ fn handle_http(
     let mut ws_key = None;
     let mut authorization = None;
     let mut hl = String::new();
-    while reader.read_line(&mut hl).is_ok() && hl.trim() != "" {
+    while reader.read_line(&mut hl).is_ok() && hl.ends_with('\n') && hl.trim() != "" {
         if let Some((k, v)) = hl.split_once(':') {
             if k.eq_ignore_ascii_case("sec-websocket-key") {
                 ws_key = Some(v.trim().to_string());
@@ -784,7 +809,21 @@ fn main() {
                 log_info!("market-data", "loaded candle history from {}", p.display());
                 Some(a)
             }
-            Err(_) => None,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                // Keep the unreadable file for inspection; the next save
+                // would otherwise replace it.
+                let mut aside = p.as_os_str().to_owned();
+                aside.push(format!(".unreadable-{}", now_sec()));
+                let moved = std::fs::rename(p, &aside);
+                log_warn!(
+                    "market-data",
+                    "event=history_load_failed path={} error={error} moved_aside={}",
+                    p.display(),
+                    moved.is_ok()
+                );
+                None
+            }
         })
         .unwrap_or_else(|| KlineAggregator::new(2000));
 
@@ -792,7 +831,8 @@ fn main() {
         agg,
         depth: DepthStore::default(),
         trades: HashMap::new(),
-        seen_reports: ReportDeduper::default(),
+        applied: HashMap::new(),
+        last_ts: 0,
     }));
 
     // Feed thread.
@@ -810,8 +850,12 @@ fn main() {
             .name("md-persist".into())
             .spawn(move || loop {
                 std::thread::sleep(Duration::from_secs(10));
-                let st = save_state.lock().unwrap();
-                let _ = st.agg.save(&path);
+                // Encode under the lock, write and fsync after releasing it:
+                // the feed threads must not wait on the disk.
+                let bytes = save_state.lock().unwrap().agg.encode();
+                if let Err(error) = KlineAggregator::write_encoded(&path, &bytes) {
+                    log_warn!("market-data", "event=history_save_failed error={error}");
+                }
             })
             .expect("spawn persist");
         log_info!("market-data", "persisting candle history every 10s");
@@ -824,6 +868,7 @@ fn main() {
         .set_nonblocking(true)
         .expect("set http listener non-blocking");
     log_info!("market-data", "chart UI + API + WS on http://{http_addr}/");
+    let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     loop {
         if SHUTDOWN.load(Ordering::SeqCst) {
             log_info!("market-data", "shutdown signal received, draining");
@@ -831,19 +876,31 @@ fn main() {
         }
         match listener.accept() {
             Ok((stream, _)) => {
+                // One thread per connection, so bounded: past the limit (or
+                // when the OS refuses a thread) the connection is closed.
+                if connections.load(Ordering::Acquire) >= MAX_CONNECTIONS {
+                    continue;
+                }
+                stream.set_nonblocking(false).ok();
                 let state = state.clone();
                 let admin_token = admin_token.clone();
                 let trading_token = trading_token.clone();
                 let order_api = order_api_pool.clone();
-                std::thread::spawn(move || {
+                let done = connections.clone();
+                connections.fetch_add(1, Ordering::AcqRel);
+                let spawned = std::thread::Builder::new().name("md-http".into()).spawn(move || {
                     handle_http(
                         stream,
                         &state,
                         admin_token.as_deref(),
                         trading_token.as_deref(),
                         &order_api,
-                    )
+                    );
+                    done.fetch_sub(1, Ordering::AcqRel);
                 });
+                if spawned.is_err() {
+                    connections.fetch_sub(1, Ordering::AcqRel);
+                }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 // No pending connection; nap briefly and re-check SHUTDOWN.
@@ -865,6 +922,27 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_trade_counts_once_across_replicas_and_replays() {
+        let mut st = State {
+            agg: KlineAggregator::new(10),
+            depth: DepthStore::default(),
+            trades: HashMap::new(),
+            applied: HashMap::new(),
+            last_ts: 0,
+        };
+        // Replica A delivers group 3's entries 10..=12; replica B, behind,
+        // delivers 10 and 11 again; a restarted node replays 9..=12.
+        let a: Vec<bool> = [(10, 0), (10, 1), (11, 0), (12, 0)].iter().map(|&(i, o)| st.take(3, i, o)).collect();
+        assert_eq!(a, [true, true, true, true]);
+        assert!(!st.take(3, 10, 1) && !st.take(3, 11, 0), "a lagging replica's copies");
+        assert!((9..=12).all(|i| !st.take(3, i, 0)), "a replayed tail");
+        assert!(st.take(3, 13, 0) && st.take(4, 1, 0), "new entries, other groups");
+        assert!(st.take(0, 0, 0) && st.take(0, 0, 0), "not from a Raft entry: always");
+        // Depth from a feed behind the group is not current.
+        assert!(!st.current(3, 12) && st.current(3, 13) && st.current(9, 0));
+    }
 
     #[test]
     fn order_api_pool_reuses_keep_alive_connection() {

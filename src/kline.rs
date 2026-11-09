@@ -133,7 +133,9 @@ impl KlineAggregator {
             let start = bucket_start(*interval, ts_sec);
             let dq = &mut series[idx];
             match dq.back_mut() {
-                Some(c) if c.start == start => {
+                // Same bucket — or an older one (a late print): fold it into
+                // the newest candle rather than append a bucket out of order.
+                Some(c) if c.start >= start => {
                     c.high = c.high.max(price);
                     c.low = c.low.min(price);
                     c.close = price;
@@ -186,9 +188,16 @@ impl KlineAggregator {
     /// Persist all candle history **atomically** (temp file + rename), with an
     /// FNV checksum so a torn write is detected rather than loaded.
     pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
-        use std::io::Write;
+        Self::write_encoded(path, &self.encode())
+    }
+
+    /// The saved form of all candle history: cheap next to writing it, so a
+    /// caller holding a lock can encode under it and write after releasing.
+    pub fn encode(&self) -> Vec<u8> {
         let mut buf: Vec<u8> = Vec::with_capacity(1 << 16);
-        buf.extend_from_slice(b"TCK1");
+        buf.extend_from_slice(b"TCK2");
+        // The interval table is part of the layout.
+        buf.extend_from_slice(&(INTERVALS.len() as u32).to_le_bytes());
         buf.extend_from_slice(&(self.cap as u64).to_le_bytes());
         buf.extend_from_slice(&(self.series.len() as u32).to_le_bytes());
         let mut instruments: Vec<_> = self.series.keys().copied().collect();
@@ -215,21 +224,30 @@ impl KlineAggregator {
         }
         let h = crate::journal::fnv1a(&buf);
         buf.extend_from_slice(&h.to_le_bytes());
+        buf
+    }
 
+    /// Write [`encode`](Self::encode)d history atomically and durably.
+    pub fn write_encoded(path: &std::path::Path, buf: &[u8]) -> std::io::Result<()> {
+        use std::io::Write;
         let tmp = path.with_extension("tmp");
         {
             let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(&buf)?;
+            f.write_all(buf)?;
             f.sync_all()?;
         }
-        std::fs::rename(&tmp, path)
+        std::fs::rename(&tmp, path)?;
+        if let Some(dir) = path.parent() {
+            std::fs::File::open(dir)?.sync_all()?;
+        }
+        Ok(())
     }
 
     /// Load history saved by [`save`](Self::save). Corrupt/missing = `Err`.
     pub fn load(path: &std::path::Path) -> std::io::Result<Self> {
         let buf = std::fs::read(path)?;
         let bad = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, m.to_string());
-        if buf.len() < 24 || &buf[0..4] != b"TCK1" {
+        if buf.len() < 28 || &buf[0..4] != b"TCK2" {
             return Err(bad("bad magic"));
         }
         let body = buf.len() - 8;
@@ -237,10 +255,13 @@ impl KlineAggregator {
         if crate::journal::fnv1a(&buf[..body]) != stored {
             return Err(bad("checksum mismatch"));
         }
-        let cap = u64::from_le_bytes(buf[4..12].try_into().unwrap()) as usize;
-        let n_inst = u32::from_le_bytes(buf[12..16].try_into().unwrap()) as usize;
+        if u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize != INTERVALS.len() {
+            return Err(bad("saved with a different interval table"));
+        }
+        let cap = u64::from_le_bytes(buf[8..16].try_into().unwrap()) as usize;
+        let n_inst = u32::from_le_bytes(buf[16..20].try_into().unwrap()) as usize;
         let mut agg = KlineAggregator::new(cap);
-        let mut pos = 16;
+        let mut pos = 20;
         let take = |pos: &mut usize, n: usize| -> std::io::Result<()> {
             if *pos + n > body {
                 return Err(bad("truncated"));
@@ -256,7 +277,7 @@ impl KlineAggregator {
                 take(&mut pos, 4)?;
                 let n = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
                 pos += 4;
-                take(&mut pos, n * 56)?;
+                take(&mut pos, n.checked_mul(56).ok_or_else(|| bad("truncated"))?)?;
                 let mut dq = VecDeque::with_capacity(n);
                 for _ in 0..n {
                     let u = |k: usize| {

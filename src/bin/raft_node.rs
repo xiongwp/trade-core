@@ -53,7 +53,19 @@ fn install_signal_handlers() {
 struct ProposalRequest {
     commands: Vec<trade_core::Command>,
     committed: mpsc::SyncSender<u64>,
+    received: Instant,
 }
+
+/// How long the ingress waits for this node to be a ready leader, and for a
+/// proposal to commit. Together they stay under order-api's matcher IO
+/// timeout (`TC_RAFT_MATCHER_IO_TIMEOUT_MS`, 5 s), so the caller hears back
+/// before it gives up and resends the same commands elsewhere.
+const INGRESS_LEADER_WAIT: Duration = Duration::from_secs(1);
+const INGRESS_COMMIT_WAIT: Duration = Duration::from_millis(3_500);
+/// A request queued longer than this is dropped, not proposed: its caller
+/// has given up (and resent it), and proposing it much later could apply it
+/// after its id has left the dedupe windows.
+const PROPOSAL_MAX_AGE: Duration = Duration::from_secs(2);
 
 /// Bounded retry/replay deduplication for commands already committed by Raft.
 ///
@@ -83,6 +95,29 @@ impl CommittedIdWindow {
 
     fn contains(&self, id: u64) -> bool {
         self.indexes.contains_key(&id)
+    }
+
+    fn clear(&mut self) {
+        self.indexes.clear();
+        self.insertion_order.clear();
+    }
+
+    /// Note the ids of one committed entry. An unseal (a rolled-back
+    /// migration) forgets everything: commands the engine refused as
+    /// "category-moved" are in here too, and a resubmission of one must be
+    /// proposed again, not acknowledged as already committed. The engine's
+    /// own window still rejects true duplicates.
+    fn remember_entry(&mut self, commands: &[trade_core::Command], index: u64) {
+        if commands.iter().any(|command| {
+            matches!(command, trade_core::Command::Migrate(op)
+                if matches!(**op, trade_core::exchange::CategoryOp::Unseal { .. }))
+        }) {
+            self.clear();
+            return;
+        }
+        for command in commands {
+            self.remember(command.id(), index);
+        }
     }
 
     fn remember(&mut self, id: u64, index: u64) {
@@ -360,12 +395,16 @@ fn main() {
                     runtime_metrics.set_raft_enqueued_index(index);
                     continue;
                 }
-                let commands = wire::decode_raft_entry(&payload)
-                    .expect("durable committed Raft entry is not a valid command batch");
+                // Every replica holds the same bytes, so skipping an entry
+                // that does not decode is deterministic; panicking on it would
+                // crash-loop the whole group on every restart.
+                let Some(commands) = wire::decode_raft_entry(&payload) else {
+                    log_error!("raft-node", "event=undecodable_entry index={index} bytes={}; skipped", payload.len());
+                    runtime_metrics.set_raft_enqueued_index(index);
+                    continue;
+                };
                 if index <= engine_snapshot_index {
-                    for command in commands {
-                        committed_ids.remember(command.id(), index);
-                    }
+                    committed_ids.remember_entry(&commands, index);
                     runtime_metrics.set_raft_enqueued_index(index);
                     runtime_metrics.set_raft_applied_index(index);
                     continue;
@@ -373,9 +412,7 @@ fn main() {
                 // Every committed command goes to the engine, whose replicated
                 // dedupe window rejects retries identically on every replica.
                 // `committed_ids` only lets a leader skip re-proposing them.
-                for command in &commands {
-                    committed_ids.remember(command.id(), index);
-                }
+                committed_ids.remember_entry(&commands, index);
                 let apply = commands;
                 if apply.is_empty() {
                     runtime_metrics.set_raft_enqueued_index(index);
@@ -407,7 +444,17 @@ fn main() {
 
             while runtime_running.load(Ordering::Acquire) {
                 while let Ok(message) = message_rx.try_recv() {
-                    node.step(message).expect("step raft message");
+                    // Proposals only enter through this node's own intake; a
+                    // peer frame carrying one would put arbitrary bytes in
+                    // the log. Anything raft refuses (a stray or local
+                    // message type, an unknown peer) is dropped, not fatal.
+                    if message.get_msg_type() == raft::eraftpb::MessageType::MsgPropose {
+                        log_warn!("raft-node", "event=peer_proposal_dropped from={}", message.from);
+                        continue;
+                    }
+                    if let Err(error) = node.step(message) {
+                        log_warn!("raft-node", "event=step_failed error={error:?}");
+                    }
                 }
                 if let Some((index, bytes)) = node.take_installed_snapshot_with_index() {
                     runtime_accepting.store(false, Ordering::Release);
@@ -423,10 +470,12 @@ fn main() {
                         "installed matching snapshot at index {index}; restarting state machine"
                     );
                     // The live Processor cannot be replaced underneath its
-                    // lock-free shard. Stop cleanly; the supervisor restarts
-                    // this process, which loads the installed snapshot before
-                    // reopening the compacted Raft tail.
+                    // lock-free shard. Stop the whole process cleanly (the
+                    // shutdown path also wakes the ingress accept loop); the
+                    // supervisor restarts it, and it loads the installed
+                    // snapshot before reopening the compacted Raft tail.
                     runtime_running.store(false, Ordering::Release);
+                    SHUTDOWN.store(true, Ordering::SeqCst);
                     return;
                 }
                 while pending.len() < PROPOSAL_BATCH {
@@ -520,6 +569,9 @@ fn main() {
                     let mut entries = Vec::new();
                     let mut waiters = Vec::new();
                     for request in requests {
+                        if request.received.elapsed() > PROPOSAL_MAX_AGE {
+                            continue; // dropping `committed` fails the caller
+                        }
                         let committed_index = request
                             .commands
                             .iter()
@@ -591,14 +643,15 @@ fn main() {
                         runtime_metrics.set_raft_enqueued_index(index);
                         continue;
                     }
-                    let commands = wire::decode_raft_entry(&payload)
-                        .expect("committed Raft entry is not a valid command batch");
+                    let Some(commands) = wire::decode_raft_entry(&payload) else {
+                        log_error!("raft-node", "event=undecodable_entry index={index} bytes={}; skipped", payload.len());
+                        runtime_metrics.set_raft_enqueued_index(index);
+                        continue;
+                    };
                     // Every committed command goes to the engine, whose
                     // replicated dedupe window rejects retries identically on
                     // every replica (see the recovery loop above).
-                    for command in &commands {
-                        committed_ids.remember(command.id(), index);
-                    }
+                    committed_ids.remember_entry(&commands, index);
                     let apply = commands;
                     if apply.is_empty() {
                         runtime_metrics.set_raft_enqueued_index(index);
@@ -804,6 +857,10 @@ fn main() {
                 std::env::var("TC_EXECUTION_KAFKA_COMPRESSION").unwrap_or_else(|_| "lz4".into()),
             )
             .set(
+                "queue.buffering.max.messages",
+                std::env::var("TC_EXECUTION_KAFKA_QUEUE_MESSAGES").unwrap_or_else(|_| "2000000".into()),
+            )
+            .set(
                 "queue.buffering.max.kbytes",
                 std::env::var("TC_EXECUTION_KAFKA_QUEUE_KBYTES")
                     .unwrap_or_else(|_| "1048576".into()),
@@ -866,25 +923,30 @@ fn main() {
     gateway::serve_committed_forever(
         listener,
         Some(md_listener),
+        raft_group_id,
         sink,
         running.clone(),
         0,
         move |commands| {
-            while !accepting.load(Ordering::Acquire) && ingress_running.load(Ordering::Acquire) {
+            // Bounded: a batch held here while this node is not a ready
+            // leader would otherwise be proposed whenever it becomes one,
+            // possibly hours after its caller gave up and resent it.
+            let deadline = Instant::now() + INGRESS_LEADER_WAIT;
+            while !accepting.load(Ordering::Acquire) {
+                if !ingress_running.load(Ordering::Acquire) || Instant::now() >= deadline {
+                    return None;
+                }
                 thread::sleep(Duration::from_millis(2));
             }
-            if ingress_running.load(Ordering::Acquire) {
-                let (committed_tx, committed_rx) = mpsc::sync_channel(1);
-                proposal_tx
-                    .send(ProposalRequest {
-                        commands,
-                        committed: committed_tx,
-                    })
-                    .expect("raft runtime stopped");
-                committed_rx.recv_timeout(Duration::from_secs(10)).ok()
-            } else {
-                None
-            }
+            let (committed_tx, committed_rx) = mpsc::sync_channel(1);
+            proposal_tx
+                .send(ProposalRequest {
+                    commands,
+                    committed: committed_tx,
+                    received: Instant::now(),
+                })
+                .ok()?; // the runtime stopped
+            committed_rx.recv_timeout(INGRESS_COMMIT_WAIT).ok()
         },
         move |_event| {},
     )
@@ -1523,7 +1585,7 @@ fn migration_route(
 
 /// Bump when a change alters matching results for the same command log (the
 /// replicas of a group must all run builds with the same value).
-const DETERMINISM_VERSION: u32 = 20_261_109;
+const DETERMINISM_VERSION: u32 = 20_261_110;
 
 /// Fingerprint (and readable description) of everything that must be equal
 /// on every replica of a group for them to compute identical results and

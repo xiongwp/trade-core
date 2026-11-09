@@ -42,6 +42,14 @@ x-raft-environment: &raft-environment
   TC_EXECUTION_CURSOR_TOPIC: "${TC_EXECUTION_CURSOR_TOPIC:-trade-execution-outbox-cursors-v1}"
   TC_EXECUTION_CURSOR_PARTITIONS: "${TC_EXECUTION_CURSOR_PARTITIONS:-16}"
   TC_EXECUTION_CURSOR_EVERY_BATCHES: "${TC_EXECUTION_CURSOR_EVERY_BATCHES:-16}"
+  # Routing: the node places each execution event on the Kafka partition of
+  # its order's database, so these must equal order-api's (same defaults).
+  TC_EXECUTION_KAFKA_PARTITIONS: "${TC_EXECUTION_KAFKA_PARTITIONS:-16}"
+  TC_DB_COUNT: "${TC_DB_COUNT:-10}"
+  TC_TABLES_PER_DB: "${TC_TABLES_PER_DB:-100}"
+  TC_VIRTUAL_DB_COUNT: "${TC_VIRTUAL_DB_COUNT:-1000}"
+  TC_VIRTUAL_TABLE_COUNT: "${TC_VIRTUAL_TABLE_COUNT:-10000}"
+  TC_SHARD_ROUTE_VERSION: "${TC_SHARD_ROUTE_VERSION:-1}"
 
 services:
   raft-1:

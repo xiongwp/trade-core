@@ -1035,6 +1035,10 @@ pub(crate) struct RecentCommandIds {
 /// must also fit a single Raft snapshot message.
 pub const DEFAULT_COMMAND_ID_WINDOW: usize = 500_000;
 
+/// Largest quantity of one order (2^40 lots). With it a price level's total,
+/// summed in u64, and a position, in i64, stay far from overflowing.
+pub const MAX_ORDER_QTY: u64 = 1 << 40;
+
 /// Fx-style hasher for u64 ids (the default SipHash costs ~4x per lookup).
 #[derive(Default, Clone, Copy)]
 pub(crate) struct IdHasher(u64);
@@ -1743,6 +1747,15 @@ impl Processor {
                     });
                     return;
                 }
+                // The same quantity bound as a new order (see `malformed`).
+                if new_qty > MAX_ORDER_QTY {
+                    emit(ExecReport::CommandRejected {
+                        instrument,
+                        command_id: cmd_id,
+                        reason: "max-qty",
+                    });
+                    return;
+                }
                 // Trading rules apply to the amended price/size too. A refused
                 // amend leaves the order untouched: a command-level rejection.
                 if !self.specs.is_empty() {
@@ -1943,6 +1956,28 @@ impl Processor {
         self.admit_and_match(order, false, emit)
     }
 
+    /// Shape rules every order must meet before anything else looks at it
+    /// (including a liquidation close): a non-zero id (id 0 bypasses the
+    /// duplicate checks, and a second resting id 0 tripped the book's
+    /// uniqueness assertion), a bounded quantity (an unbounded one
+    /// overflowed a price level's total and flipped positions' sign), and a
+    /// budget only on a limit order (a market order's price is not a budget).
+    /// A panic here would be on a committed command: every replica would
+    /// crash on it again at each restart.
+    fn malformed(order: &Order) -> Option<&'static str> {
+        if order.id.0 == 0 {
+            Some("invalid-order-id")
+        } else if order.quantity > MAX_ORDER_QTY {
+            Some("max-qty")
+        } else if order.order_type == OrderType::Market
+            && matches!(order.tif, TimeInForce::IocBudget | TimeInForce::FokBudget)
+        {
+            Some("invalid-tif")
+        } else {
+            None
+        }
+    }
+
     /// `forced` is a liquidation close: it must flatten the position even for
     /// a suspended user, a position larger than the per-order caps, or a dust
     /// remainder below the minimum size, so it skips the user/shape gates.
@@ -1957,6 +1992,15 @@ impl Processor {
         let id = order.id;
         let user = order.user;
 
+        if let Some(reason) = Self::malformed(&order) {
+            emit(ExecReport::Rejected {
+                instrument,
+                order_id: id,
+                user,
+                reason,
+            });
+            return None;
+        }
         // Circuit breaker: a halted instrument accepts no new orders (cancels
         // and modifies still work so users can pull quotes).
         if self.halted.contains(&instrument) {
@@ -2170,6 +2214,9 @@ impl Processor {
                 reason,
             })
         };
+        if let Some(reason) = Self::malformed(&order) {
+            return reject(reason, emit);
+        }
         if self.halted.contains(&instrument) {
             return reject("halted", emit);
         }

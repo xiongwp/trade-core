@@ -35,9 +35,16 @@ pub(crate) struct Backpressure {
     /// The live routing (shared with intake): after a category migrates its
     /// quorum health must come from the group that now owns it.
     pub(crate) routes: trade_core::cluster::RouteControlPlane,
-    pub(crate) mysql_lag: Vec<AtomicU64>,
+    /// The MySQL projection's lag: the largest over the DB-route partitions.
+    /// Every category's orders spread over every database, so a database
+    /// that falls behind is everyone's lag, not one order partition's.
+    pub(crate) mysql_lag: AtomicU64,
     pub(crate) match_lag: Vec<AtomicU64>,
-    pub(crate) group_unhealthy: Vec<AtomicBool>,
+    /// Per group: until when (ms since the epoch) it counts as unhealthy
+    /// after a failed forward. It expires, so an instance that stops
+    /// forwarding to a group (its partitions moved away) does not keep
+    /// refusing that group's categories forever.
+    pub(crate) group_unhealthy: Vec<AtomicU64>,
     pub(crate) soft_events: AtomicU64,
     pub(crate) hard_events: AtomicU64,
     pub(crate) emergency_events: AtomicU64,
@@ -64,10 +71,10 @@ impl Backpressure {
             topic_count: topic_count.max(1) as u32,
             partitions_per_topic: partitions_per_topic.max(1),
             routes,
-            mysql_lag: (0..partitions).map(|_| AtomicU64::new(0)).collect(),
+            mysql_lag: AtomicU64::new(0),
             match_lag: (0..partitions).map(|_| AtomicU64::new(0)).collect(),
             group_unhealthy: (0..raft_group_count.max(1))
-                .map(|_| AtomicBool::new(false))
+                .map(|_| AtomicU64::new(0))
                 .collect(),
             soft_events: AtomicU64::new(0),
             hard_events: AtomicU64::new(0),
@@ -99,10 +106,7 @@ impl Backpressure {
     }
 
     pub(crate) fn partition_lag(&self, index: usize) -> u64 {
-        let mysql = self
-            .mysql_lag
-            .get(index)
-            .map_or(0, |v| v.load(AtomicOrdering::Acquire));
+        let mysql = self.mysql_lag.load(AtomicOrdering::Acquire);
         let matcher = self
             .match_lag
             .get(index)
@@ -111,26 +115,30 @@ impl Backpressure {
     }
 
     pub(crate) fn set_partition_lags(&self, stage: &str, lags: &[u64]) {
-        let target = match stage {
-            "mysql" => &self.mysql_lag,
-            "match" => &self.match_lag,
-            _ => return,
-        };
-        for (slot, lag) in target.iter().zip(lags.iter()) {
-            slot.store(*lag, AtomicOrdering::Release);
+        match stage {
+            "mysql" => self
+                .mysql_lag
+                .store(lags.iter().copied().max().unwrap_or(0), AtomicOrdering::Release),
+            "match" => {
+                for (slot, lag) in self.match_lag.iter().zip(lags.iter()) {
+                    slot.store(*lag, AtomicOrdering::Release);
+                }
+            }
+            _ => {}
         }
     }
 
     pub(crate) fn set_group_health(&self, group: usize, healthy: bool) {
-        if let Some(flag) = self.group_unhealthy.get(group) {
-            flag.store(!healthy, AtomicOrdering::Release);
+        if let Some(until) = self.group_unhealthy.get(group) {
+            let value = if healthy { 0 } else { now_ms() + GROUP_UNHEALTHY_MS };
+            until.store(value, AtomicOrdering::Release);
         }
     }
 
     pub(crate) fn group_unhealthy(&self, group: usize) -> bool {
         self.group_unhealthy
             .get(group)
-            .is_some_and(|flag| flag.load(AtomicOrdering::Acquire))
+            .is_some_and(|until| now_ms() < until.load(AtomicOrdering::Acquire))
     }
 
     /// Current tier for a category from its partition lag and quorum health.
@@ -173,16 +181,17 @@ impl Backpressure {
     }
 
     pub(crate) fn max_partition_lag(&self) -> u64 {
-        (0..self.mysql_lag.len())
+        (0..self.match_lag.len())
             .map(|i| self.partition_lag(i))
             .max()
             .unwrap_or(0)
+            .max(self.mysql_lag.load(AtomicOrdering::Acquire))
     }
 
     pub(crate) fn unhealthy_groups(&self) -> u64 {
         self.group_unhealthy
             .iter()
-            .filter(|flag| flag.load(AtomicOrdering::Acquire))
+            .filter(|until| now_ms() < until.load(AtomicOrdering::Acquire))
             .count() as u64
     }
 
@@ -206,4 +215,14 @@ impl Backpressure {
             self.unhealthy_groups(),
         )
     }
+}
+
+/// How long a failed forward marks its group unhealthy (a later failure
+/// renews it; a success clears it).
+const GROUP_UNHEALTHY_MS: u64 = 10_000;
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64)
 }
