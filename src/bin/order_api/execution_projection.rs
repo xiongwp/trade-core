@@ -602,19 +602,15 @@ pub(crate) fn persist_execution_shard(
         // discard it before applying any mutations.
         let period = dedupe_period(&mut tx)?;
         discard_redelivered_events(&mut tx, &db, shard_db, period)?;
-        // When every inserted event for a table was an already-processed retry
-        // (ignored above, then deleted), that table has no pending rows and the
-        // three-query drain would match nothing. Same behaviour-preserving skip
-        // as the command-projection path: probe once, drain only if non-empty.
-        for table in touched {
-            let has_pending: Option<u8> = tx
-                .query_first(format!(
-                    "SELECT 1 FROM {db}.pending_execution_events WHERE shard_table={table} LIMIT 1"
-                ))
+        // Every touched table was just staged into, so drain them all — in
+        // one round trip (an empty drain is a cheap empty range scan).
+        let drains: Vec<String> = touched
+            .into_iter()
+            .map(|table| drain_statements(&db, table, period))
+            .collect();
+        if !drains.is_empty() {
+            tx.query_drop(drains.join(";\n"))
                 .map_err(|error| error.to_string())?;
-            if has_pending.is_some() {
-                apply_pending_execution_table(&mut tx, &db, table, period)?;
-            }
         }
         tx.commit().map_err(|error| error.to_string())?;
     }
@@ -650,6 +646,18 @@ pub(crate) fn apply_pending_execution_table(
     shard_table: u32,
     period: u64,
 ) -> Result<(), String> {
+    tx.query_drop(drain_statements(db, shard_table, period))
+        .map_err(|error| error.to_string())
+}
+
+/// The four statements that drain one order table's pending events (apply
+/// to the order rows, promote to the dedupe table, write fills, delete),
+/// joined with `;` so they travel in one round trip; several tables' drains
+/// can be concatenated into one round trip too. Same statements, same order
+/// as before — only the number of client/server round trips changed (they,
+/// not the statements, bounded the execution projection: up to ~5 per order
+/// table per batch, with a batch spread over ~100 tables per database).
+pub(crate) fn drain_statements(db: &str, shard_table: u32, period: u64) -> String {
     let processed = dedupe_table(period);
     let table = format!("asset_orders_{shard_table:03}");
     // MySQL 8 window functions select the last event per order while the
@@ -658,7 +666,7 @@ pub(crate) fn apply_pending_execution_table(
     // string `\`-newline escape strips the newline *and the next line's leading
     // whitespace*, so without the trailing space keyword boundaries collapse
     // (`latest_type` + `FROM` -> `latest_typeFROM`), producing MySQL error 1064.
-    tx.query_drop(format!(
+    let mut sql = format!(
         "UPDATE {db}.{table} o INNER JOIN ( \
          SELECT target_order_id, \
                 SUM(IF(report_type={trade},event_qty,0)) trade_qty, \
@@ -686,28 +694,27 @@ pub(crate) fn apply_pending_execution_table(
         cancelled = wire::RT_CANCELLED,
         rejected = wire::RT_REJECTED,
         stop_accepted = wire::RT_STOP_ACCEPTED,
-    ))
-    .map_err(|error| error.to_string())?;
-    tx.query_drop(format!(
+    );
+    sql.push_str(";\n");
+    sql.push_str(&format!(
         "INSERT IGNORE INTO {db}.{processed} (raft_group,raft_index,report_ordinal,target_order_id,shard_table,instrument,report_type,kafka_partition,kafka_offset) \
          SELECT p.raft_group,p.raft_index,p.report_ordinal,p.target_order_id,p.shard_table,p.instrument,p.report_type,p.kafka_partition,p.kafka_offset \
          FROM {db}.pending_execution_events p INNER JOIN {db}.{table} o ON o.order_id=p.target_order_id WHERE p.shard_table={shard_table}",
-    ))
-    .map_err(|error| error.to_string())?;
+    ));
+    sql.push_str(";\n");
     // Same join as the promotion above, so a fill lands exactly when its event
     // is promoted (an event whose order row is not projected yet waits in
     // pending for both). The order row supplies user_id and side.
-    tx.query_drop(format!(
+    sql.push_str(&format!(
         "INSERT IGNORE INTO {db}.order_fills (raft_group,raft_index,report_ordinal,order_id,user_id,instrument,side,price,qty,fee,fill_role,created_at) \
          SELECT p.raft_group,p.raft_index,p.report_ordinal,p.target_order_id,o.user_id,p.instrument,o.side,p.event_price,p.event_qty,p.event_fee,p.fill_role,p.created_at \
          FROM {db}.pending_execution_events p INNER JOIN {db}.{table} o ON o.order_id=p.target_order_id \
          WHERE p.shard_table={shard_table} AND p.report_type={trade}",
         trade = wire::RT_TRADE,
-    ))
-    .map_err(|error| error.to_string())?;
-    tx.query_drop(format!(
+    ));
+    sql.push_str(";\n");
+    sql.push_str(&format!(
         "DELETE p FROM {db}.pending_execution_events p INNER JOIN {db}.{processed} e ON e.raft_group=p.raft_group AND e.raft_index=p.raft_index AND e.report_ordinal=p.report_ordinal AND e.target_order_id=p.target_order_id WHERE p.shard_table={shard_table}"
-    ))
-    .map_err(|error| error.to_string())?;
-    Ok(())
+    ));
+    sql
 }
