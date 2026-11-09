@@ -16,7 +16,9 @@ x-mysql-command: &mysql-command
   # 8.4 defaults to none; asset_orders' user/category indexes take random
   # inserts that the change buffer merges instead of reading each page.
   - --innodb-change-buffering=${TC_MYSQL_CHANGE_BUFFERING:-all}
-  - --innodb-flush-log-at-trx-commit=1
+  # 1 (default): every commit is on disk. 2 trades up to ~1 s of commits on
+  # an OS crash for far fewer fsyncs; only with replicas that cover it.
+  - --innodb-flush-log-at-trx-commit=${TC_MYSQL_FLUSH_LOG_AT_TRX_COMMIT:-1}
   - --performance-schema=OFF
   - --max-connections=${TC_MYSQL_MAX_CONNECTIONS:-100}
 
