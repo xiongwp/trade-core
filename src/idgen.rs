@@ -49,8 +49,10 @@ pub struct LeafIdGen<P: SegmentProvider> {
     step: u64,
     /// Next id to hand out.
     cursor: AtomicU64,
-    /// Exclusive end of the current segment.
-    end: AtomicU64,
+    /// Start of the current segment, which is `[start, start + step)`. One
+    /// atomic, not a (start, end) pair, so a single load yields a consistent
+    /// segment; see [`Self::next_id`].
+    start: AtomicU64,
     /// Pre-fetched next segment start (the "double buffer").
     next: Mutex<Option<u64>>,
 }
@@ -63,26 +65,38 @@ impl<P: SegmentProvider> LeafIdGen<P> {
             provider,
             step,
             cursor: AtomicU64::new(start),
-            end: AtomicU64::new(start + step),
+            start: AtomicU64::new(start),
             next: Mutex::new(None),
         }
     }
 
     /// Allocate one id. Hot path: one `fetch_add` + one load.
+    ///
+    /// The id must lie in the *current* segment, checked against both ends.
+    /// Checking only `id < end` let a thread that drew an id just past the
+    /// old segment, and then lost the CPU while another thread installed the
+    /// next one, return that id: it belongs to whichever process holds the
+    /// range in between (segments of one process are not contiguous), so two
+    /// processes issued the same id.
     pub fn next_id(&self) -> u64 {
         loop {
             let id = self.cursor.fetch_add(1, Ordering::Relaxed);
-            let end = self.end.load(Ordering::Acquire);
-            if id < end {
+            let start = self.start.load(Ordering::Acquire);
+            let end = start + self.step;
+            if id >= start && id < end {
                 // Past the half-way mark: make sure the next segment is staged.
                 if id + self.step / 2 >= end {
                     self.stage_next();
                 }
                 return id;
             }
-            // Segment exhausted: install the staged (or a fresh) segment. Only
-            // one thread wins the install; losers retry the loop.
-            self.install_next(end);
+            if id >= end {
+                // Segment exhausted: install the staged (or a fresh) segment.
+                // Only one thread wins the install; losers retry the loop.
+                self.install_next(start);
+            }
+            // `id < start`: drawn before a newer segment was installed. It
+            // belongs to no segment of this process — skip it (a gap).
         }
     }
 
@@ -94,10 +108,10 @@ impl<P: SegmentProvider> LeafIdGen<P> {
         }
     }
 
-    fn install_next(&self, exhausted_end: u64) {
+    fn install_next(&self, exhausted_start: u64) {
         let mut next = self.next.lock().unwrap();
         // Someone else may have already installed a newer segment.
-        if self.end.load(Ordering::Acquire) != exhausted_end {
+        if self.start.load(Ordering::Acquire) != exhausted_start {
             return;
         }
         let start = next
@@ -111,7 +125,7 @@ impl<P: SegmentProvider> LeafIdGen<P> {
         // `fetch_add` result unique unconditionally; overruns just become gaps,
         // the standard Leaf trade-off.
         self.cursor.fetch_max(start, Ordering::AcqRel);
-        self.end.store(start + self.step, Ordering::Release);
+        self.start.store(start, Ordering::Release);
     }
 }
 
@@ -138,6 +152,38 @@ mod tests {
             }
         }
         assert_eq!(all.len(), 8 * 50_000);
+    }
+
+    /// Two generators ("processes") drawing interleaved segments from one
+    /// allocator, many threads each, small segments so installs race often:
+    /// no id may ever be issued twice.
+    #[test]
+    fn processes_sharing_an_allocator_never_issue_the_same_id() {
+        struct Shared(Arc<MemorySegmentProvider>);
+        impl SegmentProvider for Shared {
+            fn next_segment(&self, step: u64) -> u64 {
+                self.0.next_segment(step)
+            }
+        }
+        let allocator = Arc::new(MemorySegmentProvider::starting_at(1));
+        let step = 8;
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let gen = Arc::new(LeafIdGen::new(Shared(allocator.clone()), step));
+            for _ in 0..4 {
+                let gen = gen.clone();
+                handles.push(std::thread::spawn(move || {
+                    (0..20_000).map(|_| gen.next_id()).collect::<Vec<u64>>()
+                }));
+            }
+        }
+        let mut all = HashSet::new();
+        for handle in handles {
+            for id in handle.join().unwrap() {
+                assert!(all.insert(id), "id {id} issued twice");
+            }
+        }
+        assert_eq!(all.len(), 8 * 20_000);
     }
 
     #[test]
