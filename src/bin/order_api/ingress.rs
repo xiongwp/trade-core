@@ -350,7 +350,7 @@ impl KafkaIngress {
             execution_partitions: env_number("TC_EXECUTION_KAFKA_PARTITIONS", 16u32),
             execution_group: std::env::var("TC_EXECUTION_KAFKA_MYSQL_GROUP")
                 .unwrap_or_else(|_| "trade-order-execution-mysql-v1".into()),
-            execution_consumers: env_number("TC_EXECUTION_KAFKA_MYSQL_CONSUMERS", 4usize),
+            execution_consumers: env_number("TC_EXECUTION_KAFKA_MYSQL_CONSUMERS", 8usize),
             // The public knob is per physical DB. Collect one DB-wide target
             // from every shard before dispatch, so 10 DBs × 500 rows becomes a
             // roughly 5,000-event Kafka batch and each DB commits near 500.
