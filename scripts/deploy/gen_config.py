@@ -13,6 +13,7 @@ inventory.json:
   "dbs_per_mysql":    8,                           # -> TC_DB_COUNT = hosts x this
   "mysql_password_env": "MYSQL_PASSWORD",          # referenced, never inlined
   "raft_hosts":       ["mx01", ...],               # matching machines
+  "raft_failure_domains": {"mx01":"rack-a", ...}, # required for rack-aware placement
   "raft_groups":      64,
   "replicas":         3,
   "projection_hosts": ["pj01", ...],               # order-api DB workers
@@ -99,14 +100,47 @@ def main(inventory_path, out_dir):
         "TC_EXECUTION_KAFKA_BROKERS": brokers,
     }
 
-    # Raft placement: group g's replicas on consecutive hosts starting at
-    # g mod hosts, so every host carries the same number of replicas and no
-    # host holds two replicas of one group.
+    # Raft placement. With failure domains, replicas rotate across distinct
+    # racks/AZs and each domain's assignments round-robin over its hosts. The
+    # generator refuses a topology that cannot place a group's replicas in
+    # distinct domains. Without the optional map it retains the local/dev
+    # consecutive-host behavior.
     placements = {host: [] for host in raft_hosts}
     members = {}
-    for g in range(groups):
-        hosts = [raft_hosts[(g + r) % len(raft_hosts)] for r in range(replicas)]
-        members[g] = [(node + 1, host) for node, host in enumerate(hosts)]
+    failure_domains = inv.get("raft_failure_domains")
+    if failure_domains:
+        missing = [host for host in raft_hosts if host not in failure_domains]
+        unknown = [host for host in failure_domains if host not in raft_hosts]
+        assert not missing and not unknown, (
+            f"raft_failure_domains must name exactly raft_hosts; missing={missing}, unknown={unknown}"
+        )
+        domains = []
+        hosts_by_domain = {}
+        for host in raft_hosts:
+            domain = failure_domains[host]
+            assert domain, f"empty failure domain for {host}"
+            if domain not in hosts_by_domain:
+                domains.append(domain)
+                hosts_by_domain[domain] = []
+            hosts_by_domain[domain].append(host)
+        assert len(domains) >= replicas, (
+            f"{replicas} replicas need at least {replicas} failure domains; got {len(domains)}"
+        )
+        domain_cursor = {domain: 0 for domain in domains}
+        for g in range(groups):
+            selected = [domains[(g + r) % len(domains)] for r in range(replicas)]
+            hosts = []
+            for domain in selected:
+                candidates = hosts_by_domain[domain]
+                cursor = domain_cursor[domain]
+                hosts.append(candidates[cursor % len(candidates)])
+                domain_cursor[domain] = cursor + 1
+            assert len(set(hosts)) == replicas
+            members[g] = [(node + 1, host) for node, host in enumerate(hosts)]
+    else:
+        for g in range(groups):
+            hosts = [raft_hosts[(g + r) % len(raft_hosts)] for r in range(replicas)]
+            members[g] = [(node + 1, host) for node, host in enumerate(hosts)]
     for g, nodes in members.items():
         peers = ",".join(f"{node}@{host}:{raft_port(g, node)}" for node, host in nodes)
         for node, host in nodes:
@@ -170,6 +204,10 @@ def main(inventory_path, out_dir):
         "TC_KAFKA_OFFSET_COMMIT_ASYNC": "true",
         "TC_ROUTE_CONTROL_TOPIC": "trade-route-control-v1",
         "TC_ORDER_QUERY_ENABLED": "false",
+        "TC_ORDER_MAX_CONNECTIONS": 4096,
+        "TC_ORDER_CONNECTION_IDLE_TIMEOUT_MS": 75000,
+        "TC_ORDER_WRITE_TIMEOUT_MS": 30000,
+        "TC_ORDER_HTTP_THREAD_STACK_KB": 512,
     }
     projection_defaults = {
         "TC_EXECUTION_MYSQL_BATCH_PER_DB": 500,
@@ -183,6 +221,8 @@ def main(inventory_path, out_dir):
         "TC_ORDER_DLQ_PATH": "/data/order-execution-dlq.wal",
         "TC_ORDER_COMMAND_DLQ_PATH": "/data/order-command-dlq.wal",
         "TC_ORDER_QUERY_ENABLED": "true",
+        "TC_ORDER_QUERY_DB_PARALLELISM": 4,
+        "TC_ORDER_QUERY_MAX_DB_WORKERS": 32,
     }
 
     # Raft ports of groups >= 10 (40000 + 10g + n) sit inside Linux's default
