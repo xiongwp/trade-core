@@ -1,4 +1,4 @@
-//! Bootstrap DDL: databases, order/fill/dedupe tables, index and column migrations.
+//! Bootstrap DDL: databases and target order/fill/dedupe table definitions.
 
 use super::*;
 

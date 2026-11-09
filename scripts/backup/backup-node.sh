@@ -14,9 +14,12 @@
 # crash-recoverable derived files. Readers tolerate a live `docker cp` seeing a
 # file mid-append:
 #
-#   * raft.state — authoritative consensus command WAL. Its torn tail is
-#     truncated at open. Compaction is disabled until matching-state snapshot
-#     transfer/install is atomic, so the complete replay source is retained.
+#   * raft.state — authoritative consensus WAL plus the latest compacted Raft
+#     snapshot, whose opaque payload is the matching-state snapshot at the same
+#     applied index. Its torn tail is truncated at open. Compaction occurs only
+#     after that matching snapshot is durable and the execution outbox is
+#     drained through the same index, so the snapshot plus retained WAL tail is
+#     a complete replay source.
 #   * snapshot-shard-N.bin — atomic memory snapshot with raft_applied_index,
 #     protected by an FNV footer (corrupt => startup fails closed).
 #   * journal/assets/raft-batches.applied.v2 — exact result-count/fingerprint
@@ -26,9 +29,11 @@
 #     (execution_outbox.rs truncate_after_applied); the .published.cursor is an
 #     optimization (a corrupt cursor is treated as "unpublished").
 #
-# The script copies derived files first and raft.state last. An older snapshot
-# only causes more WAL replay; it cannot create a gap because the full Raft WAL
-# remains available. An unproved outbox tail is trimmed and regenerated.
+# The script copies derived files first and raft.state last. Recovery treats the
+# compacted snapshot embedded in raft.state as authoritative and validates its
+# applied index against the copied application proof/outbox state. An unproved
+# outbox tail is trimmed and regenerated. Use --verify; for an audit-grade
+# cross-file instant, freeze the container or snapshot the volume as below.
 #
 # PRODUCTION NOTE (freezing): for an audit-grade, byte-identical replica you may
 # instead briefly `docker pause` the container around the copy (a few hundred ms

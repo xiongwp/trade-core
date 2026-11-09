@@ -524,6 +524,10 @@ pub struct RaftNode {
     /// probe mode, otherwise an optimistic heartbeat can commit beyond this
     /// member's empty log and raft-rs aborts.
     rejoining: bool,
+    /// One rejection is enough to invalidate the leader's remembered match.
+    /// Repeating it during a multi-message transfer resets progress and can
+    /// livelock a replacement after the first chunk.
+    rejoin_probe_sent: bool,
 }
 
 impl RaftNode {
@@ -621,6 +625,7 @@ impl RaftNode {
             durable,
             installed_snapshot: None,
             rejoining: false,
+            rejoin_probe_sent: false,
         })
     }
 
@@ -701,6 +706,7 @@ impl RaftNode {
     /// missing append entries or a snapshot.
     pub fn begin_rejoin(&mut self) {
         self.rejoining = true;
+        self.rejoin_probe_sent = false;
     }
 
     #[inline]
@@ -847,6 +853,12 @@ impl RaftNode {
             && message.term >= self.term()
         {
             if message.commit > self.last_index() {
+                if self.rejoin_probe_sent {
+                    // The leader is already probing/transferring the missing
+                    // prefix. Ignore optimistic heartbeats until the local end
+                    // catches up; another rejection would restart the transfer.
+                    return Ok(());
+                }
                 // The leader can still remember this member as fully matched
                 // from before its disk was replaced. A rejection index above
                 // every real log index is deliberate: in replicate mode it is
@@ -863,6 +875,7 @@ impl RaftNode {
                 rejection.reject_hint = self.last_index();
                 rejection.commit = self.commit_index();
                 self.outbound.push(rejection);
+                self.rejoin_probe_sent = true;
                 return Ok(());
             }
             // A heartbeat at or below our durable end proves the leader no
@@ -1090,6 +1103,29 @@ mod tests {
     fn follower_cannot_accept_client_commands() {
         let mut follower = node(2);
         assert_eq!(follower.propose(vec![1]), Err(ProposeError::NotLeader));
+    }
+
+    #[test]
+    fn replacement_sends_only_one_probe_rejection_for_repeated_heartbeats() {
+        let mut replacement = node(2);
+        replacement.begin_rejoin();
+        let mut heartbeat = Message::default();
+        heartbeat.set_msg_type(MessageType::MsgHeartbeat);
+        heartbeat.from = 1;
+        heartbeat.to = 2;
+        heartbeat.term = 1;
+        heartbeat.commit = 10_000;
+
+        replacement.step(heartbeat.clone()).unwrap();
+        let first = replacement.take_outbound();
+        assert_eq!(first.len(), 1);
+        assert!(first[0].reject);
+
+        // A large log takes several append messages. Heartbeats can arrive
+        // between those chunks and must not reset the leader's progress.
+        replacement.step(heartbeat).unwrap();
+        assert!(replacement.take_outbound().is_empty());
+        assert!(replacement.is_rejoining());
     }
 
     #[test]
