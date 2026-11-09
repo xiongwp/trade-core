@@ -126,25 +126,63 @@ services:
           --partitions=1 --replicas=3 \
           --topic-config cleanup.policy=compact \
           "${TC_ROUTE_CONTROL_TOPIC:-trade-route-control-v1}"
+        rpk topic create --if-not-exists --brokers=redpanda:9092 \
+          --partitions=${TC_USER_STREAM_PARTITIONS:-16} --replicas=3 \
+          "${TC_USER_STREAM_TOPIC:-trade-user-events-v1}"
     restart: "no"
 
   # Private real-time push: each user's order results (committed, fills,
   # cancels, rejects) from the execution topic, no database.
   #   ws://localhost:9300/ws/user?user=<id>  (Authorization: Bearer <token>)
+  # Sharded by user: the router re-publishes the execution topic keyed by
+  # user; each pusher serves the users of its share of that topic and sends
+  # a client of another shard there (307). Connect to either port.
+  user-stream-router:
+    image: trade-core-node
+    command: ["exec user-stream"]
+    environment: &user-stream-env
+      TC_USER_STREAM_ROLE: router
+      TC_USER_STREAM_ADDR: 0.0.0.0:9300
+      TC_USER_STREAM_TOKEN: ${TC_USER_STREAM_TOKEN:-local-order-api-token}
+      TC_USER_STREAM_TOPIC: ${TC_USER_STREAM_TOPIC:-trade-user-events-v1}
+      TC_USER_STREAM_SHARDS: 2
+      # The address clients use to reach each shard, in shard order.
+      TC_USER_STREAM_PEERS: localhost:9300,localhost:9310
+      # Per-user events kept for `since=` resumes after a reconnect, and a
+      # cap on the total kept by one pusher.
+      TC_USER_STREAM_REPLAY_EVENTS: ${TC_USER_STREAM_REPLAY_EVENTS:-512}
+      TC_USER_STREAM_REPLAY_SECS: ${TC_USER_STREAM_REPLAY_SECS:-300}
+      TC_USER_STREAM_REPLAY_MAX_TOTAL: ${TC_USER_STREAM_REPLAY_MAX_TOTAL:-2000000}
+      TC_EXECUTION_KAFKA_BROKERS: ${TC_EXECUTION_KAFKA_BROKERS:-redpanda:9092,redpanda-2:9092,redpanda-3:9092}
+      TC_EXECUTION_KAFKA_TOPIC: ${TC_EXECUTION_KAFKA_TOPIC:-trade-executions-v1}
+      TC_LOG: ${TC_LOG:-info}
+      RUST_BACKTRACE: ${RUST_BACKTRACE:-1}
+    depends_on:
+      redpanda-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
   user-stream:
     image: trade-core-node
     command: ["exec user-stream"]
     ports: ["9300:9300"]
     environment:
-      TC_USER_STREAM_ADDR: 0.0.0.0:9300
-      TC_USER_STREAM_TOKEN: ${TC_USER_STREAM_TOKEN:-local-order-api-token}
-      # Per-user events kept for `since=` resumes after a reconnect.
-      TC_USER_STREAM_REPLAY_EVENTS: ${TC_USER_STREAM_REPLAY_EVENTS:-512}
-      TC_USER_STREAM_REPLAY_SECS: ${TC_USER_STREAM_REPLAY_SECS:-300}
-      TC_EXECUTION_KAFKA_BROKERS: ${TC_EXECUTION_KAFKA_BROKERS:-redpanda:9092,redpanda-2:9092,redpanda-3:9092}
-      TC_EXECUTION_KAFKA_TOPIC: ${TC_EXECUTION_KAFKA_TOPIC:-trade-executions-v1}
-      TC_LOG: ${TC_LOG:-info}
-      RUST_BACKTRACE: ${RUST_BACKTRACE:-1}
+      <<: *user-stream-env
+      TC_USER_STREAM_ROLE: pusher
+      TC_USER_STREAM_SHARD: 0
+    depends_on:
+      redpanda-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  user-stream-2:
+    image: trade-core-node
+    command: ["exec user-stream"]
+    ports: ["9310:9300"]
+    environment:
+      <<: *user-stream-env
+      TC_USER_STREAM_ROLE: pusher
+      TC_USER_STREAM_SHARD: 1
     depends_on:
       redpanda-init:
         condition: service_completed_successfully

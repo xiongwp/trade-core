@@ -32,8 +32,9 @@ pub(crate) struct Backpressure {
     pub(crate) soft_delay: Duration,
     pub(crate) topic_count: u32,
     pub(crate) partitions_per_topic: u32,
-    pub(crate) raft_group_count: usize,
-    pub(crate) raft_group_pins: Arc<HashMap<u32, usize>>,
+    /// The live routing (shared with intake): after a category migrates its
+    /// quorum health must come from the group that now owns it.
+    pub(crate) routes: trade_core::cluster::RouteControlPlane,
     pub(crate) mysql_lag: Vec<AtomicU64>,
     pub(crate) match_lag: Vec<AtomicU64>,
     pub(crate) group_unhealthy: Vec<AtomicBool>,
@@ -47,7 +48,7 @@ impl Backpressure {
         topic_count: usize,
         partitions_per_topic: u32,
         raft_group_count: usize,
-        raft_group_pins: Arc<HashMap<u32, usize>>,
+        routes: trade_core::cluster::RouteControlPlane,
     ) -> Self {
         // Defaults express ~2 s / 5 s / 15 s of a 50k commands/s/partition
         // design load; each is overridable directly for the machine's tuning.
@@ -62,8 +63,7 @@ impl Backpressure {
             soft_delay: Duration::from_millis(env_number("TC_ORDER_BP_SOFT_DELAY_MS", 2u64)),
             topic_count: topic_count.max(1) as u32,
             partitions_per_topic: partitions_per_topic.max(1),
-            raft_group_count: raft_group_count.max(1),
-            raft_group_pins,
+            routes,
             mysql_lag: (0..partitions).map(|_| AtomicU64::new(0)).collect(),
             match_lag: (0..partitions).map(|_| AtomicU64::new(0)).collect(),
             group_unhealthy: (0..raft_group_count.max(1))
@@ -95,11 +95,7 @@ impl Backpressure {
     }
 
     pub(crate) fn raft_group(&self, category_id: u32) -> usize {
-        sharding::raft_group_for_category_pinned(
-            category_id,
-            self.raft_group_count,
-            &self.raft_group_pins,
-        )
+        self.routes.group_for(category_id)
     }
 
     pub(crate) fn partition_lag(&self, index: usize) -> u64 {

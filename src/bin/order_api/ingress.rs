@@ -291,15 +291,15 @@ impl KafkaIngress {
             .create::<FutureProducer>()
             .map_err(|error| error.to_string())?;
         let topic_count = topics.len();
+        let route_control = Arc::new(trade_core::cluster::RouteControlPlane::new(
+            raft_group_count.max(1),
+            (*raft_group_pins).clone(),
+        ));
         let backpressure = Arc::new(Backpressure::from_env(
             topic_count,
             partitions,
             raft_group_count,
-            Arc::clone(&raft_group_pins),
-        ));
-        let route_control = Arc::new(trade_core::cluster::RouteControlPlane::new(
-            raft_group_count.max(1),
-            (*raft_group_pins).clone(),
+            (*route_control).clone(),
         ));
         // Optional: group→matching-node address map enabling automatic cutover
         // verification. Absent/empty leaves the legacy behavior where an

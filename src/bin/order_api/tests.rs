@@ -908,8 +908,7 @@ fn test_backpressure(
         soft_delay: Duration::ZERO,
         topic_count: 1,
         partitions_per_topic: partitions as u32,
-        raft_group_count: groups,
-        raft_group_pins: Arc::new(HashMap::new()),
+        routes: trade_core::cluster::RouteControlPlane::new(groups.max(1), HashMap::new()),
         mysql_lag: (0..partitions).map(|_| AtomicU64::new(0)).collect(),
         match_lag: (0..partitions).map(|_| AtomicU64::new(0)).collect(),
         group_unhealthy: (0..groups).map(|_| AtomicBool::new(false)).collect(),
@@ -1665,4 +1664,16 @@ fn a_partly_published_batch_is_accepted_with_the_failed_records() {
         batch_accepted_json(3, &failed),
         r#""accepted":true,"status":"PENDING","count":3,"failed":[{"index":1,"order_id":42,"error":"Message timed out"},{"index":4,"order_id":45,"error":"a 'quoted' error"}]"#
     );
+}
+
+#[test]
+fn backpressure_follows_a_migrated_category_to_its_new_group() {
+    let bp = test_backpressure(100, 250, 750, 4, 4);
+    bp.set_group_health(1, false); // group 1 lost quorum
+    // Category 5 starts on group 1 (5 mod 4).
+    assert_eq!(bp.tier_for_category(5), BackpressureTier::Emergency);
+    // Moved to group 2 (as order-api applies a migration), it is writable.
+    bp.routes.restore_pin(5, 2);
+    assert_eq!(bp.raft_group(5), 2);
+    assert_eq!(bp.tier_for_category(5), BackpressureTier::Normal);
 }

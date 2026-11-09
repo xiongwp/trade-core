@@ -29,7 +29,7 @@
 | Kafka（Redpanda） | 15 | 32 核、128 GB、4×NVMe、2×25GbE | 3 副本，`acks=all`（Redpanda 等多数副本确认） |
 | 接入 order-api | 16 | 32 核、64 GB、25GbE | HTTP/WS 收单 + 转发撮合 + 指令路由到落库 topic |
 | 落库 order-api | 16 | 16 核、64 GB、25GbE | 每台负责 25 个库的指令写入和成交写入 |
-| 用户推送 user-stream | 16 | 16 核、64 GB、25GbE | **上线前需要先改代码，见第 10 节** |
+| 用户推送 user-stream | 16 | 16 核、64 GB、25GbE | 每台 1 个 router + 1 个 pusher 分片，见 7.5 |
 | 行情 market-data | 4 | 16 核、32 GB | K 线、深度 |
 | 运维 | 4 | 16 核、64 GB、大盘 | Prometheus、Grafana、日志 |
 
@@ -48,6 +48,7 @@ python3 scripts/deploy/gen_config.py inventory.json out/
 脚本的规则：
 - 第 g 组的 3 个副本，放在从第 `g mod 撮合机台数` 台开始的连续 3 台撮合机上。这样每台机器的副本数一样多，而且同一组的副本不会落在同一台机器上；
 - 400 个库按连续区间平均分给各台落库机；
+- 推送机（`push_hosts`）每台生成 `<主机名>-router.env` 和 `<主机名>-pusher.env` 两个文件，第 i 台是第 i 个分片；
 - 端口布局和 `raft-multi-node` 完全一致：
   - 0–9 组：Raft 端口 `7000+10g+n`，服务端口 `9001/9101/9102+10g`；
   - 10–2552 组：Raft 端口 `40000+10g+n`，服务端口 `20000+3g` 起的连续 3 个。
@@ -199,8 +200,27 @@ rpl_semi_sync_source_enabled   = 1         # 一主一从，半同步
 | `trade-executions-v1` | 400 | 成交事件，按订单号对应到库 |
 | `trade-execution-outbox-cursors-v1` | 64，压缩 topic | 各组 outbox 的发布进度 |
 | `trade-route-control-v1` | 1，压缩 topic | 品种路由和迁移状态 |
+| `trade-user-events-v1` | 256 | 推送事件，按用户哈希分区（见 7.5） |
 
 所有 topic 都是 3 副本。Redpanda 在 `acks=all` 下天然要求多数副本确认；如果改用 Apache Kafka，所有 topic 都要额外设 `min.insync.replicas=2`。
+
+### 7.5 用户推送 user-stream（16 台）
+
+每台跑两个进程，都由配置脚本生成：
+
+- **router**（`<host>-router.env`）：16 个 router 组成一个消费者组，分摊读取 `trade-executions-v1` 的 400 个分区，把每条事件原样转发到 `trade-user-events-v1`，分区 = 用户哈希 mod 256，并保留原始时间戳，所以 `since` 续传不受影响。如果单个 router 跟不上（看 `tc_user_stream_events_routed_total` 的增长速度和消费积压），每台可以再多起一个 router，消费者组会自动重新分摊分区。
+- **pusher**（`<host>-pusher.env`）：第 i 台只读 `p mod 16 == i` 的分区，只保存和推送这部分用户的事件。客户端连到不负责自己的分片时，返回 307，指向 `TC_USER_STREAM_PEERS` 里对应的地址；负载均衡也可以直接按同样的哈希把用户路由到对应分片。
+
+| 参数 | 值 | 说明 |
+|---|---|---|
+| `TC_USER_STREAM_ROLE` | router / pusher | 不设置时为单实例模式，读整个成交 topic，只适合小规模 |
+| `TC_USER_STREAM_SHARDS` / `TC_USER_STREAM_SHARD` | 16 / 0–15 | 分片总数和本分片编号。user topic 的分区数要 ≥ 分片数，最好是它的整数倍 |
+| `TC_USER_STREAM_PEERS` | 16 个 `host:9300` | 按分片顺序排列，客户端能访问到的地址，用于 307 跳转 |
+| `TC_USER_STREAM_REPLAY_EVENTS` | 512 | 每个用户保留的事件数，供断线重连补发 |
+| `TC_USER_STREAM_REPLAY_SECS` | 300 | 补发窗口 |
+| `TC_USER_STREAM_REPLAY_MAX_TOTAL` | 20,000,000 | 单个 pusher 保留的事件总数上限，按每条约 350 字节估算约 7 GB；超过时先淘汰最早的事件 |
+
+**改分片数**：分片数和 user topic 的分区数都不能在线修改，要整体重新部署推送层。router 和 pusher 必须使用同一个分区数（启动时都从 Kafka 读取，不需要单独配置）。
 
 ## 8. 品种迁移（热门品种独占一个组）
 
@@ -229,7 +249,7 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
 
 ## 10. 上线前必须完成的代码改动
 
-1. **user-stream 按用户分片**：现在每个推送实例都要读完整个成交 topic，700 万条/秒单个实例消化不了。要改成按用户哈希分片消费，或者单独建一个按用户分区的推送 topic。
+1. ~~user-stream 按用户分片~~：已完成，见 7.5。上线前用第 9 节的方法实测单个 router 每秒能转发多少条，以此决定每台起几个 router。
 2. 按第 9 节的校准结果调整 `TC_DB_COUNT` 和组数，然后重新运行配置生成脚本。
 
 ## 11. 上线步骤

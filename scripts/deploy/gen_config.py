@@ -17,11 +17,13 @@ inventory.json:
   "replicas":         3,
   "projection_hosts": ["pj01", ...],               # order-api DB workers
   "ingress_hosts":    ["in01", ...],               # order-api intake
+  "push_hosts":       ["ps01", ...],               # user-stream (optional)
   "kafka_brokers":    ["kf01:9092", ...]
 }
 
 Writes out/<host>.env for every host and out/topics.sh with the Kafka topic
-creation commands.
+creation commands. Each push host gets two files: <host>-router.env and
+<host>-pusher.env (user-stream router and pusher shard, one process each).
 """
 import json
 import os
@@ -197,6 +199,34 @@ def main(inventory_path, out_dir):
             "TC_ORDER_KAFKA_MATCH_CONSUMERS": 0,
         })
 
+    # user-stream: every push host runs one router (the routers share the
+    # execution topic as a consumer group) and one pusher shard (the users
+    # whose user-topic partition p has p mod shards == its index).
+    push_hosts = inv.get("push_hosts", [])
+    user_partitions = max(16, len(push_hosts) * 16)
+    push_common = {
+        "TC_USER_STREAM_TOPIC": "trade-user-events-v1",
+        "TC_USER_STREAM_SHARDS": len(push_hosts),
+        "TC_USER_STREAM_PEERS": ",".join(f"{host}:9300" for host in push_hosts),
+        "TC_USER_STREAM_REPLAY_EVENTS": 512,
+        "TC_USER_STREAM_REPLAY_SECS": 300,
+        "TC_USER_STREAM_REPLAY_MAX_TOTAL": 20_000_000,
+        "TC_EXECUTION_KAFKA_TOPIC": "trade-executions-v1",
+    }
+    for i, host in enumerate(push_hosts):
+        write(f"{host}-router", {
+            **push_common,
+            "TC_USER_STREAM_ROLE": "router",
+            "TC_USER_STREAM_ADDR": "0.0.0.0:9310",
+            "TC_USER_STREAM_GROUP": "user-stream-router",
+        })
+        write(f"{host}-pusher", {
+            **push_common,
+            "TC_USER_STREAM_ROLE": "pusher",
+            "TC_USER_STREAM_ADDR": "0.0.0.0:9300",
+            "TC_USER_STREAM_SHARD": i,
+        })
+
     with open(os.path.join(out_dir, "topics.sh"), "w") as f:
         # Redpanda's acks=all already waits for a majority; on Apache Kafka add
         # `-c min.insync.replicas=2` to every topic.
@@ -206,6 +236,8 @@ def main(inventory_path, out_dir):
         f.write(f"rpk topic create --brokers=$B -p {db_count} -r 3 trade-executions-v1\n")
         f.write(f"rpk topic create --brokers=$B -p {groups} -r 3 -c cleanup.policy=compact trade-execution-outbox-cursors-v1\n")
         f.write("rpk topic create --brokers=$B -p 1 -r 3 -c cleanup.policy=compact trade-route-control-v1\n")
+        if push_hosts:
+            f.write(f"rpk topic create --brokers=$B -p {user_partitions} -r 3 trade-user-events-v1\n")
     print(f"db_count={db_count} groups={groups} replicas={replicas}: wrote {out_dir}/")
 
 

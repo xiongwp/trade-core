@@ -637,15 +637,14 @@ impl LabeledHistogram {
     }
 }
 
-/// Serve `GET /metrics` on `addr` in a background thread (thread per request;
-/// scrape traffic is tiny).
 /// A route handler for requests the metrics server does not itself serve.
 /// Given the first request line (`"GET /path?query HTTP/1.1"`), it returns
 /// `Some((status, content_type, body))` if it owns that route, or `None` to
 /// fall through to the default (`/metrics`). Used by the matching node to serve
 /// route-migration fingerprint queries off the same admin port.
-pub type ExtraRoute = Box<dyn Fn(&str) -> Option<(String, String, String)> + Send>;
+pub type ExtraRoute = Box<dyn Fn(&str) -> Option<(String, String, String)> + Send + Sync>;
 
+/// Serve `GET /metrics` on `addr` in a background thread.
 pub fn serve(addr: String, metrics: Arc<Metrics>) {
     serve_with_extra(addr, metrics, None);
 }
@@ -654,6 +653,7 @@ pub fn serve(addr: String, metrics: Arc<Metrics>) {
 /// binary can register additional read-only routes without duplicating the HTTP
 /// plumbing or opening a second port.
 pub fn serve_with_extra(addr: String, metrics: Arc<Metrics>, extra: Option<ExtraRoute>) {
+    let extra: Option<Arc<ExtraRoute>> = extra.map(Arc::new);
     std::thread::Builder::new()
         .name("metrics".into())
         .spawn(move || {
@@ -662,69 +662,140 @@ pub fn serve_with_extra(addr: String, metrics: Arc<Metrics>, extra: Option<Extra
                 return;
             };
             crate::log_info!("metrics", "Prometheus on http://{addr}/metrics");
+            // One thread per connection: an extra route can be slow (a
+            // migration installs a whole category's state), and while it ran
+            // the liveness probe and scrapes queued behind it — long enough
+            // for the supervisor to restart a healthy node.
+            let in_flight = Arc::new(AtomicU64::new(0));
             for mut s in listener.incoming().flatten() {
-                // Read until the request line is complete: a client may send
-                // it in several segments, and acting on a partial line
-                // answered the wrong route and broke the client's pipe.
-                let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(2)));
-                let mut request = [0u8; 1024];
-                let mut n = 0;
-                while n < request.len() && !request[..n].contains(&b'\n') {
-                    match s.read(&mut request[n..]) {
-                        Ok(0) | Err(_) => break,
-                        Ok(read) => n += read,
-                    }
+                if in_flight.load(Ordering::Acquire) >= MAX_ADMIN_CONNECTIONS {
+                    let _ = s.write_all(
+                        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                    continue;
                 }
-                let line = std::str::from_utf8(&request[..n])
-                    .ok()
-                    .and_then(|r| r.lines().next())
-                    .unwrap_or("");
-                let (status, content_type, body) = if line.starts_with("GET /healthz ") {
-                    (
-                        "200 OK".to_string(),
-                        "text/plain".to_string(),
-                        "ok\n".to_string(),
-                    )
-                } else if line.starts_with("GET /readyz ") {
-                    if metrics.is_ready() {
-                        (
-                            "200 OK".to_string(),
-                            "text/plain".to_string(),
-                            "ready\n".to_string(),
-                        )
-                    } else {
-                        (
-                            "503 Service Unavailable".to_string(),
-                            "text/plain".to_string(),
-                            "not ready\n".to_string(),
-                        )
-                    }
-                } else if let Some(handled) = extra.as_ref().and_then(|handler| handler(line)) {
-                    handled
-                } else {
-                    (
-                        "200 OK".to_string(),
-                        "text/plain; version=0.0.4".to_string(),
-                        metrics.render(),
-                    )
-                };
-                let _ = s.write_all(
-                    format!(
-                        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\n\
-                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    )
-                    .as_bytes(),
-                );
+                in_flight.fetch_add(1, Ordering::AcqRel);
+                let (metrics, extra, done) = (metrics.clone(), extra.clone(), in_flight.clone());
+                let spawned = std::thread::Builder::new().name("admin-conn".into()).spawn(move || {
+                    serve_admin_connection(&mut s, &metrics, extra.as_deref());
+                    done.fetch_sub(1, Ordering::AcqRel);
+                });
+                if spawned.is_err() {
+                    in_flight.fetch_sub(1, Ordering::AcqRel);
+                }
             }
         })
         .expect("spawn metrics");
+}
+
+/// Concurrent admin connections; past this, new ones get 503 at once.
+const MAX_ADMIN_CONNECTIONS: u64 = 64;
+
+fn serve_admin_connection(
+    s: &mut std::net::TcpStream,
+    metrics: &Metrics,
+    extra: Option<&ExtraRoute>,
+) {
+    // Read until the request line is complete: a client may send
+    // it in several segments, and acting on a partial line
+    // answered the wrong route and broke the client's pipe.
+    let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+    let mut request = [0u8; 1024];
+    let mut n = 0;
+    while n < request.len() && !request[..n].contains(&b'\n') {
+        match s.read(&mut request[n..]) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => n += read,
+        }
+    }
+    let line = std::str::from_utf8(&request[..n])
+        .ok()
+        .and_then(|r| r.lines().next())
+        .unwrap_or("");
+    let (status, content_type, body) = if line.starts_with("GET /healthz ") {
+        (
+            "200 OK".to_string(),
+            "text/plain".to_string(),
+            "ok\n".to_string(),
+        )
+    } else if line.starts_with("GET /readyz ") {
+        if metrics.is_ready() {
+            (
+                "200 OK".to_string(),
+                "text/plain".to_string(),
+                "ready\n".to_string(),
+            )
+        } else {
+            (
+                "503 Service Unavailable".to_string(),
+                "text/plain".to_string(),
+                "not ready\n".to_string(),
+            )
+        }
+    } else if let Some(handled) = extra.as_ref().and_then(|handler| handler(line)) {
+        handled
+    } else {
+        (
+            "200 OK".to_string(),
+            "text/plain; version=0.0.4".to_string(),
+            metrics.render(),
+        )
+    };
+    let _ = s.write_all(
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .as_bytes(),
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::{InstrumentId, OrderId};
+
+    #[test]
+    fn a_slow_admin_route_does_not_hold_up_the_health_probe() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let addr = format!("127.0.0.1:{port}");
+        let slow: ExtraRoute = Box::new(|line: &str| {
+            line.starts_with("GET /slow ").then(|| {
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                ("200 OK".into(), "text/plain".into(), "done\n".into())
+            })
+        });
+        serve_with_extra(addr.clone(), Arc::new(Metrics::default()), Some(slow));
+        let get = |path: &str| -> String {
+            let mut stream = loop {
+                match std::net::TcpStream::connect(&addr) {
+                    Ok(stream) => break stream,
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                }
+            };
+            stream.write_all(format!("GET {path} HTTP/1.1\r\n\r\n").as_bytes()).unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            response
+        };
+        let slow_request = {
+            let get_slow = { let addr = addr.clone(); move || {
+                let mut stream = std::net::TcpStream::connect(&addr).unwrap();
+                stream.write_all(b"GET /slow HTTP/1.1\r\n\r\n").unwrap();
+                let mut response = String::new();
+                stream.read_to_string(&mut response).unwrap();
+                response
+            }};
+            get("/healthz"); // server is up
+            std::thread::spawn(get_slow)
+        };
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let started = std::time::Instant::now();
+        assert!(get("/healthz").ends_with("ok\n"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1), "{:?}", started.elapsed());
+        assert!(slow_request.join().unwrap().ends_with("done\n"));
+    }
 
     #[test]
     fn counters_tally_and_render() {
