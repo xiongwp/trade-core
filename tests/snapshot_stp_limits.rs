@@ -405,6 +405,7 @@ fn duplicate_commands_are_rejected_and_cursor_persists() {
             sealed: &[],
             recent_command_instruments: &[],
             migration_epochs: &[],
+            group_incarnation: 0,
         },
     )
     .unwrap();

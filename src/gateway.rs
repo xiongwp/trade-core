@@ -53,6 +53,14 @@ pub struct MdFanout {
     group: u32,
 }
 
+/// The group's incarnation as the fanout announces it (0 = not assigned or
+/// not known in this process).
+fn current_incarnation(metrics: &Option<Arc<crate::metrics::Metrics>>) -> u64 {
+    metrics.as_ref().map_or(0, |metrics| {
+        metrics.group_incarnation.load(Ordering::Acquire)
+    })
+}
+
 struct MdSubscriber {
     tx: std::sync::mpsc::SyncSender<Arc<[u8]>>,
     active: Arc<AtomicBool>,
@@ -82,15 +90,22 @@ fn peer_closed(stream: &std::net::TcpStream) -> bool {
     closed
 }
 
-/// Sent to an idle subscriber every second. Its magic is not an execution
-/// event's, so readers skip it; it lets market-data tell a quiet market from
-/// a dead link (no FIN after a host loss or partition), and lets the writer
-/// notice such a link through a failing write.
-const MD_HEARTBEAT: [u8; wire::EXECUTION_EVENT_LEN] = [0; wire::EXECUTION_EVENT_LEN];
-
 impl MdFanout {
     /// Accept subscriber connections on `listener` in a background thread.
-    pub fn accept_on(listener: TcpListener, running: Arc<AtomicBool>, group: u32) -> MdFanout {
+    ///
+    /// Each subscriber first gets a hello frame naming the group and its
+    /// incarnation ([`wire::encode_md_hello`]), again whenever the
+    /// incarnation changes (before the next chunk), and as the heartbeat of
+    /// an idle second: that lets market-data tell a quiet market from a dead
+    /// link (no FIN after a host loss or partition), lets this writer notice
+    /// such a link through a failing write, and lets market-data recognise a
+    /// group rebuilt from empty logs. `metrics` carries the incarnation.
+    pub fn accept_on(
+        listener: TcpListener,
+        running: Arc<AtomicBool>,
+        group: u32,
+        metrics: Option<Arc<crate::metrics::Metrics>>,
+    ) -> MdFanout {
         let fanout = MdFanout {
             group,
             ..MdFanout::default()
@@ -131,16 +146,39 @@ impl MdFanout {
                     let (tx, rx) = std::sync::mpsc::sync_channel::<Arc<[u8]>>(queue_capacity);
                     let active = Arc::new(AtomicBool::new(true));
                     let writer_active = active.clone();
+                    let writer_metrics = metrics.clone();
                     let spawned = thread::Builder::new().name("md-subscriber".into()).spawn(move || {
+                        let mut announced = current_incarnation(&writer_metrics);
+                        if stream.write_all(&wire::encode_md_hello(group, announced)).is_err() {
+                            writer_active.store(false, Ordering::Release);
+                            return;
+                        }
                         loop {
                             match rx.recv_timeout(Duration::from_secs(1)) {
-                                Ok(chunk) if stream.write_all(&chunk).is_err() => break,
-                                Ok(_) => {}
+                                Ok(chunk) => {
+                                    // One atomic load per chunk.
+                                    let incarnation = current_incarnation(&writer_metrics);
+                                    if incarnation != announced {
+                                        announced = incarnation;
+                                        if stream
+                                            .write_all(&wire::encode_md_hello(group, incarnation))
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                    if stream.write_all(&chunk).is_err() {
+                                        break;
+                                    }
+                                }
                                 // Only when idle: on the hot path a failed
                                 // write already detects a closed peer.
                                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                                    announced = current_incarnation(&writer_metrics);
                                     if peer_closed(&stream)
-                                        || stream.write_all(&MD_HEARTBEAT).is_err()
+                                        || stream
+                                            .write_all(&wire::encode_md_hello(group, announced))
+                                            .is_err()
                                     {
                                         break;
                                     }
@@ -279,6 +317,7 @@ pub fn serve_forever(
         listener,
         md_listener,
         0,
+        None,
         sink,
         running,
         max_cmds_per_sec,
@@ -325,6 +364,7 @@ pub fn serve_committed_forever<F, R>(
     listener: TcpListener,
     md_listener: Option<TcpListener>,
     md_group: u32,
+    metrics: Option<Arc<crate::metrics::Metrics>>,
     sink: ResultSink,
     running: Arc<AtomicBool>,
     max_cmds_per_sec: u64,
@@ -341,7 +381,7 @@ where
             "market-data fanout on {}",
             l.local_addr().unwrap()
         );
-        MdFanout::accept_on(l, running.clone(), md_group)
+        MdFanout::accept_on(l, running.clone(), md_group, metrics)
     });
     let report_running = running.clone();
     let report_callback = Arc::new(report_callback);
@@ -443,7 +483,7 @@ where
             "market-data fanout on {}",
             l.local_addr().unwrap()
         );
-        MdFanout::accept_on(l, running.clone(), 0)
+        MdFanout::accept_on(l, running.clone(), 0, None)
     });
     serve_one_with_fanout(listener, fanout, sink, running, max_cmds_per_sec, submit)
 }

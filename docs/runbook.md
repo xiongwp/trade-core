@@ -395,6 +395,20 @@ and restore/verification steps. Recommended policy:
 | `dlq-tool list/replay` | Inspect and replay the order-api dead-letter files (§3). |
 | `scripts/bench/recovery.sh` | Local drill: loses a replica's data mid-load and rebuilds it, kills order-api mid-migration and aborts it, then checks exactly-once results and runs `health.py`. |
 
+Every Raft group carries an **incarnation**: a random id its first leader
+assigns through the log (`tc_group_incarnation`, identical on all replicas,
+kept in snapshots). A group rebuilt from empty logs gets a new one, and
+everything keyed by Raft index follows it: the execution publisher ignores a
+Kafka cursor of another incarnation (it would otherwise mark the new log's
+first events published without sending them), and market-data resets that
+group's replay watermark (`event=group_rebuilt`). Nothing to do by hand.
+
+Large Raft messages (a compaction snapshot) travel in 16 MiB frames up to
+`TC_RAFT_MAX_MESSAGE_BYTES` (default 1 GiB, max 2 GiB); `health.py` warns when
+a group's engine snapshot passes half of that. order-api's MySQL connections
+time out after `TC_ORDER_MYSQL_CONNECT_TIMEOUT_MS` (5 s) and
+`TC_ORDER_MYSQL_IO_TIMEOUT_MS` (30 s); the failed statement is retried.
+
 Consumer groups refuse to start when a committed offset is below the
 partition's low watermark (retention deleted unprocessed data) or missing on a
 truncated partition (offsets lost): `event=offset_preflight_failed` in the log.

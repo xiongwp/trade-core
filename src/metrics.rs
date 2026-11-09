@@ -97,6 +97,8 @@ pub struct Metrics {
     pub snapshot_ns_last: AtomicU64,
     pub snapshot_ns_max: AtomicU64,
     pub snapshot_bytes: AtomicU64,
+    /// The Raft group's incarnation, once applied (0 before).
+    pub group_incarnation: AtomicU64,
     /// Time the last snapshot spent being written and fsynced off the
     /// matching thread (Raft mode writes in the background).
     pub snapshot_write_ns_last: AtomicU64,
@@ -194,6 +196,7 @@ impl Metrics {
             format!("# HELP tc_snapshot_ns_last Matching-thread time spent on the last engine snapshot\n# TYPE tc_snapshot_ns_last gauge\ntc_snapshot_ns_last {}\n", self.snapshot_ns_last.load(Ordering::Relaxed)),
             format!("# HELP tc_snapshot_ns_max Slowest engine snapshot (matching paused meanwhile)\n# TYPE tc_snapshot_ns_max gauge\ntc_snapshot_ns_max {}\n", self.snapshot_ns_max.load(Ordering::Relaxed)),
             format!("# HELP tc_snapshot_bytes Size of the last engine snapshot\n# TYPE tc_snapshot_bytes gauge\ntc_snapshot_bytes {}\n", self.snapshot_bytes.load(Ordering::Relaxed)),
+            format!("# HELP tc_group_incarnation Random id of this Raft group's incarnation (0 until assigned)\n# TYPE tc_group_incarnation gauge\ntc_group_incarnation {}\n", self.group_incarnation.load(Ordering::Relaxed)),
             format!("# HELP tc_snapshot_write_ns_last Background write+fsync time of the last engine snapshot\n# TYPE tc_snapshot_write_ns_last gauge\ntc_snapshot_write_ns_last {}\n", self.snapshot_write_ns_last.load(Ordering::Relaxed)),
         ]
         .concat();

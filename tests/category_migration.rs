@@ -435,3 +435,24 @@ fn cancels_for_unknown_instruments_leave_no_state_behind() {
     }
     assert_eq!(p.state_fingerprint(), before);
 }
+
+#[test]
+fn the_first_incarnation_in_log_order_sticks_and_survives_a_snapshot() {
+    let mut p = processor();
+    assert_eq!(p.incarnation(), 0);
+    run(&mut p, Command::Incarnation(5));
+    // A second leader that had not applied the first one yet proposed too.
+    run(&mut p, Command::Batch(vec![Command::Incarnation(9)]));
+    assert_eq!(p.incarnation(), 5);
+
+    let dir = std::env::temp_dir().join(format!("tc-incarnation-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("snapshot.bin");
+    p.write_snapshot(&path, 0, 7).unwrap();
+    let snap = snapshot::load(&path).unwrap();
+    assert_eq!(snap.group_incarnation, 5);
+    let mut restored = processor();
+    restored.restore_state(&snap);
+    assert_eq!(restored.incarnation(), 5);
+    std::fs::remove_dir_all(dir).ok();
+}

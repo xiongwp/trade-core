@@ -339,6 +339,7 @@ pub fn encode_category_state(
         sealed: &[],
         recent_command_instruments: &instruments,
         migration_epochs: &[],
+        group_incarnation: 0,
     })
 }
 
@@ -568,6 +569,7 @@ mod tests {
             sealed: &[],
             recent_command_instruments: &[],
             migration_epochs: &[],
+            group_incarnation: 0,
         };
         snapshot::write(path, data).unwrap();
     }

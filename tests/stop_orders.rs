@@ -427,6 +427,7 @@ fn write_snapshot(p: &Processor, path: &std::path::Path) {
             sealed: &[],
             recent_command_instruments: &[],
             migration_epochs: &[],
+            group_incarnation: 0,
         },
     )
     .unwrap();

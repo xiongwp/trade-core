@@ -25,7 +25,7 @@ pub(crate) fn command_id(command: &trade_core::Command) -> u64 {
         | trade_core::Command::ResumeUser { cmd_id, .. } => *cmd_id,
         trade_core::Command::ForceClose { close_order_id, .. } => close_order_id.0,
         trade_core::Command::Batch(commands) => commands.first().map(command_id).unwrap_or(0),
-        trade_core::Command::Migrate(_) => 0,
+        trade_core::Command::Migrate(_) | trade_core::Command::Incarnation(_) => 0,
     }
 }
 

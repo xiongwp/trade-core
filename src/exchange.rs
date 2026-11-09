@@ -117,6 +117,12 @@ pub enum Command {
     /// Moving an asset category between Raft groups. Applied through each
     /// group's log like any command, so every replica does the same thing.
     Migrate(Box<CategoryOp>),
+    /// The group's incarnation: a random id its first leader proposes, so
+    /// consumers of its executions can tell a group rebuilt from empty logs
+    /// (Raft indexes restarting at 1) from the one they knew. The first one
+    /// in log order sticks; later ones (a leader that had not applied it
+    /// yet) are ignored, so every replica holds the same value.
+    Incarnation(u64),
 }
 
 /// One step of moving an asset category (`instrument` with
@@ -195,7 +201,7 @@ impl Command {
             | Command::ResumeUser { cmd_id, .. } => *cmd_id,
             Command::ForceClose { close_order_id, .. } => close_order_id.0,
             Command::Batch(commands) => commands.first().map(Command::id).unwrap_or(0),
-            Command::Migrate(_) => 0,
+            Command::Migrate(_) | Command::Incarnation(_) => 0,
         }
     }
 
@@ -211,7 +217,7 @@ impl Command {
             Command::HaltUser { instrument, .. } => *instrument,
             Command::ResumeUser { instrument, .. } => *instrument,
             Command::Batch(cmds) => cmds.first().map_or(InstrumentId(0), |c| c.instrument()),
-            Command::Migrate(_) => InstrumentId(0),
+            Command::Migrate(_) | Command::Incarnation(_) => InstrumentId(0),
         }
     }
 
@@ -994,6 +1000,9 @@ pub struct Processor {
     /// Epoch of the last migration step applied per category (see
     /// [`CategoryOp`]). Replicated state, persisted in snapshots.
     migration_epochs: std::collections::BTreeMap<u32, u64>,
+    /// The group's incarnation ([`Command::Incarnation`]); 0 until applied.
+    /// Replicated state, persisted in snapshots.
+    incarnation: u64,
     /// Dual dedup cursors — one per intake queue. The high-priority queue
     /// legitimately reorders admin commands ahead of News, so a single cursor
     /// would be poisoned by a jumping cancel and dup-reject every later New.
@@ -1254,6 +1263,7 @@ impl Processor {
             seen_command_ids: RecentCommandIds::new(DEFAULT_COMMAND_ID_WINDOW),
             sealed: std::collections::BTreeMap::new(),
             migration_epochs: std::collections::BTreeMap::new(),
+            incarnation: 0,
             max_new_id: 0,
             max_admin_id: 0,
             fees: crate::fees::FeeSchedule::default(),
@@ -1571,6 +1581,11 @@ impl Processor {
         states
     }
 
+    /// The group's incarnation ([`Command::Incarnation`]), 0 until applied.
+    pub fn incarnation(&self) -> u64 {
+        self.incarnation
+    }
+
     /// Restore engines from a snapshot. Only valid on a fresh processor.
     pub fn restore_state(&mut self, snap: &Snapshot) {
         self.max_new_id = self.max_new_id.max(snap.max_cmd_id);
@@ -1586,6 +1601,7 @@ impl Processor {
             .extend(snap.sealed.iter().map(|&(category, size)| (category, size)));
         self.migration_epochs
             .extend(snap.migration_epochs.iter().copied());
+        self.incarnation = snap.group_incarnation;
         // The exact command-id dedupe window.
         self.seen_command_ids.clear();
         for (&id, &instrument) in snap
@@ -1653,7 +1669,12 @@ impl Processor {
         // A category moved to another group (or being moved) takes no more
         // commands here. Checked before the dedupe window, so a rejected id
         // is not consumed.
-        if !self.sealed.is_empty() && !matches!(cmd, Command::Batch(_) | Command::Migrate(_)) {
+        if !self.sealed.is_empty()
+            && !matches!(
+                cmd,
+                Command::Batch(_) | Command::Migrate(_) | Command::Incarnation(_)
+            )
+        {
             let instrument = cmd.instrument();
             if self.sealed.iter().any(|(&category, &size)| {
                 crate::sharding::asset_category(instrument, size) == category
@@ -1706,7 +1727,9 @@ impl Processor {
                     cmd_id, instrument, ..
                 } => (*cmd_id, *instrument, true),
                 // Batches are gated per inner command (recursive process call).
-                Command::Batch(_) | Command::Migrate(_) => (0, InstrumentId(0), false),
+                Command::Batch(_) | Command::Migrate(_) | Command::Incarnation(_) => {
+                    (0, InstrumentId(0), false)
+                }
             };
             if id != 0 {
                 let cursor = if admin {
@@ -1734,6 +1757,11 @@ impl Processor {
                 }
             }
             Command::Migrate(op) => self.apply_category_op(*op, emit),
+            Command::Incarnation(id) => {
+                if self.incarnation == 0 {
+                    self.incarnation = id;
+                }
+            }
             Command::HaltUser {
                 instrument, user, ..
             } => {
@@ -2890,6 +2918,9 @@ impl Shard {
         self.process_and_emit(cmd, raft_index, &mut ordinal);
         if let Some(index) = raft_index {
             self.metrics.set_raft_applied_index(index);
+            self.metrics
+                .group_incarnation
+                .store(self.processor.incarnation, Ordering::Release);
         }
         let command_ns = started.elapsed().as_nanos() as u64;
         self.metrics.record_command_latency(command_ns);
@@ -2958,6 +2989,9 @@ impl Shard {
                 .unwrap_or_else(|error| panic!("{error}"));
             self.last_raft_index = raft_index;
             self.metrics.set_raft_applied_index(raft_index);
+            self.metrics
+                .group_incarnation
+                .store(self.processor.incarnation, Ordering::Release);
             return;
         }
         let wal_started = Instant::now();
@@ -3118,6 +3152,9 @@ impl Shard {
         }
         self.last_raft_index = raft_index;
         self.metrics.set_raft_applied_index(raft_index);
+        self.metrics
+            .group_incarnation
+            .store(self.processor.incarnation, Ordering::Release);
         let command_ns = started.elapsed().as_nanos() as u64;
         self.metrics.record_command_latency(command_ns);
         self.metrics
@@ -3245,6 +3282,7 @@ struct CapturedSnapshot {
     recent_command_instruments: Vec<u32>,
     sealed: Vec<(u32, u32)>,
     migration_epochs: Vec<(u32, u64)>,
+    group_incarnation: u64,
 }
 
 struct CapturedEngine {
@@ -3288,6 +3326,7 @@ impl CapturedSnapshot {
                 sealed: &self.sealed,
                 recent_command_instruments: &self.recent_command_instruments,
                 migration_epochs: &self.migration_epochs,
+                group_incarnation: self.group_incarnation,
             },
         )
     }
@@ -3322,6 +3361,7 @@ fn capture_processor_snapshot(
             .iter()
             .map(|(&c, &e)| (c, e))
             .collect(),
+        group_incarnation: processor.incarnation,
         engines: processor
             .engines
             .iter()

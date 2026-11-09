@@ -33,6 +33,7 @@
 //! dedupe window: count u64, ids u64 ..., then their instruments u32 ...
 //! sealed:    count u32, (category u32, category size u32) ...
 //! epochs:    count u32, (category u32, epoch u64) ...
+//! group incarnation u64
 //! footer:    FNV-1a-64 over all preceding bytes
 //! ```
 
@@ -45,7 +46,7 @@ use crate::order::Order;
 use crate::types::*;
 
 const MAGIC: &[u8; 4] = b"TCS1";
-const VERSION: u32 = 8;
+const VERSION: u32 = 9;
 const ORDER_ENC: usize = 56;
 /// Encoded stop: the order, then trigger price (u64) and kind (u8).
 const STOP_ENC: usize = ORDER_ENC + 8 + 1;
@@ -173,6 +174,8 @@ pub struct Snapshot {
     pub sealed: Vec<(u32, u32)>,
     /// Epoch of the last migration step applied per category.
     pub migration_epochs: Vec<(u32, u64)>,
+    /// The Raft group's incarnation (0 = not yet assigned).
+    pub group_incarnation: u64,
 }
 
 /// Borrowed state supplied when atomically writing a snapshot.
@@ -190,6 +193,7 @@ pub struct SnapshotData<'a> {
     pub recent_command_instruments: &'a [u32],
     pub sealed: &'a [(u32, u32)],
     pub migration_epochs: &'a [(u32, u64)],
+    pub group_incarnation: u64,
 }
 
 /// Write a snapshot **atomically**: temp file, fsync, rename over `path`.
@@ -261,6 +265,7 @@ pub fn encode(data: SnapshotData<'_>) -> Vec<u8> {
         buf.extend_from_slice(&category.to_le_bytes());
         buf.extend_from_slice(&epoch.to_le_bytes());
     }
+    buf.extend_from_slice(&data.group_incarnation.to_le_bytes());
     let h = fnv1a(&buf);
     buf.extend_from_slice(&h.to_le_bytes());
     buf
@@ -462,6 +467,7 @@ pub fn decode(buf: &[u8]) -> io::Result<Snapshot> {
     let migration_epochs = (0..c.count(n as u64, 12)?)
         .map(|_| Ok((c.u32()?, c.u64()?)))
         .collect::<io::Result<_>>()?;
+    let group_incarnation = c.u64()?;
     if c.pos != body_len {
         return Err(corrupt("trailing bytes"));
     }
@@ -478,6 +484,7 @@ pub fn decode(buf: &[u8]) -> io::Result<Snapshot> {
         recent_command_instruments,
         sealed,
         migration_epochs,
+        group_incarnation,
     })
 }
 
@@ -503,6 +510,7 @@ mod tests {
             recent_command_instruments: &[7, 7, 8],
             sealed: &[],
             migration_epochs: &[],
+            group_incarnation: 0,
         };
         write(&path, data(41)).unwrap();
         let bytes = std::fs::read(&path).unwrap();
@@ -548,6 +556,7 @@ mod tests {
                 recent_command_instruments: &[7, 9],
                 sealed: &[(1, 1000)],
                 migration_epochs: &[(1, 12)],
+                group_incarnation: 7,
             },
         )
         .unwrap();
@@ -573,6 +582,7 @@ mod tests {
         assert_eq!(snap.recent_command_instruments, vec![7, 9]);
         assert_eq!(snap.sealed, vec![(1, 1000)]);
         assert_eq!(snap.migration_epochs, vec![(1, 12)]);
+        assert_eq!(snap.group_incarnation, 7);
 
         // Truncated or padded data is an error, not a panic.
         let bytes = std::fs::read(&path).unwrap();

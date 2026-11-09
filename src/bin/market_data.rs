@@ -81,6 +81,10 @@ struct State {
     /// node replays its log tail: anything at or below the mark was already
     /// counted.
     applied: HashMap<u32, (u64, u32)>,
+    /// Per Raft group, the incarnation its feeds announce
+    /// (`wire::encode_md_hello`). A different one means the group was
+    /// rebuilt from empty logs: its indexes restarted, so its mark resets.
+    incarnations: HashMap<u32, u64>,
     /// Newest timestamp given to a trade: candle time never goes backwards
     /// (feed threads race for the lock; wall clocks step back).
     last_ts: u64,
@@ -112,6 +116,23 @@ impl State {
     fn current(&self, group: u32, index: u64) -> bool {
         self.applied.get(&group).is_none_or(|mark| index >= mark.0)
     }
+
+    /// A feed announced `group`'s incarnation (0: not assigned yet).
+    fn on_incarnation(&mut self, group: u32, incarnation: u64) {
+        if incarnation == 0 {
+            return;
+        }
+        match self.incarnations.insert(group, incarnation) {
+            Some(previous) if previous != incarnation => {
+                let mark = self.applied.remove(&group);
+                log_warn!(
+                    "market-data",
+                    "event=group_rebuilt group={group} incarnation={previous}->{incarnation} watermark_reset_from={mark:?}"
+                );
+            }
+            _ => {}
+        }
+    }
 }
 
 /// A replica this far behind the newest delivered entry is implausible:
@@ -134,24 +155,36 @@ fn warn_far_below_mark(group: u32, index: u64, mark: u64) {
     }
 }
 
-const MARKET_STATE_MAGIC: &[u8; 4] = b"TCM1";
+const MARKET_STATE_MAGIC: &[u8; 4] = b"TCM2";
+/// group u32 | index u64 | ordinal u32 | incarnation u64
+const MARK_RECORD_LEN: usize = 24;
 
 /// What a snapshot needs from the shared state: copied under the lock (the
 /// candle encoding is the only real work), framed and checksummed after it
 /// is released so the feed threads do not wait on that.
 struct MarketStateParts {
     candles: Vec<u8>,
-    applied: Vec<(u32, u64, u32)>,
+    applied: Vec<(u32, u64, u32, u64)>,
     last_ts: u64,
 }
 
 fn market_state_parts(state: &State) -> MarketStateParts {
-    let mut applied: Vec<_> = state
+    let mut groups: Vec<u32> = state
         .applied
-        .iter()
-        .map(|(&group, &(index, ordinal))| (group, index, ordinal))
+        .keys()
+        .chain(state.incarnations.keys())
+        .copied()
         .collect();
-    applied.sort_unstable();
+    groups.sort_unstable();
+    groups.dedup();
+    let applied = groups
+        .into_iter()
+        .map(|group| {
+            let (index, ordinal) = state.applied.get(&group).copied().unwrap_or((0, 0));
+            let incarnation = state.incarnations.get(&group).copied().unwrap_or(0);
+            (group, index, ordinal, incarnation)
+        })
+        .collect();
     MarketStateParts {
         candles: state.agg.encode(),
         applied,
@@ -174,15 +207,16 @@ fn frame_market_state(parts: MarketStateParts) -> Vec<u8> {
         applied,
         last_ts,
     } = parts;
-    let mut out = Vec::with_capacity(24 + candles.len() + applied.len() * 16);
+    let mut out = Vec::with_capacity(24 + candles.len() + applied.len() * MARK_RECORD_LEN);
     out.extend_from_slice(MARKET_STATE_MAGIC);
     out.extend_from_slice(&(candles.len() as u64).to_le_bytes());
     out.extend_from_slice(&candles);
     out.extend_from_slice(&(applied.len() as u32).to_le_bytes());
-    for (group, index, ordinal) in applied {
+    for (group, index, ordinal, incarnation) in applied {
         out.extend_from_slice(&group.to_le_bytes());
         out.extend_from_slice(&index.to_le_bytes());
         out.extend_from_slice(&ordinal.to_le_bytes());
+        out.extend_from_slice(&incarnation.to_le_bytes());
     }
     out.extend_from_slice(&last_ts.to_le_bytes());
     let checksum = trade_core::journal::fnv1a(&out);
@@ -190,9 +224,15 @@ fn frame_market_state(parts: MarketStateParts) -> Vec<u8> {
     out
 }
 
-fn decode_market_state(
-    bytes: &[u8],
-) -> std::io::Result<(KlineAggregator, HashMap<u32, (u64, u32)>, u64)> {
+/// Candles, replay marks, group incarnations, last trade timestamp.
+type RestoredMarket = (
+    KlineAggregator,
+    HashMap<u32, (u64, u32)>,
+    HashMap<u32, u64>,
+    u64,
+);
+
+fn decode_market_state(bytes: &[u8]) -> std::io::Result<RestoredMarket> {
     let bad =
         |message: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, message.to_string());
     if bytes.len() < 32 || &bytes[..4] != MARKET_STATE_MAGIC {
@@ -216,7 +256,7 @@ fn decode_market_state(
     let marks_end = marks_start
         .checked_add(
             count
-                .checked_mul(16)
+                .checked_mul(MARK_RECORD_LEN)
                 .ok_or_else(|| bad("market watermark count overflow"))?,
         )
         .ok_or_else(|| bad("market watermark length overflow"))?;
@@ -224,16 +264,21 @@ fn decode_market_state(
         return Err(bad("truncated or trailing market watermarks"));
     }
     let mut applied = HashMap::with_capacity(count);
-    for record in bytes[marks_start..marks_end].chunks_exact(16) {
+    let mut incarnations = HashMap::with_capacity(count);
+    for record in bytes[marks_start..marks_end].chunks_exact(MARK_RECORD_LEN) {
         let group = u32::from_le_bytes(record[0..4].try_into().unwrap());
         let index = u64::from_le_bytes(record[4..12].try_into().unwrap());
         let ordinal = u32::from_le_bytes(record[12..16].try_into().unwrap());
+        let incarnation = u64::from_le_bytes(record[16..24].try_into().unwrap());
         if applied.insert(group, (index, ordinal)).is_some() {
             return Err(bad("duplicate market watermark group"));
         }
+        if incarnation != 0 {
+            incarnations.insert(group, incarnation);
+        }
     }
     let last_ts = u64::from_le_bytes(bytes[marks_end..body_end].try_into().unwrap());
-    Ok((agg, applied, last_ts))
+    Ok((agg, applied, incarnations, last_ts))
 }
 
 fn write_market_state(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -334,6 +379,10 @@ fn feed_one(md_addr: String, state: Arc<Mutex<State>>) {
                     while filled - off >= EXECUTION_EVENT_LEN {
                         let frame = &buf[off..off + EXECUTION_EVENT_LEN];
                         off += EXECUTION_EVENT_LEN;
+                        if let Some((group, incarnation)) = wire::decode_md_hello(frame) {
+                            st.on_incarnation(group, incarnation);
+                            continue;
+                        }
                         let Some(event) = wire::decode_execution_event(frame) else {
                             continue;
                         };
@@ -995,16 +1044,24 @@ fn main() {
                 }
             },
         )
-        .unwrap_or_else(|| (KlineAggregator::new(2000), HashMap::new(), 0));
+        .unwrap_or_else(|| {
+            (
+                KlineAggregator::new(2000),
+                HashMap::new(),
+                HashMap::new(),
+                0,
+            )
+        });
 
     let state = Arc::new(Mutex::new(State {
         agg: restored.0,
         depth: DepthStore::default(),
         trades: HashMap::new(),
         applied: restored.1,
+        incarnations: restored.2,
         // A clock that once jumped ahead must not pin every later candle
         // to that future time across restarts.
-        last_ts: restored.2.min(now_sec() + 60),
+        last_ts: restored.3.min(now_sec() + 60),
     }));
 
     // Feed thread.
@@ -1118,6 +1175,7 @@ mod tests {
             depth: DepthStore::default(),
             trades: HashMap::new(),
             applied: HashMap::new(),
+            incarnations: HashMap::new(),
             last_ts: 0,
         };
         // Replica A delivers group 3's entries 10..=12; replica B, behind,
@@ -1151,6 +1209,7 @@ mod tests {
             depth: DepthStore::default(),
             trades: HashMap::new(),
             applied: HashMap::from([(3, (42, 7)), (9, (11, 2))]),
+            incarnations: HashMap::from([(3, 555), (12, 777)]),
             last_ts: 1_700_000_123,
         };
         state
@@ -1158,8 +1217,12 @@ mod tests {
             .on_trade(InstrumentId(17), state.last_ts, 1_005, 9);
 
         let bytes = encode_market_state(&state);
-        let (agg, applied, last_ts) = decode_market_state(&bytes).unwrap();
-        assert_eq!(applied, state.applied);
+        let (agg, applied, incarnations, last_ts) = decode_market_state(&bytes).unwrap();
+        // Group 12 has an incarnation but no trade yet: an empty mark.
+        let mut expected = state.applied.clone();
+        expected.insert(12, (0, 0));
+        assert_eq!(applied, expected);
+        assert_eq!(incarnations, state.incarnations);
         assert_eq!(last_ts, state.last_ts);
         assert_eq!(
             agg.candles(InstrumentId(17), "1s", 10),
@@ -1171,6 +1234,7 @@ mod tests {
             depth: DepthStore::default(),
             trades: HashMap::new(),
             applied,
+            incarnations,
             last_ts,
         };
         assert!(!restarted.take(3, 42, 7), "saved event is not recounted");
@@ -1178,6 +1242,27 @@ mod tests {
             restarted.take(3, 42, 8),
             "the next event remains admissible"
         );
+    }
+
+    #[test]
+    fn a_rebuilt_group_restarts_its_watermark() {
+        let mut st = State {
+            agg: KlineAggregator::new(10),
+            depth: DepthStore::default(),
+            trades: HashMap::new(),
+            applied: HashMap::new(),
+            incarnations: HashMap::new(),
+            last_ts: 0,
+        };
+        st.on_incarnation(3, 0); // not assigned yet: ignored
+        st.on_incarnation(3, 111);
+        assert!(st.take(3, 5_000, 0));
+        st.on_incarnation(3, 111); // every replica, every heartbeat: no-op
+        assert!(!st.take(3, 10, 0), "a replay of the same incarnation");
+        // The group was rebuilt from empty logs: indexes restart at 1.
+        st.on_incarnation(3, 222);
+        assert!(st.take(3, 10, 0), "the new incarnation's trades count");
+        assert!(st.current(3, 10));
     }
 
     #[test]

@@ -207,9 +207,28 @@ fn decode_raft_migration_entry(payload: &[u8]) -> Option<crate::exchange::Catego
     }
 }
 
+const RAFT_INCARNATION_MAGIC: [u8; 4] = *b"TCIN";
+
+/// A Raft entry assigning the group's incarnation ([`Command::Incarnation`]):
+/// magic, version (1), id (non-zero).
+pub fn encode_raft_incarnation_entry(id: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16);
+    out.extend_from_slice(&RAFT_INCARNATION_MAGIC);
+    out.extend_from_slice(&1u32.to_le_bytes());
+    out.extend_from_slice(&id.to_le_bytes());
+    out
+}
+
 /// Decode a command batch entry. A category-migration entry decodes to one
-/// [`Command::Migrate`].
+/// [`Command::Migrate`], an incarnation entry to one [`Command::Incarnation`].
 pub fn decode_raft_entry(payload: &[u8]) -> Option<Vec<Command>> {
+    if payload.starts_with(&RAFT_INCARNATION_MAGIC) {
+        if payload.len() != 16 || payload[4..8] != 1u32.to_le_bytes() {
+            return None;
+        }
+        let id = u64::from_le_bytes(payload[8..16].try_into().ok()?);
+        return (id != 0).then(|| vec![Command::Incarnation(id)]);
+    }
     if payload.starts_with(&RAFT_MIGRATION_MAGIC) {
         return decode_raft_migration_entry(payload).map(|op| vec![Command::Migrate(Box::new(op))]);
     }
@@ -242,6 +261,34 @@ pub const REPORT_LEN: usize = 56;
 pub const EXECUTION_EVENT_LEN: usize = 104;
 const EXECUTION_EVENT_USER_AT: usize = 96;
 const EXECUTION_EVENT_MAGIC: [u8; 4] = *b"EX01";
+const MD_HELLO_MAGIC: [u8; 4] = *b"TCMH";
+
+/// A market-data fanout frame announcing which Raft group, in which
+/// incarnation, the feed carries (sent on connect, when the incarnation is
+/// assigned, and as the idle heartbeat). Same length as an execution event,
+/// so a feed stays frame-aligned; readers that do not know it skip it.
+pub fn encode_md_hello(group: u32, incarnation: u64) -> [u8; EXECUTION_EVENT_LEN] {
+    let mut frame = [0u8; EXECUTION_EVENT_LEN];
+    frame[..4].copy_from_slice(&MD_HELLO_MAGIC);
+    frame[4..8].copy_from_slice(&1u32.to_le_bytes());
+    frame[8..12].copy_from_slice(&group.to_le_bytes());
+    frame[16..24].copy_from_slice(&incarnation.to_le_bytes());
+    frame
+}
+
+/// `(group, incarnation)` of a fanout hello frame.
+pub fn decode_md_hello(frame: &[u8]) -> Option<(u32, u64)> {
+    if frame.len() < EXECUTION_EVENT_LEN
+        || frame[..4] != MD_HELLO_MAGIC
+        || frame[4..8] != 1u32.to_le_bytes()
+    {
+        return None;
+    }
+    Some((
+        u32::from_le_bytes(frame[8..12].try_into().ok()?),
+        u64::from_le_bytes(frame[16..24].try_into().ok()?),
+    ))
+}
 
 const MT_NEW: u8 = 1;
 const MT_CANCEL: u8 = 2;
@@ -582,7 +629,7 @@ pub fn encode_command(cmd: &Command, out: &mut [u8; MSG_LEN]) {
         // Category migration travels as its own Raft entry (it carries whole
         // books), never as a command frame; standalone journals do not
         // support it.
-        Command::Migrate(_) => out.fill(0),
+        Command::Migrate(_) | Command::Incarnation(_) => out.fill(0),
     }
 }
 
@@ -1241,6 +1288,22 @@ mod tests {
         assert!(
             decode_raft_entry(&frames[0]).is_none(),
             "a bare frame is not an entry"
+        );
+    }
+
+    #[test]
+    fn incarnation_entries_and_fanout_hellos_round_trip() {
+        let entry = encode_raft_incarnation_entry(42);
+        assert!(matches!(
+            decode_raft_entry(&entry).as_deref(),
+            Some([Command::Incarnation(42)])
+        ));
+        assert!(decode_raft_entry(&encode_raft_incarnation_entry(0)).is_none());
+        let hello = encode_md_hello(7, 99);
+        assert_eq!(decode_md_hello(&hello), Some((7, 99)));
+        assert!(
+            decode_execution_event(&hello).is_none(),
+            "readers that only know execution events skip a hello"
         );
     }
 }

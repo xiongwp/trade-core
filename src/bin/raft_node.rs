@@ -380,6 +380,9 @@ fn main() {
             let mut committed_ids = CommittedIdWindow::new(dedup_max_ids);
             let mut was_leader = false;
             let mut last_announce = Instant::now();
+            // Whether this leadership already proposed the group's
+            // incarnation (see below).
+            let mut incarnation_proposed = false;
             let mut last_tick = Instant::now();
             // Compaction probe: the matching snapshot's applied index, cached
             // against the file's (mtime, len) and re-checked at most once a
@@ -584,6 +587,27 @@ fn main() {
                         std::process::exit(78);
                     }
                     last_announce = Instant::now() - announce_every;
+                }
+                if leader && !was_leader {
+                    incarnation_proposed = false;
+                }
+                // A group without an incarnation yet (a new or rebuilt one):
+                // its leader assigns one once it has applied everything
+                // committed, so an existing assignment is never missed. Two
+                // proposals racing (a leadership change) are harmless: the
+                // first in log order sticks on every replica.
+                if leader
+                    && !incarnation_proposed
+                    && runtime_metrics.group_incarnation.load(Ordering::Acquire) == 0
+                    && runtime_metrics.raft_applied_index.load(Ordering::Acquire)
+                        >= node.commit_index()
+                {
+                    incarnation_proposed = true;
+                    let entry = wire::encode_raft_incarnation_entry(new_incarnation_id(node.id()));
+                    if let Err(error) = node.propose(entry) {
+                        incarnation_proposed = false;
+                        log_warn!("raft-node", "event=incarnation_propose_failed error={error:?}");
+                    }
                 }
                 // Announce on election and then periodically, so a replica that
                 // joins (or comes back with a new disk) meets an announcement
@@ -1000,6 +1024,7 @@ fn main() {
         listener,
         Some(md_listener),
         raft_group_id,
+        Some(metrics.clone()),
         sink,
         running.clone(),
         0,
@@ -1073,6 +1098,12 @@ fn spawn_execution_outbox_publisher(
             // position, not a byte offset: replica outboxes differ in layout.
             let mut shared_position: Option<(u64, u32)> = None;
             let mut pending_checkpoint: Option<(u64, u32)> = None;
+            // The newest shared checkpoint read, with the group incarnation
+            // it belongs to. One from another incarnation (a group rebuilt
+            // from empty logs while Kafka kept the old cursor) names
+            // positions of the old log: acknowledging through it would mark
+            // the new log's first entries published without sending them.
+            let mut latest_cursor: Option<((u64, u32), u64)> = None;
             let mut batches_since_checkpoint = 0usize;
             let checkpoint_every_batches = std::env::var("TC_EXECUTION_CURSOR_EVERY_BATCHES")
                 .ok()
@@ -1109,17 +1140,17 @@ fn spawn_execution_outbox_publisher(
                             // Byte-offset checkpoints from older builds are
                             // ignored: a promoted node then republishes from
                             // its own cursor (duplicates, deduped downstream).
-                            if let Some(position) = decode_outbox_checkpoint(
+                            if let Some((position, incarnation)) = decode_outbox_checkpoint(
                                 raft_group,
                                 message.key(),
                                 message.payload(),
                             ) {
-                                shared_position = shared_position.max(Some(position));
-                                // Every event of the entries before the
-                                // checkpointed one is on Kafka.
-                                metrics
-                                    .execution_outbox_drained_through
-                                    .fetch_max(position.0.saturating_sub(1), Ordering::AcqRel);
+                                latest_cursor = match latest_cursor {
+                                    Some((seen, same)) if same == incarnation => {
+                                        Some((seen.max(position), incarnation))
+                                    }
+                                    _ => Some((position, incarnation)),
+                                };
                             }
                         }
                         Err(error) => {
@@ -1131,9 +1162,23 @@ fn spawn_execution_outbox_publisher(
                         }
                     }
                 }
+                // Only a cursor of this incarnation counts (0: not assigned
+                // yet, so nothing is trusted; at worst a few events go out
+                // twice, which consumers deduplicate).
+                let incarnation = metrics.group_incarnation.load(Ordering::Acquire);
+                if let Some((position, cursor_incarnation)) = latest_cursor {
+                    if incarnation != 0 && cursor_incarnation == incarnation {
+                        shared_position = shared_position.max(Some(position));
+                        // Every event of the entries before the
+                        // checkpointed one is on Kafka.
+                        metrics
+                            .execution_outbox_drained_through
+                            .fetch_max(position.0.saturating_sub(1), Ordering::AcqRel);
+                    }
+                }
                 if let Some(position) = pending_checkpoint {
                     let key = outbox_checkpoint_key(raft_group);
-                    let value = encode_outbox_checkpoint(position);
+                    let value = encode_outbox_checkpoint(position, incarnation);
                     let delivered = futures::executor::block_on(
                         producer.send(
                             FutureRecord::to(&checkpoint_topic)
@@ -1432,7 +1477,8 @@ fn outbox_segment_order(path: &std::path::Path) -> Option<(u32, u64)> {
 }
 
 /// Shared publish checkpoint, one per Raft group: key = group (big
-/// endian) + `@pos`, value = raft_index (LE u64) + ordinal (LE u32).
+/// endian) + `@pos`, value = raft_index (LE u64) + ordinal (LE u32) +
+/// group incarnation (LE u64).
 const OUTBOX_POSITION_KEY: &[u8] = b"@pos";
 
 fn outbox_checkpoint_key(raft_group: u32) -> Vec<u8> {
@@ -1442,31 +1488,35 @@ fn outbox_checkpoint_key(raft_group: u32) -> Vec<u8> {
     key
 }
 
-fn encode_outbox_checkpoint((raft_index, ordinal): (u64, u32)) -> [u8; 12] {
-    let mut value = [0u8; 12];
+fn encode_outbox_checkpoint((raft_index, ordinal): (u64, u32), incarnation: u64) -> [u8; 20] {
+    let mut value = [0u8; 20];
     value[..8].copy_from_slice(&raft_index.to_le_bytes());
-    value[8..].copy_from_slice(&ordinal.to_le_bytes());
+    value[8..12].copy_from_slice(&ordinal.to_le_bytes());
+    value[12..].copy_from_slice(&incarnation.to_le_bytes());
     value
 }
 
-/// A logical checkpoint of `expected_group`; `None` for other groups and
-/// for the byte-offset checkpoints older builds wrote (8-byte payload).
+/// A checkpoint of `expected_group`: (position, group incarnation); `None`
+/// for other groups and anything not in this layout.
 fn decode_outbox_checkpoint(
     expected_group: u32,
     key: Option<&[u8]>,
     payload: Option<&[u8]>,
-) -> Option<(u64, u32)> {
+) -> Option<((u64, u32), u64)> {
     let (key, payload) = (key?, payload?);
     if key.len() != 4 + OUTBOX_POSITION_KEY.len()
         || &key[4..] != OUTBOX_POSITION_KEY
-        || payload.len() != 12
+        || payload.len() != 20
         || u32::from_be_bytes(key[..4].try_into().ok()?) != expected_group
     {
         return None;
     }
     Some((
-        u64::from_le_bytes(payload[..8].try_into().ok()?),
-        u32::from_le_bytes(payload[8..].try_into().ok()?),
+        (
+            u64::from_le_bytes(payload[..8].try_into().ok()?),
+            u32::from_le_bytes(payload[8..12].try_into().ok()?),
+        ),
+        u64::from_le_bytes(payload[12..].try_into().ok()?),
     ))
 }
 
@@ -1780,6 +1830,21 @@ fn remember_group_config(path: &std::path::Path, current: &mut Option<u64>, fing
             "event=group_config_persist_failed error={error}"
         );
     }
+}
+
+/// A random non-zero group incarnation id below 2^53 (exact as a metric).
+fn new_incarnation_id(node_id: u64) -> u64 {
+    use std::hash::BuildHasher;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    // RandomState is seeded from the OS's random source.
+    let random = std::collections::hash_map::RandomState::new().hash_one((
+        nanos,
+        node_id,
+        std::process::id(),
+    ));
+    (random & ((1 << 53) - 1)).max(1)
 }
 
 fn clear_rejoin_marker(path: &std::path::Path) -> std::io::Result<()> {
@@ -2119,16 +2184,16 @@ mod tests {
     #[test]
     fn shared_outbox_checkpoint_is_a_logical_position_scoped_by_group() {
         let key = outbox_checkpoint_key(7);
-        let payload = encode_outbox_checkpoint((12_345, 3));
+        let payload = encode_outbox_checkpoint((12_345, 3), 99);
         assert_eq!(
             decode_outbox_checkpoint(7, Some(&key), Some(&payload)),
-            Some((12_345, 3))
+            Some(((12_345, 3), 99))
         );
         assert_eq!(
             decode_outbox_checkpoint(8, Some(&key), Some(&payload)),
             None
         );
-        // An older build's byte-offset checkpoint is ignored, not misread.
+        // Any other layout is ignored, not misread.
         let mut legacy_key = 7u32.to_be_bytes().to_vec();
         legacy_key.extend_from_slice(b"outbox-shard-0.bin");
         assert_eq!(
