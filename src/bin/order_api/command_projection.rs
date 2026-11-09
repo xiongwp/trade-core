@@ -241,30 +241,32 @@ pub(crate) fn persist_mysql_shard_with(
         }
     }
 
+    // Every write of the batch in one round trip (values inlined, see
+    // `multi_insert_sql`): one prepare + execute per order table used to
+    // dominate, with a batch spread over ~100 tables per database.
+    let mut statements = Vec::with_capacity(orders_by_table.len() + modifies.len() + 1);
     if command_log_enabled() {
-        exec_multi_insert(
-                &mut tx,
-                &format!("INSERT IGNORE INTO {db}.processed_commands (category_id,kafka_partition,kafka_offset,command_id,user_id,shard_table)"),
-                6,
-                processed,
-            )
-            .map_err(|error| error.to_string())?;
+        statements.extend(multi_insert_sql(
+            &format!("INSERT IGNORE INTO {db}.processed_commands (category_id,kafka_partition,kafka_offset,command_id,user_id,shard_table)"),
+            6,
+            &processed,
+        ));
     }
     let pending_tables = orders_by_table.keys().copied().collect::<Vec<_>>();
-    for (table, values) in orders_by_table {
-        exec_multi_insert(
-                &mut tx,
-                &format!("INSERT IGNORE INTO {db}.asset_orders_{table:03} (order_id,category_id,user_id,instrument,side,price,qty,status)"),
-                8,
-                values,
-            )
-            .map_err(|error| error.to_string())?;
+    for (table, values) in &orders_by_table {
+        statements.extend(multi_insert_sql(
+            &format!("INSERT IGNORE INTO {db}.asset_orders_{table:03} (order_id,category_id,user_id,instrument,side,price,qty,status)"),
+            8,
+            values,
+        ));
     }
-    for (table, order_id, user, new_price, new_qty) in modifies {
-        tx.exec_drop(
-                format!("UPDATE {db}.{table} SET price=:price,qty=:qty,status='MODIFY_PENDING' WHERE order_id=:id AND user_id=:user"),
-                params! {"price" => new_price, "qty" => new_qty, "id" => order_id, "user" => user},
-            )
+    for (table, order_id, user, new_price, new_qty) in &modifies {
+        statements.push(format!(
+            "UPDATE {db}.{table} SET price={new_price},qty={new_qty},status='MODIFY_PENDING' WHERE order_id={order_id} AND user_id={user}"
+        ));
+    }
+    if !statements.is_empty() {
+        tx.query_drop(statements.join(";\n"))
             .map_err(|error| error.to_string())?;
     }
     // Results may have reached this database before the command projection.

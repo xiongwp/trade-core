@@ -24,23 +24,35 @@ impl OrderStore {
     }
 }
 
-pub(crate) fn exec_multi_insert(
-    tx: &mut Transaction<'_>,
-    prefix: &str,
-    columns: usize,
-    values: Vec<Value>,
-) -> mysql::Result<()> {
+/// A multi-row `INSERT` as SQL text with the values inlined (rendered and
+/// escaped by the driver), so it can share one round trip with other
+/// statements. The prepared multi-row insert it replaced cost a prepare and
+/// an execute per table, and its text changed with the row count, so the
+/// server-side statement cache rarely hit.
+pub(crate) fn multi_insert_sql(prefix: &str, columns: usize, values: &[Value]) -> Option<String> {
     if values.is_empty() {
-        return Ok(());
+        return None;
     }
     debug_assert_eq!(values.len() % columns, 0);
-    let row = format!("({})", vec!["?"; columns].join(","));
-    let rows = vec![row; values.len() / columns].join(",");
-    tx.exec_drop(
-        format!("{prefix} VALUES {rows}"),
-        Params::Positional(values),
-    )
+    let mut sql = String::with_capacity(prefix.len() + values.len() * 12);
+    sql.push_str(prefix);
+    sql.push_str(" VALUES ");
+    for (row, chunk) in values.chunks(columns).enumerate() {
+        if row > 0 {
+            sql.push(',');
+        }
+        sql.push('(');
+        for (column, value) in chunk.iter().enumerate() {
+            if column > 0 {
+                sql.push(',');
+            }
+            sql.push_str(&value.as_sql(false));
+        }
+        sql.push(')');
+    }
+    Some(sql)
 }
+
 
 /// One MySQL URL per physical database. An explicit `TC_ORDER_MYSQL_SHARD_URLS`
 /// list must match the configured `db_count` (part of the versioned route

@@ -591,27 +591,24 @@ pub(crate) fn persist_execution_shard(
                 Value::from(record.offset as u64),
             ]);
         }
-        exec_multi_insert(
-            &mut tx,
+        // Stage, discard redeliveries, and drain every touched table in one
+        // round trip (plus the period read): the same statements in the same
+        // order, inside the same transaction.
+        let period = dedupe_period(&mut tx)?;
+        let mut statements = Vec::with_capacity(touched.len() + 2);
+        statements.extend(multi_insert_sql(
             &format!("INSERT IGNORE INTO {db}.pending_execution_events (raft_group,raft_index,report_ordinal,target_order_id,shard_table,instrument,report_type,event_qty,event_price,event_fee,fill_role,kafka_partition,kafka_offset)"),
             13,
-            values,
-        )
-        .map_err(|error| error.to_string())?;
+            &values,
+        ));
         // A Kafka retry can reinsert an already-processed event into pending;
         // discard it before applying any mutations.
-        let period = dedupe_period(&mut tx)?;
-        discard_redelivered_events(&mut tx, &db, shard_db, period)?;
-        // Every touched table was just staged into, so drain them all — in
-        // one round trip (an empty drain is a cheap empty range scan).
-        let drains: Vec<String> = touched
-            .into_iter()
-            .map(|table| drain_statements(&db, table, period))
-            .collect();
-        if !drains.is_empty() {
-            tx.query_drop(drains.join(";\n"))
-                .map_err(|error| error.to_string())?;
-        }
+        statements.push(discard_statements(&db, shard_db, period));
+        // Every touched table was just staged into, so drain them all (an
+        // empty drain is a cheap empty range scan).
+        statements.extend(touched.into_iter().map(|table| drain_statements(&db, table, period)));
+        tx.query_drop(statements.join(";\n"))
+            .map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())?;
     }
     Ok(())
@@ -619,25 +616,35 @@ pub(crate) fn persist_execution_shard(
 
 /// Drop pending events that were already applied (a Kafka or outbox
 /// redelivery), checking the pre-ring table too while it still exists.
+#[cfg(test)]
 pub(crate) fn discard_redelivered_events(
     tx: &mut Transaction<'_>,
     db: &str,
     shard_db: u32,
     period: u64,
 ) -> Result<(), String> {
-    // The current and the previous period's tables hold every event applied
-    // within the last retention period (see `DEDUPE_TABLES`).
+    tx.query_drop(discard_statements(db, shard_db, period))
+        .map_err(|error| error.to_string())
+}
+
+/// The statements that drop already-applied (redelivered) events from
+/// pending, joined with `;`. The current and the previous period's tables
+/// hold every event applied within the last retention period (see
+/// `DEDUPE_TABLES`).
+pub(crate) fn discard_statements(db: &str, shard_db: u32, period: u64) -> String {
     let mut tables = vec![dedupe_table(period), dedupe_table(period + DEDUPE_TABLES - 1)];
     if has_legacy_dedupe(shard_db) {
         tables.push("processed_execution_events_legacy".to_string());
     }
-    for table in tables {
-        tx.query_drop(format!(
-            "DELETE p FROM {db}.pending_execution_events p INNER JOIN {db}.{table} e ON e.raft_group=p.raft_group AND e.raft_index=p.raft_index AND e.report_ordinal=p.report_ordinal AND e.target_order_id=p.target_order_id"
-        ))
-        .map_err(|error| error.to_string())?;
-    }
-    Ok(())
+    tables
+        .iter()
+        .map(|table| {
+            format!(
+                "DELETE p FROM {db}.pending_execution_events p INNER JOIN {db}.{table} e ON e.raft_group=p.raft_group AND e.raft_index=p.raft_index AND e.report_ordinal=p.report_ordinal AND e.target_order_id=p.target_order_id"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";\n")
 }
 
 pub(crate) fn apply_pending_execution_table(
