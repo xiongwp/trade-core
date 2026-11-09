@@ -1409,12 +1409,26 @@ fn migration_route(
             .and_then(|value| value.parse().ok())
             .ok_or_else(|| route_reply("400 Bad Request", "category=<id> required\n".into()))
     };
+    // The migration's epoch (its freeze record's route-log position);
+    // required: an unfenced step could undo a newer migration.
+    let epoch = || -> Result<u64, RouteResponse> {
+        param("epoch")
+            .and_then(|value| value.parse().ok())
+            .filter(|epoch| *epoch > 0)
+            .ok_or_else(|| route_reply("400 Bad Request", "epoch=<n> (n > 0) required\n".into()))
+    };
     let propose = |op: trade_core::exchange::CategoryOp| -> RouteResponse {
+        let entry = wire::encode_raft_migration_entry(&op);
+        // One Raft message carries the entry: past the limit, followers
+        // would refuse it forever and the whole group would stop.
+        if entry.len() > MAX_RAFT_MESSAGE_BYTES / 2 {
+            return route_reply(
+                "413 Payload Too Large",
+                format!("migration entry of {} bytes exceeds half the {MAX_RAFT_MESSAGE_BYTES}-byte Raft message limit\n", entry.len()),
+            );
+        }
         let (reply, committed) = mpsc::sync_channel(1);
-        if admin_tx
-            .send((wire::encode_raft_migration_entry(&op), reply))
-            .is_err()
-        {
+        if admin_tx.send((entry, reply)).is_err() {
             return route_reply("503 Service Unavailable", "raft runtime stopped\n".into());
         }
         match committed.recv_timeout(Duration::from_secs(15)) {
@@ -1431,36 +1445,45 @@ fn migration_route(
             snapshot_trigger();
             route_reply("200 OK", "{\"requested\":true}".into())
         }
-        "/migration/seal" => match category() {
-            Ok(category) => propose(CategoryOp::Seal { category, category_size }),
+        "/migration/seal" => match category().and_then(|c| Ok((c, epoch()?))) {
+            Ok((category, epoch)) => propose(CategoryOp::Seal { category, category_size, epoch }),
             Err(response) => response,
         },
-        "/migration/drop" => match category() {
-            Ok(category) => propose(CategoryOp::Drop { category, category_size }),
+        "/migration/drop" => match category().and_then(|c| Ok((c, epoch()?))) {
+            Ok((category, epoch)) => propose(CategoryOp::Drop { category, category_size, epoch }),
             Err(response) => response,
         },
-        // Undo a seal (a migration that failed before cutover): installing an
-        // empty state lifts the seal and leaves the books untouched.
-        "/migration/unseal" => match category() {
-            Ok(category) => propose(CategoryOp::Install {
-                category,
-                category_size,
-                engines: Vec::new(),
-                positions: Vec::new(),
-            }),
+        // Undo a seal (a migration that failed before cutover).
+        "/migration/unseal" => match category().and_then(|c| Ok((c, epoch()?))) {
+            Ok((category, epoch)) => propose(CategoryOp::Unseal { category, category_size, epoch }),
             Err(response) => response,
+        },
+        // Whether the category is sealed here and the epoch of its last
+        // migration step, as of the durable snapshot (the orchestrator
+        // checks that its steps applied, not just committed).
+        "/migration/status" => match category() {
+            Err(response) => response,
+            Ok(category) => match trade_core::migration::snapshot_migration_status(snapshot_path, category) {
+                Ok(Some((index, sealed, epoch))) => route_reply(
+                    "200 OK",
+                    format!("{{\"raft_applied_index\":{index},\"sealed\":{sealed},\"epoch\":{epoch}}}"),
+                ),
+                Ok(None) => route_reply("503 Service Unavailable", "no durable snapshot yet\n".into()),
+                Err(error) => route_reply("500 Internal Server Error", format!("{error}\n")),
+            },
         },
         "/category-state" => match category() {
             Err(response) => response,
             Ok(category) => match trade_core::snapshot::load(snapshot_path) {
                 Err(error) => route_reply("503 Service Unavailable", format!("no durable snapshot: {error}\n")),
                 Ok(snap) => {
-                    let (engines, positions) =
-                        trade_core::migration::export_category(&snap, category, category_size);
+                    let export = trade_core::migration::export_category(&snap, category, category_size);
                     let bytes = trade_core::migration::encode_category_state(
                         snap.raft_applied_index,
-                        &engines,
-                        &positions,
+                        &export.engines,
+                        &export.positions,
+                        &export.halted,
+                        &export.command_ids,
                     );
                     let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
                     route_reply(
@@ -1471,8 +1494,8 @@ fn migration_route(
             },
         },
         "/migration/install" => {
-            let category = match category() {
-                Ok(category) => category,
+            let (category, epoch) = match category().and_then(|c| Ok((c, epoch()?))) {
+                Ok(pair) => pair,
                 Err(response) => return Some(response),
             };
             let (Some(from), Some(min_index)) =
@@ -1514,11 +1537,18 @@ fn migration_route(
                     ),
                 ));
             }
+            let command_ids = match (&state.recent_command_ids, &state.recent_command_instruments) {
+                (Some(ids), Some(instruments)) => ids.iter().copied().zip(instruments.iter().copied()).collect(),
+                _ => Vec::new(),
+            };
             propose(CategoryOp::Install {
                 category,
                 category_size,
+                epoch,
                 engines: state.engines,
                 positions: state.positions,
+                halted: state.halted,
+                command_ids,
             })
         }
         _ => return None,

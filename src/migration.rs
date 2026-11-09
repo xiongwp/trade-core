@@ -54,14 +54,53 @@ pub fn snapshot_category_fingerprint(
 ) -> io::Result<Option<CategoryFingerprint>> {
     match snapshot::load(snapshot_path) {
         Ok(snap) => {
-            let fingerprint = fingerprint_engine_states(&snap.engines, |instrument| {
-                asset_category(instrument, category_size) == category_id
-            });
+            let in_category = |instrument| asset_category(instrument, category_size) == category_id;
+            let books = fingerprint_engine_states(&snap.engines, in_category);
+            // Positions too: an install merged into leftover positions would
+            // otherwise compare equal.
+            let mut positions: Vec<(u64, u32, i64)> = snap
+                .positions
+                .iter()
+                .copied()
+                .filter(|&(_, instrument, quantity)| quantity != 0 && in_category(crate::types::InstrumentId(instrument)))
+                .collect();
+            positions.sort_unstable();
+            let fingerprint = if positions.is_empty() {
+                books
+            } else {
+                let mut bytes = books.to_le_bytes().to_vec();
+                for (user, instrument, quantity) in positions {
+                    bytes.extend_from_slice(&user.to_le_bytes());
+                    bytes.extend_from_slice(&instrument.to_le_bytes());
+                    bytes.extend_from_slice(&quantity.to_le_bytes());
+                }
+                crate::journal::fnv1a(&bytes)
+            };
             Ok(Some(CategoryFingerprint {
                 raft_applied_index: snap.raft_applied_index,
                 fingerprint,
             }))
         }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// A category's migration state in a durable snapshot: (applied index,
+/// sealed, epoch of the last migration step). `Ok(None)` without a snapshot.
+pub fn snapshot_migration_status(
+    snapshot_path: &Path,
+    category_id: u32,
+) -> io::Result<Option<(u64, bool, u64)>> {
+    match snapshot::load(snapshot_path) {
+        Ok(snap) => Ok(Some((
+            snap.raft_applied_index,
+            snap.sealed.iter().any(|(category, _)| *category == category_id),
+            snap.migration_epochs
+                .iter()
+                .find(|(category, _)| *category == category_id)
+                .map_or(0, |(_, epoch)| *epoch),
+        ))),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
@@ -156,7 +195,7 @@ pub fn export_category(
     snap: &crate::snapshot::Snapshot,
     category: u32,
     category_size: u32,
-) -> (Vec<crate::snapshot::EngineState>, Vec<(u64, u32, i64)>) {
+) -> CategoryExport {
     let engines = snap
         .engines
         .iter()
@@ -171,7 +210,31 @@ pub fn export_category(
         })
         .copied()
         .collect();
-    (engines, positions)
+    let in_category =
+        |instrument: u32| asset_category(crate::types::InstrumentId(instrument), category_size) == category;
+    let halted = snap.halted.iter().copied().filter(|&instrument| in_category(instrument)).collect();
+    // Recent command ids of the category, oldest first (v8 snapshots know
+    // each id's instrument; older ones cannot tell, and carry none).
+    let command_ids = match (&snap.recent_command_ids, &snap.recent_command_instruments) {
+        (Some(ids), Some(instruments)) => ids
+            .iter()
+            .zip(instruments)
+            .filter(|(_, &instrument)| in_category(instrument))
+            .map(|(&id, &instrument)| (id, instrument))
+            .collect(),
+        _ => Vec::new(),
+    };
+    CategoryExport { engines, positions, halted, command_ids }
+}
+
+/// What a migration moves: see [`export_category`].
+pub struct CategoryExport {
+    pub engines: Vec<crate::snapshot::EngineState>,
+    pub positions: Vec<(u64, u32, i64)>,
+    /// Halted instruments of the category.
+    pub halted: Vec<u32>,
+    /// (command id, instrument) of the category's recent commands.
+    pub command_ids: Vec<(u64, u32)>,
 }
 
 /// Encode a category's exported state, with the source index it was taken
@@ -180,18 +243,24 @@ pub fn encode_category_state(
     raft_applied_index: u64,
     engines: &[crate::snapshot::EngineState],
     positions: &[(u64, u32, i64)],
+    halted: &[u32],
+    command_ids: &[(u64, u32)],
 ) -> Vec<u8> {
+    let ids: Vec<u64> = command_ids.iter().map(|(id, _)| *id).collect();
+    let instruments: Vec<u32> = command_ids.iter().map(|(_, instrument)| *instrument).collect();
     crate::snapshot::encode(crate::snapshot::SnapshotData {
         journal_seq: 0,
         raft_applied_index,
         max_cmd_id: 0,
         max_admin_id: 0,
-        halted: &[],
+        halted,
         suspended: &[],
         positions,
         engines,
-        recent_command_ids: Some(&[]),
+        recent_command_ids: Some(&ids),
         sealed: &[],
+        recent_command_instruments: Some(&instruments),
+        migration_epochs: &[],
     })
 }
 
@@ -400,6 +469,8 @@ mod tests {
             engines: &engines,
             recent_command_ids: None,
             sealed: &[],
+            recent_command_instruments: None,
+            migration_epochs: &[],
         };
         snapshot::write(path, data).unwrap();
     }

@@ -156,10 +156,7 @@ pub(crate) fn handle(
                         "{{\"accepted\":true,\"route_version\":{version},\"state\":\"ACTIVE\"}}"
                     )
                 }),
-                "/admin/routes/abort" => Ok(format!(
-                    "{{\"accepted\":{},\"state\":\"ABORTED\"}}",
-                    kafka.route_control.abort(category)
-                )),
+                "/admin/routes/abort" => abort_migration(&kafka, category),
                 _ => Err("unknown route migration action".into()),
             });
             match result {

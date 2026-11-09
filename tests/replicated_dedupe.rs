@@ -33,7 +33,7 @@ fn restart(p: &Processor, window: usize, tag: &str) -> Processor {
     let path = dir.join("snapshot.bin");
     p.write_snapshot(&path, 0, 7).unwrap();
     let snap = snapshot::load(&path).unwrap();
-    assert_eq!(snap.format_version, 6);
+    assert_eq!(snap.format_version, 8);
     let mut restored = processor(window);
     restored.restore_state(&snap);
     std::fs::remove_dir_all(&dir).unwrap();
@@ -110,6 +110,8 @@ fn a_pre_window_snapshot_restores_with_the_legacy_seed() {
             engines: &old.export_state(),
             recent_command_ids: None,
             sealed: &[],
+            recent_command_instruments: None,
+            migration_epochs: &[],
         },
     )
     .unwrap();

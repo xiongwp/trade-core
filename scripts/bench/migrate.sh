@@ -66,11 +66,32 @@ migrate() { # at-second category to-group
         "localhost:9200/admin/routes/migrate?category=$category&to=$to" | sed 's/^/   /'
     echo
 }
+# An orchestrator crash mid-migration: order-api is killed about a second
+# into moving category 3, so the category stays frozen (and possibly sealed
+# or installed) until /admin/routes/abort on the restarted instance rolls it
+# back. Held orders for it are resent by the client until it thaws.
+crash_mid_migration() { # at-second category to-group
+    local at=$1 category=$2 to=$3
+    sleep $((at - (SECONDS - T0))) 2>/dev/null || true
+    kill -0 "$CLIENT" 2>/dev/null || return 0
+    echo "== +$((SECONDS - T0))s migrate category $category -> group $to, kill -9 order-api mid-way"
+    curl -s --max-time 120 -X POST -H "Authorization: Bearer $TOKEN" \
+        "localhost:9200/admin/routes/migrate?category=$category&to=$to" >/dev/null 2>&1 &
+    sleep "${CRASH_AFTER:-1}"
+    docker kill -s KILL trade-core-order-1 >/dev/null
+    "${COMPOSE[@]}" start order >/dev/null 2>&1
+    until docker ps --format '{{.Names}} {{.Status}}' | grep -q 'trade-core-order-1 .*(healthy)'; do sleep 1; done
+    echo "== +$((SECONDS - T0))s abort category $category"
+    curl -s --max-time 300 -X POST -H "Authorization: Bearer $TOKEN" \
+        "localhost:9200/admin/routes/abort?category=$category" | sed 's/^/   /'
+    echo
+}
 T0=$SECONDS
 (
     migrate 20 1 2
     migrate 45 2 3
-    migrate 70 1 1
+    crash_mid_migration 55 3 0
+    migrate 80 1 1
 ) &
 MIGRATIONS=$!
 STATUS=0

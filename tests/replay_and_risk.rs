@@ -41,6 +41,8 @@ fn snapshot_restores_exact_ids_before_replaying_a_duplicate_tail() {
         }],
         recent_command_ids: None,
         sealed: Vec::new(),
+        recent_command_instruments: None,
+        migration_epochs: Vec::new(),
     };
     let mut processor = trade_core::exchange::Processor::new(|| Box::new(PriceTimePriority), None);
     processor.restore_state(&snapshot);

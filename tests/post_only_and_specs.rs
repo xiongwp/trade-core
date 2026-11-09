@@ -377,6 +377,8 @@ fn resting_post_only_survives_snapshot_and_replay_is_deterministic() {
             engines: &engines,
             recent_command_ids: None,
             sealed: &[],
+            recent_command_instruments: None,
+            migration_epochs: &[],
         },
     )
     .unwrap();

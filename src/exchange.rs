@@ -122,24 +122,40 @@ pub enum Command {
 /// One step of moving an asset category (`instrument` with
 /// `asset_category(instrument, category_size) == category`) between groups.
 #[derive(Debug)]
+///
+/// Every step carries its migration's `epoch` (the route-log position of
+/// the migration's freeze record; 0 for steps logged before epochs existed,
+/// which apply unfenced). The group remembers the last epoch per category,
+/// so a step of an older or a concurrent migration cannot undo a newer one:
+/// a seal never overrides another migration's seal, an install never
+/// predates the category's current epoch, and unseal/drop only apply for
+/// the epoch that sealed/installed the category here.
 pub enum CategoryOp {
     /// On the source: from here on reject the category's commands with
     /// "category-moved" (persisted in snapshots). Its state is exported from
     /// a snapshot taken after this point, so nothing applied later is lost.
-    Seal { category: u32, category_size: u32 },
-    /// On the target: install the exported books, untriggered stops and
-    /// positions, and accept the category's commands. Refused whole
-    /// ("category-not-empty") when this group already holds state for one of
-    /// its instruments.
+    Seal { category: u32, category_size: u32, epoch: u64 },
+    /// On the target: install the exported books, untriggered stops,
+    /// positions and halts, plus the category's recent command ids (so a
+    /// command redelivered after the move is still recognised), and accept
+    /// the category's commands. Refused whole ("category-not-empty") when
+    /// this group already holds state for one of its instruments.
     Install {
         category: u32,
         category_size: u32,
+        epoch: u64,
         engines: Vec<EngineState>,
         positions: Vec<(u64, u32, i64)>,
+        halted: Vec<u32>,
+        command_ids: Vec<(u64, u32)>,
     },
-    /// On the source, once traffic has moved: forget the category's state
-    /// (it stays sealed, so a stray late command is still rejected).
-    Drop { category: u32, category_size: u32 },
+    /// On the source, when a migration is rolled back: accept the
+    /// category's commands again.
+    Unseal { category: u32, category_size: u32, epoch: u64 },
+    /// On the source, once traffic has moved (or on the target, when a
+    /// migration is rolled back): forget the category's state (it stays
+    /// sealed, so a stray late command is still rejected).
+    Drop { category: u32, category_size: u32, epoch: u64 },
 }
 
 /// Intake metadata carried alongside a command. Raft entries retain their
@@ -968,6 +984,9 @@ pub struct Processor {
     legacy_command_ids: Vec<u64>,
     /// Categories sealed by a migration: category -> category size.
     sealed: std::collections::BTreeMap<u32, u32>,
+    /// Epoch of the last migration step applied per category (see
+    /// [`CategoryOp`]). Replicated state, persisted in snapshots.
+    migration_epochs: std::collections::BTreeMap<u32, u64>,
     /// Dual dedup cursors — one per intake queue. The high-priority queue
     /// legitimately reorders admin commands ahead of News, so a single cursor
     /// would be poisoned by a jumping cancel and dup-reject every later New.
@@ -1012,6 +1031,10 @@ pub struct Processor {
 pub(crate) struct RecentCommandIds {
     set: std::collections::HashSet<u64, std::hash::BuildHasherDefault<IdHasher>>,
     ring: Vec<u64>,
+    /// Instrument of each `ring` slot: a migration carries a category's
+    /// recent ids to its new group. `u32::MAX` when unknown (restored from
+    /// a snapshot older than v8).
+    instruments: Vec<u32>,
     /// Slot of the oldest id once the ring is full.
     head: usize,
     cap: usize,
@@ -1044,20 +1067,24 @@ impl RecentCommandIds {
         Self {
             set: Default::default(),
             ring: Vec::new(),
+            instruments: Vec::new(),
             head: 0,
             cap: cap.max(1),
         }
     }
 
-    /// Record `id`; false when it is already in the window (a duplicate).
-    fn insert(&mut self, id: u64) -> bool {
+    /// Record `id` (a command for `instrument`); false when it is already in
+    /// the window (a duplicate).
+    fn insert(&mut self, id: u64, instrument: u32) -> bool {
         if !self.set.insert(id) {
             return false;
         }
         if self.ring.len() < self.cap {
             self.ring.push(id);
+            self.instruments.push(instrument);
         } else {
             let expired = std::mem::replace(&mut self.ring[self.head], id);
+            self.instruments[self.head] = instrument;
             self.set.remove(&expired);
             self.head = (self.head + 1) % self.cap;
         }
@@ -1067,7 +1094,16 @@ impl RecentCommandIds {
     fn clear(&mut self) {
         self.set.clear();
         self.ring.clear();
+        self.instruments.clear();
         self.head = 0;
+    }
+
+    /// Instruments in the same order as [`Self::to_vec`].
+    fn instruments_vec(&self) -> Vec<u32> {
+        let mut out = Vec::with_capacity(self.instruments.len());
+        out.extend_from_slice(&self.instruments[self.head..]);
+        out.extend_from_slice(&self.instruments[..self.head]);
+        out
     }
 
     /// Oldest first: inserting them in this order rebuilds the same window.
@@ -1204,6 +1240,7 @@ impl Processor {
             seen_command_ids: RecentCommandIds::new(DEFAULT_COMMAND_ID_WINDOW),
             legacy_command_ids: Vec::new(),
             sealed: std::collections::BTreeMap::new(),
+            migration_epochs: std::collections::BTreeMap::new(),
             max_new_id: 0,
             max_admin_id: 0,
             fees: crate::fees::FeeSchedule::default(),
@@ -1240,27 +1277,80 @@ impl Processor {
         let in_category = |instrument: InstrumentId, category: u32, size: u32| {
             crate::sharding::asset_category(instrument, size) == category
         };
+        let (category, epoch) = match &op {
+            CategoryOp::Seal { category, epoch, .. }
+            | CategoryOp::Install { category, epoch, .. }
+            | CategoryOp::Unseal { category, epoch, .. }
+            | CategoryOp::Drop { category, epoch, .. } => (*category, *epoch),
+        };
+        let current = self.migration_epochs.get(&category).copied().unwrap_or(0);
+        // Epoch 0: a step logged before epochs existed; applies unfenced.
+        let fenced = epoch != 0;
+        let stale = match &op {
+            // Never over another migration's seal, never older than the last step.
+            CategoryOp::Seal { .. } => {
+                fenced && (epoch < current || (self.sealed.contains_key(&category) && current != epoch))
+            }
+            CategoryOp::Install { .. } => fenced && epoch < current,
+            // Only the migration that sealed / installed it here.
+            CategoryOp::Unseal { .. } | CategoryOp::Drop { .. } => fenced && epoch != current,
+        };
+        if stale {
+            emit(ExecReport::CommandRejected {
+                instrument: InstrumentId(0),
+                command_id: epoch,
+                reason: "stale-migration",
+            });
+            return;
+        }
         match op {
-            CategoryOp::Seal { category, category_size } => {
+            CategoryOp::Seal { category, category_size, .. } => {
                 self.sealed.insert(category, category_size);
+            }
+            CategoryOp::Unseal { category, .. } => {
+                self.sealed.remove(&category);
             }
             CategoryOp::Install {
                 category,
                 category_size,
                 engines,
                 positions,
+                halted,
+                command_ids,
+                ..
             } => {
-                let occupied = engines.iter().find(|state| {
-                    !in_category(state.instrument, category, category_size)
-                        || self
-                            .engines
-                            .get(&state.instrument)
-                            .is_some_and(|engine| !engine.book().is_empty())
-                        || self.stops.contains_key(&state.instrument)
-                });
-                if let Some(state) = occupied {
+                // Anything this group still holds for the category (books,
+                // stops, open positions) would be merged with, not replaced
+                // by, the install — and positions are not in the fingerprint
+                // of the books, so it would go unnoticed.
+                let holds_state = |instrument: InstrumentId| {
+                    self.engines
+                        .get(&instrument)
+                        .is_some_and(|engine| !engine.book().is_empty())
+                        || self.stops.contains_key(&instrument)
+                };
+                let occupied = engines
+                    .iter()
+                    .map(|state| state.instrument)
+                    .find(|&instrument| !in_category(instrument, category, category_size) || holds_state(instrument))
+                    .or_else(|| {
+                        self.engines
+                            .keys()
+                            .chain(self.stops.keys())
+                            .copied()
+                            .find(|&instrument| in_category(instrument, category, category_size) && holds_state(instrument))
+                    })
+                    .or_else(|| {
+                        self.positions
+                            .iter()
+                            .find(|(&(_, instrument), &quantity)| {
+                                quantity != 0 && in_category(instrument, category, category_size)
+                            })
+                            .map(|(&(_, instrument), _)| instrument)
+                    });
+                if let Some(instrument) = occupied {
                     emit(ExecReport::CommandRejected {
-                        instrument: state.instrument,
+                        instrument,
                         command_id: 0,
                         reason: "category-not-empty",
                     });
@@ -1284,8 +1374,20 @@ impl Processor {
                         *self.positions.entry((user, InstrumentId(instrument))).or_insert(0) += quantity;
                     }
                 }
+                for instrument in halted {
+                    if in_category(InstrumentId(instrument), category, category_size) {
+                        self.halted.insert(InstrumentId(instrument));
+                    }
+                }
+                // The category's commands applied on the source: a
+                // redelivery of one after the move is still a duplicate here.
+                for (id, instrument) in command_ids {
+                    if in_category(InstrumentId(instrument), category, category_size) {
+                        self.seen_command_ids.insert(id, instrument);
+                    }
+                }
             }
-            CategoryOp::Drop { category, category_size } => {
+            CategoryOp::Drop { category, category_size, .. } => {
                 self.sealed.insert(category, category_size);
                 self.engines
                     .retain(|&instrument, _| !in_category(instrument, category, category_size));
@@ -1303,6 +1405,9 @@ impl Processor {
                 self.halted
                     .retain(|&instrument| !in_category(instrument, category, category_size));
             }
+        }
+        if fenced {
+            self.migration_epochs.insert(category, epoch);
         }
     }
 
@@ -1427,6 +1532,7 @@ impl Processor {
         }
         self.sealed
             .extend(snap.sealed.iter().map(|&(category, size)| (category, size)));
+        self.migration_epochs.extend(snap.migration_epochs.iter().copied());
         // Exact command-id dedupe. A v6 snapshot carries the window itself.
         // Older ones do not: fall back to what the previous code used (the
         // ids of every order the snapshot holds, plus the ids the caller
@@ -1434,19 +1540,21 @@ impl Processor {
         // upgrade decides retries exactly as before.
         if let Some(ids) = &snap.recent_command_ids {
             self.seen_command_ids.clear();
-            for &id in ids {
-                self.seen_command_ids.insert(id);
+            let instruments = snap.recent_command_instruments.as_deref().unwrap_or(&[]);
+            for (k, &id) in ids.iter().enumerate() {
+                self.seen_command_ids
+                    .insert(id, instruments.get(k).copied().unwrap_or(u32::MAX));
             }
         } else {
             for id in std::mem::take(&mut self.legacy_command_ids) {
-                self.seen_command_ids.insert(id);
+                self.seen_command_ids.insert(id, u32::MAX);
             }
             for e in &snap.engines {
                 for id in e.orders.iter().map(|order| order.id.0) {
-                    self.seen_command_ids.insert(id);
+                    self.seen_command_ids.insert(id, e.instrument.0);
                 }
                 for id in e.stops.iter().map(|stop| stop.order.id.0) {
-                    self.seen_command_ids.insert(id);
+                    self.seen_command_ids.insert(id, e.instrument.0);
                 }
             }
         }
@@ -1521,7 +1629,9 @@ impl Processor {
                 return;
             }
         }
-        if exact_id != 0 && (!self.seen_command_ids.insert(exact_id) || self.would_duplicate_live(&cmd)) {
+        if exact_id != 0
+            && (!self.seen_command_ids.insert(exact_id, cmd.instrument().0) || self.would_duplicate_live(&cmd))
+        {
             emit(ExecReport::CommandRejected {
                 instrument: cmd.instrument(),
                 command_id: exact_id,
@@ -3009,7 +3119,9 @@ struct CapturedSnapshot {
     positions: HashMap<(u64, InstrumentId), i64>,
     engines: Vec<CapturedEngine>,
     recent_command_ids: Vec<u64>,
+    recent_command_instruments: Vec<u32>,
     sealed: Vec<(u32, u32)>,
+    migration_epochs: Vec<(u32, u64)>,
 }
 
 struct CapturedEngine {
@@ -3051,6 +3163,8 @@ impl CapturedSnapshot {
                 engines: &engines,
                 recent_command_ids: Some(&self.recent_command_ids),
                 sealed: &self.sealed,
+                recent_command_instruments: Some(&self.recent_command_instruments),
+                migration_epochs: &self.migration_epochs,
             },
         )
     }
@@ -3070,7 +3184,9 @@ fn capture_processor_snapshot(
         suspended: processor.suspended.iter().copied().collect(),
         positions: processor.positions.clone(),
         recent_command_ids: processor.seen_command_ids.to_vec(),
+        recent_command_instruments: processor.seen_command_ids.instruments_vec(),
         sealed: processor.sealed.iter().map(|(&category, &size)| (category, size)).collect(),
+        migration_epochs: processor.migration_epochs.iter().map(|(&c, &e)| (c, e)).collect(),
         engines: processor
             .engines
             .iter()

@@ -48,6 +48,10 @@ const VERSION_STOPS: u32 = 5;
 const VERSION_DEDUP_WINDOW: u32 = 6;
 /// v7: v6 plus the categories sealed by a migration.
 const VERSION_SEALED: u32 = 7;
+/// v8: v7 plus each dedupe-window id's instrument (a migration carries a
+/// category's recent ids to the target) and the per-category migration
+/// epochs that fence stale migration steps.
+const VERSION_MIGRATION_EPOCHS: u32 = 8;
 const LEGACY_VERSION: u32 = 3;
 const ORDER_ENC: usize = 56;
 /// Encoded stop: the order, then trigger price (u64) and kind (u8).
@@ -177,6 +181,10 @@ pub struct Snapshot {
     pub recent_command_ids: Option<Vec<u64>>,
     /// Categories sealed by a migration: (category, category size) (v7+).
     pub sealed: Vec<(u32, u32)>,
+    /// Instrument of each `recent_command_ids` entry, same order (v8+).
+    pub recent_command_instruments: Option<Vec<u32>>,
+    /// Epoch of the last migration step applied per category (v8+).
+    pub migration_epochs: Vec<(u32, u64)>,
 }
 
 /// Borrowed state supplied when atomically writing a snapshot.
@@ -193,6 +201,10 @@ pub struct SnapshotData<'a> {
     pub recent_command_ids: Option<&'a [u64]>,
     /// Sealed categories (written as v7 when any; needs the window too).
     pub sealed: &'a [(u32, u32)],
+    /// Instrument of each window id (written as v8; needs the window).
+    pub recent_command_instruments: Option<&'a [u32]>,
+    /// Migration epoch per category (v8).
+    pub migration_epochs: &'a [(u32, u64)],
 }
 
 /// Write a snapshot **atomically**: temp file, fsync, rename over `path`.
@@ -204,7 +216,11 @@ pub fn write(path: &Path, data: SnapshotData<'_>) -> io::Result<()> {
 /// The on-disk encoding of a snapshot (also how a category's state travels
 /// between Raft groups during a migration; see [`crate::migration`]).
 pub fn encode(data: SnapshotData<'_>) -> Vec<u8> {
-    let version = if data.recent_command_ids.is_some() && !data.sealed.is_empty() {
+    let version = if data.recent_command_ids.is_some()
+        && (data.recent_command_instruments.is_some() || !data.migration_epochs.is_empty())
+    {
+        VERSION_MIGRATION_EPOCHS
+    } else if data.recent_command_ids.is_some() && !data.sealed.is_empty() {
         VERSION_SEALED
     } else if data.recent_command_ids.is_some() {
         VERSION_DEDUP_WINDOW
@@ -264,6 +280,22 @@ pub fn encode(data: SnapshotData<'_>) -> Vec<u8> {
         for (category, size) in data.sealed {
             buf.extend_from_slice(&category.to_le_bytes());
             buf.extend_from_slice(&size.to_le_bytes());
+        }
+    }
+    if version >= VERSION_MIGRATION_EPOCHS {
+        let instruments = data.recent_command_instruments.unwrap_or(&[]);
+        assert!(
+            instruments.is_empty() || instruments.len() == data.recent_command_ids.map_or(0, <[u64]>::len),
+            "one instrument per dedupe-window id"
+        );
+        buf.extend_from_slice(&(instruments.len() as u64).to_le_bytes());
+        for instrument in instruments {
+            buf.extend_from_slice(&instrument.to_le_bytes());
+        }
+        buf.extend_from_slice(&(data.migration_epochs.len() as u32).to_le_bytes());
+        for (category, epoch) in data.migration_epochs {
+            buf.extend_from_slice(&category.to_le_bytes());
+            buf.extend_from_slice(&epoch.to_le_bytes());
         }
     }
     let h = fnv1a(&buf);
@@ -373,7 +405,9 @@ pub fn decode(buf: &[u8]) -> io::Result<Snapshot> {
         return Err(corrupt("checksum mismatch"));
     }
     let version = u32::from_le_bytes(buf[4..8].try_into().unwrap());
-    if ![LEGACY_VERSION, VERSION, VERSION_STOPS, VERSION_DEDUP_WINDOW, VERSION_SEALED].contains(&version) {
+    if ![LEGACY_VERSION, VERSION, VERSION_STOPS, VERSION_DEDUP_WINDOW, VERSION_SEALED, VERSION_MIGRATION_EPOCHS]
+        .contains(&version)
+    {
         return Err(corrupt("unsupported version"));
     }
     let journal_seq = u64::from_le_bytes(buf[8..16].try_into().unwrap());
@@ -488,7 +522,45 @@ pub fn decode(buf: &[u8]) -> io::Result<Snapshot> {
             pos += 8;
         }
     }
+    let mut recent_command_instruments = None;
+    let mut migration_epochs = Vec::new();
+    if version >= VERSION_MIGRATION_EPOCHS {
+        if pos + 8 > body_len {
+            return Err(corrupt("truncated window instruments"));
+        }
+        let n = u64::from_le_bytes(buf[pos..pos + 8].try_into().unwrap()) as usize;
+        pos += 8;
+        if n > (body_len - pos) / 4
+            || (n != 0 && n != recent_command_ids.as_ref().map_or(0, Vec::len))
+        {
+            return Err(corrupt("bad window instruments"));
+        }
+        let instruments: Vec<u32> = (0..n)
+            .map(|k| u32::from_le_bytes(buf[pos + k * 4..pos + k * 4 + 4].try_into().unwrap()))
+            .collect();
+        pos += n * 4;
+        if n != 0 {
+            recent_command_instruments = Some(instruments);
+        }
+        if pos + 4 > body_len {
+            return Err(corrupt("truncated migration epochs"));
+        }
+        let n = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+        if n > (body_len - pos) / 12 {
+            return Err(corrupt("truncated migration epochs"));
+        }
+        for _ in 0..n {
+            migration_epochs.push((
+                u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()),
+                u64::from_le_bytes(buf[pos + 4..pos + 12].try_into().unwrap()),
+            ));
+            pos += 12;
+        }
+    }
     Ok(Snapshot {
+        recent_command_instruments,
+        migration_epochs,
         sealed,
         recent_command_ids,
         format_version: version,
@@ -523,6 +595,8 @@ mod tests {
             engines: &[],
             recent_command_ids: Some(&[1, 2, 3]),
             sealed: &[],
+            recent_command_instruments: None,
+            migration_epochs: &[],
         };
         write(&path, data(41)).unwrap();
         let bytes = std::fs::read(&path).unwrap();
@@ -566,6 +640,8 @@ mod tests {
                 engines: &engines,
                 recent_command_ids: None,
                 sealed: &[],
+                recent_command_instruments: None,
+                migration_epochs: &[],
             },
         )
         .unwrap();

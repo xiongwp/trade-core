@@ -113,21 +113,32 @@ const RAFT_MIGRATION_MAGIC: [u8; 4] = *b"TCMG";
 /// ([`crate::exchange::CategoryOp`]). An install carries the category's
 /// exported state in the snapshot encoding, so it can be large; it travels
 /// as its own entry rather than as command frames.
+///
+/// Version 2 adds the migration epoch (u64 after the header) and the unseal
+/// step; version 1 entries (no epoch) still decode, with epoch 0.
 pub fn encode_raft_migration_entry(op: &crate::exchange::CategoryOp) -> Vec<u8> {
     use crate::exchange::CategoryOp;
-    let (kind, category, size) = match op {
-        CategoryOp::Seal { category, category_size } => (1u8, *category, *category_size),
-        CategoryOp::Install { category, category_size, .. } => (2u8, *category, *category_size),
-        CategoryOp::Drop { category, category_size } => (3u8, *category, *category_size),
+    let (kind, category, size, epoch) = match op {
+        CategoryOp::Seal { category, category_size, epoch } => (1u8, *category, *category_size, *epoch),
+        CategoryOp::Install { category, category_size, epoch, .. } => (2u8, *category, *category_size, *epoch),
+        CategoryOp::Drop { category, category_size, epoch } => (3u8, *category, *category_size, *epoch),
+        CategoryOp::Unseal { category, category_size, epoch } => (4u8, *category, *category_size, *epoch),
     };
-    let mut out = Vec::with_capacity(17);
+    let mut out = Vec::with_capacity(25);
     out.extend_from_slice(&RAFT_MIGRATION_MAGIC);
-    out.extend_from_slice(&1u32.to_le_bytes());
+    out.extend_from_slice(&2u32.to_le_bytes());
     out.push(kind);
     out.extend_from_slice(&category.to_le_bytes());
     out.extend_from_slice(&size.to_le_bytes());
-    if let CategoryOp::Install { engines, positions, .. } = op {
-        out.extend_from_slice(&crate::migration::encode_category_state(0, engines, positions));
+    out.extend_from_slice(&epoch.to_le_bytes());
+    if let CategoryOp::Install { engines, positions, halted, command_ids, .. } = op {
+        out.extend_from_slice(&crate::migration::encode_category_state(
+            0,
+            engines,
+            positions,
+            halted,
+            command_ids,
+        ));
     }
     out
 }
@@ -137,18 +148,32 @@ fn decode_raft_migration_entry(payload: &[u8]) -> Option<crate::exchange::Catego
     if payload.len() < 17 || payload[..4] != RAFT_MIGRATION_MAGIC {
         return None;
     }
+    let version = u32::from_le_bytes(payload[4..8].try_into().ok()?);
     let category = u32::from_le_bytes(payload[9..13].try_into().ok()?);
     let category_size = u32::from_le_bytes(payload[13..17].try_into().ok()?);
+    let (epoch, body) = match version {
+        1 => (0, &payload[17..]),
+        2 => (u64::from_le_bytes(payload.get(17..25)?.try_into().ok()?), &payload[25..]),
+        _ => return None,
+    };
     match payload[8] {
-        1 => Some(CategoryOp::Seal { category, category_size }),
-        3 => Some(CategoryOp::Drop { category, category_size }),
+        1 => Some(CategoryOp::Seal { category, category_size, epoch }),
+        3 => Some(CategoryOp::Drop { category, category_size, epoch }),
+        4 if version >= 2 => Some(CategoryOp::Unseal { category, category_size, epoch }),
         2 => {
-            let state = crate::snapshot::decode(&payload[17..]).ok()?;
+            let state = crate::snapshot::decode(body).ok()?;
+            let command_ids = match (&state.recent_command_ids, &state.recent_command_instruments) {
+                (Some(ids), Some(instruments)) => ids.iter().copied().zip(instruments.iter().copied()).collect(),
+                _ => Vec::new(),
+            };
             Some(CategoryOp::Install {
                 category,
                 category_size,
+                epoch,
                 engines: state.engines,
                 positions: state.positions,
+                halted: state.halted,
+                command_ids,
             })
         }
         _ => None,
@@ -782,6 +807,7 @@ pub const REJECT_REASONS: &[&str] = &[
     "stop-not-amendable",
     "category-moved",
     "category-not-empty",
+    "stale-migration",
 ];
 
 /// Wire code of a reject reason (0 if it is not in [`REJECT_REASONS`]).
@@ -1007,17 +1033,23 @@ mod tests {
     #[test]
     fn migration_entries_round_trip_including_the_installed_state() {
         use crate::exchange::CategoryOp;
-        let seal = encode_raft_migration_entry(&CategoryOp::Seal { category: 7, category_size: 1000 });
+        let seal = encode_raft_migration_entry(&CategoryOp::Seal { category: 7, category_size: 1000, epoch: 42 });
         match decode_raft_entry(&seal).unwrap().as_slice() {
             [Command::Migrate(op)] => {
-                assert!(matches!(**op, CategoryOp::Seal { category: 7, category_size: 1000 }))
+                assert!(matches!(**op, CategoryOp::Seal { category: 7, category_size: 1000, epoch: 42 }))
             }
             other => panic!("{other:?}"),
         }
+        let unseal = encode_raft_migration_entry(&CategoryOp::Unseal { category: 7, category_size: 1000, epoch: 42 });
+        assert!(matches!(
+            decode_raft_entry(&unseal).unwrap().as_slice(),
+            [Command::Migrate(op)] if matches!(**op, CategoryOp::Unseal { epoch: 42, .. })
+        ));
         let order = Order::limit(OrderId(9), Side::Buy, 10, 2).on(InstrumentId(7_001));
         let install = encode_raft_migration_entry(&CategoryOp::Install {
             category: 7,
             category_size: 1000,
+            epoch: 42,
             engines: vec![crate::snapshot::EngineState {
                 instrument: InstrumentId(7_001),
                 engine_seq: 3,
@@ -1025,18 +1057,38 @@ mod tests {
                 stops: Vec::new(),
             }],
             positions: vec![(5, 7_001, -2)],
+            halted: vec![7_001],
+            command_ids: vec![(9, 7_001), (11, 7_002)],
         });
         match decode_raft_entry(&install).unwrap().as_slice() {
             [Command::Migrate(op)] => match &**op {
-                CategoryOp::Install { engines, positions, .. } => {
+                CategoryOp::Install { engines, positions, halted, command_ids, epoch, .. } => {
                     assert_eq!(engines[0].orders[0].id, OrderId(9));
                     assert_eq!(positions, &vec![(5, 7_001, -2)]);
+                    assert_eq!(halted, &vec![7_001]);
+                    assert_eq!(command_ids, &vec![(9, 7_001), (11, 7_002)]);
+                    assert_eq!(*epoch, 42);
                 }
                 other => panic!("{other:?}"),
             },
             other => panic!("{other:?}"),
         }
         assert!(decode_raft_config_entry(&seal).is_none());
+    }
+
+    #[test]
+    fn a_version_1_migration_entry_still_decodes_unfenced() {
+        use crate::exchange::CategoryOp;
+        // As written before epochs: magic, version 1, kind, category, size.
+        let mut v1 = RAFT_MIGRATION_MAGIC.to_vec();
+        v1.extend_from_slice(&1u32.to_le_bytes());
+        v1.push(3);
+        v1.extend_from_slice(&7u32.to_le_bytes());
+        v1.extend_from_slice(&1000u32.to_le_bytes());
+        assert!(matches!(
+            decode_raft_entry(&v1).unwrap().as_slice(),
+            [Command::Migrate(op)] if matches!(**op, CategoryOp::Drop { category: 7, category_size: 1000, epoch: 0 })
+        ));
     }
 
     #[test]
