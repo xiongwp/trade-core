@@ -1014,14 +1014,14 @@ fn backpressure_is_isolated_per_category_and_takes_group_max() {
     assert_eq!(bp.tier_for_category(0), BackpressureTier::Hard);
     assert_eq!(bp.tier_for_category(1), BackpressureTier::Normal);
     assert_eq!(bp.tier_for_category(4), BackpressureTier::Hard); // 4 -> partition 0
-                                                                 // MySQL lag is per database, and every category writes to every
-                                                                 // database: one slow database throttles every category.
+    // A slow database does not stop trading: matching is unaffected, the
+    // projection's backlog waits in Kafka (the global pipeline limit bounds it).
     bp.set_partition_lags("match", &[0, 0, 0, 0]);
     bp.set_partition_lags("mysql", &[0, 0, 800, 0, 0, 0]);
     for category in 0..4 {
-        assert_eq!(bp.tier_for_category(category), BackpressureTier::Emergency);
+        assert_eq!(bp.tier_for_category(category), BackpressureTier::Normal);
     }
-    assert_eq!(bp.max_partition_lag(), 800);
+    assert_eq!(bp.max_partition_lag(), 800, "still reported");
     // Drain both -> everything recovers to normal.
     bp.set_partition_lags("mysql", &[0, 0, 0, 0, 0, 0]);
     assert_eq!(bp.tier_for_category(0), BackpressureTier::Normal);
@@ -1044,14 +1044,14 @@ fn backpressure_quorum_loss_is_per_group_and_recoverable() {
 fn backpressure_admit_maps_tiers_to_ingress_status() {
     let bp = test_backpressure(100, 250, 750, 1, 1);
     // Soft accepts (slowdown only).
-    bp.set_partition_lags("mysql", &[150]);
+    bp.set_partition_lags("match", &[150]);
     assert!(bp.admit(0).is_ok());
     // Hard -> 429.
-    bp.set_partition_lags("mysql", &[300]);
+    bp.set_partition_lags("match", &[300]);
     let hard = bp.admit(0).unwrap_err();
     assert_eq!(ingress_error_status(&hard), "429 Too Many Requests");
     // Emergency -> 503.
-    bp.set_partition_lags("mysql", &[900]);
+    bp.set_partition_lags("match", &[900]);
     let emergency = bp.admit(0).unwrap_err();
     assert_eq!(ingress_error_status(&emergency), "503 Service Unavailable");
 }
@@ -1117,10 +1117,14 @@ fn read_dlq(path: &Path) -> Vec<(i32, i64, String, Vec<u8>)> {
         assert_eq!(journal::fnv1a(&body), u64::from_le_bytes(checksum));
         let partition = i32::from_le_bytes(body[8..12].try_into().unwrap());
         let offset = i64::from_le_bytes(body[12..20].try_into().unwrap());
-        let reason_len = u32::from_le_bytes(body[20..24].try_into().unwrap()) as usize;
-        let reason = String::from_utf8(body[24..24 + reason_len].to_vec()).unwrap();
-        let mut cursor = 24 + reason_len;
-        let payload_len = u32::from_le_bytes(body[cursor..cursor + 4].try_into().unwrap()) as usize;
+        let topic_len = u32::from_le_bytes(body[20..24].try_into().unwrap()) as usize;
+        assert_eq!(&body[24..24 + topic_len], b"trade-executions-v1");
+        let at = 24 + topic_len;
+        let reason_len = u32::from_le_bytes(body[at..at + 4].try_into().unwrap()) as usize;
+        let reason = String::from_utf8(body[at + 4..at + 4 + reason_len].to_vec()).unwrap();
+        let mut cursor = at + 4 + reason_len;
+        let payload_len =
+            u32::from_le_bytes(body[cursor..cursor + 4].try_into().unwrap()) as usize;
         cursor += 4;
         let payload = body[cursor..cursor + payload_len].to_vec();
         out.push((partition, offset, reason, payload));
@@ -1145,6 +1149,7 @@ fn persist_retry_dead_letters_after_exhausting_retries() {
         &metrics,
         3,
         Duration::ZERO,
+        "trade-executions-v1",
         7,
         42,
         b"raw-envelope",
@@ -1188,6 +1193,7 @@ fn persist_retry_commits_and_skips_dlq_on_eventual_success() {
         &metrics,
         5,
         Duration::ZERO,
+        "trade-executions-v1",
         1,
         2,
         b"x",

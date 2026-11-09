@@ -206,10 +206,10 @@ pub(crate) fn forward_kafka_batch(
 }
 
 pub(crate) fn is_leader(metrics_addr: &str) -> bool {
-    let Ok(mut stream) = TcpStream::connect(metrics_addr) else {
+    let timeout = Duration::from_millis(env_number("TC_RAFT_LEADER_PROBE_TIMEOUT_MS", 1_000u64));
+    let Ok(mut stream) = trade_core::migration::connect_timeout(metrics_addr, timeout) else {
         return false;
     };
-    let timeout = Duration::from_millis(env_number("TC_RAFT_LEADER_PROBE_TIMEOUT_MS", 1_000u64));
     let _ = stream.set_read_timeout(Some(timeout));
     let _ = stream.set_write_timeout(Some(timeout));
     let _ = stream.write_all(b"GET /metrics HTTP/1.1\r\nHost: raft\r\nConnection: close\r\n\r\n");
@@ -250,7 +250,8 @@ impl MatcherConnection {
             {
                 continue;
             }
-            let Ok(stream) = TcpStream::connect(&target.order_addr) else {
+            let connect = Duration::from_millis(env_number("TC_RAFT_LEADER_PROBE_TIMEOUT_MS", 1_000u64));
+            let Ok(stream) = trade_core::migration::connect_timeout(&target.order_addr, connect) else {
                 continue;
             };
             stream.set_nodelay(true)?;

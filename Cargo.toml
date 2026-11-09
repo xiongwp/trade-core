@@ -125,5 +125,9 @@ name = "user-stream"
 path = "src/bin/user_stream.rs"
 
 [[bin]]
+name = "dlq-tool"
+path = "src/bin/dlq_tool.rs"
+
+[[bin]]
 name = "journal-inspect"
 path = "src/bin/journal_inspect.rs"

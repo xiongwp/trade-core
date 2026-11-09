@@ -35,12 +35,11 @@ pub(crate) struct Backpressure {
     /// The live routing (shared with intake): after a category migrates its
     /// quorum health must come from the group that now owns it.
     pub(crate) routes: trade_core::cluster::RouteControlPlane,
-    /// The MySQL projection's lag: the largest over the DB-route partitions.
-    /// Every category's orders spread over every database, so a database
-    /// that falls behind is everyone's lag, not one order partition's.
+    /// The MySQL projection's lag, the largest over the DB-route partitions
+    /// (reported; see [`Self::partition_lag`] for why it gates nothing).
     pub(crate) mysql_lag: AtomicU64,
     pub(crate) match_lag: Vec<AtomicU64>,
-    /// Per group: until when (ms since the epoch) it counts as unhealthy
+    /// Per group: until when (monotonic ms) it counts as unhealthy
     /// after a failed forward. It expires, so an instance that stops
     /// forwarding to a group (its partitions moved away) does not keep
     /// refusing that group's categories forever.
@@ -105,13 +104,15 @@ impl Backpressure {
         self.routes.group_for(category_id)
     }
 
+    /// A category's tier follows its order partition's matching lag only.
+    /// The MySQL projection does not gate trading per category: a database
+    /// that falls behind (or one MySQL host down) would otherwise stop the
+    /// whole market within seconds although matching is unaffected; its
+    /// backlog waits in Kafka and is bounded by the global pipeline limit.
     pub(crate) fn partition_lag(&self, index: usize) -> u64 {
-        let mysql = self.mysql_lag.load(AtomicOrdering::Acquire);
-        let matcher = self
-            .match_lag
+        self.match_lag
             .get(index)
-            .map_or(0, |v| v.load(AtomicOrdering::Acquire));
-        mysql.max(matcher)
+            .map_or(0, |v| v.load(AtomicOrdering::Acquire))
     }
 
     pub(crate) fn set_partition_lags(&self, stage: &str, lags: &[u64]) {
@@ -226,8 +227,9 @@ impl Backpressure {
 /// renews it; a success clears it).
 const GROUP_UNHEALTHY_MS: u64 = 10_000;
 
+/// Milliseconds on a monotonic clock (a wall-clock step must not stretch or
+/// cut short an unhealthy mark).
 fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_millis() as u64)
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64 + 1
 }

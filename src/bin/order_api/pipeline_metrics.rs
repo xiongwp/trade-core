@@ -261,12 +261,14 @@ impl OrderPipelineMetrics {
             "# TYPE tc_order_mysql_consumer_lag gauge\ntc_order_mysql_consumer_lag {}\n\
 # TYPE tc_order_match_consumer_lag gauge\ntc_order_match_consumer_lag {}\n\
 # TYPE tc_order_dlq_total counter\ntc_order_dlq_total {}\n\
+# TYPE tc_order_command_dlq_total counter\ntc_order_command_dlq_total {}\n\
 # TYPE tc_order_lag_read_failures counter\ntc_order_lag_read_failures {}\n\
 # TYPE tc_order_lag_monitors_ready gauge\ntc_order_lag_monitors_ready {}\n\
 # TYPE tc_order_dedupe_truncated_partitions counter\ntc_order_dedupe_truncated_partitions {}\n",
             self.observed_mysql_lag.load(AtomicOrdering::Relaxed),
             self.observed_match_lag.load(AtomicOrdering::Relaxed),
             self.dlq_total.load(AtomicOrdering::Relaxed),
+            super::dlq::COMMAND_DEAD_LETTERED.load(AtomicOrdering::Relaxed),
             self.lag_read_failures.load(AtomicOrdering::Relaxed),
             u8::from(self.lag_monitors_ready()),
             self.dedupe_truncated_partitions.load(AtomicOrdering::Relaxed),

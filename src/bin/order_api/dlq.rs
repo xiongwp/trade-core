@@ -4,13 +4,14 @@ use super::*;
 
 /// Header stamped on a fresh dead-letter file; a version bump changes it so old
 /// files are rejected rather than silently misparsed.
-pub(crate) const DLQ_HEADER: [u8; 8] = *b"TCDLQ01\0";
+pub(crate) const DLQ_HEADER: [u8; 8] = *b"TCDLQ02\0";
 
 /// Append-only dead-letter log for order-execution messages that exhausted
 /// their retry budget. Mirrors the journal WAL style: a magic header, one
-/// length-framed record per poison message carrying `(partition, offset,
-/// reason, original payload)`, each closed by an FNV-1a checksum so a torn
-/// tail is detected and dropped on read.
+/// length-framed record per poison message carrying `(time, topic,
+/// partition, offset, reason, original payload)`, each closed by an FNV-1a
+/// checksum so a torn tail is detected and dropped on read. `dlq-tool`
+/// lists and replays them (to the topic and partition they came from).
 pub(crate) struct DlqWriter {
     pub(crate) file: File,
 }
@@ -47,16 +48,20 @@ impl DlqWriter {
 
     pub(crate) fn append(
         &mut self,
+        topic: &str,
         partition: i32,
         offset: i64,
         reason: &str,
         payload: &[u8],
     ) -> io::Result<()> {
         let reason = reason.as_bytes();
-        let mut body = Vec::with_capacity(28 + reason.len() + payload.len());
+        let topic = topic.as_bytes();
+        let mut body = Vec::with_capacity(32 + topic.len() + reason.len() + payload.len());
         body.extend_from_slice(&journal::now_nanos().to_le_bytes());
         body.extend_from_slice(&partition.to_le_bytes());
         body.extend_from_slice(&offset.to_le_bytes());
+        body.extend_from_slice(&(topic.len() as u32).to_le_bytes());
+        body.extend_from_slice(topic);
         body.extend_from_slice(&(reason.len() as u32).to_le_bytes());
         body.extend_from_slice(reason);
         body.extend_from_slice(&(payload.len() as u32).to_le_bytes());
@@ -92,6 +97,7 @@ pub(crate) fn persist_with_retry<F>(
     metrics: &OrderPipelineMetrics,
     max_retries: u32,
     base_backoff: Duration,
+    topic: &str,
     partition: i32,
     offset: i64,
     payload: &[u8],
@@ -109,7 +115,7 @@ where
                     .map_err(|_| "DLQ mutex poisoned".to_string())
                     .and_then(|mut writer| {
                         writer
-                            .append(partition, offset, &error, payload)
+                            .append(topic, partition, offset, &error, payload)
                             .map_err(|e| e.to_string())
                     });
                 match written {
@@ -150,13 +156,15 @@ where
 /// (`TC_ORDER_COMMAND_DLQ_PATH`) for an operator to replay. If even the
 /// dead-letter write fails, the process stops before the offset moves, so
 /// the message is redelivered rather than lost.
+/// Commands dead-lettered by this process (`tc_order_command_dlq_total`).
+pub(crate) static COMMAND_DEAD_LETTERED: AtomicU64 = AtomicU64::new(0);
+
 pub(crate) fn dead_letter_command(
     stage: &str,
     message: &rdkafka::message::BorrowedMessage<'_>,
     error: &str,
 ) {
     static DLQ: std::sync::OnceLock<Mutex<DlqWriter>> = std::sync::OnceLock::new();
-    static DEAD_LETTERED: AtomicU64 = AtomicU64::new(0);
     let dlq = DLQ.get_or_init(|| {
         let path = std::env::var("TC_ORDER_COMMAND_DLQ_PATH")
             .unwrap_or_else(|_| "order-command-dlq.wal".into());
@@ -166,12 +174,11 @@ pub(crate) fn dead_letter_command(
     let payload = rdkafka::message::Message::payload(message).unwrap_or_default();
     let partition = rdkafka::message::Message::partition(message);
     let offset = rdkafka::message::Message::offset(message);
+    let topic = rdkafka::message::Message::topic(message);
     dlq.lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .append(partition, offset, &reason, payload)
-        .unwrap_or_else(|io| {
-            panic!("command DLQ append failed ({io}); refusing to skip offset {offset}")
-        });
-    let total = DEAD_LETTERED.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+        .append(topic, partition, offset, &reason, payload)
+        .unwrap_or_else(|io| panic!("command DLQ append failed ({io}); refusing to skip offset {offset}"));
+    let total = COMMAND_DEAD_LETTERED.fetch_add(1, AtomicOrdering::Relaxed) + 1;
     log_error!("order-kafka", stage; "event=command_dead_lettered partition={partition} offset={offset} total={total} error={error}");
 }

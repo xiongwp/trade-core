@@ -80,10 +80,12 @@ pub(crate) fn parse_shard_urls(db_count: usize) -> Vec<String> {
             .filter(|url| !url.is_empty())
             .map(str::to_string)
             .collect::<Vec<_>>();
-        match validate_shard_urls(&urls, db_count) {
-            Ok(()) => return urls,
-            Err(error) => log_warn!("order-api", "{error}"),
+        // A wrong list is fatal: falling back to TC_ORDER_MYSQL_URL put every
+        // database on that one server, and the count then validated.
+        if let Err(error) = validate_shard_urls(&urls, db_count) {
+            panic!("{error}");
         }
+        return urls;
     }
     let url = std::env::var("TC_ORDER_MYSQL_URL").expect("TC_ORDER_MYSQL_URL");
     vec![url; db_count]

@@ -16,7 +16,7 @@ RUN cargo build --release \
     --bin raft-node \
     --bin raft-multi-node \
     --bin trade-core --bin order --bin order-api --bin user-stream --bin market-data --bin order_client --bin order_load \
-    --bin journal-inspect
+    --bin journal-inspect --bin dlq-tool
 
 FROM debian:stable-slim
 COPY --from=build /src/target/release/trade-core /usr/local/bin/trade-core
@@ -30,6 +30,7 @@ COPY --from=build /src/target/release/raft-sim /usr/local/bin/raft-sim
 COPY --from=build /src/target/release/raft-node /usr/local/bin/raft-node
 COPY --from=build /src/target/release/raft-multi-node /usr/local/bin/raft-multi-node
 COPY --from=build /src/target/release/journal-inspect /usr/local/bin/journal-inspect
+COPY --from=build /src/target/release/dlq-tool /usr/local/bin/dlq-tool
 
 EXPOSE 9001 9101 8080
 

@@ -306,6 +306,101 @@ pub(crate) fn decode_db_kafka_record(
     })
 }
 
+/// Refuse to start a consumer whose committed position would silently lose
+/// or re-run data — `auto.offset.reset` hides both:
+/// - committed offset below the partition's low watermark: retention deleted
+///   messages this group never processed;
+/// - no committed offset although the partition's history is already
+///   truncated: the group's offsets were lost (e.g. expired while it was
+///   down), and restarting from the earliest message would re-run commands
+///   beyond the matching dedupe window.
+/// `TC_KAFKA_OFFSET_PREFLIGHT=warn` only logs (for a deliberate reset).
+pub(crate) fn preflight_offsets(consumer: &BaseConsumer, group: &str, partitions: &[(String, i32)]) {
+    if partitions.is_empty() {
+        return;
+    }
+    let enforce = std::env::var("TC_KAFKA_OFFSET_PREFLIGHT").map_or(true, |mode| mode != "warn");
+    let mut list = TopicPartitionList::new();
+    for (topic, partition) in partitions {
+        list.add_partition(topic, *partition);
+    }
+    let committed = loop {
+        match consumer.committed_offsets(list.clone(), Duration::from_secs(10)) {
+            Ok(committed) => break committed,
+            Err(error) => {
+                log_warn!("order-kafka", "event=offset_preflight_retry group={group} error={error}");
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+    };
+    let mut problems = Vec::new();
+    for element in committed.elements() {
+        let (topic, partition) = (element.topic(), element.partition());
+        let low = loop {
+            match consumer.fetch_watermarks(topic, partition, Duration::from_secs(10)) {
+                Ok((low, _high)) => break low,
+                Err(error) => {
+                    log_warn!("order-kafka", "event=offset_preflight_retry group={group} error={error}");
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+            }
+        };
+        match element.offset() {
+            Offset::Offset(offset) if offset < low => problems.push(format!(
+                "{topic}[{partition}]: committed {offset} < low watermark {low} ({} messages deleted unprocessed)",
+                low - offset
+            )),
+            Offset::Offset(_) => {}
+            _ if low > 0 => problems.push(format!(
+                "{topic}[{partition}]: no committed offset but history starts at {low} (offsets lost)"
+            )),
+            _ => {}
+        }
+    }
+    if problems.is_empty() {
+        return;
+    }
+    for problem in &problems {
+        log_error!("order-kafka", "event=offset_preflight_failed group={group} {problem}");
+    }
+    if enforce {
+        panic!(
+            "consumer group {group}: {} partition(s) would silently skip or re-run data (see the log); \
+             set TC_KAFKA_OFFSET_PREFLIGHT=warn to start anyway",
+            problems.len()
+        );
+    }
+}
+
+/// Every partition of `topics`, from broker metadata.
+pub(crate) fn topic_partitions(consumer: &BaseConsumer, topics: &[&str]) -> Vec<(String, i32)> {
+    let mut partitions = Vec::new();
+    for topic in topics {
+        let metadata = loop {
+            match consumer.fetch_metadata(Some(topic), Duration::from_secs(10)) {
+                Ok(metadata) => break metadata,
+                Err(error) => {
+                    log_warn!("order-kafka", "event=metadata_retry topic={topic} error={error}");
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+            }
+        };
+        for topic_metadata in metadata.topics() {
+            for partition in topic_metadata.partitions() {
+                partitions.push((topic_metadata.name().to_string(), partition.id()));
+            }
+        }
+    }
+    partitions
+}
+
+pub(crate) fn assigned_partitions(list: &TopicPartitionList) -> Vec<(String, i32)> {
+    list.elements()
+        .iter()
+        .map(|element| (element.topic().to_string(), element.partition()))
+        .collect()
+}
+
 pub(crate) fn run_db_kafka_stage(
     kafka: KafkaIngress,
     category_size: u32,
@@ -331,6 +426,7 @@ pub(crate) fn run_db_kafka_stage(
                 .expect("assign routed command DB partition");
         }
     }
+    preflight_offsets(&consumer, &kafka.db_group, &assigned_partitions(&assignment));
     consumer
         .assign(&assignment)
         .expect("assign routed command DB ownership");
@@ -425,6 +521,7 @@ pub(crate) fn run_kafka_stage<F>(
         .iter()
         .map(String::as_str)
         .collect::<Vec<_>>();
+    preflight_offsets(&consumer, &group_id, &topic_partitions(&consumer, &topics));
     consumer.subscribe(&topics).expect("subscribe order topics");
     log_info!(
         "order-kafka", format_args!("{stage}-{worker}");

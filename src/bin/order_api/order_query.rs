@@ -207,23 +207,33 @@ impl QueryWorkerLimiter {
         }
     }
 
-    fn acquire_up_to(&self, wanted: usize) -> QueryWorkerPermit<'_> {
+    /// Up to `wanted` worker slots, at least one; `None` after `wait`
+    /// without a free slot. Bounded: when a database stalls and its queries
+    /// hold every slot, later requests fail fast instead of parking their
+    /// connection threads (which share the limit with order intake).
+    fn acquire_up_to(&self, wanted: usize, wait: Duration) -> Option<QueryWorkerPermit<'_>> {
+        let deadline = std::time::Instant::now() + wait;
         let mut available = self
             .available
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         while *available == 0 {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return None;
+            }
             available = self
                 .wake
-                .wait(available)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .wait_timeout(available, left)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
         }
         let count = wanted.max(1).min(*available);
         *available -= count;
-        QueryWorkerPermit {
+        Some(QueryWorkerPermit {
             limiter: self,
             count,
-        }
+        })
     }
 }
 
@@ -240,7 +250,10 @@ impl Drop for QueryWorkerPermit<'_> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *available = (*available + self.count).min(self.limiter.max);
-        self.limiter.wake.notify_all();
+        // One waiter per returned slot, not a thundering herd.
+        for _ in 0..self.count {
+            self.limiter.wake.notify_one();
+        }
     }
 }
 
@@ -264,6 +277,13 @@ fn query_worker_limiter() -> &'static QueryWorkerLimiter {
     })
 }
 
+pub(crate) const QUERY_CAPACITY_EXHAUSTED: &str = "query capacity exhausted";
+
+fn query_wait() -> Duration {
+    static WAIT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *WAIT.get_or_init(|| Duration::from_millis(env_number("TC_ORDER_QUERY_WAIT_MS", 2_000u64)))
+}
+
 fn query_parallelism() -> usize {
     static PARALLELISM: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *PARALLELISM.get_or_init(|| env_number("TC_ORDER_QUERY_DB_PARALLELISM", 4usize).max(1))
@@ -282,11 +302,14 @@ pub(crate) fn fan_out<T: mysql::prelude::FromRow + Send>(
         .metrics
         .query_waiting_requests
         .fetch_add(1, AtomicOrdering::AcqRel);
-    let permit = query_worker_limiter().acquire_up_to(wanted);
+    let permit = query_worker_limiter().acquire_up_to(wanted, query_wait());
     store
         .metrics
         .query_waiting_requests
         .fetch_sub(1, AtomicOrdering::AcqRel);
+    let Some(permit) = permit else {
+        return Err(QUERY_CAPACITY_EXHAUSTED.into());
+    };
     let worker_count = permit.count;
     store
         .metrics
@@ -456,6 +479,10 @@ pub(crate) fn order_query_response(
     match serve_order_query(store, &request) {
         Ok(Some(body)) => ("200 OK", body),
         Ok(None) => ("404 Not Found", "{\"error\":\"order not found\"}".into()),
+        Err(error) if error == QUERY_CAPACITY_EXHAUSTED => (
+            "503 Service Unavailable",
+            format!("{{\"error\":\"{QUERY_CAPACITY_EXHAUSTED}\"}}"),
+        ),
         Err(error) => {
             log_warn!(
                 "order-api",
@@ -476,10 +503,15 @@ mod unit {
     #[test]
     fn query_worker_limiter_never_grants_more_than_its_global_budget() {
         let limiter = QueryWorkerLimiter::new(3);
-        let first = limiter.acquire_up_to(2);
+        let wait = Duration::from_millis(10);
+        let first = limiter.acquire_up_to(2, wait).unwrap();
         assert_eq!(first.count, 2);
-        let second = limiter.acquire_up_to(2);
+        let second = limiter.acquire_up_to(2, wait).unwrap();
         assert_eq!(second.count, 1);
+        assert!(
+            limiter.acquire_up_to(1, wait).is_none(),
+            "a full limiter fails fast instead of parking the caller"
+        );
         drop(first);
         drop(second);
         assert_eq!(

@@ -2,20 +2,20 @@
 
 use super::*;
 
+/// At most one rejection log line per 5 s: under overload every request is
+/// rejected, and logging each one would make the overload worse. Monotonic,
+/// so a wall-clock step back cannot silence it.
 fn should_log_ingress_rejection() -> bool {
-    static LAST_LOG_SEC: AtomicU64 = AtomicU64::new(0);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_secs());
-    let previous = LAST_LOG_SEC.load(AtomicOrdering::Relaxed);
-    now >= previous.saturating_add(5)
-        && LAST_LOG_SEC
-            .compare_exchange(
-                previous,
-                now,
-                AtomicOrdering::Relaxed,
-                AtomicOrdering::Relaxed,
-            )
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    static NEXT_LOG_SEC: AtomicU64 = AtomicU64::new(0);
+    let now = START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_secs();
+    let next = NEXT_LOG_SEC.load(AtomicOrdering::Relaxed);
+    now >= next
+        && NEXT_LOG_SEC
+            .compare_exchange(next, now + 5, AtomicOrdering::Relaxed, AtomicOrdering::Relaxed)
             .is_ok()
 }
 
@@ -48,6 +48,20 @@ pub(crate) fn respond_content(
     let _ = stream.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: {connection}\r\n\r\n{body}", body.len()).as_bytes());
 }
 
+/// Longest request or header line, and most headers, of one request.
+const MAX_HEAD_LINE: u64 = 16 * 1024;
+const MAX_HEADERS: usize = 100;
+
+/// `read_line`, bounded: a line without a newline within the limit is an
+/// error, not a buffer that grows until allocation fails.
+fn read_head_line(reader: &mut BufReader<TcpStream>, line: &mut String) -> io::Result<usize> {
+    let read = reader.by_ref().take(MAX_HEAD_LINE).read_line(line)?;
+    if read > 0 && !line.ends_with('\n') {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "request line too long"));
+    }
+    Ok(read)
+}
+
 pub(crate) fn handle(
     stream: TcpStream,
     category_size: u32,
@@ -61,7 +75,7 @@ pub(crate) fn handle(
     let mut reader = BufReader::new(stream);
     loop {
         let mut first = String::new();
-        match reader.read_line(&mut first) {
+        match read_head_line(&mut reader, &mut first) {
             Ok(0) | Err(_) => return,
             Ok(_) if first.trim().is_empty() => continue,
             Ok(_) => {}
@@ -75,9 +89,14 @@ pub(crate) fn handle(
         let mut content_length = 0usize;
         let mut upgrade_websocket = false;
         let mut websocket_key: Option<String> = None;
+        let mut headers = 0;
         loop {
             let mut header = String::new();
-            match reader.read_line(&mut header) {
+            headers += 1;
+            if headers > MAX_HEADERS {
+                return;
+            }
+            match read_head_line(&mut reader, &mut header) {
                 Ok(0) | Err(_) => return,
                 Ok(_) if header.trim().is_empty() => break,
                 Ok(_) => {}
@@ -135,10 +154,12 @@ pub(crate) fn handle(
             let backlog = metrics.backlog();
             let unhealthy_groups = kafka.backpressure.unhealthy_groups();
             let lag_monitors_ready = !ingress_enabled || metrics.lag_monitors_ready();
-            let ready = !SHUTDOWN.load(AtomicOrdering::Acquire)
-                && lag_monitors_ready
-                && backlog < kafka.max_pipeline_backlog
-                && unhealthy_groups == 0;
+            // Process-local only. Backlog and Raft health are the same on
+            // every instance: gating on them would pull all instances out of
+            // a load balancer at once (and the admin abort endpoint with
+            // them), while 429 backpressure already sheds that load per
+            // category. They are reported, not enforced.
+            let ready = !SHUTDOWN.load(AtomicOrdering::Acquire) && lag_monitors_ready;
             let status = if ready {
                 "200 OK"
             } else {
@@ -313,8 +334,9 @@ pub(crate) fn handle(
                     }
                     Err(error) => {
                         let status = ingress_error_status(&error);
-                        // Rejected ingress is an異常 path: keep it correlatable
-                        // (success stays silent — the metrics carry it).
+                        // Rejected ingress is an abnormal path: keep it
+                        // correlatable (success stays silent — the metrics
+                        // carry it), but rate-limited.
                         if should_log_ingress_rejection() {
                             log_warn!(
                                 "order-api",
@@ -331,10 +353,12 @@ pub(crate) fn handle(
                     }
                 },
                 Err(error) => {
-                    log_warn!(
-                        "order-api",
-                        "event=batch_rejected status=\"400 Bad Request\" error={error}"
-                    );
+                    if should_log_ingress_rejection() {
+                        log_warn!(
+                            "order-api",
+                            "event=batch_rejected status=\"400 Bad Request\" error={error}"
+                        );
+                    }
                     respond(
                         reader.get_mut(),
                         "400 Bad Request",
@@ -399,15 +423,17 @@ pub(crate) fn handle(
             ),
             Err(error) => {
                 let status = ingress_error_status(&error);
-                match req_ctx {
-                    Some((order_id, category)) => log_warn!(
-                        "order-api",
-                        "event=order_rejected status=\"{status}\" order_id={order_id} category={category} error={error}"
-                    ),
-                    None => log_warn!(
-                        "order-api",
-                        "event=order_rejected status=\"{status}\" error={error}"
-                    ),
+                if should_log_ingress_rejection() {
+                    match req_ctx {
+                        Some((order_id, category)) => log_warn!(
+                            "order-api",
+                            "event=order_rejected status=\"{status}\" order_id={order_id} category={category} error={error}"
+                        ),
+                        None => log_warn!(
+                            "order-api",
+                            "event=order_rejected status=\"{status}\" error={error}"
+                        ),
+                    }
                 }
                 respond(
                     reader.get_mut(),
