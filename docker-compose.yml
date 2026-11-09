@@ -122,6 +122,10 @@ services:
           --partitions=${TC_EXECUTION_CURSOR_PARTITIONS:-16} --replicas=3 \
           --topic-config cleanup.policy=compact \
           "${TC_EXECUTION_CURSOR_TOPIC:-trade-execution-outbox-cursors-v1}"
+        rpk topic create --if-not-exists --brokers=redpanda:9092 \
+          --partitions=1 --replicas=3 \
+          --topic-config cleanup.policy=compact \
+          "${TC_ROUTE_CONTROL_TOPIC:-trade-route-control-v1}"
     restart: "no"
 
   # Private real-time push: each user's order results (committed, fills,
@@ -330,6 +334,10 @@ services:
       # Commands packed into one Raft entry (= one WAL fsync), across categories
       # and queued Kafka batches; capped at the Raft entry limit of 10000.
       TC_RAFT_PACK_SIZE: ${TC_RAFT_PACK_SIZE:-5000}
+      # Category migration (POST /admin/routes/migrate?category=C&to=G): every
+      # replica's admin address per group; the leader is found per step.
+      TC_MIGRATION_GROUP_ENDPOINTS: ${TC_MIGRATION_GROUP_ENDPOINTS:-0=raft-1:9102|raft-2:9102|raft-3:9102|raft-4:9102|raft-5:9102,1=raft-1:9112|raft-2:9112|raft-3:9112|raft-4:9112|raft-5:9112,2=raft-1:9122|raft-2:9122|raft-3:9122|raft-4:9122|raft-5:9122,3=raft-1:9132|raft-2:9132|raft-3:9132|raft-4:9132|raft-5:9132}
+      TC_ROUTE_CONTROL_TOPIC: ${TC_ROUTE_CONTROL_TOPIC:-trade-route-control-v1}
       # Applied-event dedupe history: rows live between 1x and 2x this many
       # hours. Must exceed the longest execution-event redelivery.
       TC_ORDER_DEDUPE_RETENTION_HOURS: ${TC_ORDER_DEDUPE_RETENTION_HOURS:-24}

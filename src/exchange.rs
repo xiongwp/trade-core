@@ -664,6 +664,17 @@ impl ExchangeHandle {
         }
     }
 
+    /// A function that does what [`snapshot_now`](Self::snapshot_now) does,
+    /// for callers that cannot hold the handle (e.g. an admin route).
+    pub fn snapshot_trigger(&self) -> Arc<dyn Fn() + Send + Sync> {
+        let requests = self.snap_requests.clone();
+        Arc::new(move || {
+            for request in &requests {
+                request.store(true, Ordering::Release);
+            }
+        })
+    }
+
     /// Pause matching and block until every shard has quiesced.
     pub fn pause(&self) {
         self.started.store(false, Ordering::Release);

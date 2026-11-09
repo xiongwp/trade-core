@@ -87,7 +87,8 @@ fn connect(addr: &str) -> (TcpStream, BufReader<TcpStream>) {
 fn http_get(addr: &str, path: &str) -> Option<String> {
     let mut stream = TcpStream::connect(addr).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
-    write!(stream, "GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").ok()?;
+    let request = format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).ok()?;
     let mut text = String::new();
     stream.read_to_string(&mut text).ok()?;
     text.split_once("\r\n\r\n").map(|(_, body)| body.to_string())

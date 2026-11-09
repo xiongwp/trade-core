@@ -660,8 +660,18 @@ pub fn serve_with_extra(addr: String, metrics: Arc<Metrics>, extra: Option<Extra
             };
             crate::log_info!("metrics", "Prometheus on http://{addr}/metrics");
             for mut s in listener.incoming().flatten() {
+                // Read until the request line is complete: a client may send
+                // it in several segments, and acting on a partial line
+                // answered the wrong route and broke the client's pipe.
+                let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(2)));
                 let mut request = [0u8; 1024];
-                let n = s.read(&mut request).unwrap_or(0);
+                let mut n = 0;
+                while n < request.len() && !request[..n].contains(&b'\n') {
+                    match s.read(&mut request[n..]) {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => n += read,
+                    }
+                }
                 let line = std::str::from_utf8(&request[..n])
                     .ok()
                     .and_then(|r| r.lines().next())

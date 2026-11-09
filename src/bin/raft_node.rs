@@ -314,6 +314,10 @@ fn main() {
         .max(1);
     let asset_root = data_dir.join("journal").join("assets");
     let runtime_snapshot_path = engine_snapshot_path.clone();
+    // Migration steps proposed by the admin routes below: (entry, reply with
+    // the committed index). Only a leader proposes; elsewhere the reply
+    // channel is dropped and the caller is told to ask the leader.
+    let (admin_tx, admin_rx) = mpsc::channel::<(Vec<u8>, mpsc::SyncSender<u64>)>();
     thread::Builder::new()
         .name("raft-runtime".into())
         .spawn(move || {
@@ -533,6 +537,20 @@ fn main() {
                         == 1;
                 runtime_metrics.set_ready(ready);
                 runtime_accepting.store(leader && ready, Ordering::Release);
+                while let Ok((entry, reply)) = admin_rx.try_recv() {
+                    if !leader {
+                        continue; // dropping `reply` fails the caller
+                    }
+                    match node.propose(entry) {
+                        Ok(()) => {
+                            let index = node.last_index();
+                            commit_waiters.entry(index).or_default().push(reply);
+                        }
+                        Err(error) => {
+                            log_warn!("raft-node", "event=migration_propose_failed error={error:?}");
+                        }
+                    }
+                }
                 if leader && !pending.is_empty() {
                     let requests = std::mem::take(&mut pending);
                     let mut entries = Vec::new();
@@ -715,8 +733,24 @@ fn main() {
     //    index, so the control plane can auto-capture a migration's freeze index
     //    from the source group instead of an operator hand-supplying it.
     let fingerprint_snapshot_path = engine_snapshot_path.clone();
+    let migration_snapshot_path = engine_snapshot_path.clone();
+    let snapshot_trigger = handle.snapshot_trigger();
+    let category_size = std::env::var("TC_ORDER_CATEGORY_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|size| *size > 0)
+        .unwrap_or(trade_core::sharding::DEFAULT_ASSET_CATEGORY_SIZE);
     let applied_index_metrics = metrics.clone();
     let fingerprint_route: trade_core::metrics::ExtraRoute = Box::new(move |line: &str| {
+        if let Some(response) = migration_route(
+            line,
+            &migration_snapshot_path,
+            category_size,
+            &admin_tx,
+            snapshot_trigger.as_ref(),
+        ) {
+            return Some(response);
+        }
         if trade_core::migration::is_applied_index_request(line) {
             let index = applied_index_metrics
                 .raft_applied_index
@@ -740,7 +774,7 @@ fn main() {
         let response = match trade_core::migration::snapshot_category_fingerprint(
             &fingerprint_snapshot_path,
             category,
-            trade_core::sharding::DEFAULT_ASSET_CATEGORY_SIZE,
+            category_size,
         ) {
             Ok(Some(fp)) => (
                 "200 OK".to_string(),
@@ -1271,6 +1305,162 @@ fn execution_category_key(frame: &[u8; wire::REPORT_LEN], category_size: u32) ->
         frame[4..8].try_into().expect("execution instrument"),
     ));
     trade_core::sharding::asset_category(instrument, category_size).to_be_bytes()
+}
+
+type RouteResponse = (String, String, String);
+
+fn route_reply(status: &str, body: String) -> RouteResponse {
+    let content_type = if body.starts_with('{') { "application/json" } else { "text/plain" };
+    (status.to_string(), content_type.to_string(), body)
+}
+
+/// Admin routes for moving a category between groups (driven by order-api's
+/// `/admin/migrate`; see `trade_core::exchange::CategoryOp`):
+///
+/// * `GET /category-state?category=C` — the category's books, stops and
+///   positions from this node's durable snapshot, hex-encoded, with the
+///   snapshot's Raft index;
+/// * `GET /migration/seal?category=C`, `GET /migration/drop?category=C` —
+///   propose the step through this group's log (leader only) and answer the
+///   committed index;
+/// * `GET /migration/install?category=C&from=HOST:PORT&min_index=N` — pull
+///   the category's state from a node of the source group (refusing a
+///   snapshot older than `min_index`, i.e. taken before the seal) and
+///   propose installing it;
+/// * `GET /migration/snapshot` — take a snapshot now.
+fn migration_route(
+    line: &str,
+    snapshot_path: &std::path::Path,
+    category_size: u32,
+    admin_tx: &mpsc::Sender<(Vec<u8>, mpsc::SyncSender<u64>)>,
+    snapshot_trigger: &(dyn Fn() + Send + Sync),
+) -> Option<RouteResponse> {
+    let target = line.split_whitespace().nth(1)?;
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    let param = |key: &str| {
+        query
+            .split('&')
+            .find_map(|pair| pair.strip_prefix(key)?.strip_prefix('='))
+    };
+    let category = || -> Result<u32, RouteResponse> {
+        param("category")
+            .and_then(|value| value.parse().ok())
+            .ok_or_else(|| route_reply("400 Bad Request", "category=<id> required\n".into()))
+    };
+    let propose = |op: trade_core::exchange::CategoryOp| -> RouteResponse {
+        let (reply, committed) = mpsc::sync_channel(1);
+        if admin_tx
+            .send((wire::encode_raft_migration_entry(&op), reply))
+            .is_err()
+        {
+            return route_reply("503 Service Unavailable", "raft runtime stopped\n".into());
+        }
+        match committed.recv_timeout(Duration::from_secs(15)) {
+            Ok(index) => route_reply("200 OK", format!("{{\"index\":{index}}}")),
+            Err(_) => route_reply(
+                "503 Service Unavailable",
+                "not the leader, or not committed in time; ask the leader\n".into(),
+            ),
+        }
+    };
+    use trade_core::exchange::CategoryOp;
+    Some(match path {
+        "/migration/snapshot" => {
+            snapshot_trigger();
+            route_reply("200 OK", "{\"requested\":true}".into())
+        }
+        "/migration/seal" => match category() {
+            Ok(category) => propose(CategoryOp::Seal { category, category_size }),
+            Err(response) => response,
+        },
+        "/migration/drop" => match category() {
+            Ok(category) => propose(CategoryOp::Drop { category, category_size }),
+            Err(response) => response,
+        },
+        // Undo a seal (a migration that failed before cutover): installing an
+        // empty state lifts the seal and leaves the books untouched.
+        "/migration/unseal" => match category() {
+            Ok(category) => propose(CategoryOp::Install {
+                category,
+                category_size,
+                engines: Vec::new(),
+                positions: Vec::new(),
+            }),
+            Err(response) => response,
+        },
+        "/category-state" => match category() {
+            Err(response) => response,
+            Ok(category) => match trade_core::snapshot::load(snapshot_path) {
+                Err(error) => route_reply("503 Service Unavailable", format!("no durable snapshot: {error}\n")),
+                Ok(snap) => {
+                    let (engines, positions) =
+                        trade_core::migration::export_category(&snap, category, category_size);
+                    let bytes = trade_core::migration::encode_category_state(
+                        snap.raft_applied_index,
+                        &engines,
+                        &positions,
+                    );
+                    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+                    route_reply(
+                        "200 OK",
+                        format!("{{\"raft_applied_index\":{},\"state\":\"{hex}\"}}", snap.raft_applied_index),
+                    )
+                }
+            },
+        },
+        "/migration/install" => {
+            let category = match category() {
+                Ok(category) => category,
+                Err(response) => return Some(response),
+            };
+            let (Some(from), Some(min_index)) =
+                (param("from"), param("min_index").and_then(|v| v.parse::<u64>().ok()))
+            else {
+                return Some(route_reply("400 Bad Request", "from=<host:port>&min_index=<n> required\n".into()));
+            };
+            let fetched = trade_core::migration::http_get(
+                from,
+                &format!("/category-state?category={category}"),
+                Duration::from_secs(10),
+            );
+            let body = match fetched {
+                Ok((200, body)) => body,
+                Ok((status, body)) => {
+                    return Some(route_reply("502 Bad Gateway", format!("source answered {status}: {body}\n")))
+                }
+                Err(error) => return Some(route_reply("502 Bad Gateway", format!("source unreachable: {error}\n"))),
+            };
+            let hex = body
+                .split("\"state\":\"")
+                .nth(1)
+                .and_then(|rest| rest.split('"').next())
+                .unwrap_or("");
+            let bytes: Option<Vec<u8>> = (0..hex.len())
+                .step_by(2)
+                .map(|at| hex.get(at..at + 2).and_then(|pair| u8::from_str_radix(pair, 16).ok()))
+                .collect();
+            let state = match bytes.as_deref().map(trade_core::snapshot::decode) {
+                Some(Ok(state)) => state,
+                _ => return Some(route_reply("502 Bad Gateway", "undecodable category state\n".into())),
+            };
+            if state.raft_applied_index < min_index {
+                return Some(route_reply(
+                    "409 Conflict",
+                    format!(
+                        "source snapshot at {} predates the seal at {min_index}; snapshot the source and retry\n",
+                        state.raft_applied_index
+                    ),
+                ));
+            }
+            propose(CategoryOp::Install {
+                category,
+                category_size,
+                engines: state.engines,
+                positions: state.positions,
+            })
+        }
+        _ => return None,
+    })
 }
 
 /// Bump when a change alters matching results for the same command log (the

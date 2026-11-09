@@ -275,6 +275,25 @@ impl RouteControlPlane {
         Ok(*migration)
     }
 
+    /// Mark a migration verified by the data-plane checks (order-api's
+    /// `/admin/routes/migrate`): the source's snapshot covers its seal, the
+    /// target's covers its install, and both category fingerprints match.
+    /// Unlike [`caught_up`](Self::caught_up) this compares no Raft indexes:
+    /// the two groups number their logs independently, so the source's seal
+    /// index says nothing about the target's.
+    pub fn verified(&self, category_id: u32, fingerprint: u64) -> Result<CategoryMigration, String> {
+        let mut migrations = self.migrations.write().unwrap();
+        let migration = migrations
+            .get_mut(&category_id)
+            .ok_or("category migration is not active")?;
+        if migration.state == MigrationState::Verified {
+            return Err("migration already verified".into());
+        }
+        migration.fingerprint = fingerprint;
+        migration.state = MigrationState::Verified;
+        Ok(*migration)
+    }
+
     pub fn activate(&self, category_id: u32) -> Result<u64, String> {
         let mut migrations = self.migrations.write().unwrap();
         let migration = migrations
@@ -290,6 +309,40 @@ impl RouteControlPlane {
             .insert(category_id, migration.to_group);
         migrations.remove(&category_id);
         Ok(self.version.fetch_add(1, Ordering::AcqRel) + 1)
+    }
+
+    /// Apply a durable route record written by any order-api instance (see
+    /// order-api's route log): the category now belongs to `group`.
+    pub fn restore_pin(&self, category_id: u32, group: usize) {
+        if group < self.group_count {
+            self.pins.write().unwrap().insert(category_id, group);
+            self.migrations.write().unwrap().remove(&category_id);
+            self.version.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// Apply a durable "frozen for migration" record written by another
+    /// instance: hold the category's commands here too, so no instance keeps
+    /// forwarding it to the source group while it is being moved.
+    pub fn restore_freeze(&self, category_id: u32, to_group: usize) {
+        if to_group >= self.group_count {
+            return;
+        }
+        let from_group = self.group_for(category_id);
+        self.migrations
+            .write()
+            .unwrap()
+            .entry(category_id)
+            .or_insert(CategoryMigration {
+                category_id,
+                route_version: self.version.fetch_add(1, Ordering::AcqRel) + 1,
+                from_group,
+                to_group,
+                state: MigrationState::Freezing,
+                frozen_index: 0,
+                target_index: 0,
+                fingerprint: 0,
+            });
     }
 
     pub fn abort(&self, category_id: u32) -> bool {

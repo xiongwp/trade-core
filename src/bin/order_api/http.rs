@@ -147,6 +147,8 @@ pub(crate) fn handle(
                             migration.route_version
                         )
                     }),
+                "/admin/routes/migrate" => required::<usize>(query, "to")
+                    .and_then(|to| migrate_category(&kafka, category, to)),
                 "/admin/routes/frozen" => freeze_migration(&kafka, category, query),
                 "/admin/routes/caught-up" => verify_caught_up(&kafka, category, query),
                 "/admin/routes/activate" => kafka.route_control.activate(category).map(|version| {

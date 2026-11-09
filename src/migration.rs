@@ -261,14 +261,17 @@ pub fn fetch_category_fingerprint(
 /// peer that closes without draining our request can make the OS deliver an
 /// RST, surfacing as ConnectionReset on the trailing read even though the full
 /// response is already in hand. Only an error with no bytes received is fatal.
-fn http_get(addr: &str, path: &str, timeout: Duration) -> io::Result<(u16, String)> {
+/// Minimal blocking `GET` returning (status, body), for node-to-node admin calls.
+pub fn http_get(addr: &str, path: &str, timeout: Duration) -> io::Result<(u16, String)> {
     let mut stream = TcpStream::connect(addr)?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
-    write!(
-        stream,
-        "GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
-    )?;
+    // One write: `write!` on an unbuffered stream issues a write per
+    // formatted piece, and the admin server reads a request with a single
+    // `read`. It then saw a truncated request line, answered, and closed,
+    // and the rest of the request failed with a broken pipe.
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes())?;
     let mut raw = Vec::new();
     let mut chunk = [0u8; 2048];
     loop {

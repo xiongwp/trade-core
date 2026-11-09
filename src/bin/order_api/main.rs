@@ -38,6 +38,7 @@ mod ingress;
 mod kafka_stage;
 mod order_query;
 mod pipeline_metrics;
+mod route_log;
 mod raft_forward;
 mod schema;
 mod store;
@@ -121,6 +122,8 @@ fn main() {
     let kafka = KafkaIngress::from_env(metrics.clone(), matcher_groups.len())
         .expect("configure Kafka order ingress")
         .expect("TC_ORDER_KAFKA_BROKERS is required");
+    // Shared route state (pins, migration freezes) before any consumer runs.
+    route_log::load_and_follow(&kafka);
     // API ingress and matcher-forwarder roles do not touch MySQL. Requiring
     // every replica to open a pool to every shard creates O(processes*shards)
     // connections and repeats all bootstrap DDL, defeating horizontal scaling.
