@@ -339,6 +339,7 @@ fn duplicate_commands_are_rejected_and_cursor_persists() {
             positions: &[],
             engines: &p.export_state(),
             recent_command_ids: None,
+            sealed: &[],
         },
     )
     .unwrap();

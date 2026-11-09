@@ -149,6 +149,52 @@ pub fn fingerprint_response_json(category_id: u32, fp: CategoryFingerprint) -> S
     )
 }
 
+/// One asset category's state, cut out of a snapshot: the books and
+/// untriggered stops of its instruments, and the positions on them. This is
+/// what a migration installs on the target group.
+pub fn export_category(
+    snap: &crate::snapshot::Snapshot,
+    category: u32,
+    category_size: u32,
+) -> (Vec<crate::snapshot::EngineState>, Vec<(u64, u32, i64)>) {
+    let engines = snap
+        .engines
+        .iter()
+        .filter(|state| asset_category(state.instrument, category_size) == category)
+        .cloned()
+        .collect();
+    let positions = snap
+        .positions
+        .iter()
+        .filter(|(_, instrument, _)| {
+            asset_category(crate::types::InstrumentId(*instrument), category_size) == category
+        })
+        .copied()
+        .collect();
+    (engines, positions)
+}
+
+/// Encode a category's exported state, with the source index it was taken
+/// at, in the snapshot format (checksummed) for transfer between groups.
+pub fn encode_category_state(
+    raft_applied_index: u64,
+    engines: &[crate::snapshot::EngineState],
+    positions: &[(u64, u32, i64)],
+) -> Vec<u8> {
+    crate::snapshot::encode(crate::snapshot::SnapshotData {
+        journal_seq: 0,
+        raft_applied_index,
+        max_cmd_id: 0,
+        max_admin_id: 0,
+        halted: &[],
+        suspended: &[],
+        positions,
+        engines,
+        recent_command_ids: Some(&[]),
+        sealed: &[],
+    })
+}
+
 /// Parse a `group:host:port` migration-endpoint map from an environment-style
 /// spec, e.g. `"0=10.0.0.1:9102,1=10.0.0.2:9102"`. Each entry maps a Raft group
 /// id to the admin/metrics address serving that group's `/fingerprint` route.
@@ -350,6 +396,7 @@ mod tests {
             positions: &[],
             engines: &engines,
             recent_command_ids: None,
+            sealed: &[],
         };
         snapshot::write(path, data).unwrap();
     }

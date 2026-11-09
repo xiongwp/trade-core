@@ -109,6 +109,7 @@ fn a_pre_window_snapshot_restores_with_the_legacy_seed() {
             positions: &[],
             engines: &old.export_state(),
             recent_command_ids: None,
+            sealed: &[],
         },
     )
     .unwrap();

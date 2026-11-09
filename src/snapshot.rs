@@ -46,6 +46,8 @@ const VERSION: u32 = 4; // v4: + last durably applied Raft index
 const VERSION_STOPS: u32 = 5;
 /// v6: stops section always present, plus the exact command-id dedupe window.
 const VERSION_DEDUP_WINDOW: u32 = 6;
+/// v7: v6 plus the categories sealed by a migration.
+const VERSION_SEALED: u32 = 7;
 const LEGACY_VERSION: u32 = 3;
 const ORDER_ENC: usize = 56;
 /// Encoded stop: the order, then trigger price (u64) and kind (u8).
@@ -105,6 +107,7 @@ fn decode_order(b: &[u8; ORDER_ENC]) -> Order {
 }
 
 /// One engine's state inside a snapshot.
+#[derive(Debug, Clone)]
 pub struct EngineState {
     pub instrument: InstrumentId,
     pub engine_seq: Timestamp,
@@ -172,6 +175,8 @@ pub struct Snapshot {
     /// The exact command-id dedupe window, oldest first (v6+); `None` for
     /// older snapshots, which did not persist it.
     pub recent_command_ids: Option<Vec<u64>>,
+    /// Categories sealed by a migration: (category, category size) (v7+).
+    pub sealed: Vec<(u32, u32)>,
 }
 
 /// Borrowed state supplied when atomically writing a snapshot.
@@ -186,11 +191,22 @@ pub struct SnapshotData<'a> {
     pub engines: &'a [EngineState],
     /// Dedupe window to persist (written as v6); `None` writes v4/v5.
     pub recent_command_ids: Option<&'a [u64]>,
+    /// Sealed categories (written as v7 when any; needs the window too).
+    pub sealed: &'a [(u32, u32)],
 }
 
 /// Write a snapshot **atomically**: temp file, fsync, rename over `path`.
 pub fn write(path: &Path, data: SnapshotData<'_>) -> io::Result<()> {
-    let version = if data.recent_command_ids.is_some() {
+    let buf = encode(data);
+    write_bytes(path, &buf)
+}
+
+/// The on-disk encoding of a snapshot (also how a category's state travels
+/// between Raft groups during a migration; see [`crate::migration`]).
+pub fn encode(data: SnapshotData<'_>) -> Vec<u8> {
+    let version = if data.recent_command_ids.is_some() && !data.sealed.is_empty() {
+        VERSION_SEALED
+    } else if data.recent_command_ids.is_some() {
         VERSION_DEDUP_WINDOW
     } else if data.engines.iter().any(|e| !e.stops.is_empty()) {
         VERSION_STOPS
@@ -243,9 +259,19 @@ pub fn write(path: &Path, data: SnapshotData<'_>) -> io::Result<()> {
             buf.extend_from_slice(&id.to_le_bytes());
         }
     }
+    if version >= VERSION_SEALED {
+        buf.extend_from_slice(&(data.sealed.len() as u32).to_le_bytes());
+        for (category, size) in data.sealed {
+            buf.extend_from_slice(&category.to_le_bytes());
+            buf.extend_from_slice(&size.to_le_bytes());
+        }
+    }
     let h = fnv1a(&buf);
     buf.extend_from_slice(&h.to_le_bytes());
+    buf
+}
 
+fn write_bytes(path: &Path, buf: &[u8]) -> io::Result<()> {
     let tmp = path.with_extension("tmp");
     {
         let mut f = OpenOptions::new()
@@ -253,7 +279,7 @@ pub fn write(path: &Path, data: SnapshotData<'_>) -> io::Result<()> {
             .write(true)
             .truncate(true)
             .open(&tmp)?;
-        f.write_all(&buf)?;
+        f.write_all(buf)?;
         f.sync_all()?; // durable before it can become "the" snapshot
     }
     fs::rename(&tmp, path)?; // atomic on POSIX filesystems
@@ -331,6 +357,11 @@ pub fn raft_applied_index_of(bytes: &[u8]) -> io::Result<u64> {
 pub fn load(path: &Path) -> io::Result<Snapshot> {
     let mut buf = Vec::new();
     File::open(path)?.read_to_end(&mut buf)?;
+    decode(&buf)
+}
+
+/// Decode [`encode`]d bytes; `Err` on corruption or version mismatch.
+pub fn decode(buf: &[u8]) -> io::Result<Snapshot> {
     let corrupt = |msg: &str| io::Error::new(io::ErrorKind::InvalidData, msg.to_string());
 
     if buf.len() < 4 + 4 + 8 + 4 + 8 || &buf[0..4] != MAGIC {
@@ -342,7 +373,7 @@ pub fn load(path: &Path) -> io::Result<Snapshot> {
         return Err(corrupt("checksum mismatch"));
     }
     let version = u32::from_le_bytes(buf[4..8].try_into().unwrap());
-    if ![LEGACY_VERSION, VERSION, VERSION_STOPS, VERSION_DEDUP_WINDOW].contains(&version) {
+    if ![LEGACY_VERSION, VERSION, VERSION_STOPS, VERSION_DEDUP_WINDOW, VERSION_SEALED].contains(&version) {
         return Err(corrupt("unsupported version"));
     }
     let journal_seq = u64::from_le_bytes(buf[8..16].try_into().unwrap());
@@ -434,11 +465,31 @@ pub fn load(path: &Path) -> io::Result<Snapshot> {
         let ids = (0..n)
             .map(|k| u64::from_le_bytes(buf[pos + k * 8..pos + k * 8 + 8].try_into().unwrap()))
             .collect();
+        pos += n * 8;
         Some(ids)
     } else {
         None
     };
+    let mut sealed = Vec::new();
+    if version >= VERSION_SEALED {
+        if pos + 4 > body_len {
+            return Err(corrupt("truncated sealed categories"));
+        }
+        let n = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+        if n > (body_len - pos) / 8 {
+            return Err(corrupt("truncated sealed categories"));
+        }
+        for _ in 0..n {
+            sealed.push((
+                u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()),
+                u32::from_le_bytes(buf[pos + 4..pos + 8].try_into().unwrap()),
+            ));
+            pos += 8;
+        }
+    }
     Ok(Snapshot {
+        sealed,
         recent_command_ids,
         format_version: version,
         journal_seq,
@@ -471,6 +522,7 @@ mod tests {
             positions: &[],
             engines: &[],
             recent_command_ids: Some(&[1, 2, 3]),
+            sealed: &[],
         };
         write(&path, data(41)).unwrap();
         let bytes = std::fs::read(&path).unwrap();
@@ -513,6 +565,7 @@ mod tests {
                 positions: &[(9, 7, -3)],
                 engines: &engines,
                 recent_command_ids: None,
+                sealed: &[],
             },
         )
         .unwrap();

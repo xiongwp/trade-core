@@ -114,6 +114,32 @@ pub enum Command {
     /// queue interleaves): all must target this shard's instruments. Each inner
     /// command is journaled/replicated individually, preserving the total order.
     Batch(Vec<Command>),
+    /// Moving an asset category between Raft groups. Applied through each
+    /// group's log like any command, so every replica does the same thing.
+    Migrate(Box<CategoryOp>),
+}
+
+/// One step of moving an asset category (`instrument` with
+/// `asset_category(instrument, category_size) == category`) between groups.
+#[derive(Debug)]
+pub enum CategoryOp {
+    /// On the source: from here on reject the category's commands with
+    /// "category-moved" (persisted in snapshots). Its state is exported from
+    /// a snapshot taken after this point, so nothing applied later is lost.
+    Seal { category: u32, category_size: u32 },
+    /// On the target: install the exported books, untriggered stops and
+    /// positions, and accept the category's commands. Refused whole
+    /// ("category-not-empty") when this group already holds state for one of
+    /// its instruments.
+    Install {
+        category: u32,
+        category_size: u32,
+        engines: Vec<EngineState>,
+        positions: Vec<(u64, u32, i64)>,
+    },
+    /// On the source, once traffic has moved: forget the category's state
+    /// (it stays sealed, so a stray late command is still rejected).
+    Drop { category: u32, category_size: u32 },
 }
 
 /// Intake metadata carried alongside a command. Raft entries retain their
@@ -141,6 +167,7 @@ impl Command {
             | Command::ResumeUser { cmd_id, .. } => *cmd_id,
             Command::ForceClose { close_order_id, .. } => close_order_id.0,
             Command::Batch(commands) => commands.first().map(Command::id).unwrap_or(0),
+            Command::Migrate(_) => 0,
         }
     }
 
@@ -156,6 +183,7 @@ impl Command {
             Command::HaltUser { instrument, .. } => *instrument,
             Command::ResumeUser { instrument, .. } => *instrument,
             Command::Batch(cmds) => cmds.first().map_or(InstrumentId(0), |c| c.instrument()),
+            Command::Migrate(_) => InstrumentId(0),
         }
     }
 
@@ -927,6 +955,8 @@ pub struct Processor {
     /// Ids to seed the window with when restoring a pre-v6 snapshot, which
     /// has no window (see `ExchangeConfig::legacy_command_ids`).
     legacy_command_ids: Vec<u64>,
+    /// Categories sealed by a migration: category -> category size.
+    sealed: std::collections::BTreeMap<u32, u32>,
     /// Dual dedup cursors — one per intake queue. The high-priority queue
     /// legitimately reorders admin commands ahead of News, so a single cursor
     /// would be poisoned by a jumping cancel and dup-reject every later New.
@@ -1143,6 +1173,10 @@ impl TriggerBook {
     fn is_empty(&self) -> bool {
         self.index.is_empty()
     }
+
+    fn len(&self) -> usize {
+        self.index.len()
+    }
 }
 
 impl Processor {
@@ -1158,6 +1192,7 @@ impl Processor {
             dedup: false,
             seen_command_ids: RecentCommandIds::new(DEFAULT_COMMAND_ID_WINDOW),
             legacy_command_ids: Vec::new(),
+            sealed: std::collections::BTreeMap::new(),
             max_new_id: 0,
             max_admin_id: 0,
             fees: crate::fees::FeeSchedule::default(),
@@ -1187,6 +1222,77 @@ impl Processor {
     pub fn with_specs(mut self, specs: InstrumentSpecs) -> Self {
         self.specs = specs;
         self
+    }
+
+    /// The category migration steps (see [`CategoryOp`]).
+    fn apply_category_op(&mut self, op: CategoryOp, emit: &mut dyn FnMut(ExecReport)) {
+        let in_category = |instrument: InstrumentId, category: u32, size: u32| {
+            crate::sharding::asset_category(instrument, size) == category
+        };
+        match op {
+            CategoryOp::Seal { category, category_size } => {
+                self.sealed.insert(category, category_size);
+            }
+            CategoryOp::Install {
+                category,
+                category_size,
+                engines,
+                positions,
+            } => {
+                let occupied = engines.iter().find(|state| {
+                    !in_category(state.instrument, category, category_size)
+                        || self
+                            .engines
+                            .get(&state.instrument)
+                            .is_some_and(|engine| !engine.book().is_empty())
+                        || self.stops.contains_key(&state.instrument)
+                });
+                if let Some(state) = occupied {
+                    emit(ExecReport::CommandRejected {
+                        instrument: state.instrument,
+                        command_id: 0,
+                        reason: "category-not-empty",
+                    });
+                    return;
+                }
+                self.sealed.remove(&category);
+                for state in engines {
+                    self.engine_for(state.instrument)
+                        .restore(state.engine_seq, &state.orders);
+                    for stop in state.stops {
+                        self.stop_seq += 1;
+                        self.stops
+                            .entry(state.instrument)
+                            .or_default()
+                            .insert(stop, self.stop_seq);
+                        self.pending_stops += 1;
+                    }
+                }
+                for (user, instrument, quantity) in positions {
+                    if in_category(InstrumentId(instrument), category, category_size) {
+                        *self.positions.entry((user, InstrumentId(instrument))).or_insert(0) += quantity;
+                    }
+                }
+            }
+            CategoryOp::Drop { category, category_size } => {
+                self.sealed.insert(category, category_size);
+                self.engines
+                    .retain(|&instrument, _| !in_category(instrument, category, category_size));
+                let mut removed_stops = 0;
+                self.stops.retain(|&instrument, book| {
+                    let keep = !in_category(instrument, category, category_size);
+                    if !keep {
+                        removed_stops += book.len();
+                    }
+                    keep
+                });
+                self.pending_stops -= removed_stops;
+                self.positions
+                    .retain(|&(_, instrument), _| !in_category(instrument, category, category_size));
+                self.halted
+                    .retain(|&instrument| !in_category(instrument, category, category_size));
+            }
+        }
     }
 
     /// A new order whose id is still resting (or waiting as a stop) is a
@@ -1308,6 +1414,8 @@ impl Processor {
         for &(u, i, q) in &snap.positions {
             *self.positions.entry((u, InstrumentId(i))).or_insert(0) += q;
         }
+        self.sealed
+            .extend(snap.sealed.iter().map(|&(category, size)| (category, size)));
         // Exact command-id dedupe. A v6 snapshot carries the window itself.
         // Older ones do not: fall back to what the previous code used (the
         // ids of every order the snapshot holds, plus the ids the caller
@@ -1386,6 +1494,22 @@ impl Processor {
             Command::Batch(_) => 0,
             _ => cmd.id(),
         };
+        // A category moved to another group (or being moved) takes no more
+        // commands here. Checked before the dedupe window, so a rejected id
+        // is not consumed.
+        if !self.sealed.is_empty() && !matches!(cmd, Command::Batch(_) | Command::Migrate(_)) {
+            let instrument = cmd.instrument();
+            if self.sealed.iter().any(|(&category, &size)| {
+                crate::sharding::asset_category(instrument, size) == category
+            }) {
+                emit(ExecReport::CommandRejected {
+                    instrument,
+                    command_id: exact_id,
+                    reason: "category-moved",
+                });
+                return;
+            }
+        }
         if exact_id != 0 && (!self.seen_command_ids.insert(exact_id) || self.would_duplicate_live(&cmd)) {
             emit(ExecReport::CommandRejected {
                 instrument: cmd.instrument(),
@@ -1425,7 +1549,7 @@ impl Processor {
                     cmd_id, instrument, ..
                 } => (*cmd_id, *instrument, true),
                 // Batches are gated per inner command (recursive process call).
-                Command::Batch(_) => (0, InstrumentId(0), false),
+                Command::Batch(_) | Command::Migrate(_) => (0, InstrumentId(0), false),
             };
             if id != 0 {
                 let cursor = if admin {
@@ -1452,6 +1576,7 @@ impl Processor {
                     self.process(c, emit);
                 }
             }
+            Command::Migrate(op) => self.apply_category_op(*op, emit),
             Command::HaltUser {
                 instrument, user, ..
             } => {
@@ -2853,6 +2978,7 @@ struct CapturedSnapshot {
     positions: HashMap<(u64, InstrumentId), i64>,
     engines: Vec<CapturedEngine>,
     recent_command_ids: Vec<u64>,
+    sealed: Vec<(u32, u32)>,
 }
 
 struct CapturedEngine {
@@ -2893,6 +3019,7 @@ impl CapturedSnapshot {
                 positions: &positions,
                 engines: &engines,
                 recent_command_ids: Some(&self.recent_command_ids),
+                sealed: &self.sealed,
             },
         )
     }
@@ -2912,6 +3039,7 @@ fn capture_processor_snapshot(
         suspended: processor.suspended.iter().copied().collect(),
         positions: processor.positions.clone(),
         recent_command_ids: processor.seen_command_ids.to_vec(),
+        sealed: processor.sealed.iter().map(|(&category, &size)| (category, size)).collect(),
         engines: processor
             .engines
             .iter()

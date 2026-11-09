@@ -424,6 +424,7 @@ fn write_snapshot(p: &Processor, path: &std::path::Path) {
             positions: &[],
             engines: &engines,
             recent_command_ids: None,
+            sealed: &[],
         },
     )
     .unwrap();

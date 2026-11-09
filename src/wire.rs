@@ -506,6 +506,10 @@ pub fn encode_command(cmd: &Command, out: &mut [u8; MSG_LEN]) {
         // Batches are flattened at the shard: encode_command is called per inner
         // command for journal/replication; a Batch itself never reaches here.
         Command::Batch(_) => out.fill(0),
+        // Category migration travels as its own Raft entry (it carries whole
+        // books), never as a command frame; standalone journals do not
+        // support it.
+        Command::Migrate(_) => out.fill(0),
     }
 }
 
@@ -724,6 +728,8 @@ pub const REJECT_REASONS: &[&str] = &[
     "min-notional",
     "invalid-stop",
     "stop-not-amendable",
+    "category-moved",
+    "category-not-empty",
 ];
 
 /// Wire code of a reject reason (0 if it is not in [`REJECT_REASONS`]).
