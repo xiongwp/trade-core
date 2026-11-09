@@ -402,12 +402,20 @@ services:
       # Bound Kafka fanout pressure to fit the default 8 GiB Docker Desktop VM.
       # Production sets this from measured bytes/command and node memory.
       TC_ORDER_MAX_PIPELINE_BACKLOG: ${TC_ORDER_MAX_PIPELINE_BACKLOG:-50000}
+      # Bound thread-per-connection HTTP/WS resource use and slow clients.
+      TC_ORDER_MAX_CONNECTIONS: ${TC_ORDER_MAX_CONNECTIONS:-4096}
+      TC_ORDER_CONNECTION_IDLE_TIMEOUT_MS: ${TC_ORDER_CONNECTION_IDLE_TIMEOUT_MS:-75000}
+      TC_ORDER_WRITE_TIMEOUT_MS: ${TC_ORDER_WRITE_TIMEOUT_MS:-30000}
+      TC_ORDER_HTTP_THREAD_STACK_KB: ${TC_ORDER_HTTP_THREAD_STACK_KB:-512}
+      # Account-history fan-out is bounded both per request and per process.
+      TC_ORDER_QUERY_DB_PARALLELISM: ${TC_ORDER_QUERY_DB_PARALLELISM:-4}
+      TC_ORDER_QUERY_MAX_DB_WORKERS: ${TC_ORDER_QUERY_MAX_DB_WORKERS:-32}
     ports:
       - "9200:9200"
     healthcheck:
-      # :9200 serves /metrics; a TCP connect via bash /dev/tcp is enough to
-      # gate dependents (debian:stable-slim has no curl/wget).
-      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9200 && exec 3>&- 3<&-"]
+      # Readiness waits for current Kafka lag readings, bounded backlog and no
+      # recently failed Raft group. The image has bash but no curl/wget.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9200; printf 'GET /readyz HTTP/1.0\\r\\n\\r\\n' >&3; head -1 <&3 | grep -q ' 200 '"]
       interval: 5s
       timeout: 3s
       retries: 40

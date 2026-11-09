@@ -844,7 +844,7 @@ def parse_args(argv):
     p.add_argument("--catchup-timeout", type=float, default=120.0)
     p.add_argument("--resource-prefix", default=None,
                    help="docker container name prefix for coarse resource "
-                        "sampling via `docker stats` (e.g. kaishi-29a4a3-raft-)")
+                        "sampling via `docker stats` (e.g. trade-core-raft-)")
     p.add_argument("--output", default="acceptance-out")
     p.add_argument("--slo-mode", choices=["enforce", "warn"], default="enforce",
                    help="latency/RTO/resource breaches FAIL (enforce) or WARN")
@@ -856,7 +856,7 @@ def parse_args(argv):
                    help="command run at fault-stage end (default: docker start it)")
     p.add_argument("--fault-node", type=int, default=None,
                    help="physical node index being killed (for endpoint exclusion)")
-    p.add_argument("--fault-container-prefix", default="kaishi-29a4a3-raft-",
+    p.add_argument("--fault-container-prefix", default="trade-core-raft-",
                    help="prefix used to build default fault/recover commands")
     p.add_argument("--dry-run-faults", action="store_true",
                    help="print fault commands instead of executing them")

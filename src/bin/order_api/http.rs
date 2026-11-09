@@ -10,7 +10,12 @@ fn should_log_ingress_rejection() -> bool {
     let previous = LAST_LOG_SEC.load(AtomicOrdering::Relaxed);
     now >= previous.saturating_add(5)
         && LAST_LOG_SEC
-            .compare_exchange(previous, now, AtomicOrdering::Relaxed, AtomicOrdering::Relaxed)
+            .compare_exchange(
+                previous,
+                now,
+                AtomicOrdering::Relaxed,
+                AtomicOrdering::Relaxed,
+            )
             .is_ok()
 }
 
@@ -114,6 +119,45 @@ pub(crate) fn handle(
             Vec::new()
         };
         let (path, query) = uri.split_once('?').unwrap_or((&uri, ""));
+        if method == "GET" && path == "/healthz" {
+            respond(
+                reader.get_mut(),
+                "200 OK",
+                "{\"status\":\"alive\"}",
+                keep_alive,
+            );
+            if !keep_alive {
+                return;
+            }
+            continue;
+        }
+        if method == "GET" && path == "/readyz" {
+            let backlog = metrics.backlog();
+            let unhealthy_groups = kafka.backpressure.unhealthy_groups();
+            let lag_monitors_ready = !ingress_enabled || metrics.lag_monitors_ready();
+            let ready = !SHUTDOWN.load(AtomicOrdering::Acquire)
+                && lag_monitors_ready
+                && backlog < kafka.max_pipeline_backlog
+                && unhealthy_groups == 0;
+            let status = if ready {
+                "200 OK"
+            } else {
+                "503 Service Unavailable"
+            };
+            respond(
+                reader.get_mut(),
+                status,
+                &format!(
+                    "{{\"ready\":{ready},\"lag_monitors_ready\":{lag_monitors_ready},\"backlog\":{backlog},\"backlog_limit\":{},\"unhealthy_raft_groups\":{unhealthy_groups}}}",
+                    kafka.max_pipeline_backlog,
+                ),
+                keep_alive,
+            );
+            if !keep_alive {
+                return;
+            }
+            continue;
+        }
         if method == "GET" && path == "/metrics" {
             respond_content(
                 reader.get_mut(),

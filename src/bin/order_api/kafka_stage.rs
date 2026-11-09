@@ -792,6 +792,7 @@ pub(crate) fn run_consumer_lag_monitor(
         match read_consumer_group_lag(&consumer, &topics, per_topic) {
             Ok(lags) => {
                 consecutive_failures = 0;
+                kafka.metrics.set_lag_monitor_ready(stage, true);
                 let total: u64 = lags.iter().sum();
                 // Global backlog master switch keeps the summed view; the
                 // per-category tier machine keeps the per-partition breakdown.
@@ -806,6 +807,7 @@ pub(crate) fn run_consumer_lag_monitor(
                 consecutive_failures = consecutive_failures.saturating_add(1);
                 if consecutive_failures == STALE_AFTER {
                     // Drop the now-stale reading once, exactly as it goes stale.
+                    kafka.metrics.set_lag_monitor_ready(stage, false);
                     kafka.metrics.set_observed_lag(stage, 0);
                     kafka
                         .backpressure

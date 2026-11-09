@@ -6,16 +6,16 @@ symptom. Each entry: **symptom** (which alert or `event=` log line fires),
 
 ## Topology & conventions
 
-- **5 raft nodes** `kaishi-29a4a3-raft-{1..5}-1`, each hosting **4 independent
+- **5 raft nodes** `trade-core-raft-{1..5}-1`, each hosting **4 independent
   Raft groups** (0..3). Group 0 uses `/data`; groups 1..3 use `/data/group-N`.
   Quorum per group = 3 of 5.
-- **10 MySQL order shards** `kaishi-29a4a3-mysql-order-{0..9}-1` (external
+- **10 MySQL order shards** `trade-core-mysql-order-{0..9}-1` (external
   account/settlement system; trade-core only writes executions to them via the
   order-api consumer).
-- **3 Redpanda (Kafka) brokers** `kaishi-29a4a3-redpanda[-2,-3]-1`.
+- **3 Redpanda (Kafka) brokers** `trade-core-redpanda[-2,-3]-1`.
 - Per-group `/metrics` host port = `9200 + group*10 + node`
   (e.g. node 1 group 0 = `9201`, node 5 group 3 = `9235`).
-- Set `PREFIX=kaishi-29a4a3` for the commands below.
+- Set `PREFIX=trade-core` for the commands below.
 - Persistence per group: `raft.state` is the sole authoritative command WAL;
   `journal/snapshot-shard-N.bin` is the atomic in-memory state image and embeds
   `raft_applied_index`; `journal/assets/raft-batches.applied.v2` stores exact
@@ -28,6 +28,11 @@ symptom. Each entry: **symptom** (which alert or `event=` log line fires),
 |---|---|
 | `tc_raft_role` | 0 follower, 1 candidate, 2 leader |
 | `tc_raft_leader_id` | current leader (0 = no leader / election in progress) |
+| `tc_order_http_active_connections` | live order HTTP/WS sessions on this process |
+| `tc_order_http_rejected_connections` | sessions refused by `TC_ORDER_MAX_CONNECTIONS` |
+| `tc_order_query_active_workers` | DB history-query workers currently running |
+| `tc_order_query_waiting_requests` | history queries waiting for the global worker budget |
+| `tc_order_lag_monitors_ready` | 1 after both Kafka pipeline lag views are current |
 | `tc_raft_term` | consensus term (rising fast = repeated elections) |
 | `tc_raft_commit_index` | highest quorum-committed entry |
 | `tc_raft_applied_index` | highest entry fully applied to matching |

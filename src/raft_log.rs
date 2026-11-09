@@ -859,8 +859,10 @@ impl RaftNode {
         // Raft's Progress.matched is intentionally monotonic because a voter
         // is assumed never to lose stable storage while retaining its id. An
         // explicitly marked replacement breaks that assumption. Handle its
-        // authenticated-by-protocol reset request before raft-rs can discard
-        // the lower append response as stale.
+        // explicitly marked reset request before raft-rs can discard the
+        // lower append response as stale. The magic context is a protocol
+        // discriminator, not authentication; deployments without transport
+        // authentication must isolate the Raft network from untrusted peers.
         if self.is_leader()
             && message.get_msg_type() == MessageType::MsgAppendResponse
             && message.term == self.term()
@@ -870,8 +872,10 @@ impl RaftNode {
         {
             let peer = message.from;
             let hint = message.reject_hint;
+            let mut lowered_from = None;
             let recognized = if let Some(progress) = self.node.raft.mut_prs().get_mut(peer) {
                 if hint <= progress.matched {
+                    lowered_from = (hint < progress.matched).then_some(progress.matched);
                     progress.matched = hint;
                     progress.committed_index = progress.committed_index.min(hint);
                     progress.pending_request_snapshot = raft::INVALID_INDEX;
@@ -886,6 +890,13 @@ impl RaftNode {
             };
             if recognized {
                 let target = self.commit_index();
+                if let Some(previous) = lowered_from {
+                    crate::log_warn!(
+                        "raft",
+                        "event=rejoin_progress_reset peer={peer} term={} matched_from={previous} matched_to={hint} target_commit={target}",
+                        self.term(),
+                    );
+                }
                 self.node.raft.send_append(peer);
                 self.drive();
                 let mut target_message = Message::default();

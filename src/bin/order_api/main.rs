@@ -62,6 +62,16 @@ use raft_forward::*;
 use schema::*;
 use store::*;
 
+struct HttpConnectionGuard {
+    metrics: Arc<OrderPipelineMetrics>,
+}
+
+impl Drop for HttpConnectionGuard {
+    fn drop(&mut self) {
+        self.metrics.close_http_connection();
+    }
+}
+
 /// Set by the SIGTERM/SIGINT handler (async-signal-safe: a lone atomic store).
 /// The HTTP accept loop observes it and stops taking new connections.
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
@@ -339,6 +349,22 @@ fn main() {
             .expect("spawn execution MySQL projection consumer");
         consumer_threads.push(handle);
     }
+    let http_max_connections = env_number("TC_ORDER_MAX_CONNECTIONS", 4_096u64).max(1);
+    let http_idle_timeout =
+        Duration::from_millis(env_number("TC_ORDER_CONNECTION_IDLE_TIMEOUT_MS", 75_000u64).max(1));
+    let http_write_timeout =
+        Duration::from_millis(env_number("TC_ORDER_WRITE_TIMEOUT_MS", 30_000u64).max(1));
+    let http_thread_stack = env_number("TC_ORDER_HTTP_THREAD_STACK_KB", 512usize)
+        .max(128)
+        .saturating_mul(1_024);
+    log_info!(
+        "order-api",
+        "http max_connections={} idle_timeout_ms={} write_timeout_ms={} thread_stack_bytes={}",
+        http_max_connections,
+        http_idle_timeout.as_millis(),
+        http_write_timeout.as_millis(),
+        http_thread_stack,
+    );
     let listener = TcpListener::bind("0.0.0.0:9200").expect("bind order API");
     // Non-blocking accept so a SIGTERM/SIGINT (e.g. `docker stop`) stops the API
     // taking new connections and lets the process exit cleanly instead of being
@@ -358,24 +384,49 @@ fn main() {
             break;
         }
         match listener.accept() {
-            Ok((stream, _peer)) => {
+            Ok((mut stream, peer)) => {
                 // Accepted sockets must be blocking for the handler's blocking reads.
                 stream.set_nonblocking(false).ok();
+                if stream.set_read_timeout(Some(http_idle_timeout)).is_err()
+                    || stream.set_write_timeout(Some(http_write_timeout)).is_err()
+                {
+                    log_warn!("order-api", "event=http_socket_config_failed peer={peer}");
+                    continue;
+                }
+                if !shared_metrics.try_open_http_connection(http_max_connections) {
+                    respond(
+                        &mut stream,
+                        "503 Service Unavailable",
+                        "{\"error\":\"connection limit reached\"}",
+                        false,
+                    );
+                    continue;
+                }
                 let metrics = shared_metrics.clone();
                 let kafka = shared_kafka.clone();
                 let token = token.clone();
                 let query_store = query_store.clone();
-                std::thread::spawn(move || {
-                    handle(
-                        stream,
-                        category_size,
-                        metrics,
-                        kafka,
-                        &token,
-                        ingress_enabled,
-                        query_store,
-                    )
-                });
+                let guard = HttpConnectionGuard {
+                    metrics: metrics.clone(),
+                };
+                if let Err(error) = std::thread::Builder::new()
+                    .name("order-http".into())
+                    .stack_size(http_thread_stack)
+                    .spawn(move || {
+                        let _guard = guard;
+                        handle(
+                            stream,
+                            category_size,
+                            metrics,
+                            kafka,
+                            &token,
+                            ingress_enabled,
+                            query_store,
+                        )
+                    })
+                {
+                    log_warn!("order-api", "event=http_thread_spawn_failed error={error}");
+                }
             }
             Err(ref error) if error.kind() == io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(100));

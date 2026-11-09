@@ -75,7 +75,7 @@ hot copy so it can run against a busy node without perturbing it.
 ## backup-node.sh
 
 ```bash
-export TC_PROJECT=kaishi-29a4a3          # compose project prefix (default)
+export TC_PROJECT=trade-core              # compose project prefix (default)
 
 # One node (all 4 groups), verified:
 scripts/backup/backup-node.sh --node 1 --verify
@@ -152,8 +152,10 @@ To return a repaired/replaced node to service:
 # a) Restore its volume from the latest verified backup. --rejoin is mandatory
 #    when the live cluster still knows this voter id:
 scripts/backup/restore-node.sh --backup /backups/…/raft-3 --volume ${PREFIX}_raft-3-data --force --no-boot --rejoin
-# b) Start ONE repaired member. Rejoin mode suppresses its election and makes
-#    the leader rediscover the restored log end before normal replication.
+# b) Start ONE repaired member. Rejoin mode suppresses its election and sends
+#    an explicit same-ID replacement handshake. The leader lowers only that
+#    voter's in-memory progress to its durable log end, then resumes normal
+#    append/snapshot replication without requiring a leader election.
 docker start ${PREFIX}-raft-3-1
 ```
 Wait until every group on the member reports `tc_ready 1` and logs
@@ -161,6 +163,12 @@ Wait until every group on the member reports `tc_ready 1` and logs
 members at once: rejoining members do not campaign. For a brand-new member with
 a new voter id, seed the volume to shorten catch-up, then do the ConfChange
 add/remove procedure (runbook §7) instead of `--rejoin`.
+
+The handshake uses an exact-term, known-voter protocol marker but is not an
+identity credential. This deployment intentionally omits mTLS; keep Raft ports
+on a private, firewalled network where only the configured matching nodes can
+send traffic. The leader logs `event=rejoin_progress_reset` whenever it really
+lowers a peer's remembered progress.
 
 ### Restoring MySQL
 

@@ -191,19 +191,132 @@ pub(crate) fn query_conn(store: &OrderStore, db: u32) -> Result<mysql::PooledCon
         .map_err(|error| error.to_string())
 }
 
-/// Run one statement per physical DB in parallel and concatenate the rows.
+struct QueryWorkerLimiter {
+    available: Mutex<usize>,
+    wake: std::sync::Condvar,
+    max: usize,
+}
+
+impl QueryWorkerLimiter {
+    fn new(max: usize) -> Self {
+        let max = max.max(1);
+        Self {
+            available: Mutex::new(max),
+            wake: std::sync::Condvar::new(),
+            max,
+        }
+    }
+
+    fn acquire_up_to(&self, wanted: usize) -> QueryWorkerPermit<'_> {
+        let mut available = self
+            .available
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while *available == 0 {
+            available = self
+                .wake
+                .wait(available)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        let count = wanted.max(1).min(*available);
+        *available -= count;
+        QueryWorkerPermit {
+            limiter: self,
+            count,
+        }
+    }
+}
+
+struct QueryWorkerPermit<'a> {
+    limiter: &'a QueryWorkerLimiter,
+    count: usize,
+}
+
+impl Drop for QueryWorkerPermit<'_> {
+    fn drop(&mut self) {
+        let mut available = self
+            .limiter
+            .available
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *available = (*available + self.count).min(self.limiter.max);
+        self.limiter.wake.notify_all();
+    }
+}
+
+struct ActiveQueryWorkers<'a> {
+    metrics: &'a OrderPipelineMetrics,
+    count: u64,
+}
+
+impl Drop for ActiveQueryWorkers<'_> {
+    fn drop(&mut self) {
+        self.metrics
+            .query_active_workers
+            .fetch_sub(self.count, AtomicOrdering::AcqRel);
+    }
+}
+
+fn query_worker_limiter() -> &'static QueryWorkerLimiter {
+    static LIMITER: std::sync::OnceLock<QueryWorkerLimiter> = std::sync::OnceLock::new();
+    LIMITER.get_or_init(|| {
+        QueryWorkerLimiter::new(env_number("TC_ORDER_QUERY_MAX_DB_WORKERS", 32usize))
+    })
+}
+
+fn query_parallelism() -> usize {
+    static PARALLELISM: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *PARALLELISM.get_or_init(|| env_number("TC_ORDER_QUERY_DB_PARALLELISM", 4usize).max(1))
+}
+
+/// Run one statement per physical DB with bounded process-wide parallelism and
+/// concatenate the rows. Expanding from 10 to 100 databases therefore changes
+/// work per request, but cannot create one OS thread per database per client.
 pub(crate) fn fan_out<T: mysql::prelude::FromRow + Send>(
     store: &OrderStore,
-    sql_for_db: impl Fn(u32) -> String,
+    sql_for_db: impl Fn(u32) -> String + Sync,
 ) -> Result<Vec<T>, String> {
+    let db_count = store.routing.db_count as u32;
+    let wanted = query_parallelism().min(db_count as usize).max(1);
+    store
+        .metrics
+        .query_waiting_requests
+        .fetch_add(1, AtomicOrdering::AcqRel);
+    let permit = query_worker_limiter().acquire_up_to(wanted);
+    store
+        .metrics
+        .query_waiting_requests
+        .fetch_sub(1, AtomicOrdering::AcqRel);
+    let worker_count = permit.count;
+    store
+        .metrics
+        .query_active_workers
+        .fetch_add(worker_count as u64, AtomicOrdering::AcqRel);
+    let _active = ActiveQueryWorkers {
+        metrics: &store.metrics,
+        count: worker_count as u64,
+    };
+    let next_db = std::sync::atomic::AtomicU32::new(0);
     std::thread::scope(|scope| {
-        let workers = (0..store.routing.db_count as u32)
-            .map(|db| {
-                let sql = sql_for_db(db);
+        let workers = (0..worker_count)
+            .map(|_| {
+                let next_db = &next_db;
+                let sql_for_db = &sql_for_db;
                 scope.spawn(move || {
-                    query_conn(store, db)?
-                        .query::<T, _>(sql)
-                        .map_err(|e| e.to_string())
+                    let mut rows = Vec::new();
+                    loop {
+                        let db = next_db.fetch_add(1, AtomicOrdering::Relaxed);
+                        if db >= db_count {
+                            break;
+                        }
+                        let sql = sql_for_db(db);
+                        rows.extend(
+                            query_conn(store, db)?
+                                .query::<T, _>(sql)
+                                .map_err(|error| error.to_string())?,
+                        );
+                    }
+                    Ok::<Vec<T>, String>(rows)
                 })
             })
             .collect::<Vec<_>>();
@@ -353,5 +466,26 @@ pub(crate) fn order_query_response(
                 "{\"error\":\"order query failed\"}".into(),
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod unit {
+    use super::*;
+
+    #[test]
+    fn query_worker_limiter_never_grants_more_than_its_global_budget() {
+        let limiter = QueryWorkerLimiter::new(3);
+        let first = limiter.acquire_up_to(2);
+        assert_eq!(first.count, 2);
+        let second = limiter.acquire_up_to(2);
+        assert_eq!(second.count, 1);
+        drop(first);
+        drop(second);
+        assert_eq!(
+            *limiter.available.lock().unwrap(),
+            3,
+            "all worker slots return through the RAII permits"
+        );
     }
 }

@@ -50,7 +50,7 @@
 set -euo pipefail
 
 # ---- configuration ----------------------------------------------------------
-PROJECT="${TC_PROJECT:-kaishi-29a4a3}"
+PROJECT="${TC_PROJECT:-trade-core}"
 NODE_IMAGE="${TC_NODE_IMAGE:-trade-core-node}"
 DEFAULT_OUT_ROOT="${TC_BACKUP_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/backups}"
 MYSQL_SHARDS="${TC_MYSQL_SHARDS:-10}"
@@ -75,7 +75,7 @@ Options:
   -h, --help     This help.
 
 Environment overrides:
-  TC_PROJECT (compose project prefix, default kaishi-29a4a3),
+  TC_PROJECT (compose project prefix, default trade-core),
   TC_NODE_IMAGE, TC_BACKUP_ROOT, TC_MYSQL_SHARDS,
   TC_MYSQL_USER, TC_MYSQL_PASSWORD.
 EOF

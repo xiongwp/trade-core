@@ -1721,3 +1721,42 @@ fn json_escape_keeps_acks_valid_json() {
     assert_eq!(json_escape("plain"), "plain");
     assert_eq!(json_escape("a\"b\\c\nd\u{1}"), "a\\\"b\\\\c\\u000ad\\u0001");
 }
+
+#[test]
+fn http_connection_admission_is_bounded_and_observable() {
+    let metrics = OrderPipelineMetrics::default();
+    assert!(metrics.try_open_http_connection(2));
+    assert!(metrics.try_open_http_connection(2));
+    assert!(!metrics.try_open_http_connection(2));
+    assert_eq!(
+        metrics
+            .http_active_connections
+            .load(AtomicOrdering::Relaxed),
+        2
+    );
+    assert_eq!(
+        metrics
+            .http_rejected_connections
+            .load(AtomicOrdering::Relaxed),
+        1
+    );
+    metrics.close_http_connection();
+    assert!(metrics.try_open_http_connection(2));
+    metrics.close_http_connection();
+    metrics.close_http_connection();
+    assert!(metrics
+        .render()
+        .contains("tc_order_http_active_connections 0"));
+}
+
+#[test]
+fn lag_monitor_readiness_requires_both_pipeline_stages() {
+    let metrics = OrderPipelineMetrics::default();
+    assert!(!metrics.lag_monitors_ready());
+    metrics.set_lag_monitor_ready("mysql", true);
+    assert!(!metrics.lag_monitors_ready());
+    metrics.set_lag_monitor_ready("match", true);
+    assert!(metrics.lag_monitors_ready());
+    metrics.set_lag_monitor_ready("mysql", false);
+    assert!(!metrics.lag_monitors_ready());
+}

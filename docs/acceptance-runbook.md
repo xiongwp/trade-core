@@ -168,7 +168,7 @@ outbox pending 作为“积压归零”依据，而不是所有副本求和—�
 python3 scripts/acceptance/run-ladder.py \
     --bench-bin target/release/deps/order_batch_e2e-<hash> \
     --smoke --smoke-seconds 15 \
-    --resource-prefix kaishi-29a4a3-raft- \
+    --resource-prefix trade-core-raft- \
     --output acceptance-smoke
 ```
 

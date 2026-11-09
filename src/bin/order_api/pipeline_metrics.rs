@@ -4,6 +4,17 @@ use super::*;
 
 #[derive(Default)]
 pub(crate) struct OrderPipelineMetrics {
+    /// HTTP/TCP sessions currently owned by request-handler threads. Long-lived
+    /// WebSocket order sessions count too, so the admission limit also bounds
+    /// their memory and thread footprint.
+    pub(crate) http_active_connections: AtomicU64,
+    /// Connections dropped at accept time because the process-wide session
+    /// limit was already occupied.
+    pub(crate) http_rejected_connections: AtomicU64,
+    /// Database fan-out workers currently executing history-query shards.
+    pub(crate) query_active_workers: AtomicU64,
+    /// HTTP history queries waiting for a slot in the global DB worker budget.
+    pub(crate) query_waiting_requests: AtomicU64,
     pub(crate) mysql_commit_ns_total: AtomicU64,
     pub(crate) mysql_commit_ns_max: AtomicU64,
     pub(crate) mysql_commit_samples: AtomicU64,
@@ -34,11 +45,56 @@ pub(crate) struct OrderPipelineMetrics {
     /// clears the lag after a short staleness window, and this counter makes the
     /// condition observable instead of silent.
     pub(crate) lag_read_failures: AtomicU64,
+    /// Bit 0 = MySQL projection lag monitor has a current reading; bit 1 =
+    /// matching lag monitor has one. Readiness stays false until both have
+    /// contacted Kafka at least once and drops again after their reading is
+    /// stale.
+    pub(crate) lag_monitor_ready_mask: AtomicU64,
     /// Expired dedupe partitions truncated (see `DedupeRing`).
     pub(crate) dedupe_truncated_partitions: AtomicU64,
 }
 
 impl OrderPipelineMetrics {
+    pub(crate) fn try_open_http_connection(&self, max: u64) -> bool {
+        let opened = self
+            .http_active_connections
+            .fetch_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |active| {
+                (active < max).then_some(active + 1)
+            })
+            .is_ok();
+        if !opened {
+            self.http_rejected_connections
+                .fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        opened
+    }
+
+    pub(crate) fn close_http_connection(&self) {
+        let previous = self
+            .http_active_connections
+            .fetch_sub(1, AtomicOrdering::AcqRel);
+        debug_assert!(previous > 0, "HTTP connection gauge underflow");
+    }
+
+    pub(crate) fn set_lag_monitor_ready(&self, stage: &str, ready: bool) {
+        let bit = match stage {
+            "mysql" => 1,
+            "match" => 2,
+            _ => return,
+        };
+        if ready {
+            self.lag_monitor_ready_mask
+                .fetch_or(bit, AtomicOrdering::Release);
+        } else {
+            self.lag_monitor_ready_mask
+                .fetch_and(!bit, AtomicOrdering::Release);
+        }
+    }
+
+    pub(crate) fn lag_monitors_ready(&self) -> bool {
+        self.lag_monitor_ready_mask.load(AtomicOrdering::Acquire) & 3 == 3
+    }
+
     pub(crate) fn record(
         total: &AtomicU64,
         max: &AtomicU64,
@@ -157,12 +213,22 @@ impl OrderPipelineMetrics {
 
     pub(crate) fn render(&self) -> String {
         format!(
-            "# TYPE tc_order_mysql_commit_ns_total counter\ntc_order_mysql_commit_ns_total {}\n\
+            "# TYPE tc_order_http_active_connections gauge\ntc_order_http_active_connections {}\n\
+# TYPE tc_order_http_rejected_connections counter\ntc_order_http_rejected_connections {}\n\
+# TYPE tc_order_query_active_workers gauge\ntc_order_query_active_workers {}\n\
+# TYPE tc_order_query_waiting_requests gauge\ntc_order_query_waiting_requests {}\n\
+# TYPE tc_order_mysql_commit_ns_total counter\ntc_order_mysql_commit_ns_total {}\n\
 # TYPE tc_order_mysql_commit_ns_max gauge\ntc_order_mysql_commit_ns_max {}\n\
 # TYPE tc_order_mysql_commit_samples counter\ntc_order_mysql_commit_samples {}\n\
 # TYPE tc_order_raft_forward_ns_total counter\ntc_order_raft_forward_ns_total {}\n\
 # TYPE tc_order_raft_forward_ns_max gauge\ntc_order_raft_forward_ns_max {}\n\
 # TYPE tc_order_raft_forward_samples counter\ntc_order_raft_forward_samples {}\n",
+            self.http_active_connections
+                .load(AtomicOrdering::Relaxed),
+            self.http_rejected_connections
+                .load(AtomicOrdering::Relaxed),
+            self.query_active_workers.load(AtomicOrdering::Relaxed),
+            self.query_waiting_requests.load(AtomicOrdering::Relaxed),
             self.mysql_commit_ns_total.load(AtomicOrdering::Relaxed),
             self.mysql_commit_ns_max.load(AtomicOrdering::Relaxed),
             self.mysql_commit_samples.load(AtomicOrdering::Relaxed),
@@ -196,11 +262,13 @@ impl OrderPipelineMetrics {
 # TYPE tc_order_match_consumer_lag gauge\ntc_order_match_consumer_lag {}\n\
 # TYPE tc_order_dlq_total counter\ntc_order_dlq_total {}\n\
 # TYPE tc_order_lag_read_failures counter\ntc_order_lag_read_failures {}\n\
+# TYPE tc_order_lag_monitors_ready gauge\ntc_order_lag_monitors_ready {}\n\
 # TYPE tc_order_dedupe_truncated_partitions counter\ntc_order_dedupe_truncated_partitions {}\n",
             self.observed_mysql_lag.load(AtomicOrdering::Relaxed),
             self.observed_match_lag.load(AtomicOrdering::Relaxed),
             self.dlq_total.load(AtomicOrdering::Relaxed),
             self.lag_read_failures.load(AtomicOrdering::Relaxed),
+            u8::from(self.lag_monitors_ready()),
             self.dedupe_truncated_partitions.load(AtomicOrdering::Relaxed),
         ) + &self.mysql_commit_hist.render_standalone(
             "order_mysql_commit_ns",

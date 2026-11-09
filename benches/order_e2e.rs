@@ -9,7 +9,36 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+fn pipeline_backlog(addr: &str) -> std::io::Result<u64> {
+    let mut stream = TcpStream::connect(addr)?;
+    stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+    stream.write_all(b"GET /metrics HTTP/1.0\r\nHost: order-api\r\n\r\n")?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    response
+        .lines()
+        .find_map(|line| {
+            let mut fields = line.split_whitespace();
+            (fields.next()? == "tc_order_ingress_backlog").then(|| fields.next()?.parse().ok())?
+        })
+        .ok_or_else(|| std::io::Error::other("tc_order_ingress_backlog missing"))
+}
+
+fn wait_for_empty_pipeline(addr: &str) {
+    let deadline = Instant::now() + Duration::from_secs(180);
+    loop {
+        if pipeline_backlog(addr).is_ok_and(|backlog| backlog == 0) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "order pipeline did not drain before the benchmark"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
 
 fn percentile(values: &mut [u64], p: f64) -> u64 {
     values.sort_unstable();
@@ -67,6 +96,7 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(10_000u32)
         .max(1);
+    wait_for_empty_pipeline(&addr);
     let base = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
