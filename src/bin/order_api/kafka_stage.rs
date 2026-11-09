@@ -64,6 +64,50 @@ pub(crate) fn commit_kafka_batch(
         .map_err(|error| error.to_string())
 }
 
+/// Offsets this consumer has processed, re-committed synchronously once it
+/// goes idle. Batch commits are asynchronous and a failed one is not
+/// retried: when it was the last batch of a partition (e.g. during a broker
+/// leadership change), the committed offset stayed behind for good. The
+/// records were projected, so this only caused redelivery on restart, but
+/// the group lag stayed above zero indefinitely: it fed backpressure and
+/// never let a drain finish. Idle-time only, so throughput is unaffected.
+#[derive(Default)]
+pub(crate) struct IdleCommit {
+    offsets: HashMap<(String, i32), i64>,
+    dirty: bool,
+}
+
+impl IdleCommit {
+    pub(crate) fn record(&mut self, records: &[KafkaRecord]) {
+        for record in records {
+            let next = self
+                .offsets
+                .entry((record.topic.clone(), record.partition))
+                .or_insert(0);
+            *next = (*next).max(record.offset + 1);
+        }
+        self.dirty |= !records.is_empty();
+    }
+
+    pub(crate) fn flush(&mut self, consumer: &BaseConsumer) {
+        if !self.dirty {
+            return;
+        }
+        let mut list = TopicPartitionList::new();
+        for ((topic, partition), offset) in &self.offsets {
+            if list
+                .add_partition_offset(topic, *partition, Offset::Offset(*offset))
+                .is_err()
+            {
+                return;
+            }
+        }
+        if consumer.commit(&list, CommitMode::Sync).is_ok() {
+            self.dirty = false;
+        }
+    }
+}
+
 pub(crate) fn rewind_kafka_batch(consumer: &BaseConsumer, records: &[KafkaRecord]) {
     let mut offsets: HashMap<(&str, i32), i64> = HashMap::new();
     for record in records {
@@ -185,6 +229,7 @@ pub(crate) fn run_db_kafka_stage(
     consumer
         .assign(&assignment)
         .expect("assign routed command DB ownership");
+    let mut idle_commit = IdleCommit::default();
     loop {
         // Between batches only: a batch in hand is finished and its offsets
         // committed. Returning drops the consumer, which leaves its group so
@@ -194,6 +239,7 @@ pub(crate) fn run_db_kafka_stage(
             return;
         }
         let Some(first) = consumer.poll(Duration::from_millis(100)) else {
+            idle_commit.flush(&consumer);
             continue;
         };
         let mut batch = Vec::with_capacity(kafka.batch_size);
@@ -222,7 +268,10 @@ pub(crate) fn run_db_kafka_stage(
             .submit(forwarder.routing, &batch)
             .and_then(|()| commit_kafka_batch(&consumer, &batch, kafka.async_offset_commits))
         {
-            Ok(()) => kafka.metrics.complete("mysql", batch.len() as u64),
+            Ok(()) => {
+                idle_commit.record(&batch);
+                kafka.metrics.complete("mysql", batch.len() as u64);
+            }
             Err(error) => {
                 log_warn!("order-db", worker; "event=batch_retry error={error}");
                 rewind_kafka_batch(&consumer, &batch);
@@ -280,6 +329,7 @@ pub(crate) fn run_kafka_stage<F>(
     let mut consecutive_failures = 0u32;
     let mut last_failure_log = std::time::Instant::now() - Duration::from_secs(30);
 
+    let mut idle_commit = IdleCommit::default();
     loop {
         // Between batches only: a batch in hand is finished and its offsets
         // committed. Returning drops the consumer, which leaves its group so
@@ -290,6 +340,7 @@ pub(crate) fn run_kafka_stage<F>(
         }
         let mut batch = Vec::with_capacity(batch_size);
         let Some(first) = consumer.poll(Duration::from_millis(100)) else {
+            idle_commit.flush(&consumer);
             continue;
         };
         match first {
@@ -332,6 +383,7 @@ pub(crate) fn run_kafka_stage<F>(
             .and_then(|()| commit_kafka_batch(&consumer, &batch, kafka.async_offset_commits))
         {
             Ok(()) => {
+                idle_commit.record(&batch);
                 kafka.metrics.complete(stage, batch.len() as u64);
                 consecutive_failures = 0;
             }
