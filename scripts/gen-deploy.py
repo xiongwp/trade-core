@@ -63,6 +63,8 @@ RAFT_ENV_KEYS = [
     ("TC_EXECUTION_PUBLISH_BATCH", "4096"),
     ("TC_EXECUTION_KAFKA_DELIVERY_TIMEOUT_MS", "15000"),
     ("TC_EXECUTION_KAFKA_TOPIC", "trade-executions-v1"),
+    ("TC_MARKET_KAFKA_TOPIC", "trade-market-events-v1"),
+    ("TC_MARKET_KAFKA_PARTITIONS", "16"),
     ("TC_EXECUTION_CURSOR_TOPIC", "trade-execution-outbox-cursors-v1"),
     ("TC_EXECUTION_CURSOR_PARTITIONS", "16"),
     ("TC_EXECUTION_CURSOR_EVERY_BATCHES", "16"),

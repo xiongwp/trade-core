@@ -969,6 +969,8 @@ fn main() {
     let md_listener = TcpListener::bind(md_addr).expect("bind market-data fanout");
     let execution_topic =
         std::env::var("TC_EXECUTION_KAFKA_TOPIC").unwrap_or_else(|_| "trade-executions-v1".into());
+    let market_topic =
+        std::env::var("TC_MARKET_KAFKA_TOPIC").unwrap_or_else(|_| "trade-market-events-v1".into());
     let execution_producer = execution_kafka_brokers.map(|brokers| {
         let mut config = ClientConfig::new();
         config
@@ -1029,9 +1031,16 @@ fn main() {
             .and_then(|value| value.parse::<i32>().ok())
             .unwrap_or(16)
             .max(1);
+        let market_partitions = std::env::var("TC_MARKET_KAFKA_PARTITIONS")
+            .ok()
+            .and_then(|value| value.parse::<i32>().ok())
+            .unwrap_or(16)
+            .max(1);
         spawn_execution_outbox_publisher(
             execution_outbox_dir,
             execution_topic.clone(),
+            market_topic,
+            market_partitions,
             checkpoint_topic,
             checkpoint_partitions,
             brokers,
@@ -1102,6 +1111,8 @@ fn main() {
 fn spawn_execution_outbox_publisher(
     root: PathBuf,
     topic: String,
+    market_topic: String,
+    market_partitions: i32,
     checkpoint_topic: String,
     checkpoint_partitions: i32,
     brokers: String,
@@ -1335,17 +1346,46 @@ fn spawn_execution_outbox_publisher(
                                         })
                                 })
                                 .collect::<Vec<_>>();
+                            // One canonical copy per trade, partitioned by Raft
+                            // group. Unlike the order-result topic (partitioned
+                            // by target order/database), this stream is ordered
+                            // for deterministic candle replay.
+                            let market_prepared = records
+                                .iter()
+                                .filter_map(|record| {
+                                    let payload = record.kafka_payload();
+                                    let event = wire::decode_execution_event(&payload)?;
+                                    (event.report.type_code == wire::RT_TRADE).then_some((
+                                        u64::from(record.raft_group).to_be_bytes(),
+                                        (record.raft_group % market_partitions as u32) as i32,
+                                        payload,
+                                    ))
+                                })
+                                .collect::<Vec<_>>();
                             let deliveries =
                                 futures::executor::block_on(futures::future::join_all(
-                                    prepared.iter().map(|(key, partition, payload)| {
-                                        producer.send(
-                                            FutureRecord::to(&topic)
-                                                .partition(*partition)
-                                                .key(key)
-                                                .payload(payload),
-                                            Duration::from_secs(5),
-                                        )
-                                    }),
+                                    prepared
+                                        .iter()
+                                        .map(|(key, partition, payload)| {
+                                            producer.send(
+                                                FutureRecord::to(&topic)
+                                                    .partition(*partition)
+                                                    .key(key)
+                                                    .payload(payload),
+                                                Duration::from_secs(5),
+                                            )
+                                        })
+                                        .chain(market_prepared.iter().map(
+                                            |(key, partition, payload)| {
+                                                producer.send(
+                                                    FutureRecord::to(&market_topic)
+                                                        .partition(*partition)
+                                                        .key(key)
+                                                        .payload(payload),
+                                                    Duration::from_secs(5),
+                                                )
+                                            },
+                                        )),
                                 ));
                             if deliveries.iter().all(Result::is_ok) {
                                 published_any = true;

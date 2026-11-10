@@ -31,6 +31,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use rdkafka::consumer::{BaseConsumer, Consumer};
+use rdkafka::message::{Message as KafkaMessage, Timestamp};
+use rdkafka::topic_partition_list::{Offset, TopicPartitionList};
+use rdkafka::ClientConfig;
 use trade_core::kline::KlineAggregator;
 use trade_core::wire::{self, EXECUTION_EVENT_LEN, RT_DEPTH_END, RT_DEPTH_LEVEL};
 use trade_core::{log_info, log_warn, InstrumentId, Order, OrderId, Price, Qty, Side};
@@ -85,6 +89,10 @@ struct State {
     /// (`wire::encode_md_hello`). A different one means the group was
     /// rebuilt from empty logs: its indexes restarted, so its mark resets.
     incarnations: HashMap<u32, u64>,
+    /// Next Kafka offset to consume per market-topic partition. It is captured
+    /// in the same atomic file as candles and watermarks, so restart never
+    /// skips a trade whose candle was not durable yet.
+    kafka_offsets: HashMap<i32, i64>,
     /// Newest timestamp given to a trade: candle time never goes backwards
     /// (feed threads race for the lock; wall clocks step back).
     last_ts: u64,
@@ -157,7 +165,8 @@ fn warn_far_below_mark(group: u32, index: u64, mark: u64) {
     }
 }
 
-const MARKET_STATE_MAGIC: &[u8; 4] = b"TCM2";
+const MARKET_STATE_MAGIC: &[u8; 4] = b"TCM3";
+const PREVIOUS_MARKET_STATE_MAGIC: &[u8; 4] = b"TCM2";
 /// group u32 | index u64 | ordinal u32 | incarnation u64
 const MARK_RECORD_LEN: usize = 24;
 
@@ -167,6 +176,7 @@ const MARK_RECORD_LEN: usize = 24;
 struct MarketStateParts {
     candles: Vec<u8>,
     applied: Vec<(u32, u64, u32, u64)>,
+    kafka_offsets: Vec<(i32, i64)>,
     last_ts: u64,
 }
 
@@ -187,9 +197,16 @@ fn market_state_parts(state: &State) -> MarketStateParts {
             (group, index, ordinal, incarnation)
         })
         .collect();
+    let mut kafka_offsets = state
+        .kafka_offsets
+        .iter()
+        .map(|(&partition, &offset)| (partition, offset))
+        .collect::<Vec<_>>();
+    kafka_offsets.sort_unstable();
     MarketStateParts {
         candles: state.agg.encode(),
         applied,
+        kafka_offsets,
         last_ts: state.last_ts,
     }
 }
@@ -207,9 +224,12 @@ fn frame_market_state(parts: MarketStateParts) -> Vec<u8> {
     let MarketStateParts {
         candles,
         applied,
+        kafka_offsets,
         last_ts,
     } = parts;
-    let mut out = Vec::with_capacity(24 + candles.len() + applied.len() * MARK_RECORD_LEN);
+    let mut out = Vec::with_capacity(
+        28 + candles.len() + applied.len() * MARK_RECORD_LEN + kafka_offsets.len() * 12,
+    );
     out.extend_from_slice(MARKET_STATE_MAGIC);
     out.extend_from_slice(&(candles.len() as u64).to_le_bytes());
     out.extend_from_slice(&candles);
@@ -219,6 +239,11 @@ fn frame_market_state(parts: MarketStateParts) -> Vec<u8> {
         out.extend_from_slice(&index.to_le_bytes());
         out.extend_from_slice(&ordinal.to_le_bytes());
         out.extend_from_slice(&incarnation.to_le_bytes());
+    }
+    out.extend_from_slice(&(kafka_offsets.len() as u32).to_le_bytes());
+    for (partition, offset) in kafka_offsets {
+        out.extend_from_slice(&partition.to_le_bytes());
+        out.extend_from_slice(&offset.to_le_bytes());
     }
     out.extend_from_slice(&last_ts.to_le_bytes());
     let checksum = trade_core::journal::fnv1a(&out);
@@ -231,13 +256,24 @@ type RestoredMarket = (
     KlineAggregator,
     HashMap<u32, (u64, u32)>,
     HashMap<u32, u64>,
+    HashMap<i32, i64>,
     u64,
 );
 
 fn decode_market_state(bytes: &[u8]) -> std::io::Result<RestoredMarket> {
     let bad =
         |message: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, message.to_string());
-    if bytes.len() < 32 || &bytes[..4] != MARKET_STATE_MAGIC {
+    if bytes.starts_with(b"TCK2") {
+        return Ok((
+            KlineAggregator::decode(bytes)?,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            0,
+        ));
+    }
+    let previous = bytes.get(..4) == Some(PREVIOUS_MARKET_STATE_MAGIC);
+    if bytes.len() < 32 || (!previous && bytes.get(..4) != Some(MARKET_STATE_MAGIC)) {
         return Err(bad("bad market state magic"));
     }
     let body_end = bytes.len() - 8;
@@ -262,9 +298,6 @@ fn decode_market_state(bytes: &[u8]) -> std::io::Result<RestoredMarket> {
                 .ok_or_else(|| bad("market watermark count overflow"))?,
         )
         .ok_or_else(|| bad("market watermark length overflow"))?;
-    if marks_end.checked_add(8) != Some(body_end) {
-        return Err(bad("truncated or trailing market watermarks"));
-    }
     let mut applied = HashMap::with_capacity(count);
     let mut incarnations = HashMap::with_capacity(count);
     for record in bytes[marks_start..marks_end].chunks_exact(MARK_RECORD_LEN) {
@@ -279,8 +312,42 @@ fn decode_market_state(bytes: &[u8]) -> std::io::Result<RestoredMarket> {
             incarnations.insert(group, incarnation);
         }
     }
-    let last_ts = u64::from_le_bytes(bytes[marks_end..body_end].try_into().unwrap());
-    Ok((agg, applied, incarnations, last_ts))
+    let (kafka_offsets, last_ts_at) = if previous {
+        if marks_end.checked_add(8) != Some(body_end) {
+            return Err(bad("truncated or trailing market watermarks"));
+        }
+        (HashMap::new(), marks_end)
+    } else {
+        let count_end = marks_end
+            .checked_add(4)
+            .ok_or_else(|| bad("market offset count overflow"))?;
+        if count_end > body_end {
+            return Err(bad("truncated market offset count"));
+        }
+        let offset_count =
+            u32::from_le_bytes(bytes[marks_end..count_end].try_into().unwrap()) as usize;
+        let offsets_end = count_end
+            .checked_add(
+                offset_count
+                    .checked_mul(12)
+                    .ok_or_else(|| bad("market offset count overflow"))?,
+            )
+            .ok_or_else(|| bad("market offsets length overflow"))?;
+        if offsets_end.checked_add(8) != Some(body_end) {
+            return Err(bad("truncated or trailing market offsets"));
+        }
+        let mut offsets = HashMap::with_capacity(offset_count);
+        for record in bytes[count_end..offsets_end].chunks_exact(12) {
+            let partition = i32::from_le_bytes(record[..4].try_into().unwrap());
+            let offset = i64::from_le_bytes(record[4..12].try_into().unwrap());
+            if partition < 0 || offset < 0 || offsets.insert(partition, offset).is_some() {
+                return Err(bad("invalid or duplicate market Kafka offset"));
+            }
+        }
+        (offsets, offsets_end)
+    };
+    let last_ts = u64::from_le_bytes(bytes[last_ts_at..body_end].try_into().unwrap());
+    Ok((agg, applied, incarnations, kafka_offsets, last_ts))
 }
 
 fn write_market_state(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -323,6 +390,32 @@ fn idle_feed_read(error: &std::io::Error) -> bool {
         error.kind(),
         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
     )
+}
+
+fn apply_trade_event(state: &mut State, event: wire::ExecutionEvent, ts: u64) -> bool {
+    let report = event.report;
+    if report.type_code != RT_TRADE
+        || !state.take(event.raft_group, event.raft_index, event.ordinal)
+    {
+        return false;
+    }
+    state.last_ts = state.last_ts.max(ts);
+    let ts = state.last_ts;
+    state
+        .agg
+        .on_trade(report.instrument, ts, report.price, report.qty);
+    let trades = state.trades.entry(report.instrument).or_default();
+    trades.push_back((
+        ts,
+        report.price,
+        report.qty,
+        report.maker_fee,
+        report.taker_fee,
+    ));
+    if trades.len() > 1000 {
+        trades.pop_front();
+    }
+    true
 }
 
 fn feed_one(md_addr: String, state: Arc<Mutex<State>>) {
@@ -394,15 +487,7 @@ fn feed_one(md_addr: String, state: Arc<Mutex<State>>) {
                         }
                         match r.type_code {
                             RT_TRADE => {
-                                if !st.take(event.raft_group, event.raft_index, event.ordinal) {
-                                    continue;
-                                }
-                                st.agg.on_trade(r.instrument, ts, r.price, r.qty);
-                                let dq = st.trades.entry(r.instrument).or_default();
-                                dq.push_back((ts, r.price, r.qty, r.maker_fee, r.taker_fee));
-                                if dq.len() > 1000 {
-                                    dq.pop_front();
-                                }
+                                apply_trade_event(&mut st, event, ts);
                             }
                             RT_DEPTH_LEVEL => {
                                 let lvl = r.aux_id as usize;
@@ -445,6 +530,104 @@ fn feed_one(md_addr: String, state: Arc<Mutex<State>>) {
             last_disconnect_warning = std::time::Instant::now();
         }
         std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+/// Durable candle source. The dedicated topic has one canonical event per
+/// trade and is partitioned by Raft group, preserving the order required by
+/// `State::take`. TCP fanout remains enabled for low-latency depth and may win
+/// the race for a trade; the same event id makes the Kafka copy a no-op.
+fn kafka_trade_loop(brokers: String, topic: String, state: Arc<Mutex<State>>) {
+    let consumer: BaseConsumer = ClientConfig::new()
+        .set("bootstrap.servers", &brokers)
+        .set("group.id", "market-data-authoritative-replay")
+        .set("enable.auto.commit", "false")
+        .set("enable.auto.offset.store", "false")
+        .set("auto.offset.reset", "error")
+        .set("isolation.level", "read_committed")
+        .create()
+        .expect("create market-data Kafka consumer");
+    let metadata = consumer
+        .fetch_metadata(Some(&topic), Duration::from_secs(10))
+        .expect("fetch market-data topic metadata");
+    let topic_metadata = metadata
+        .topics()
+        .iter()
+        .find(|metadata| metadata.name() == topic)
+        .expect("market-data topic exists");
+    assert!(
+        topic_metadata.error().is_none(),
+        "market-data topic metadata error: {:?}",
+        topic_metadata.error()
+    );
+    let restored_offsets = state.lock().unwrap().kafka_offsets.clone();
+    let mut assignment = TopicPartitionList::new();
+    for partition in topic_metadata.partitions() {
+        let partition = partition.id();
+        let (low, high) = consumer
+            .fetch_watermarks(&topic, partition, Duration::from_secs(5))
+            .expect("fetch market-data partition watermarks");
+        let offset = match restored_offsets.get(&partition).copied() {
+            Some(offset) if offset < low => panic!(
+                "market-data Kafka offset {offset} for partition {partition} is below retained low watermark {low}; restore a newer market snapshot before starting"
+            ),
+            Some(offset) if offset > high => panic!(
+                "market-data Kafka offset {offset} for partition {partition} is beyond high watermark {high}; topic was likely recreated"
+            ),
+            Some(offset) => Offset::Offset(offset),
+            None if low == 0 => Offset::Beginning,
+            None => panic!(
+                "market-data has no durable offset for partition {partition}, but Kafka history starts at {low}"
+            ),
+        };
+        assignment
+            .add_partition_offset(&topic, partition, offset)
+            .expect("build market-data Kafka assignment");
+    }
+    consumer
+        .assign(&assignment)
+        .expect("assign every market-data Kafka partition");
+    log_info!(
+        "market-data",
+        "authoritative trade replay from Kafka topic={topic} partitions={}",
+        topic_metadata.partitions().len()
+    );
+
+    while !SHUTDOWN.load(Ordering::Acquire) {
+        let Some(message) = consumer.poll(Duration::from_millis(500)) else {
+            continue;
+        };
+        match message {
+            Ok(message) => {
+                let partition = message.partition();
+                let next_offset = message.offset().saturating_add(1);
+                let ts = match message.timestamp() {
+                    Timestamp::CreateTime(ms) | Timestamp::LogAppendTime(ms) if ms >= 0 => {
+                        ms as u64 / 1_000
+                    }
+                    _ => now_sec(),
+                };
+                let mut state = state.lock().unwrap();
+                if let Some(event) = message.payload().and_then(wire::decode_execution_event) {
+                    apply_trade_event(&mut state, event, ts);
+                } else {
+                    log_warn!(
+                        "market-data",
+                        "event=invalid_market_event partition={partition} offset={}",
+                        message.offset()
+                    );
+                }
+                state
+                    .kafka_offsets
+                    .entry(partition)
+                    .and_modify(|offset| *offset = (*offset).max(next_offset))
+                    .or_insert(next_offset);
+            }
+            Err(error) => {
+                log_warn!("market-data", "event=kafka_trade_read_failed error={error}");
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
     }
 }
 
@@ -1051,6 +1234,7 @@ fn main() {
                 KlineAggregator::new(2000),
                 HashMap::new(),
                 HashMap::new(),
+                HashMap::new(),
                 0,
             )
         });
@@ -1061,9 +1245,10 @@ fn main() {
         trades: HashMap::new(),
         applied: restored.1,
         incarnations: restored.2,
+        kafka_offsets: restored.3,
         // A clock that once jumped ahead must not pin every later candle
         // to that future time across restarts.
-        last_ts: restored.3.min(now_sec() + 60),
+        last_ts: restored.4.min(now_sec() + 60),
     }));
 
     // Feed thread.
@@ -1072,6 +1257,24 @@ fn main() {
         .name("md-feed".into())
         .spawn(move || feed_loop(md_addr, feed_state))
         .expect("spawn feed");
+
+    let kafka_brokers = std::env::var("TC_MARKET_KAFKA_BROKERS")
+        .or_else(|_| std::env::var("TC_EXECUTION_KAFKA_BROKERS"))
+        .unwrap_or_default();
+    if !kafka_brokers.trim().is_empty() {
+        let kafka_topic = std::env::var("TC_MARKET_KAFKA_TOPIC")
+            .unwrap_or_else(|_| "trade-market-events-v1".into());
+        let kafka_state = state.clone();
+        std::thread::Builder::new()
+            .name("md-kafka-replay".into())
+            .spawn(move || kafka_trade_loop(kafka_brokers, kafka_topic, kafka_state))
+            .expect("spawn market-data Kafka replay");
+    } else {
+        log_warn!(
+            "market-data",
+            "TC_MARKET_KAFKA_BROKERS is empty: candle feed has no durable replay source"
+        );
+    }
 
     // Persistence thread: atomic snapshot every 10 s. Keep the path so the main
     // thread can take one final snapshot on graceful shutdown.

@@ -121,6 +121,9 @@ services:
           --partitions=${TC_EXECUTION_KAFKA_PARTITIONS:-16} --replicas=3 \
           "${TC_EXECUTION_KAFKA_TOPIC:-trade-executions-v1}"
         rpk topic create --if-not-exists --brokers=redpanda:9092 \
+          --partitions=${TC_MARKET_KAFKA_PARTITIONS:-4} --replicas=3 \
+          "${TC_MARKET_KAFKA_TOPIC:-trade-market-events-v1}"
+        rpk topic create --if-not-exists --brokers=redpanda:9092 \
           --partitions=${TC_EXECUTION_CURSOR_PARTITIONS:-16} --replicas=3 \
           --topic-config cleanup.policy=compact \
           "${TC_EXECUTION_CURSOR_TOPIC:-trade-execution-outbox-cursors-v1}"
@@ -201,6 +204,8 @@ services:
       TC_ORDER_API_ADDR: order:9200
       TC_ORDER_API_TOKEN: ${TC_ORDER_API_TOKEN:-local-order-api-token}
       TC_ORDER_API_MAX_IDLE_CONNECTIONS: ${TC_ORDER_API_MAX_IDLE_CONNECTIONS:-32}
+      TC_MARKET_KAFKA_BROKERS: ${TC_MARKET_KAFKA_BROKERS:-redpanda:9092,redpanda-2:9092,redpanda-3:9092}
+      TC_MARKET_KAFKA_TOPIC: ${TC_MARKET_KAFKA_TOPIC:-trade-market-events-v1}
       TC_LOG: ${TC_LOG:-info}
       RUST_BACKTRACE: ${RUST_BACKTRACE:-1}
     depends_on:

@@ -205,6 +205,8 @@ def main(inventory_path, out_dir):
         # many); the node default (16) would map groups onto partitions that
         # do not exist or leave created ones unused.
         "TC_EXECUTION_CURSOR_PARTITIONS": groups,
+        "TC_MARKET_KAFKA_TOPIC": "trade-market-events-v1",
+        "TC_MARKET_KAFKA_PARTITIONS": groups,
         "TC_SUPERVISOR_LIVENESS_GRACE_SECS": 300,
         "TC_SUPERVISOR_LIVENESS_FAILURES": 6,
         "TC_SUPERVISOR_START_CONCURRENCY": 16,
@@ -345,6 +347,7 @@ def main(inventory_path, out_dir):
         f.write(f"for g in $(seq 0 {groups - 1}); do rpk topic create --brokers=$B -p 16 -r 3 -c retention.ms=$R \"orders-v2-g$g\"; done\n")
         f.write(f"rpk topic create --brokers=$B -p {db_count} -r 3 -c retention.ms=$R trade-order-db-v1\n")
         f.write(f"rpk topic create --brokers=$B -p {db_count} -r 3 -c retention.ms=$R trade-executions-v1\n")
+        f.write(f"rpk topic create --brokers=$B -p {groups} -r 3 -c retention.ms=$R trade-market-events-v1\n")
         f.write(f"rpk topic create --brokers=$B -p {groups} -r 3 -c cleanup.policy=compact trade-execution-outbox-cursors-v1\n")
         f.write("rpk topic create --brokers=$B -p 1 -r 3 -c cleanup.policy=compact trade-route-control-v1\n")
         if push_hosts:
