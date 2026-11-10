@@ -47,6 +47,9 @@ const RT_TRADE: u8 = 2;
 /// Set by the SIGTERM/SIGINT handler so the main accept loop can break out and
 /// run the candle-history flush before exiting.
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+static MARKET_KAFKA_REQUIRED: AtomicBool = AtomicBool::new(false);
+static MARKET_KAFKA_READY: AtomicBool = AtomicBool::new(false);
+static MARKET_STORAGE_HEALTHY: AtomicBool = AtomicBool::new(true);
 
 /// Async-signal-safe handler: touches only an atomic flag, nothing else.
 extern "C" fn on_signal(_sig: libc::c_int) {
@@ -587,6 +590,7 @@ fn kafka_trade_loop(brokers: String, topic: String, state: Arc<Mutex<State>>) {
     consumer
         .assign(&assignment)
         .expect("assign every market-data Kafka partition");
+    MARKET_KAFKA_READY.store(true, Ordering::Release);
     log_info!(
         "market-data",
         "authoritative trade replay from Kafka topic={topic} partitions={}",
@@ -599,6 +603,7 @@ fn kafka_trade_loop(brokers: String, topic: String, state: Arc<Mutex<State>>) {
         };
         match message {
             Ok(message) => {
+                MARKET_KAFKA_READY.store(true, Ordering::Release);
                 let partition = message.partition();
                 let next_offset = message.offset().saturating_add(1);
                 let ts = match message.timestamp() {
@@ -624,8 +629,15 @@ fn kafka_trade_loop(brokers: String, topic: String, state: Arc<Mutex<State>>) {
                     .or_insert(next_offset);
             }
             Err(error) => {
+                MARKET_KAFKA_READY.store(false, Ordering::Release);
                 log_warn!("market-data", "event=kafka_trade_read_failed error={error}");
                 std::thread::sleep(Duration::from_secs(1));
+                if consumer
+                    .fetch_metadata(Some(&topic), Duration::from_secs(5))
+                    .is_ok()
+                {
+                    MARKET_KAFKA_READY.store(true, Ordering::Release);
+                }
             }
         }
     }
@@ -858,6 +870,25 @@ fn handle_http(
     }
 
     match path {
+        "/healthz" => respond(&mut stream, "200 OK", "text/plain", b"ok\n"),
+        "/readyz" => {
+            let kafka_ready = !MARKET_KAFKA_REQUIRED.load(Ordering::Acquire)
+                || MARKET_KAFKA_READY.load(Ordering::Acquire);
+            let storage_ready = MARKET_STORAGE_HEALTHY.load(Ordering::Acquire);
+            if kafka_ready && storage_ready {
+                respond(&mut stream, "200 OK", "text/plain", b"ready\n");
+            } else {
+                let body = format!(
+                    "not ready: kafka_ready={kafka_ready} storage_ready={storage_ready}\n"
+                );
+                respond(
+                    &mut stream,
+                    "503 Service Unavailable",
+                    "text/plain",
+                    body.as_bytes(),
+                );
+            }
+        }
         "/" | "/index.html" => respond(
             &mut stream,
             "200 OK",
@@ -1258,6 +1289,10 @@ fn main() {
         .spawn(move || feed_loop(md_addr, feed_state))
         .expect("spawn feed");
 
+    let kafka_required = std::env::var("TC_MARKET_KAFKA_REQUIRED")
+        .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "no" | "NO"))
+        .unwrap_or(true);
+    MARKET_KAFKA_REQUIRED.store(kafka_required, Ordering::Release);
     let kafka_brokers = std::env::var("TC_MARKET_KAFKA_BROKERS")
         .or_else(|_| std::env::var("TC_EXECUTION_KAFKA_BROKERS"))
         .unwrap_or_default();
@@ -1267,12 +1302,24 @@ fn main() {
         let kafka_state = state.clone();
         std::thread::Builder::new()
             .name("md-kafka-replay".into())
-            .spawn(move || kafka_trade_loop(kafka_brokers, kafka_topic, kafka_state))
+            .spawn(move || {
+                let result = std::panic::catch_unwind(|| {
+                    kafka_trade_loop(kafka_brokers, kafka_topic, kafka_state)
+                });
+                MARKET_KAFKA_READY.store(false, Ordering::Release);
+                if !SHUTDOWN.load(Ordering::Acquire) {
+                    log_warn!(
+                        "market-data",
+                        "event=authoritative_kafka_replay_stopped result={result:?}; aborting to prevent stale reads"
+                    );
+                    std::process::abort();
+                }
+            })
             .expect("spawn market-data Kafka replay");
     } else {
         log_warn!(
             "market-data",
-            "TC_MARKET_KAFKA_BROKERS is empty: candle feed has no durable replay source"
+            "TC_MARKET_KAFKA_BROKERS is empty: candle feed has no durable replay source; required={kafka_required}"
         );
     }
 
@@ -1288,8 +1335,12 @@ fn main() {
                 // the feed threads must not wait on the disk.
                 let parts = market_state_parts(&save_state.lock().unwrap());
                 let bytes = frame_market_state(parts);
-                if let Err(error) = write_market_state(&path, &bytes) {
-                    log_warn!("market-data", "event=history_save_failed error={error}");
+                match write_market_state(&path, &bytes) {
+                    Ok(()) => MARKET_STORAGE_HEALTHY.store(true, Ordering::Release),
+                    Err(error) => {
+                        MARKET_STORAGE_HEALTHY.store(false, Ordering::Release);
+                        log_warn!("market-data", "event=history_save_failed error={error}");
+                    }
                 }
             })
             .expect("spawn persist");
@@ -1381,6 +1432,7 @@ mod tests {
             trades: HashMap::new(),
             applied: HashMap::new(),
             incarnations: HashMap::new(),
+            kafka_offsets: HashMap::new(),
             last_ts: 0,
         };
         // Replica A delivers group 3's entries 10..=12; replica B, behind,
@@ -1415,6 +1467,7 @@ mod tests {
             trades: HashMap::new(),
             applied: HashMap::from([(3, (42, 7)), (9, (11, 2))]),
             incarnations: HashMap::from([(3, 555), (12, 777)]),
+            kafka_offsets: HashMap::from([(0, 123), (7, 456)]),
             last_ts: 1_700_000_123,
         };
         state
@@ -1422,12 +1475,14 @@ mod tests {
             .on_trade(InstrumentId(17), state.last_ts, 1_005, 9);
 
         let bytes = encode_market_state(&state);
-        let (agg, applied, incarnations, last_ts) = decode_market_state(&bytes).unwrap();
+        let (agg, applied, incarnations, kafka_offsets, last_ts) =
+            decode_market_state(&bytes).unwrap();
         // Group 12 has an incarnation but no trade yet: an empty mark.
         let mut expected = state.applied.clone();
         expected.insert(12, (0, 0));
         assert_eq!(applied, expected);
         assert_eq!(incarnations, state.incarnations);
+        assert_eq!(kafka_offsets, state.kafka_offsets);
         assert_eq!(last_ts, state.last_ts);
         assert_eq!(
             agg.candles(InstrumentId(17), "1s", 10),
@@ -1440,12 +1495,55 @@ mod tests {
             trades: HashMap::new(),
             applied,
             incarnations,
+            kafka_offsets,
             last_ts,
         };
         assert!(!restarted.take(3, 42, 7), "saved event is not recounted");
         assert!(
             restarted.take(3, 42, 8),
             "the next event remains admissible"
+        );
+    }
+
+    #[test]
+    fn previous_market_snapshot_loads_with_empty_kafka_offsets() {
+        let mut state = State {
+            agg: KlineAggregator::new(10),
+            depth: DepthStore::default(),
+            trades: HashMap::new(),
+            applied: HashMap::from([(2, (99, 3))]),
+            incarnations: HashMap::from([(2, 44)]),
+            kafka_offsets: HashMap::new(),
+            last_ts: 1_700_000_456,
+        };
+        state
+            .agg
+            .on_trade(InstrumentId(8), state.last_ts, 2_000, 5);
+        let parts = market_state_parts(&state);
+        let mut previous = Vec::new();
+        previous.extend_from_slice(PREVIOUS_MARKET_STATE_MAGIC);
+        previous.extend_from_slice(&(parts.candles.len() as u64).to_le_bytes());
+        previous.extend_from_slice(&parts.candles);
+        previous.extend_from_slice(&(parts.applied.len() as u32).to_le_bytes());
+        for (group, index, ordinal, incarnation) in parts.applied {
+            previous.extend_from_slice(&group.to_le_bytes());
+            previous.extend_from_slice(&index.to_le_bytes());
+            previous.extend_from_slice(&ordinal.to_le_bytes());
+            previous.extend_from_slice(&incarnation.to_le_bytes());
+        }
+        previous.extend_from_slice(&parts.last_ts.to_le_bytes());
+        let checksum = trade_core::journal::fnv1a(&previous);
+        previous.extend_from_slice(&checksum.to_le_bytes());
+
+        let (agg, applied, incarnations, offsets, last_ts) =
+            decode_market_state(&previous).unwrap();
+        assert_eq!(applied, state.applied);
+        assert_eq!(incarnations, state.incarnations);
+        assert!(offsets.is_empty());
+        assert_eq!(last_ts, state.last_ts);
+        assert_eq!(
+            agg.candles(InstrumentId(8), "1s", 10),
+            state.agg.candles(InstrumentId(8), "1s", 10)
         );
     }
 
@@ -1457,6 +1555,7 @@ mod tests {
             trades: HashMap::new(),
             applied: HashMap::new(),
             incarnations: HashMap::new(),
+            kafka_offsets: HashMap::new(),
             last_ts: 0,
         };
         st.on_incarnation(3, 0); // not assigned yet: ignored

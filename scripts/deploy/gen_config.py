@@ -19,6 +19,7 @@ inventory.json:
   "projection_hosts": ["pj01", ...],               # order-api DB workers
   "ingress_hosts":    ["in01", ...],               # order-api intake
   "push_hosts":       ["ps01", ...],               # user-stream (optional)
+  "market_data_hosts":["md01", ...],               # market API/read models (optional)
   "route_version":    1,                           # bump with any change below
   "virtual_db_count": 400000,                      # fixed for the life of the data
   "kafka_brokers":    ["kf01:9092", ...]
@@ -98,6 +99,7 @@ def main(inventory_path, out_dir):
         "TC_ORDER_KAFKA_PARTITIONS_PER_TOPIC": 16,
         "TC_ORDER_KAFKA_BROKERS": brokers,
         "TC_EXECUTION_KAFKA_BROKERS": brokers,
+        "TC_MARKET_KAFKA_BROKERS": brokers,
     }
 
     # Raft placement. With failure domains, replicas rotate across distinct
@@ -323,6 +325,13 @@ def main(inventory_path, out_dir):
             "TC_USER_STREAM_ROLE": "pusher",
             "TC_USER_STREAM_ADDR": "0.0.0.0:9300",
             "TC_USER_STREAM_SHARD": i,
+        })
+
+    for host in inv.get("market_data_hosts", []):
+        write(host, {
+            "TC_MARKET_KAFKA_TOPIC": "trade-market-events-v1",
+            "TC_MARKET_KAFKA_REQUIRED": "true",
+            "TC_ORDER_API_ADDR": f"{inv['ingress_hosts'][0]}:9200",
         })
 
     # Endpoints for scripts/ops/health.py: every replica's metrics port per

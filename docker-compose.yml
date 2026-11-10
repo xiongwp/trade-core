@@ -206,6 +206,7 @@ services:
       TC_ORDER_API_MAX_IDLE_CONNECTIONS: ${TC_ORDER_API_MAX_IDLE_CONNECTIONS:-32}
       TC_MARKET_KAFKA_BROKERS: ${TC_MARKET_KAFKA_BROKERS:-redpanda:9092,redpanda-2:9092,redpanda-3:9092}
       TC_MARKET_KAFKA_TOPIC: ${TC_MARKET_KAFKA_TOPIC:-trade-market-events-v1}
+      TC_MARKET_KAFKA_REQUIRED: ${TC_MARKET_KAFKA_REQUIRED:-true}
       TC_LOG: ${TC_LOG:-info}
       RUST_BACKTRACE: ${RUST_BACKTRACE:-1}
     depends_on:
@@ -228,8 +229,9 @@ services:
     volumes:
       - market-data-history:/data/md
     healthcheck:
-      # debian:stable-slim ships no curl/wget; bash /dev/tcp probes the HTTP port.
-      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080 && exec 3>&- 3<&-"]
+      # Liveness only. Traffic admission must probe /readyz so a temporary
+      # Kafka/storage outage does not create a restart storm.
+      test: ["CMD", "raft-multi-node", "probe", "/healthz", "8080"]
       interval: 5s
       timeout: 3s
       retries: 40

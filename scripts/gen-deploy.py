@@ -242,6 +242,8 @@ def render_node_compose(topo, n):
         "x-raft-environment: &raft-environment",
     ]
     for key, default in RAFT_ENV_KEYS:
+        if key in ("TC_MARKET_KAFKA_PARTITIONS", "TC_EXECUTION_CURSOR_PARTITIONS"):
+            default = str(topo["groups"])
         lines.append(f'  {key}: "${{{key}:-{default}}}"')
     lines.append(
         '  TC_EXECUTION_KAFKA_BROKERS: "${TC_EXECUTION_KAFKA_BROKERS'
@@ -305,6 +307,8 @@ def render_node_env(topo, n):
         "# 32 GiB / 8-core Raft-node baseline (uncomment and calibrate after load test):",
     ]
     for key, default in RAFT_ENV_KEYS:
+        if key in ("TC_MARKET_KAFKA_PARTITIONS", "TC_EXECUTION_CURSOR_PARTITIONS"):
+            default = str(topo["groups"])
         lines.append(f"#{key}={default}")
     lines.append("")
     return "\n".join(lines)
@@ -404,7 +408,7 @@ def render_gateway_compose(topo):
         "    ports:",
         '      - "9200:9200"',
         "    healthcheck:",
-        '      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9200 && exec 3>&- 3<&-"]',
+        '      test: ["CMD", "raft-multi-node", "probe", "/readyz", "9200"]',
         "      interval: 5s",
         "      timeout: 3s",
         "      retries: 40",
@@ -467,12 +471,15 @@ def render_gateway_compose(topo):
         "      TC_TRADING_TOKEN: ${TC_TRADING_TOKEN:?set in gateway.env}",
         "      TC_ORDER_API_ADDR: order:9200",
         "      TC_ORDER_API_TOKEN: ${TC_ORDER_API_TOKEN:?set in gateway.env}",
+        "      TC_MARKET_KAFKA_BROKERS: ${TC_MARKET_KAFKA_BROKERS:?set in gateway.env}",
+        "      TC_MARKET_KAFKA_TOPIC: ${TC_MARKET_KAFKA_TOPIC:-trade-market-events-v1}",
+        "      TC_MARKET_KAFKA_REQUIRED: ${TC_MARKET_KAFKA_REQUIRED:-true}",
         "    ports:",
         '      - "8081:8080"',
         "    volumes:",
         '      - "market-data-history:/data/md"',
         "    healthcheck:",
-        '      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080 && exec 3>&- 3<&-"]',
+        '      test: ["CMD", "raft-multi-node", "probe", "/healthz", "8080"]',
         "      interval: 5s",
         "      timeout: 3s",
         "      retries: 40",
@@ -498,6 +505,7 @@ def render_gateway_env():
             "TC_ADMIN_TOKEN=CHANGE-ME",
             "TC_TRADING_TOKEN=CHANGE-ME",
             "TC_ORDER_KAFKA_BROKERS=CHANGE-ME-broker-1:9092,CHANGE-ME-broker-2:9092",
+            "TC_MARKET_KAFKA_BROKERS=CHANGE-ME-broker-1:9092,CHANGE-ME-broker-2:9092",
             "TC_COMMAND_DB_CONSUMERS_PER_REPLICA=8",
             "TC_MATCH_CONSUMERS_PER_REPLICA=4",
             "TC_EXECUTION_DB_CONSUMERS_PER_REPLICA=8",
