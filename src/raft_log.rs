@@ -886,6 +886,26 @@ impl RaftNode {
         self.drive();
     }
 
+    /// Report whether a `MsgSnapshot` this node sent to `to` left this host.
+    ///
+    /// After sending a snapshot, raft pauses that follower until it answers.
+    /// If the transport lost the message, the follower never answers and
+    /// raft would never send it anything again — the replica stays behind
+    /// until the next leader change. A failure report puts it back to probing
+    /// so the leader resends.
+    pub fn report_snapshot(&mut self, to: u64, delivered: bool) {
+        let status = if delivered {
+            raft::SnapshotStatus::Finish
+        } else {
+            raft::SnapshotStatus::Failure
+        };
+        self.node.report_snapshot(to, status);
+        if !delivered {
+            self.node.report_unreachable(to);
+        }
+        self.drive();
+    }
+
     /// Deliver one peer message received from the cluster transport.
     pub fn step(&mut self, message: Message) -> Result<(), raft::Error> {
         // A replacement forgot its vote and every entry it acknowledged
@@ -1690,6 +1710,80 @@ mod tests {
         );
         assert!(nodes[4].commit_index() >= compact_at);
         assert!(nodes[4].snapshot_index() >= compact_at);
+    }
+
+    /// One delivery round where `drop` decides which messages the transport
+    /// loses. Returns how many it dropped.
+    fn pump_dropping(nodes: &mut [RaftNode], mut drop: impl FnMut(&Message) -> bool) -> usize {
+        let mut dropped = 0;
+        for _ in 0..200 {
+            let mut messages = Vec::new();
+            for n in nodes.iter_mut() {
+                messages.extend(n.take_outbound());
+            }
+            if messages.is_empty() {
+                break;
+            }
+            for message in messages {
+                if drop(&message) {
+                    dropped += 1;
+                    continue;
+                }
+                if let Some(target) = nodes.iter_mut().find(|n| n.id() == message.to) {
+                    let _ = target.step(message);
+                }
+            }
+        }
+        dropped
+    }
+
+    #[test]
+    fn a_lost_snapshot_is_resent_once_reported_failed() {
+        let mut nodes = (1..=5).map(node).collect::<Vec<_>>();
+        let active = [true, true, true, true, false];
+        nodes[0].campaign().unwrap();
+        pump_active(&mut nodes, &active);
+        assert!(nodes[0].is_leader());
+        for i in 0..4u8 {
+            nodes[0].propose(vec![b'x' + i]).unwrap();
+            pump_active(&mut nodes, &active);
+        }
+        let compact_at = nodes[0].take_committed().last().unwrap().index;
+        let blob = b"engine-state".to_vec();
+        assert!(nodes[0].compact(compact_at, blob.clone()).unwrap());
+        for n in &mut nodes[1..4] {
+            n.take_committed();
+        }
+
+        // Node 5 reconnects, but the transport loses every snapshot sent to it.
+        let is_snapshot =
+            |m: &Message| m.get_msg_type() == raft::eraftpb::MessageType::MsgSnapshot;
+        let mut lost = 0;
+        for _ in 0..60 {
+            for n in nodes.iter_mut() {
+                n.tick();
+            }
+            lost += pump_dropping(&mut nodes, |m| is_snapshot(m));
+        }
+        assert_eq!(lost, 1, "raft sends one snapshot, then waits for the follower");
+        assert!(
+            nodes[4].snapshot_index() < compact_at,
+            "without a failure report the follower is never sent anything again"
+        );
+
+        // The transport reports the loss: the leader resends and node 5 catches up.
+        nodes[0].report_snapshot(5, false);
+        for _ in 0..60 {
+            for n in nodes.iter_mut() {
+                n.tick();
+            }
+            pump_dropping(&mut nodes, |_| false);
+            if nodes[4].snapshot_index() >= compact_at {
+                break;
+            }
+        }
+        assert_eq!(nodes[4].take_installed_snapshot(), Some(blob));
+        assert!(nodes[4].commit_index() >= compact_at);
     }
 
     #[test]

@@ -403,7 +403,15 @@ fn main() {
         .name("raft-runtime".into())
         .spawn(move || {
             let mut node = raft_node;
-            let transport = PeerTransport::spawn(runtime_peers, runtime_metrics.clone());
+            // Peer writers report whether each snapshot left this host; raft
+            // must hear about a lost one or it never resends (see
+            // RaftNode::report_snapshot).
+            let (snapshot_report_tx, snapshot_report_rx) = mpsc::channel::<(u64, bool)>();
+            let transport = PeerTransport::spawn(
+                runtime_peers,
+                runtime_metrics.clone(),
+                snapshot_report_tx,
+            );
             let mut pending = Vec::new();
             let mut commit_waiters: BTreeMap<u64, Vec<mpsc::SyncSender<u64>>> = BTreeMap::new();
             let mut commit_started: BTreeMap<u64, Instant> = BTreeMap::new();
@@ -522,6 +530,9 @@ fn main() {
             }
 
             while runtime_running.load(Ordering::Acquire) {
+                while let Ok((to, delivered)) = snapshot_report_rx.try_recv() {
+                    node.report_snapshot(to, delivered);
+                }
                 while let Ok(message) = message_rx.try_recv() {
                     // Proposals only enter through this node's own intake; a
                     // peer frame carrying one would put arbitrary bytes in
@@ -2080,7 +2091,11 @@ struct PeerTransport {
 }
 
 impl PeerTransport {
-    fn spawn(peers: HashMap<u64, String>, metrics: Arc<trade_core::metrics::Metrics>) -> Self {
+    fn spawn(
+        peers: HashMap<u64, String>,
+        metrics: Arc<trade_core::metrics::Metrics>,
+        snapshot_reports: mpsc::Sender<(u64, bool)>,
+    ) -> Self {
         let queue_capacity = std::env::var("TC_RAFT_TRANSPORT_QUEUE")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
@@ -2090,9 +2105,10 @@ impl PeerTransport {
         for (id, addr) in peers {
             let (tx, rx) = mpsc::sync_channel(queue_capacity);
             let worker_metrics = metrics.clone();
+            let worker_reports = snapshot_reports.clone();
             thread::Builder::new()
                 .name(format!("raft-peer-{id}"))
-                .spawn(move || run_peer_writer(addr, rx, worker_metrics))
+                .spawn(move || run_peer_writer(addr, rx, worker_metrics, worker_reports))
                 .expect("spawn Raft peer writer");
             senders.insert(id, tx);
         }
@@ -2114,13 +2130,37 @@ impl PeerTransport {
     }
 }
 
+/// How long a snapshot write may stall before the attempt counts as failed.
+/// Ordinary messages keep 500 ms; a snapshot of hundreds of MB to a busy
+/// follower routinely stalls longer than that while it writes to disk.
+fn snapshot_write_timeout() -> Duration {
+    static TIMEOUT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *TIMEOUT.get_or_init(|| {
+        Duration::from_millis(
+            std::env::var("TC_RAFT_SNAPSHOT_WRITE_TIMEOUT_MS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(30_000)
+                .max(500),
+        )
+    })
+}
+
 fn run_peer_writer(
     addr: String,
     rx: mpsc::Receiver<Message>,
     metrics: Arc<trade_core::metrics::Metrics>,
+    snapshot_reports: mpsc::Sender<(u64, bool)>,
 ) {
     let mut stream: Option<TcpStream> = None;
     while let Ok(message) = rx.recv() {
+        let is_snapshot =
+            message.get_msg_type() == raft::eraftpb::MessageType::MsgSnapshot;
+        let write_timeout = if is_snapshot {
+            snapshot_write_timeout()
+        } else {
+            Duration::from_millis(500)
+        };
         let Ok(bytes) = message.write_to_bytes() else {
             continue;
         };
@@ -2162,10 +2202,10 @@ fn run_peer_writer(
                     }
                 }
             }
-            if stream
-                .as_mut()
-                .is_some_and(|stream| stream.write_all(&frame).is_ok())
-            {
+            if stream.as_mut().is_some_and(|stream| {
+                stream.set_write_timeout(Some(write_timeout)).is_ok()
+                    && stream.write_all(&frame).is_ok()
+            }) {
                 delivered = true;
                 break;
             }
@@ -2175,6 +2215,18 @@ fn run_peer_writer(
             metrics
                 .raft_transport_dropped
                 .fetch_add(1, Ordering::Relaxed);
+        }
+        if is_snapshot {
+            if !delivered {
+                log_warn!(
+                    "raft-node",
+                    "event=snapshot_send_failed to={} bytes={}; raft will resend",
+                    message.to,
+                    bytes.len()
+                );
+            }
+            // The runtime may be gone during shutdown; nothing to tell then.
+            let _ = snapshot_reports.send((message.to, delivered));
         }
     }
 }
