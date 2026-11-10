@@ -47,7 +47,7 @@ const RT_TRADE: u8 = 2;
 /// Set by the SIGTERM/SIGINT handler so the main accept loop can break out and
 /// run the candle-history flush before exiting.
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
-static MARKET_KAFKA_REQUIRED: AtomicBool = AtomicBool::new(false);
+static MARKET_KAFKA_REQUIRED: AtomicBool = AtomicBool::new(true);
 static MARKET_KAFKA_READY: AtomicBool = AtomicBool::new(false);
 static MARKET_STORAGE_HEALTHY: AtomicBool = AtomicBool::new(true);
 
@@ -83,11 +83,11 @@ struct State {
     /// Recent trades per instrument (newest last), bounded ring:
     /// (ts, price, qty, maker_fee, taker_fee).
     trades: HashMap<InstrumentId, TradeRing>,
-    /// Per Raft group, the newest (raft index, ordinal) taken. Every replica
-    /// of a group sends the same reports in the same order, and a restarted
-    /// node replays its log tail: anything at or below the mark was already
-    /// counted.
-    applied: HashMap<u32, (u64, u32)>,
+    /// Per (Raft group, instrument), the newest (raft index, ordinal) taken.
+    /// Independent asset queues in one group can finish out of global index
+    /// order, while each asset remains ordered. A group-wide watermark would
+    /// therefore discard valid trades from a slower asset queue.
+    applied: HashMap<(u32, u32), (u64, u32)>,
     /// Per Raft group, the incarnation its feeds announce
     /// (`wire::encode_md_hello`). A different one means the group was
     /// rebuilt from empty logs: its indexes restarted, so its mark resets.
@@ -104,17 +104,17 @@ struct State {
 impl State {
     /// Whether a report of `group` at (`index`, `ordinal`) is new. Index 0:
     /// not from a Raft entry (a standalone exchange): always taken.
-    fn take(&mut self, group: u32, index: u64, ordinal: u32) -> bool {
+    fn take(&mut self, group: u32, instrument: InstrumentId, index: u64, ordinal: u32) -> bool {
         if index == 0 {
             return true;
         }
-        let mark = self.applied.entry(group).or_insert((0, 0));
+        let mark = self.applied.entry((group, instrument.0)).or_insert((0, 0));
         if (index, ordinal) <= *mark {
             // Far below the mark on every delivery is not a lagging replica
             // but a matching cluster whose Raft logs were wiped while this
             // state was kept: all its trades would be dropped as replays.
             if index.saturating_add(REPLAY_SUSPICION_GAP) < mark.0 {
-                warn_far_below_mark(group, index, mark.0);
+                warn_far_below_mark(group, instrument, index, mark.0);
             }
             return false;
         }
@@ -124,9 +124,9 @@ impl State {
 
     /// Whether a feed that last saw `index` of `group` is caught up with the
     /// group (so its depth is current, not a lagging replica's).
-    fn current(&self, group: u32, index: u64) -> bool {
+    fn current(&self, group: u32, instrument: InstrumentId, index: u64) -> bool {
         self.applied
-            .get(&group)
+            .get(&(group, instrument.0))
             .map_or(true, |mark| index >= mark.0)
     }
 
@@ -137,10 +137,12 @@ impl State {
         }
         match self.incarnations.insert(group, incarnation) {
             Some(previous) if previous != incarnation => {
-                let mark = self.applied.remove(&group);
+                let before = self.applied.len();
+                self.applied.retain(|(applied_group, _), _| *applied_group != group);
+                let removed = before - self.applied.len();
                 log_warn!(
                     "market-data",
-                    "event=group_rebuilt group={group} incarnation={previous}->{incarnation} watermark_reset_from={mark:?}"
+                    "event=group_rebuilt group={group} incarnation={previous}->{incarnation} asset_watermarks_removed={removed}"
                 );
             }
             _ => {}
@@ -152,7 +154,7 @@ impl State {
 /// the group was more likely rebuilt from empty logs.
 const REPLAY_SUSPICION_GAP: u64 = 10_000_000;
 
-fn warn_far_below_mark(group: u32, index: u64, mark: u64) {
+fn warn_far_below_mark(group: u32, instrument: InstrumentId, index: u64, mark: u64) {
     static LAST: AtomicU64 = AtomicU64::new(0);
     let now = now_sec();
     let last = LAST.load(Ordering::Relaxed);
@@ -163,43 +165,48 @@ fn warn_far_below_mark(group: u32, index: u64, mark: u64) {
     {
         log_warn!(
             "market-data",
-            "event=trades_far_below_watermark group={group} index={index} watermark={mark}: dropped as replays; if the matching cluster was rebuilt from empty Raft logs, stop market-data and delete its klines.bin"
+            "event=trades_far_below_watermark group={group} instrument={} index={index} watermark={mark}: dropped as replays; if the matching cluster was rebuilt from empty Raft logs, stop market-data and delete its klines.bin",
+            instrument.0
         );
     }
 }
 
-const MARKET_STATE_MAGIC: &[u8; 4] = b"TCM3";
-const PREVIOUS_MARKET_STATE_MAGIC: &[u8; 4] = b"TCM2";
-/// group u32 | index u64 | ordinal u32 | incarnation u64
-const MARK_RECORD_LEN: usize = 24;
+const MARKET_STATE_MAGIC: &[u8; 4] = b"TCM4";
+const PREVIOUS_MARKET_STATE_MAGIC: &[u8; 4] = b"TCM3";
+const LEGACY_MARKET_STATE_MAGIC: &[u8; 4] = b"TCM2";
+/// group u32 | instrument u32 | index u64 | ordinal u32
+const ASSET_MARK_RECORD_LEN: usize = 20;
+/// group u32 | incarnation u64
+const INCARNATION_RECORD_LEN: usize = 12;
+/// TCM2/TCM3: group u32 | index u64 | ordinal u32 | incarnation u64
+const LEGACY_MARK_RECORD_LEN: usize = 24;
 
 /// What a snapshot needs from the shared state: copied under the lock (the
 /// candle encoding is the only real work), framed and checksummed after it
 /// is released so the feed threads do not wait on that.
 struct MarketStateParts {
     candles: Vec<u8>,
-    applied: Vec<(u32, u64, u32, u64)>,
+    applied: Vec<(u32, u32, u64, u32)>,
+    incarnations: Vec<(u32, u64)>,
     kafka_offsets: Vec<(i32, i64)>,
     last_ts: u64,
 }
 
 fn market_state_parts(state: &State) -> MarketStateParts {
-    let mut groups: Vec<u32> = state
+    let mut applied = state
         .applied
-        .keys()
-        .chain(state.incarnations.keys())
-        .copied()
-        .collect();
-    groups.sort_unstable();
-    groups.dedup();
-    let applied = groups
-        .into_iter()
-        .map(|group| {
-            let (index, ordinal) = state.applied.get(&group).copied().unwrap_or((0, 0));
-            let incarnation = state.incarnations.get(&group).copied().unwrap_or(0);
-            (group, index, ordinal, incarnation)
+        .iter()
+        .map(|(&(group, instrument), &(index, ordinal))| {
+            (group, instrument, index, ordinal)
         })
-        .collect();
+        .collect::<Vec<_>>();
+    applied.sort_unstable();
+    let mut incarnations = state
+        .incarnations
+        .iter()
+        .map(|(&group, &incarnation)| (group, incarnation))
+        .collect::<Vec<_>>();
+    incarnations.sort_unstable();
     let mut kafka_offsets = state
         .kafka_offsets
         .iter()
@@ -209,6 +216,7 @@ fn market_state_parts(state: &State) -> MarketStateParts {
     MarketStateParts {
         candles: state.agg.encode(),
         applied,
+        incarnations,
         kafka_offsets,
         last_ts: state.last_ts,
     }
@@ -227,20 +235,29 @@ fn frame_market_state(parts: MarketStateParts) -> Vec<u8> {
     let MarketStateParts {
         candles,
         applied,
+        incarnations,
         kafka_offsets,
         last_ts,
     } = parts;
     let mut out = Vec::with_capacity(
-        28 + candles.len() + applied.len() * MARK_RECORD_LEN + kafka_offsets.len() * 12,
+        36 + candles.len()
+            + applied.len() * ASSET_MARK_RECORD_LEN
+            + incarnations.len() * INCARNATION_RECORD_LEN
+            + kafka_offsets.len() * 12,
     );
     out.extend_from_slice(MARKET_STATE_MAGIC);
     out.extend_from_slice(&(candles.len() as u64).to_le_bytes());
     out.extend_from_slice(&candles);
     out.extend_from_slice(&(applied.len() as u32).to_le_bytes());
-    for (group, index, ordinal, incarnation) in applied {
+    for (group, instrument, index, ordinal) in applied {
         out.extend_from_slice(&group.to_le_bytes());
+        out.extend_from_slice(&instrument.to_le_bytes());
         out.extend_from_slice(&index.to_le_bytes());
         out.extend_from_slice(&ordinal.to_le_bytes());
+    }
+    out.extend_from_slice(&(incarnations.len() as u32).to_le_bytes());
+    for (group, incarnation) in incarnations {
+        out.extend_from_slice(&group.to_le_bytes());
         out.extend_from_slice(&incarnation.to_le_bytes());
     }
     out.extend_from_slice(&(kafka_offsets.len() as u32).to_le_bytes());
@@ -257,10 +274,11 @@ fn frame_market_state(parts: MarketStateParts) -> Vec<u8> {
 /// Candles, replay marks, group incarnations, last trade timestamp.
 type RestoredMarket = (
     KlineAggregator,
-    HashMap<u32, (u64, u32)>,
+    HashMap<(u32, u32), (u64, u32)>,
     HashMap<u32, u64>,
     HashMap<i32, i64>,
     u64,
+    bool,
 );
 
 fn decode_market_state(bytes: &[u8]) -> std::io::Result<RestoredMarket> {
@@ -273,10 +291,13 @@ fn decode_market_state(bytes: &[u8]) -> std::io::Result<RestoredMarket> {
             HashMap::new(),
             HashMap::new(),
             0,
+            false,
         ));
     }
+    let current = bytes.get(..4) == Some(MARKET_STATE_MAGIC);
     let previous = bytes.get(..4) == Some(PREVIOUS_MARKET_STATE_MAGIC);
-    if bytes.len() < 32 || (!previous && bytes.get(..4) != Some(MARKET_STATE_MAGIC)) {
+    let legacy = bytes.get(..4) == Some(LEGACY_MARKET_STATE_MAGIC);
+    if bytes.len() < 32 || (!current && !previous && !legacy) {
         return Err(bad("bad market state magic"));
     }
     let body_end = bytes.len() - 8;
@@ -294,41 +315,88 @@ fn decode_market_state(bytes: &[u8]) -> std::io::Result<RestoredMarket> {
     let agg = KlineAggregator::decode(&bytes[12..candle_end])?;
     let count = u32::from_le_bytes(bytes[candle_end..candle_end + 4].try_into().unwrap()) as usize;
     let marks_start = candle_end + 4;
+    let mark_len = if current {
+        ASSET_MARK_RECORD_LEN
+    } else {
+        LEGACY_MARK_RECORD_LEN
+    };
     let marks_end = marks_start
         .checked_add(
             count
-                .checked_mul(MARK_RECORD_LEN)
+                .checked_mul(mark_len)
                 .ok_or_else(|| bad("market watermark count overflow"))?,
         )
         .ok_or_else(|| bad("market watermark length overflow"))?;
+    if marks_end > body_end {
+        return Err(bad("truncated market watermarks"));
+    }
     let mut applied = HashMap::with_capacity(count);
-    let mut incarnations = HashMap::with_capacity(count);
-    for record in bytes[marks_start..marks_end].chunks_exact(MARK_RECORD_LEN) {
-        let group = u32::from_le_bytes(record[0..4].try_into().unwrap());
-        let index = u64::from_le_bytes(record[4..12].try_into().unwrap());
-        let ordinal = u32::from_le_bytes(record[12..16].try_into().unwrap());
-        let incarnation = u64::from_le_bytes(record[16..24].try_into().unwrap());
-        if applied.insert(group, (index, ordinal)).is_some() {
-            return Err(bad("duplicate market watermark group"));
+    let mut incarnations = HashMap::new();
+    let mut cursor = marks_end;
+    if current {
+        for record in bytes[marks_start..marks_end].chunks_exact(ASSET_MARK_RECORD_LEN) {
+            let group = u32::from_le_bytes(record[0..4].try_into().unwrap());
+            let instrument = u32::from_le_bytes(record[4..8].try_into().unwrap());
+            let index = u64::from_le_bytes(record[8..16].try_into().unwrap());
+            let ordinal = u32::from_le_bytes(record[16..20].try_into().unwrap());
+            if applied
+                .insert((group, instrument), (index, ordinal))
+                .is_some()
+            {
+                return Err(bad("duplicate market asset watermark"));
+            }
         }
-        if incarnation != 0 {
-            incarnations.insert(group, incarnation);
+        let count_end = cursor
+            .checked_add(4)
+            .ok_or_else(|| bad("market incarnation count overflow"))?;
+        if count_end > body_end {
+            return Err(bad("truncated market incarnation count"));
+        }
+        let incarnation_count =
+            u32::from_le_bytes(bytes[cursor..count_end].try_into().unwrap()) as usize;
+        let incarnations_end = count_end
+            .checked_add(
+                incarnation_count
+                    .checked_mul(INCARNATION_RECORD_LEN)
+                    .ok_or_else(|| bad("market incarnation count overflow"))?,
+            )
+            .ok_or_else(|| bad("market incarnation length overflow"))?;
+        if incarnations_end > body_end {
+            return Err(bad("truncated market incarnations"));
+        }
+        for record in bytes[count_end..incarnations_end].chunks_exact(INCARNATION_RECORD_LEN) {
+            let group = u32::from_le_bytes(record[0..4].try_into().unwrap());
+            let incarnation = u64::from_le_bytes(record[4..12].try_into().unwrap());
+            if incarnation == 0 || incarnations.insert(group, incarnation).is_some() {
+                return Err(bad("invalid or duplicate market incarnation"));
+            }
+        }
+        cursor = incarnations_end;
+    } else {
+        // TCM2/TCM3 had one group-wide watermark. It cannot be safely mapped
+        // to independent asset queues, so retain only group incarnations.
+        for record in bytes[marks_start..marks_end].chunks_exact(LEGACY_MARK_RECORD_LEN) {
+            let group = u32::from_le_bytes(record[0..4].try_into().unwrap());
+            let incarnation = u64::from_le_bytes(record[16..24].try_into().unwrap());
+            if incarnation != 0 && incarnations.insert(group, incarnation).is_some() {
+                return Err(bad("duplicate legacy market incarnation"));
+            }
         }
     }
-    let (kafka_offsets, last_ts_at) = if previous {
-        if marks_end.checked_add(8) != Some(body_end) {
+    let (kafka_offsets, last_ts_at) = if legacy {
+        if cursor.checked_add(8) != Some(body_end) {
             return Err(bad("truncated or trailing market watermarks"));
         }
-        (HashMap::new(), marks_end)
+        (HashMap::new(), cursor)
     } else {
-        let count_end = marks_end
+        let count_end = cursor
             .checked_add(4)
             .ok_or_else(|| bad("market offset count overflow"))?;
         if count_end > body_end {
             return Err(bad("truncated market offset count"));
         }
         let offset_count =
-            u32::from_le_bytes(bytes[marks_end..count_end].try_into().unwrap()) as usize;
+            u32::from_le_bytes(bytes[cursor..count_end].try_into().unwrap()) as usize;
         let offsets_end = count_end
             .checked_add(
                 offset_count
@@ -350,7 +418,14 @@ fn decode_market_state(bytes: &[u8]) -> std::io::Result<RestoredMarket> {
         (offsets, offsets_end)
     };
     let last_ts = u64::from_le_bytes(bytes[last_ts_at..body_end].try_into().unwrap());
-    Ok((agg, applied, incarnations, kafka_offsets, last_ts))
+    Ok((
+        agg,
+        applied,
+        incarnations,
+        kafka_offsets,
+        last_ts,
+        !legacy,
+    ))
 }
 
 fn write_market_state(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -398,7 +473,12 @@ fn idle_feed_read(error: &std::io::Error) -> bool {
 fn apply_trade_event(state: &mut State, event: wire::ExecutionEvent, ts: u64) -> bool {
     let report = event.report;
     if report.type_code != RT_TRADE
-        || !state.take(event.raft_group, event.raft_index, event.ordinal)
+        || !state.take(
+            event.raft_group,
+            report.instrument,
+            event.raft_index,
+            event.ordinal,
+        )
     {
         return false;
     }
@@ -448,10 +528,8 @@ fn feed_one(md_addr: String, state: Arc<Mutex<State>>) {
         log_info!("market-data", "subscribed to {md_addr}");
         let mut buf = vec![0u8; EXECUTION_EVENT_LEN * 512];
         let mut filled = 0usize;
-        // This connection's depth snapshots in progress, and the newest Raft
-        // index it delivered (to tell whether its depth is current).
+        // This connection's depth snapshots in progress.
         let mut pending: HashMap<InstrumentId, Depth> = HashMap::new();
-        let mut last_index = 0u64;
         loop {
             match sock.read(&mut buf[filled..]) {
                 Ok(0) => break,
@@ -485,12 +563,11 @@ fn feed_one(md_addr: String, state: Arc<Mutex<State>>) {
                             continue;
                         };
                         let r = event.report;
-                        if event.raft_index != 0 {
-                            last_index = last_index.max(event.raft_index);
-                        }
                         match r.type_code {
                             RT_TRADE => {
-                                apply_trade_event(&mut st, event, ts);
+                                if !MARKET_KAFKA_REQUIRED.load(Ordering::Acquire) {
+                                    apply_trade_event(&mut st, event, ts);
+                                }
                             }
                             RT_DEPTH_LEVEL => {
                                 let lvl = r.aux_id as usize;
@@ -510,7 +587,11 @@ fn feed_one(md_addr: String, state: Arc<Mutex<State>>) {
                             }
                             RT_DEPTH_END => {
                                 if let Some(mut d) = pending.remove(&r.instrument) {
-                                    if st.current(event.raft_group, last_index) {
+                                    if st.current(
+                                        event.raft_group,
+                                        r.instrument,
+                                        event.raft_index,
+                                    ) {
                                         d.bids.truncate(r.aux_id as usize & 0xFF);
                                         d.asks.truncate((r.aux_id as usize >> 8) & 0xFF);
                                         st.depth.live.insert(r.instrument, d);
@@ -1267,6 +1348,7 @@ fn main() {
                 HashMap::new(),
                 HashMap::new(),
                 0,
+                true,
             )
         });
 
@@ -1435,28 +1517,39 @@ mod tests {
             kafka_offsets: HashMap::new(),
             last_ts: 0,
         };
+        let asset = InstrumentId(7);
         // Replica A delivers group 3's entries 10..=12; replica B, behind,
         // delivers 10 and 11 again; a restarted node replays 9..=12.
         let a: Vec<bool> = [(10, 0), (10, 1), (11, 0), (12, 0)]
             .iter()
-            .map(|&(i, o)| st.take(3, i, o))
+            .map(|&(i, o)| st.take(3, asset, i, o))
             .collect();
         assert_eq!(a, [true, true, true, true]);
         assert!(
-            !st.take(3, 10, 1) && !st.take(3, 11, 0),
+            !st.take(3, asset, 10, 1) && !st.take(3, asset, 11, 0),
             "a lagging replica's copies"
         );
-        assert!((9..=12).all(|i| !st.take(3, i, 0)), "a replayed tail");
         assert!(
-            st.take(3, 13, 0) && st.take(4, 1, 0),
+            (9..=12).all(|i| !st.take(3, asset, i, 0)),
+            "a replayed tail"
+        );
+        assert!(
+            st.take(3, asset, 13, 0) && st.take(4, asset, 1, 0),
             "new entries, other groups"
         );
         assert!(
-            st.take(0, 0, 0) && st.take(0, 0, 0),
+            st.take(0, asset, 0, 0) && st.take(0, asset, 0, 0),
             "not from a Raft entry: always"
         );
-        // Depth from a feed behind the group is not current.
-        assert!(!st.current(3, 12) && st.current(3, 13) && st.current(9, 0));
+        // Depth from a feed behind this asset is not current.
+        assert!(
+            !st.current(3, asset, 12)
+                && st.current(3, asset, 13)
+                && st.current(9, asset, 0)
+        );
+        // A faster queue for another asset must not make a valid older index
+        // from this asset look like a replay.
+        assert!(st.take(3, InstrumentId(8), 5, 0));
     }
 
     #[test]
@@ -1465,7 +1558,7 @@ mod tests {
             agg: KlineAggregator::new(10),
             depth: DepthStore::default(),
             trades: HashMap::new(),
-            applied: HashMap::from([(3, (42, 7)), (9, (11, 2))]),
+            applied: HashMap::from([((3, 17), (42, 7)), ((9, 23), (11, 2))]),
             incarnations: HashMap::from([(3, 555), (12, 777)]),
             kafka_offsets: HashMap::from([(0, 123), (7, 456)]),
             last_ts: 1_700_000_123,
@@ -1475,15 +1568,13 @@ mod tests {
             .on_trade(InstrumentId(17), state.last_ts, 1_005, 9);
 
         let bytes = encode_market_state(&state);
-        let (agg, applied, incarnations, kafka_offsets, last_ts) =
+        let (agg, applied, incarnations, kafka_offsets, last_ts, has_offsets) =
             decode_market_state(&bytes).unwrap();
-        // Group 12 has an incarnation but no trade yet: an empty mark.
-        let mut expected = state.applied.clone();
-        expected.insert(12, (0, 0));
-        assert_eq!(applied, expected);
+        assert_eq!(applied, state.applied);
         assert_eq!(incarnations, state.incarnations);
         assert_eq!(kafka_offsets, state.kafka_offsets);
         assert_eq!(last_ts, state.last_ts);
+        assert!(has_offsets);
         assert_eq!(
             agg.candles(InstrumentId(17), "1s", 10),
             state.agg.candles(InstrumentId(17), "1s", 10)
@@ -1498,22 +1589,25 @@ mod tests {
             kafka_offsets,
             last_ts,
         };
-        assert!(!restarted.take(3, 42, 7), "saved event is not recounted");
         assert!(
-            restarted.take(3, 42, 8),
+            !restarted.take(3, InstrumentId(17), 42, 7),
+            "saved event is not recounted"
+        );
+        assert!(
+            restarted.take(3, InstrumentId(17), 42, 8),
             "the next event remains admissible"
         );
     }
 
     #[test]
-    fn previous_market_snapshot_loads_with_empty_kafka_offsets() {
+    fn previous_market_snapshot_keeps_offsets_but_drops_group_watermark() {
         let mut state = State {
             agg: KlineAggregator::new(10),
             depth: DepthStore::default(),
             trades: HashMap::new(),
-            applied: HashMap::from([(2, (99, 3))]),
+            applied: HashMap::from([((2, 8), (99, 3))]),
             incarnations: HashMap::from([(2, 44)]),
-            kafka_offsets: HashMap::new(),
+            kafka_offsets: HashMap::from([(0, 321)]),
             last_ts: 1_700_000_456,
         };
         state
@@ -1524,23 +1618,25 @@ mod tests {
         previous.extend_from_slice(PREVIOUS_MARKET_STATE_MAGIC);
         previous.extend_from_slice(&(parts.candles.len() as u64).to_le_bytes());
         previous.extend_from_slice(&parts.candles);
-        previous.extend_from_slice(&(parts.applied.len() as u32).to_le_bytes());
-        for (group, index, ordinal, incarnation) in parts.applied {
-            previous.extend_from_slice(&group.to_le_bytes());
-            previous.extend_from_slice(&index.to_le_bytes());
-            previous.extend_from_slice(&ordinal.to_le_bytes());
-            previous.extend_from_slice(&incarnation.to_le_bytes());
-        }
+        previous.extend_from_slice(&1u32.to_le_bytes());
+        previous.extend_from_slice(&2u32.to_le_bytes());
+        previous.extend_from_slice(&99u64.to_le_bytes());
+        previous.extend_from_slice(&3u32.to_le_bytes());
+        previous.extend_from_slice(&44u64.to_le_bytes());
+        previous.extend_from_slice(&1u32.to_le_bytes());
+        previous.extend_from_slice(&0i32.to_le_bytes());
+        previous.extend_from_slice(&321i64.to_le_bytes());
         previous.extend_from_slice(&parts.last_ts.to_le_bytes());
         let checksum = trade_core::journal::fnv1a(&previous);
         previous.extend_from_slice(&checksum.to_le_bytes());
 
-        let (agg, applied, incarnations, offsets, last_ts) =
+        let (agg, applied, incarnations, offsets, last_ts, has_offsets) =
             decode_market_state(&previous).unwrap();
-        assert_eq!(applied, state.applied);
+        assert!(applied.is_empty());
         assert_eq!(incarnations, state.incarnations);
-        assert!(offsets.is_empty());
+        assert_eq!(offsets, state.kafka_offsets);
         assert_eq!(last_ts, state.last_ts);
+        assert!(has_offsets);
         assert_eq!(
             agg.candles(InstrumentId(8), "1s", 10),
             state.agg.candles(InstrumentId(8), "1s", 10)
@@ -1560,13 +1656,20 @@ mod tests {
         };
         st.on_incarnation(3, 0); // not assigned yet: ignored
         st.on_incarnation(3, 111);
-        assert!(st.take(3, 5_000, 0));
+        let asset = InstrumentId(5);
+        assert!(st.take(3, asset, 5_000, 0));
         st.on_incarnation(3, 111); // every replica, every heartbeat: no-op
-        assert!(!st.take(3, 10, 0), "a replay of the same incarnation");
+        assert!(
+            !st.take(3, asset, 10, 0),
+            "a replay of the same incarnation"
+        );
         // The group was rebuilt from empty logs: indexes restart at 1.
         st.on_incarnation(3, 222);
-        assert!(st.take(3, 10, 0), "the new incarnation's trades count");
-        assert!(st.current(3, 10));
+        assert!(
+            st.take(3, asset, 10, 0),
+            "the new incarnation's trades count"
+        );
+        assert!(st.current(3, asset, 10));
     }
 
     #[test]
