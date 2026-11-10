@@ -29,10 +29,26 @@ fn metric(addr: &str, name: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("metric {name} missing from {addr}"))
 }
 
+fn discover_local_leader() -> (String, String) {
+    for node in 1..=5 {
+        let metrics_addr = format!("127.0.0.1:92{node:02}");
+        if metric(&metrics_addr, "tc_raft_role") == Ok(2) {
+            return (format!("127.0.0.1:93{node:02}"), metrics_addr);
+        }
+    }
+    panic!("no local Raft leader found on nodes 1..5");
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
-    let order_addr = args.next().unwrap_or_else(|| "127.0.0.1:9305".into());
-    let metrics_addr = args.next().unwrap_or_else(|| "127.0.0.1:9205".into());
+    let first = args.next();
+    let (order_addr, metrics_addr) = match first {
+        Some(order_addr) => (
+            order_addr,
+            args.next().unwrap_or_else(|| "127.0.0.1:9205".into()),
+        ),
+        None => discover_local_leader(),
+    };
     let commands = args
         .next()
         .and_then(|v| v.parse().ok())
@@ -46,7 +62,6 @@ fn main() {
     let role = metric(&metrics_addr, "tc_raft_role").expect("read leader role");
     assert_eq!(role, 2, "{metrics_addr} is not the current leader");
     let commit_before = metric(&metrics_addr, "tc_raft_commit_index").expect("read commit index");
-    let target = commit_before + commands;
     let base = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -60,12 +75,16 @@ fn main() {
     let ack_reader = std::thread::spawn(move || {
         let mut ack = [0u8; 9];
         let mut received = 0u64;
+        let mut last_index = commit_before;
         while received < commands {
             reader.read_exact(&mut ack).expect("read committed ACK");
             assert_eq!(ack[0], 1, "invalid committed ACK");
-            assert!(u64::from_be_bytes(ack[1..].try_into().unwrap()) > commit_before);
+            let index = u64::from_be_bytes(ack[1..].try_into().unwrap());
+            assert!(index > commit_before);
+            last_index = last_index.max(index);
             received += 1;
         }
+        last_index
     });
 
     let started = Instant::now();
@@ -79,7 +98,7 @@ fn main() {
         wire::encode_new(&order, &mut frame);
         writer.write_all(&frame).expect("write command frame");
     }
-    ack_reader.join().expect("ACK reader");
+    let target = ack_reader.join().expect("ACK reader");
     let ack_elapsed = started.elapsed();
     drop(writer);
 
