@@ -66,8 +66,15 @@ fn main() {
         .unwrap_or(1_000usize)
         .clamp(1, RAFT_BATCH_MAX_COMMANDS);
 
-    let role = metric(&metrics_addr, "tc_raft_role").expect("read leader role");
-    assert_eq!(role, 2, "{metrics_addr} is not the current leader");
+    if !local_discovery {
+        let role = metric(&metrics_addr, "tc_raft_role").expect("read leader role");
+        assert_eq!(role, 2, "{metrics_addr} is not the current leader");
+    } else {
+        // Leadership can change immediately after discovery. Every batch below
+        // rediscovers and retries with the same command IDs, so this initial
+        // endpoint is only a baseline for the displayed commit index.
+        (order_addr, metrics_addr) = discover_local_leader();
+    }
     let commit_before = metric(&metrics_addr, "tc_raft_commit_index").expect("read commit index");
     let base = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -138,6 +145,10 @@ fn main() {
 
     let deadline = Instant::now() + Duration::from_secs(30);
     let committed = loop {
+        if local_discovery {
+            let (_, current_metrics_addr) = discover_local_leader();
+            metrics_addr = current_metrics_addr;
+        }
         let current = metric(&metrics_addr, "tc_raft_commit_index").expect("poll commit index");
         if current >= target || Instant::now() >= deadline {
             break current;
