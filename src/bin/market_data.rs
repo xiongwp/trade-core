@@ -646,6 +646,8 @@ fn kafka_trade_loop(brokers: String, topic: String, state: Arc<Mutex<State>>) {
     );
     let restored_offsets = state.lock().unwrap().kafka_offsets.clone();
     let mut assignment = TopicPartitionList::new();
+    let mut replay_positions = HashMap::new();
+    let mut startup_highs = HashMap::new();
     for partition in topic_metadata.partitions() {
         let partition = partition.id();
         let (low, high) = consumer
@@ -664,6 +666,9 @@ fn kafka_trade_loop(brokers: String, topic: String, state: Arc<Mutex<State>>) {
                 "market-data has no durable offset for partition {partition}, but Kafka history starts at {low}"
             ),
         };
+        let position = restored_offsets.get(&partition).copied().unwrap_or(low);
+        replay_positions.insert(partition, position);
+        startup_highs.insert(partition, high);
         assignment
             .add_partition_offset(&topic, partition, offset)
             .expect("build market-data Kafka assignment");
@@ -671,7 +676,10 @@ fn kafka_trade_loop(brokers: String, topic: String, state: Arc<Mutex<State>>) {
     consumer
         .assign(&assignment)
         .expect("assign every market-data Kafka partition");
-    MARKET_KAFKA_READY.store(true, Ordering::Release);
+    let mut caught_up = startup_highs
+        .iter()
+        .all(|(partition, high)| replay_positions.get(partition).is_some_and(|offset| offset >= high));
+    MARKET_KAFKA_READY.store(caught_up, Ordering::Release);
     log_info!(
         "market-data",
         "authoritative trade replay from Kafka topic={topic} partitions={}",
@@ -684,7 +692,6 @@ fn kafka_trade_loop(brokers: String, topic: String, state: Arc<Mutex<State>>) {
         };
         match message {
             Ok(message) => {
-                MARKET_KAFKA_READY.store(true, Ordering::Release);
                 let partition = message.partition();
                 let next_offset = message.offset().saturating_add(1);
                 let ts = match message.timestamp() {
@@ -694,20 +701,34 @@ fn kafka_trade_loop(brokers: String, topic: String, state: Arc<Mutex<State>>) {
                     _ => now_sec(),
                 };
                 let mut state = state.lock().unwrap();
-                if let Some(event) = message.payload().and_then(wire::decode_execution_event) {
-                    apply_trade_event(&mut state, event, ts);
-                } else {
-                    log_warn!(
-                        "market-data",
-                        "event=invalid_market_event partition={partition} offset={}",
-                        message.offset()
-                    );
-                }
+                let event = message
+                    .payload()
+                    .and_then(wire::decode_execution_event)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "invalid market event partition={partition} offset={}",
+                            message.offset()
+                        )
+                    });
+                assert_eq!(
+                    event.report.type_code,
+                    RT_TRADE,
+                    "non-trade event in market topic partition={partition} offset={}",
+                    message.offset()
+                );
+                apply_trade_event(&mut state, event, ts);
                 state
                     .kafka_offsets
                     .entry(partition)
                     .and_modify(|offset| *offset = (*offset).max(next_offset))
                     .or_insert(next_offset);
+                replay_positions.insert(partition, next_offset);
+                caught_up = startup_highs.iter().all(|(partition, high)| {
+                    replay_positions
+                        .get(partition)
+                        .is_some_and(|offset| offset >= high)
+                });
+                MARKET_KAFKA_READY.store(caught_up, Ordering::Release);
             }
             Err(error) => {
                 MARKET_KAFKA_READY.store(false, Ordering::Release);
@@ -717,7 +738,7 @@ fn kafka_trade_loop(brokers: String, topic: String, state: Arc<Mutex<State>>) {
                     .fetch_metadata(Some(&topic), Duration::from_secs(5))
                     .is_ok()
                 {
-                    MARKET_KAFKA_READY.store(true, Ordering::Release);
+                    MARKET_KAFKA_READY.store(caught_up, Ordering::Release);
                 }
             }
         }
@@ -1306,6 +1327,10 @@ fn main() {
             .unwrap_or(32)
             .clamp(1, 4_096),
     ));
+    let kafka_required = std::env::var("TC_MARKET_KAFKA_REQUIRED")
+        .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "no" | "NO"))
+        .unwrap_or(true);
+    MARKET_KAFKA_REQUIRED.store(kafka_required, Ordering::Release);
 
     // Load persisted candle history, if any.
     let persist: Option<PathBuf> = (data_dir != "none").then(|| {
@@ -1351,6 +1376,10 @@ fn main() {
                 true,
             )
         });
+    assert!(
+        !kafka_required || restored.5 || restored.0.instruments().is_empty(),
+        "legacy market snapshot has candles but no Kafka offsets; migrate from TCM2/TCK2 with a retained full market topic or rebuild the read model explicitly"
+    );
 
     let state = Arc::new(Mutex::new(State {
         agg: restored.0,
@@ -1371,10 +1400,6 @@ fn main() {
         .spawn(move || feed_loop(md_addr, feed_state))
         .expect("spawn feed");
 
-    let kafka_required = std::env::var("TC_MARKET_KAFKA_REQUIRED")
-        .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "no" | "NO"))
-        .unwrap_or(true);
-    MARKET_KAFKA_REQUIRED.store(kafka_required, Ordering::Release);
     let kafka_brokers = std::env::var("TC_MARKET_KAFKA_BROKERS")
         .or_else(|_| std::env::var("TC_EXECUTION_KAFKA_BROKERS"))
         .unwrap_or_default();
