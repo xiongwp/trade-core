@@ -37,10 +37,13 @@ symptom. Each entry: **symptom** (which alert or `event=` log line fires),
 | `tc_raft_commit_index` | highest quorum-committed entry |
 | `tc_raft_applied_index` | highest entry fully applied to matching |
 | `tc_raft_apply_lag` | committed-but-not-applied backlog |
+| `tc_raft_runtime_heartbeat_unix_ms` | Raft event-loop heartbeat; older than 5 s means the loop is wedged |
 | `tc_journal_seq` | processed command count/cursor (legacy metric name) |
 | `tc_execution_outbox_pending` | execution events durable but not yet acked by Kafka |
 | `tc_execution_outbox_publish_healthy` | 1 = publisher healthy, 0 = failing |
 | `tc_asset_wal_errors` | command/application durability failures — should stay 0 |
+| `tc_snapshot_write_failures` | atomic engine-snapshot writes that failed |
+| `tc_storage_healthy` | 1 only while local WAL/proof and latest snapshot write are healthy |
 | `tc_order_dlq_total` | order-api messages dead-lettered (poison) |
 
 ### Fail-stop philosophy
@@ -50,6 +53,13 @@ proof or outbox barrier (disk full / EIO), or a corrupt file at startup **panics
 relaunch, recovery loads the last memory snapshot and replays the committed
 Raft WAL tail. For already-proved batches it recomputes the result count and
 fingerprint before suppressing duplicate publication; mismatch aborts startup.
+
+Health endpoints have separate meanings: `/healthz` and `/livez` are liveness
+and may restart only this group after repeated failures; `/readyz` removes the
+replica from traffic while it is electing, catching up, or storage/outbox is
+unhealthy; `/consensusz` checks leader visibility plus the Raft loop heartbeat;
+`/storagez` checks the local WAL/snapshot path. Never use `/readyz` as a process
+liveness restart trigger: a quorum outage would otherwise restart every voter.
 
 ---
 

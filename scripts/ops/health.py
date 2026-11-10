@@ -22,6 +22,7 @@ healthy, 1 warnings, 2 failures (e.g. a group without quorum or leader).
 import json
 import os
 import sys
+import time
 import urllib.request
 
 LOCAL = {
@@ -87,6 +88,11 @@ def check_group(group, replicas, limits):
         report("WARN", f"group {group}", f"several replicas report leadership {terms}", "an old leader not yet stepped down; recheck in a few seconds")
     leader = max(leaders, key=lambda a: seen[a].get("tc_raft_term", 0))
     lm = seen[leader]
+    heartbeat_age = time.time() * 1000 - lm.get("tc_raft_runtime_heartbeat_unix_ms", 0)
+    if heartbeat_age > 5_000:
+        report("FAIL", f"group {group} leader {leader}",
+               f"Raft runtime heartbeat stale by {heartbeat_age / 1000:,.1f}s",
+               "capture thread stacks; restart only this group process")
     applied = lm.get("tc_raft_applied_index", 0)
     for addr, m in seen.items():
         behind = applied - m.get("tc_raft_applied_index", 0)
@@ -94,6 +100,9 @@ def check_group(group, replicas, limits):
             report("WARN", f"group {group} {addr}", f"{behind:,.0f} entries behind the leader", "catching up; if it does not shrink, check its disk and logs")
         if m.get("tc_asset_wal_errors", 0) > 0:
             report("FAIL", f"group {group} {addr}", "WAL write errors (fail-stop)", "disk full or failing: runbook §5")
+        if m.get("tc_storage_healthy", 1) != 1:
+            report("FAIL", f"group {group} {addr}", "local WAL or snapshot storage unhealthy",
+                   "isolate this replica, check free space and media errors, then restore or rebuild it")
     if lm.get("tc_ready", 0) != 1:
         report("WARN", f"group {group} leader {leader}", "not ready (apply lag, outbox backlog or publisher unhealthy)", "see the outbox lines below and Kafka health")
     for addr, m in seen.items():

@@ -246,9 +246,7 @@ impl Metrics {
     }
 
     pub fn consensus_healthy(&self) -> bool {
-        let heartbeat = self
-            .raft_runtime_heartbeat_unix_ms
-            .load(Ordering::Acquire);
+        let heartbeat = self.raft_runtime_heartbeat_unix_ms.load(Ordering::Acquire);
         self.raft_term.load(Ordering::Acquire) > 0
             && self.raft_leader_id.load(Ordering::Acquire) != 0
             && unix_time_ms().saturating_sub(heartbeat) <= 5_000
@@ -764,65 +762,64 @@ fn serve_admin_connection(
         .ok()
         .and_then(|r| r.lines().next())
         .unwrap_or("");
-    let (status, content_type, body) = if line.starts_with("GET /healthz ")
-        || line.starts_with("GET /livez ")
-    {
-        (
-            "200 OK".to_string(),
-            "text/plain".to_string(),
-            "ok\n".to_string(),
-        )
-    } else if line.starts_with("GET /readyz ") {
-        if metrics.is_ready() {
+    let (status, content_type, body) =
+        if line.starts_with("GET /healthz ") || line.starts_with("GET /livez ") {
             (
                 "200 OK".to_string(),
                 "text/plain".to_string(),
-                "ready\n".to_string(),
+                "ok\n".to_string(),
             )
+        } else if line.starts_with("GET /readyz ") {
+            if metrics.is_ready() {
+                (
+                    "200 OK".to_string(),
+                    "text/plain".to_string(),
+                    "ready\n".to_string(),
+                )
+            } else {
+                (
+                    "503 Service Unavailable".to_string(),
+                    "text/plain".to_string(),
+                    "not ready\n".to_string(),
+                )
+            }
+        } else if line.starts_with("GET /consensusz ") {
+            if metrics.consensus_healthy() {
+                (
+                    "200 OK".to_string(),
+                    "text/plain".to_string(),
+                    "consensus healthy\n".to_string(),
+                )
+            } else {
+                (
+                    "503 Service Unavailable".to_string(),
+                    "text/plain".to_string(),
+                    "consensus unavailable or stalled\n".to_string(),
+                )
+            }
+        } else if line.starts_with("GET /storagez ") {
+            if metrics.storage_healthy() {
+                (
+                    "200 OK".to_string(),
+                    "text/plain".to_string(),
+                    "storage healthy\n".to_string(),
+                )
+            } else {
+                (
+                    "503 Service Unavailable".to_string(),
+                    "text/plain".to_string(),
+                    "storage unhealthy\n".to_string(),
+                )
+            }
+        } else if let Some(handled) = extra.as_ref().and_then(|handler| handler(line)) {
+            handled
         } else {
-            (
-                "503 Service Unavailable".to_string(),
-                "text/plain".to_string(),
-                "not ready\n".to_string(),
-            )
-        }
-    } else if line.starts_with("GET /consensusz ") {
-        if metrics.consensus_healthy() {
             (
                 "200 OK".to_string(),
-                "text/plain".to_string(),
-                "consensus healthy\n".to_string(),
+                "text/plain; version=0.0.4".to_string(),
+                metrics.render(),
             )
-        } else {
-            (
-                "503 Service Unavailable".to_string(),
-                "text/plain".to_string(),
-                "consensus unavailable or stalled\n".to_string(),
-            )
-        }
-    } else if line.starts_with("GET /storagez ") {
-        if metrics.storage_healthy() {
-            (
-                "200 OK".to_string(),
-                "text/plain".to_string(),
-                "storage healthy\n".to_string(),
-            )
-        } else {
-            (
-                "503 Service Unavailable".to_string(),
-                "text/plain".to_string(),
-                "storage unhealthy\n".to_string(),
-            )
-        }
-    } else if let Some(handled) = extra.as_ref().and_then(|handler| handler(line)) {
-        handled
-    } else {
-        (
-            "200 OK".to_string(),
-            "text/plain; version=0.0.4".to_string(),
-            metrics.render(),
-        )
-    };
+        };
     let _ = s.write_all(
         format!(
             "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\n\
@@ -942,6 +939,26 @@ mod tests {
         assert!(text.contains("tc_execution_kafka_publish_samples 1"));
         assert!(text.contains("tc_execution_kafka_publish_ns_max 700"));
         assert!(text.contains("tc_raft_apply_lag 3"));
+    }
+
+    #[test]
+    fn consensus_and_storage_health_track_the_actual_subsystems() {
+        let m = Metrics::default();
+        assert!(!m.consensus_healthy());
+        assert!(m.storage_healthy());
+
+        m.set_raft_state(0, 7, 3, 42);
+        assert!(m.consensus_healthy());
+        m.raft_runtime_heartbeat_unix_ms
+            .store(unix_time_ms().saturating_sub(6_000), Ordering::Release);
+        assert!(!m.consensus_healthy());
+
+        let failed = Err(std::io::Error::other("disk full"));
+        m.record_snapshot_write_result(&failed);
+        assert!(!m.storage_healthy());
+        assert_eq!(m.snapshot_write_failures.load(Ordering::Relaxed), 1);
+        m.record_snapshot_write_result(&Ok(()));
+        assert!(m.storage_healthy());
     }
 
     #[test]

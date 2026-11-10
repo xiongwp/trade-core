@@ -99,8 +99,10 @@ raft-multi-node 1 64 /data
 `raft-multi-node` 会为本机的每个副本启动一个 `raft-node` 子进程：
 - 每个子进程单独重启，按 1、2、4…30 秒退避；
 - 每个数据目录加独占锁；
-- 进程卡住时有存活探测，会被杀掉并重启；
-- 启动时检查所有端口是否冲突。
+- 启动恢复受并发闸门和抖动控制，不会同时拉起全部 group；
+- `/healthz` 连续失败才会杀掉子进程；无 Leader、追平中或存储降级只会让
+  `/readyz` 返回 503，不会触发重启风暴；
+- 启动前检查成员数、重复 ID/地址、主机名、端口和本机端口冲突。
 
 ### 6.2 参数
 
@@ -127,6 +129,17 @@ raft-multi-node 1 64 /data
 | `TC_EXECUTION_KAFKA_DELIVERY_TIMEOUT_MS` | 15000 | 发布超时。要长于 broker 切主时间：超时的消息会被跳过而后面的照样写入，重发后同一订单的事件会乱序。也不能太长：等待期间发布线程阻塞，健康状态和积压指标停在旧值 |
 | `TC_SUPERVISOR_LIVENESS_GRACE_SECS` | 300 | 子进程启动后多久才开始做存活探测，要大于最长的 WAL 恢复时间 |
 | `TC_SUPERVISOR_LIVENESS_FAILURES` | 6 | 连续这么多次探测失败（每 5 秒一次）就杀掉重启 |
+| `TC_SUPERVISOR_START_CONCURRENCY` | 16 | 同一物理机同时处于 WAL/快照恢复阶段的最大 group 数 |
+| `TC_SUPERVISOR_STARTUP_JITTER_MS` | 2000 | group/node 维度的确定性启动抖动上限，分散整批机器重启的连接风暴 |
+| `TC_SUPERVISOR_STARTUP_SLOT_TIMEOUT_SECS` | 300 | 单个恢复任务占用启动并发名额的最长时间；超时只释放名额，不杀进程 |
+| `TC_SUPERVISOR_MAX_GROUPS` | 1024 | 单机配置的 group 硬上限，超出时启动前拒绝配置 |
+| `TC_RAFT_CHILD_NOFILE` | 16384 | 每个 group 子进程的文件描述符软上限（不超过宿主硬上限） |
+| `TC_RAFT_CHILD_MAX_ADDRESS_SPACE_MB` | 0 | 可选的每 group 地址空间硬上限；0 表示交给 systemd/cgroup 管理 |
+
+每个 Raft 管理端口提供四层检查：`/livez`（等同 `/healthz`，只看进程）、
+`/readyz`（初始化、Leader、apply lag、outbox、WAL/快照）、`/consensusz`
+（Leader 和 Raft event-loop 心跳）以及 `/storagez`（WAL/快照写状态）。Kubernetes/
+systemd 只能用 `/healthz` 做自动重启依据；`/readyz` 只用于摘流。
 
 ## 7. order-api：一个镜像，两种角色
 

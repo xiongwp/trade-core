@@ -2,6 +2,7 @@
 
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitCode};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -263,7 +264,8 @@ impl Slot {
             self.placement.raft_port,
             self.data_dir.display()
         );
-        match Command::new(binary)
+        let mut command = Command::new(binary);
+        command
             .env("TC_RAFT_GROUP_ID", group.to_string())
             .arg(self.placement.local_node.to_string())
             // Bind on all interfaces: binding to the service hostname needs a
@@ -275,10 +277,48 @@ impl Slot {
             .arg(format!("0.0.0.0:{order_port}"))
             .arg(&self.data_dir)
             .arg(format!("0.0.0.0:{md_port}"))
-            .arg(format!("0.0.0.0:{metrics_port}"))
-            .spawn()
-        {
-            Ok(child) => self.child = Some(child),
+            .arg(format!("0.0.0.0:{metrics_port}"));
+        let child_nofile = env_u64("TC_RAFT_CHILD_NOFILE", 16_384) as libc::rlim_t;
+        let child_address_space = env_u64("TC_RAFT_CHILD_MAX_ADDRESS_SPACE_MB", 0)
+            .saturating_mul(1024 * 1024) as libc::rlim_t;
+        // setrlimit is async-signal-safe and is applied after fork, before
+        // exec, so one runaway group cannot consume every descriptor or all
+        // address space on a multi-group host. A zero memory limit disables
+        // RLIMIT_AS; production may instead use a per-group cgroup.
+        unsafe {
+            command.pre_exec(move || {
+                let mut nofile = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                if libc::getrlimit(libc::RLIMIT_NOFILE, &mut nofile) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                nofile.rlim_cur = child_nofile.min(nofile.rlim_max);
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &nofile) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if child_address_space > 0 {
+                    let address_space = libc::rlimit {
+                        rlim_cur: child_address_space,
+                        rlim_max: child_address_space,
+                    };
+                    if libc::setrlimit(libc::RLIMIT_AS, &address_space) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+        match command.spawn() {
+            Ok(child) => {
+                log_info!(
+                    "raft-multi-node",
+                    "group={group} event=child_spawned pid={}",
+                    child.id()
+                );
+                self.child = Some(child);
+            }
             Err(error) => {
                 log_error!(
                     "raft-multi-node",
@@ -305,7 +345,10 @@ fn probe_status(port: u16, path: &str) -> Option<u16> {
     };
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     if stream
-        .write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").as_bytes())
+        .write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
         .is_err()
     {
         return None;
@@ -319,7 +362,11 @@ fn probe_status(port: u16, path: &str) -> Option<u16> {
         }
         used += read;
     }
-    let status = std::str::from_utf8(&response[..used]).ok()?.lines().next()?;
+    parse_http_status(&response[..used])
+}
+
+fn parse_http_status(response: &[u8]) -> Option<u16> {
+    let status = std::str::from_utf8(response).ok()?.lines().next()?;
     let mut fields = status.split_whitespace();
     match fields.next()? {
         "HTTP/1.0" | "HTTP/1.1" => {}
@@ -339,8 +386,7 @@ fn startup_jitter(group: u16, node: u16, max: Duration) -> Duration {
     }
     // Stable across restarts but spread across both group and node, so a
     // simultaneous fleet reboot does not recreate the same launch wave.
-    let mixed = (group as u64).wrapping_mul(0x9e37_79b9)
-        ^ (node as u64).wrapping_mul(0x85eb_ca6b);
+    let mixed = (group as u64).wrapping_mul(0x9e37_79b9) ^ (node as u64).wrapping_mul(0x85eb_ca6b);
     Duration::from_millis(mixed % (max_ms + 1))
 }
 
@@ -355,11 +401,25 @@ fn main() -> ExitCode {
     trade_core::oblog::init_from_env();
     trade_core::oblog::set_panic_hook("raft-multi-node");
     let mut args = std::env::args().skip(1);
-    let node: u16 = args
-        .next()
-        .expect("node id")
-        .parse()
-        .expect("numeric node id");
+    let first = args.next().expect("node id or probe");
+    if first == "probe" {
+        let path = args.next().unwrap_or_else(|| "/healthz".into());
+        let ports = args
+            .map(|value| value.parse::<u16>().expect("numeric probe port"))
+            .collect::<Vec<_>>();
+        if ports.is_empty() {
+            return ExitCode::from(2);
+        }
+        return if ports
+            .into_iter()
+            .all(|port| probe_status(port, &path) == Some(200))
+        {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
+    let node: u16 = first.parse().expect("numeric node id");
     let groups: u16 = args
         .next()
         .expect("raft group count")
@@ -384,9 +444,7 @@ fn main() -> ExitCode {
     assert!(groups > 0, "at least one Raft group is required");
 
     let placements = match explicit_placements {
-        Some(value) => {
-            parse_placements(&value, replicas).expect("valid TC_RAFT_GROUP_PLACEMENTS")
-        }
+        Some(value) => parse_placements(&value, replicas).expect("valid TC_RAFT_GROUP_PLACEMENTS"),
         None => (0..groups)
             .map(|group| GroupPlacement {
                 group,
@@ -422,14 +480,10 @@ fn main() -> ExitCode {
     let liveness_grace = Duration::from_secs(env_u64("TC_SUPERVISOR_LIVENESS_GRACE_SECS", 120));
     let liveness_failures = env_u64("TC_SUPERVISOR_LIVENESS_FAILURES", 6).max(1) as u32;
     let start_concurrency = env_u64("TC_SUPERVISOR_START_CONCURRENCY", 16).max(1) as usize;
-    let startup_timeout = Duration::from_secs(env_u64(
-        "TC_SUPERVISOR_STARTUP_SLOT_TIMEOUT_SECS",
-        300,
-    ));
-    let startup_jitter_max = Duration::from_millis(env_u64(
-        "TC_SUPERVISOR_STARTUP_JITTER_MS",
-        2_000,
-    ));
+    let startup_timeout =
+        Duration::from_secs(env_u64("TC_SUPERVISOR_STARTUP_SLOT_TIMEOUT_SECS", 300));
+    let startup_jitter_max =
+        Duration::from_millis(env_u64("TC_SUPERVISOR_STARTUP_JITTER_MS", 2_000));
     unsafe {
         let handler = on_signal as *const () as libc::sighandler_t;
         libc::signal(libc::SIGTERM, handler);
@@ -441,6 +495,7 @@ fn main() -> ExitCode {
         .into_iter()
         .map(|placement| {
             let group = placement.group;
+            let local_node = placement.local_node;
             // One isolated directory per group (state, journal, per-asset WAL
             // tree), side by side, so a replica can be rebuilt by moving just
             // its own directory aside (scripts/ops/rebuild-replica.sh).
@@ -453,9 +508,7 @@ fn main() -> ExitCode {
                 child: None,
                 started: now,
                 restarts: 0,
-                restart_at: Some(
-                    now + startup_jitter(group, placement.local_node, startup_jitter_max),
-                ),
+                restart_at: Some(now + startup_jitter(group, local_node, startup_jitter_max)),
                 probe_failures: 0,
                 next_probe: now,
                 startup_complete: false,
@@ -543,9 +596,7 @@ fn main() -> ExitCode {
                         );
                     }
                 }
-            } else if starting < start_concurrency
-                && slot.restart_at.is_some_and(|at| now >= at)
-            {
+            } else if starting < start_concurrency && slot.restart_at.is_some_and(|at| now >= at) {
                 slot.restart_at = None;
                 slot.spawn(&binary, startup_timeout);
                 if slot.child.is_some() {
@@ -721,5 +772,17 @@ mod tests {
             .collect::<std::collections::HashSet<_>>();
         assert!(values.len() > 90);
         assert!(values.iter().all(|value| *value <= max));
+    }
+
+    #[test]
+    fn health_probe_parses_a_complete_status_line() {
+        assert_eq!(parse_http_status(b"HTTP/1.1 200 OK\r\nX: y\r\n"), Some(200));
+        assert_eq!(
+            parse_http_status(b"HTTP/1.0 503 Service Unavailable\r\n"),
+            Some(503)
+        );
+        assert_eq!(parse_http_status(b"HTTP/2 200\r\n"), None);
+        assert_eq!(parse_http_status(b"HTTP/1.1 nope\r\n"), None);
+        assert_eq!(parse_http_status(b"HTTP/1.1"), None);
     }
 }

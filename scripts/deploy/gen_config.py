@@ -206,6 +206,12 @@ def main(inventory_path, out_dir):
         "TC_EXECUTION_CURSOR_PARTITIONS": groups,
         "TC_SUPERVISOR_LIVENESS_GRACE_SECS": 300,
         "TC_SUPERVISOR_LIVENESS_FAILURES": 6,
+        "TC_SUPERVISOR_START_CONCURRENCY": 16,
+        "TC_SUPERVISOR_STARTUP_JITTER_MS": 2000,
+        "TC_SUPERVISOR_STARTUP_SLOT_TIMEOUT_SECS": 300,
+        "TC_SUPERVISOR_MAX_GROUPS": 1024,
+        "TC_RAFT_CHILD_NOFILE": 16384,
+        "TC_RAFT_CHILD_MAX_ADDRESS_SPACE_MB": 0,
     }
     partitions = groups * 16
     per_partition = max(1, 2_000_000 // partitions)  # design commands/s/partition

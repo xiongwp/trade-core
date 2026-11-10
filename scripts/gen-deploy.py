@@ -269,7 +269,7 @@ def render_node_compose(topo, n):
             "    volumes:",
             f'      - "{svc}-data:/data"',
             "    healthcheck:",
-            f'      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/{metrics_port} && exec 3>&- 3<&-"]',
+            f'      test: ["CMD", "raft-multi-node", "probe", "/healthz", "{metrics_port}"]',
             "      interval: 5s",
             "      timeout: 3s",
             "      retries: 40",

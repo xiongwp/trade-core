@@ -1215,6 +1215,23 @@ mod tests {
     }
 
     #[test]
+    fn isolated_leader_steps_down_without_restarting_the_group() {
+        let mut nodes = (1..=5).map(node).collect::<Vec<_>>();
+        elect(&mut nodes, 0);
+
+        // Drop every outbound heartbeat and do not deliver peer responses.
+        for _ in 0..25 {
+            nodes[0].tick();
+            nodes[0].take_outbound();
+        }
+        assert!(!nodes[0].is_leader());
+        assert_eq!(
+            nodes[0].propose(b"stale-leader".to_vec()),
+            Err(ProposeError::NotLeader)
+        );
+    }
+
+    #[test]
     fn follower_cannot_accept_client_commands() {
         let mut follower = node(2);
         assert_eq!(follower.propose(vec![1]), Err(ProposeError::NotLeader));

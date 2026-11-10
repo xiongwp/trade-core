@@ -212,6 +212,12 @@ emergency: lag >= 15 秒或 quorum 丢失 -> 停止该 category 写入
 
 50 台 Raft 机器承载 100 group 时，每台平均运行 10 个 replica。需要将线程固定到 CPU，并让空载线程休眠；禁止空载 busy-spin 消耗所有核心。
 
+每台宿主由 systemd/cgroup 设置 CPU quota、`MemoryMax`、`LimitNOFILE` 和进程数上限；
+launcher 内部再用 `TC_SUPERVISOR_MAX_GROUPS`、`TC_RAFT_CHILD_NOFILE` 以及可选的
+`TC_RAFT_CHILD_MAX_ADDRESS_SPACE_MB` 做第二层隔离。启动恢复使用
+`TC_SUPERVISOR_START_CONCURRENCY` 和 `TC_SUPERVISOR_STARTUP_JITTER_MS`，避免整批宿主
+重启时同时扫描 WAL、安装快照并建立 peer 连接。
+
 生产launcher通过每台机器独立的 `TC_RAFT_GROUP_PLACEMENTS` 注入本机副本清单，格式为
 `group|local_node|id@host:port,...;...`。未设置时才使用开发环境的“每台机器承载全部group”
 模式。placement必须保证同一group的副本分散到不同故障域，并同步生成Order worker使用的

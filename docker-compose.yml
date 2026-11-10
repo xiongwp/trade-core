@@ -204,20 +204,20 @@ services:
       TC_LOG: ${TC_LOG:-info}
       RUST_BACKTRACE: ${RUST_BACKTRACE:-1}
     depends_on:
-      # raft-* live in docker-compose.raft.yml and define no healthcheck, so
-      # they stay service_started; order exposes one and gates the UI proxy.
+      # Raft container health is process liveness for every local group. Loss
+      # of leader/quorum only removes readiness and must not trigger restarts.
       order:
         condition: service_healthy
       raft-1:
-        condition: service_started
+        condition: service_healthy
       raft-2:
-        condition: service_started
+        condition: service_healthy
       raft-3:
-        condition: service_started
+        condition: service_healthy
       raft-4:
-        condition: service_started
+        condition: service_healthy
       raft-5:
-        condition: service_started
+        condition: service_healthy
     ports:
       - "8081:8080"   # chart UI + JSON API + WebSocket (8080 is in use locally)
     volumes:

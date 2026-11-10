@@ -17,6 +17,14 @@ x-raft-environment: &raft-environment
   TC_MD_WRITE_TIMEOUT_MS: "${TC_MD_WRITE_TIMEOUT_MS:-5000}"
   TC_RAFT_READY_MAX_APPLY_LAG: "${TC_RAFT_READY_MAX_APPLY_LAG:-32}"
   TC_RAFT_READY_MAX_OUTBOX_PENDING: "${TC_RAFT_READY_MAX_OUTBOX_PENDING:-10000}"
+  TC_SUPERVISOR_START_CONCURRENCY: "${TC_SUPERVISOR_START_CONCURRENCY:-16}"
+  TC_SUPERVISOR_STARTUP_JITTER_MS: "${TC_SUPERVISOR_STARTUP_JITTER_MS:-2000}"
+  TC_SUPERVISOR_STARTUP_SLOT_TIMEOUT_SECS: "${TC_SUPERVISOR_STARTUP_SLOT_TIMEOUT_SECS:-300}"
+  TC_SUPERVISOR_LIVENESS_GRACE_SECS: "${TC_SUPERVISOR_LIVENESS_GRACE_SECS:-120}"
+  TC_SUPERVISOR_LIVENESS_FAILURES: "${TC_SUPERVISOR_LIVENESS_FAILURES:-6}"
+  TC_SUPERVISOR_MAX_GROUPS: "${TC_SUPERVISOR_MAX_GROUPS:-1024}"
+  TC_RAFT_CHILD_NOFILE: "${TC_RAFT_CHILD_NOFILE:-16384}"
+  TC_RAFT_CHILD_MAX_ADDRESS_SPACE_MB: "${TC_RAFT_CHILD_MAX_ADDRESS_SPACE_MB:-0}"
   TC_RAFT_DEDUP_MAX_IDS: "${TC_RAFT_DEDUP_MAX_IDS:-1000000}"
   # Deterministic config: must be identical on every replica of a group. A new
   # leader announces its fingerprint in the log and a replica that differs
@@ -64,6 +72,8 @@ services:
     environment: *raft-environment
     ports: ["9301:9001", "9201:9102", "9401:9011", "9211:9112", "9501:9021", "9221:9122", "9601:9031", "9231:9132"]
     volumes: ["raft-1-data:/data"]
+    ulimits: { nofile: { soft: 65536, hard: 65536 } }
+    healthcheck: { test: ["CMD", "raft-multi-node", "probe", "/healthz", "9102", "9112", "9122", "9132"], interval: 5s, timeout: 4s, retries: 12, start_period: 120s }
     restart: unless-stopped
   raft-2:
     image: trade-core-node
@@ -71,6 +81,8 @@ services:
     environment: *raft-environment
     ports: ["9302:9001", "9202:9102", "9402:9011", "9212:9112", "9502:9021", "9222:9122", "9602:9031", "9232:9132"]
     volumes: ["raft-2-data:/data"]
+    ulimits: { nofile: { soft: 65536, hard: 65536 } }
+    healthcheck: { test: ["CMD", "raft-multi-node", "probe", "/healthz", "9102", "9112", "9122", "9132"], interval: 5s, timeout: 4s, retries: 12, start_period: 120s }
     restart: unless-stopped
   raft-3:
     image: trade-core-node
@@ -78,6 +90,8 @@ services:
     environment: *raft-environment
     ports: ["9303:9001", "9203:9102", "9403:9011", "9213:9112", "9503:9021", "9223:9122", "9603:9031", "9233:9132"]
     volumes: ["raft-3-data:/data"]
+    ulimits: { nofile: { soft: 65536, hard: 65536 } }
+    healthcheck: { test: ["CMD", "raft-multi-node", "probe", "/healthz", "9102", "9112", "9122", "9132"], interval: 5s, timeout: 4s, retries: 12, start_period: 120s }
     restart: unless-stopped
   raft-4:
     image: trade-core-node
@@ -85,6 +99,8 @@ services:
     environment: *raft-environment
     ports: ["9304:9001", "9204:9102", "9404:9011", "9214:9112", "9504:9021", "9224:9122", "9604:9031", "9234:9132"]
     volumes: ["raft-4-data:/data"]
+    ulimits: { nofile: { soft: 65536, hard: 65536 } }
+    healthcheck: { test: ["CMD", "raft-multi-node", "probe", "/healthz", "9102", "9112", "9122", "9132"], interval: 5s, timeout: 4s, retries: 12, start_period: 120s }
     restart: unless-stopped
   raft-5:
     image: trade-core-node
@@ -92,6 +108,8 @@ services:
     environment: *raft-environment
     ports: ["9305:9001", "9205:9102", "9405:9011", "9215:9112", "9505:9021", "9225:9122", "9605:9031", "9235:9132"]
     volumes: ["raft-5-data:/data"]
+    ulimits: { nofile: { soft: 65536, hard: 65536 } }
+    healthcheck: { test: ["CMD", "raft-multi-node", "probe", "/healthz", "9102", "9112", "9122", "9132"], interval: 5s, timeout: 4s, retries: 12, start_period: 120s }
     restart: unless-stopped
 
 volumes:
