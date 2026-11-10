@@ -41,7 +41,11 @@ fn discover_local_leader() -> (String, String) {
 }
 
 fn main() {
-    let mut args = std::env::args().skip(1);
+    let args: Vec<String> = std::env::args()
+        .skip(1)
+        .filter(|arg| arg != "--bench")
+        .collect();
+    let mut args = args.into_iter();
     let first = args.next();
     let local_discovery = first.is_none();
     let (mut order_addr, mut metrics_addr) = match first {
