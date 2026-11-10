@@ -351,6 +351,23 @@ def main(inventory_path, out_dir):
     with open(os.path.join(out_dir, "health.json"), "w") as f:
         json.dump(health, f, indent=1)
 
+    # Prometheus file_sd targets, one file per job, matching the jobs that
+    # deploy/prometheus/trade-core-alerts.yml expects. Raft replicas carry a
+    # raft_group label: most matching metrics have no group label of their
+    # own, and the alerts aggregate per group.
+    prometheus = {
+        "raft": [
+            {"targets": addrs, "labels": {"raft_group": group}}
+            for group, addrs in health["raft_groups"].items()
+        ],
+        "order-api": [{"targets": health["order_api"]}],
+        "user-stream": [{"targets": health["user_stream"]}],
+        "market-data": [{"targets": health["market_data"]}],
+    }
+    for name, target_groups in prometheus.items():
+        with open(os.path.join(out_dir, f"prometheus-{name}.json"), "w") as f:
+            json.dump(target_groups, f, indent=1)
+
     with open(os.path.join(out_dir, "topics.sh"), "w") as f:
         # Redpanda's acks=all already waits for a majority; on Apache Kafka add
         # `-c min.insync.replicas=2` to every topic.

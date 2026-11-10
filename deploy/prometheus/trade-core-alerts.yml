@@ -1,0 +1,205 @@
+# Prometheus alerting rules for trade-core.
+#
+# Scrape setup this file assumes (see deploy/prometheus/README.md):
+#   job="trade-core-raft"       every Raft replica's metrics port, labelled
+#                               raft_group="<group id>" (one target per replica)
+#   job="trade-core-order-api"  every order-api process (ingress and workers)
+#   job="trade-core-user-stream", job="trade-core-market-data"
+# scripts/deploy/gen_config.py writes matching file_sd target files.
+#
+# Thresholds follow scripts/ops/health.py and the SLOs in
+# docs/production-deployment-5m-tps.md. Severity:
+#   critical = trading on some categories has stopped or data is at risk: page
+#   warning  = degraded or heading there: ticket / look within the hour
+groups:
+  - name: trade-core-raft
+    rules:
+      - alert: TradeCoreRaftNoLeader
+        expr: max by (raft_group) (tc_raft_role{job="trade-core-raft"}) < 2
+        for: 15s
+        labels: {severity: critical}
+        annotations:
+          summary: "Raft group {{ $labels.raft_group }} has no leader"
+          description: "Its categories refuse orders. Check peer connectivity and exit-78 config mismatches (runbook §2)."
+      - alert: TradeCoreRaftQuorumAtRisk
+        expr: |
+          count by (raft_group) (up{job="trade-core-raft"} == 1)
+            <= count by (raft_group) (up{job="trade-core-raft"}) / 2
+        for: 15s
+        labels: {severity: critical}
+        annotations:
+          summary: "Raft group {{ $labels.raft_group }} lost its majority"
+          description: "Only {{ $value }} replicas reachable. Bring replicas back (runbook §2)."
+      - alert: TradeCoreRaftReplicaDown
+        expr: up{job="trade-core-raft"} == 0
+        for: 1m
+        labels: {severity: warning}
+        annotations:
+          summary: "Raft replica {{ $labels.instance }} (group {{ $labels.raft_group }}) is down"
+          description: "The group still has a majority unless TradeCoreRaftQuorumAtRisk fires. Restart it; if its data is lost use scripts/ops/rebuild-replica.sh."
+      - alert: TradeCoreRaftLeaderNotReady
+        expr: (tc_raft_role{job="trade-core-raft"} == 2) and on (instance) (tc_ready{job="trade-core-raft"} == 0)
+        for: 30s
+        labels: {severity: critical}
+        annotations:
+          summary: "Leader of Raft group {{ $labels.raft_group }} is not accepting orders"
+          description: "Apply lag, execution outbox backlog, unhealthy publisher, WAL error or low disk. See the outbox and storage alerts."
+      - alert: TradeCoreRaftRuntimeStalled
+        expr: time() * 1000 - tc_raft_runtime_heartbeat_unix_ms{job="trade-core-raft"} > 5000
+        for: 30s
+        labels: {severity: critical}
+        annotations:
+          summary: "Raft runtime of {{ $labels.instance }} stalled"
+          description: "Heartbeat {{ $value | humanizeDuration }} old. Capture thread stacks, then restart only this group process."
+      - alert: TradeCoreWalErrors
+        expr: tc_asset_wal_errors{job="trade-core-raft"} > 0
+        labels: {severity: critical}
+        annotations:
+          summary: "WAL write errors on {{ $labels.instance }}"
+          description: "The replica stopped (fail-stop). Disk full or failing: runbook §5."
+      - alert: TradeCoreStorageUnhealthy
+        expr: tc_storage_healthy{job="trade-core-raft"} != 1
+        labels: {severity: critical}
+        annotations:
+          summary: "Local WAL/snapshot storage unhealthy on {{ $labels.instance }}"
+          description: "Isolate the replica, check free space and media errors, then restore or rebuild it."
+      - alert: TradeCoreDiskLow
+        expr: tc_storage_free_bytes{job="trade-core-raft"} < 20 * 1024^3
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.instance }} has {{ $value | humanize1024 }}B free"
+          description: "Below TC_RAFT_MIN_FREE_BYTES (10 GiB in the generated config) the replica stops accepting commands."
+      - alert: TradeCoreReplicaLagging
+        expr: |
+          max by (raft_group) (tc_raft_applied_index{job="trade-core-raft"})
+            - on (raft_group) group_right tc_raft_applied_index{job="trade-core-raft"}
+          > 10000
+        for: 2m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.instance }} is {{ $value }} entries behind its group's leader"
+          description: "Catching up should shrink this; if not, check its disk, logs and snapshot transfer."
+      - alert: TradeCoreOutboxBacklog
+        expr: (tc_raft_role{job="trade-core-raft"} == 2) and on (instance) (tc_execution_outbox_pending{job="trade-core-raft"} > 50000)
+        for: 1m
+        labels: {severity: warning}
+        annotations:
+          summary: "Group {{ $labels.raft_group }}: execution events not on Kafka yet"
+          description: "Kafka slow or down (runbook §4). Above TC_RAFT_READY_MAX_OUTBOX_PENDING the leader stops accepting orders."
+      - alert: TradeCoreExecutionPublisherUnhealthy
+        expr: (tc_raft_role{job="trade-core-raft"} == 2) and on (instance) (tc_execution_outbox_publish_healthy{job="trade-core-raft"} == 0)
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: "Group {{ $labels.raft_group }} cannot publish executions to Kafka"
+          description: "The leader stops accepting orders while this lasts. Check the brokers; it recovers by itself once Kafka answers."
+      - alert: TradeCoreWalFsyncSlow
+        expr: tc_wal_fsync_ns_p99{job="trade-core-raft"} > 50e6
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "WAL fsync p99 {{ $value | humanize }}ns on {{ $labels.instance }}"
+          description: "Above 50 ms the Raft commit SLO cannot hold. Check the disk (NVMe write cache, noisy neighbours)."
+      - alert: TradeCoreRaftCommitSlow
+        expr: (tc_raft_role{job="trade-core-raft"} == 2) and on (instance) (tc_raft_commit_ns_p99{job="trade-core-raft"} > 20e6)
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Group {{ $labels.raft_group }} commit p99 above the 20 ms SLO"
+          description: "Usually slow fsync on a majority of replicas or network latency between them."
+      - alert: TradeCoreRaftTransportDropping
+        expr: rate(tc_raft_transport_dropped{job="trade-core-raft"}[5m]) > 0
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.instance }} keeps dropping Raft messages"
+          description: "A peer is unreachable or its queue is full. Raft retries, but a persistent drop rate means a sick link or peer."
+      - alert: TradeCoreSnapshotLarge
+        expr: tc_snapshot_bytes{job="trade-core-raft"} > 512 * 1024^2
+        for: 30m
+        labels: {severity: warning}
+        annotations:
+          summary: "Engine snapshot of group {{ $labels.raft_group }} is {{ $value | humanize1024 }}B"
+          description: "A lagging follower needs it in one message (TC_RAFT_MAX_MESSAGE_BYTES, default 1 GiB). Migrate categories away or raise the limit."
+
+  - name: trade-core-order-api
+    rules:
+      - alert: TradeCoreOrderApiDown
+        expr: up{job="trade-core-order-api"} == 0
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: "order-api {{ $labels.instance }} is down"
+          description: "Restart it; it resumes from committed Kafka offsets."
+      - alert: TradeCoreRaftForwardFailing
+        expr: tc_order_bp_quorum_unhealthy_groups{job="trade-core-order-api"} > 0
+        for: 30s
+        labels: {severity: critical}
+        annotations:
+          summary: "{{ $value }} Raft group(s) failing forwards from {{ $labels.instance }}"
+          description: "Their categories answer 503. See the Raft group alerts."
+      - alert: TradeCoreBackpressureEmergency
+        expr: increase(tc_order_bp_emergency_total{job="trade-core-order-api"}[5m]) > 0
+        labels: {severity: critical}
+        annotations:
+          summary: "order-api {{ $labels.instance }} is refusing orders (emergency backpressure)"
+          description: "A category's matching lag passed the emergency limit or its group lost quorum."
+      - alert: TradeCoreBackpressureHard
+        expr: increase(tc_order_bp_hard_total{job="trade-core-order-api"}[5m]) > 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "order-api {{ $labels.instance }} keeps answering 429"
+          description: "Sustained overload of a category's matching stage."
+      - alert: TradeCoreMatchLag
+        expr: tc_order_match_consumer_lag{job="trade-core-order-api"} > 500000
+        for: 2m
+        labels: {severity: warning}
+        annotations:
+          summary: "Matching consumer lag {{ $value }} on {{ $labels.instance }}"
+          description: "Overloaded or a Raft group is down; scripts/ops/rates.py shows whether it drains."
+      - alert: TradeCoreMysqlLag
+        expr: tc_order_mysql_consumer_lag{job="trade-core-order-api"} > 500000
+        for: 2m
+        labels: {severity: warning}
+        annotations:
+          summary: "MySQL projection lag {{ $value }} on {{ $labels.instance }}"
+          description: "Order rows and fills fall behind matching; check MySQL commit latency."
+      - alert: TradeCoreMysqlCommitSlow
+        expr: tc_order_mysql_commit_ns_p99{job="trade-core-order-api"} > 500e6 or tc_execution_mysql_commit_ns_p99{job="trade-core-order-api"} > 500e6
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "MySQL commit p99 above 500 ms on {{ $labels.instance }}"
+          description: "The Kafka-to-MySQL SLO (p99 500 ms) cannot hold."
+      - alert: TradeCoreDeadLetters
+        expr: increase(tc_order_dlq_total{job="trade-core-order-api"}[15m]) > 0 or increase(tc_order_command_dlq_total{job="trade-core-order-api"}[15m]) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: "New dead-lettered messages on {{ $labels.instance }}"
+          description: "dlq-tool list <TC_ORDER_DLQ_PATH or TC_ORDER_COMMAND_DLQ_PATH>; fix the cause, then dlq-tool replay (runbook §3)."
+      - alert: TradeCoreLagMonitorBlind
+        expr: tc_order_lag_monitors_ready{job="trade-core-order-api"} == 0 or increase(tc_order_lag_read_failures{job="trade-core-order-api"}[5m]) > 5
+        for: 2m
+        labels: {severity: warning}
+        annotations:
+          summary: "order-api {{ $labels.instance }} cannot read Kafka lag"
+          description: "Backpressure runs on stale lag values. Check broker connectivity."
+
+  - name: trade-core-edge
+    rules:
+      - alert: TradeCoreUserStreamDown
+        expr: up{job="trade-core-user-stream"} == 0
+        for: 1m
+        labels: {severity: warning}
+        annotations:
+          summary: "user-stream {{ $labels.instance }} is down"
+          description: "Users on its shard get no private pushes; reconnecting clients resume with after=/since=."
+      - alert: TradeCoreMarketDataDown
+        expr: up{job="trade-core-market-data"} == 0
+        for: 1m
+        labels: {severity: warning}
+        annotations:
+          summary: "market-data {{ $labels.instance }} is down"
+          description: "Charts and depth stop updating; it replays from Kafka on restart."
