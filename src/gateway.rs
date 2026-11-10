@@ -30,7 +30,7 @@ use std::time::Duration;
 use crate::exchange::{Command, OrderGateway, ResultSink};
 use crate::wire::{self, WireView, MSG_LEN, REPORT_LEN};
 
-const COMMITTED_BATCH_MAGIC: [u8; 4] = *b"TCB1";
+pub const COMMITTED_BATCH_MAGIC: [u8; 4] = *b"TCB1";
 
 /// Market-data fanout: subscribers connected on a side port each receive a copy
 /// of every execution-report frame (write-only feed — e.g. a candle/K-line
