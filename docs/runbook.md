@@ -41,6 +41,11 @@ symptom. Each entry: **symptom** (which alert or `event=` log line fires),
 | `tc_journal_seq` | processed command count/cursor (legacy metric name) |
 | `tc_execution_outbox_pending` | execution events durable but not yet acked by Kafka |
 | `tc_execution_outbox_publish_healthy` | 1 = publisher healthy, 0 = failing |
+| `tc_market_kafka_ready` | 1 only after authoritative market replay reaches its startup high watermarks |
+| `tc_market_kafka_replay_lag` | remaining startup market events; must reach zero before routing reads |
+| `tc_market_storage_healthy` | last atomic market-state save succeeded |
+| `tc_market_state_save_failures_total` | persistent market snapshot write failures; alert on any increase |
+| `tc_market_last_persist_unix_seconds` | last successful TCM4 save; alert when older than 30 seconds |
 | `tc_asset_wal_errors` | command/application durability failures — should stay 0 |
 | `tc_snapshot_write_failures` | atomic engine-snapshot writes that failed |
 | `tc_storage_healthy` | 1 only while local WAL/proof and latest snapshot write are healthy |

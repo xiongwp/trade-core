@@ -664,9 +664,10 @@ fn kafka_replay_lag(highs: &HashMap<i32, i64>, positions: &HashMap<i32, i64>) ->
     highs
         .iter()
         .map(|(partition, high)| {
-            high.saturating_sub(positions.get(partition).copied().unwrap_or(0)) as u64
+            high.saturating_sub(positions.get(partition).copied().unwrap_or(0))
+                .max(0) as u64
         })
-        .sum()
+        .fold(0u64, u64::saturating_add)
 }
 
 fn kafka_trade_loop(
@@ -1471,6 +1472,7 @@ fn main() {
         "legacy market snapshot has candles but no Kafka offsets; migrate from TCM2/TCK2 with a retained full market topic or rebuild the read model explicitly"
     );
     if legacy_bootstrap {
+        MARKET_STORAGE_HEALTHY.store(false, Ordering::Release);
         log_warn!(
             "market-data",
             "event=legacy_market_bootstrap offsets will start at current Kafka high watermarks; use only while the market topic has no unprocessed events"
@@ -1634,6 +1636,13 @@ mod tests {
         assert!(!idle_feed_read(&std::io::Error::from(
             std::io::ErrorKind::ConnectionReset
         )));
+    }
+
+    #[test]
+    fn kafka_startup_lag_is_saturating_across_partitions() {
+        let highs = HashMap::from([(0, 10), (1, 20), (2, 0)]);
+        let positions = HashMap::from([(0, 3), (1, 25), (2, 0)]);
+        assert_eq!(kafka_replay_lag(&highs, &positions), 7);
     }
 
     #[test]

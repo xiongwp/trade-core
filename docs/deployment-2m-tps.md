@@ -308,6 +308,9 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
 | `tc_order_mysql_consumer_lag` | 指令落库积压 |
 | `tc_order_match_consumer_lag` | 撮合积压 |
 | `tc_execution_outbox_pending` | outbox 未发布事件数 |
+| `tc_market_kafka_replay_lag` | 行情 Kafka 权威回放尚未追平的事件数 |
+| `tc_market_storage_healthy` | 行情 candle/offset 原子快照是否可写 |
+| `tc_market_last_persist_unix_seconds` | 行情状态最近一次成功持久化时间 |
 | `tc_snapshot_ns_max` | 快照导致的撮合停顿 |
 | `tc_order_dedupe_truncated_partitions` | 去重表轮转清理次数 |
 | 各 Raft 组的 apply lag 和选举次数 | 撮合健康状况 |
