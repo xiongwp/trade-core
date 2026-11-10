@@ -412,7 +412,32 @@ kept in snapshots). A group rebuilt from empty logs gets a new one, and
 everything keyed by Raft index follows it: the execution publisher ignores a
 Kafka cursor of another incarnation (it would otherwise mark the new log's
 first events published without sending them), and market-data resets that
-group's replay watermark (`event=group_rebuilt`). Nothing to do by hand.
+group's per-asset replay watermarks (`event=group_rebuilt`). Nothing to do by
+hand.
+
+### TCM2/TCK2 market-state upgrade
+
+Current market snapshots are `TCM4`: candles, per-group/per-asset replay
+watermarks and Kafka next offsets cross one fsync boundary. `TCM3` is read
+directly because it already has offsets. A `TCM2`/`TCK2` file has candles but
+no Kafka position and therefore refuses production readiness by default.
+
+For a first rollout of `trade-market-events-v1`, use this ordered procedure:
+
+1. Stop order ingress and verify no client can write directly to Raft.
+2. Create the market topic and verify every partition has high watermark zero,
+   or otherwise prove all existing topic events are already represented in the
+   saved candles.
+3. Gracefully stop the old market-data process so it flushes `klines.bin`.
+4. Start only market-data once with
+   `TC_MARKET_ALLOW_LEGACY_BOOTSTRAP=true`; wait for `/readyz` and at least one
+   persistence interval, then verify the file magic is `TCM4`.
+5. Restart market-data with the flag false. Only then deploy Raft publishers
+   and reopen ingress.
+
+Never leave the bootstrap flag enabled. It intentionally starts missing
+partition offsets at their current high watermarks and is unsafe during live
+publishing.
 
 Large Raft messages (a compaction snapshot) travel in 16 MiB frames up to
 `TC_RAFT_MAX_MESSAGE_BYTES` (default 1 GiB, max 2 GiB); `health.py` warns when

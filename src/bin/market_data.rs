@@ -621,7 +621,12 @@ fn feed_one(md_addr: String, state: Arc<Mutex<State>>) {
 /// trade and is partitioned by Raft group, preserving the order required by
 /// `State::take`. TCP fanout remains enabled for low-latency depth and may win
 /// the race for a trade; the same event id makes the Kafka copy a no-op.
-fn kafka_trade_loop(brokers: String, topic: String, state: Arc<Mutex<State>>) {
+fn kafka_trade_loop(
+    brokers: String,
+    topic: String,
+    state: Arc<Mutex<State>>,
+    bootstrap_missing_offsets_at_high: bool,
+) {
     let consumer: BaseConsumer = ClientConfig::new()
         .set("bootstrap.servers", &brokers)
         .set("group.id", "market-data-authoritative-replay")
@@ -661,17 +666,30 @@ fn kafka_trade_loop(brokers: String, topic: String, state: Arc<Mutex<State>>) {
                 "market-data Kafka offset {offset} for partition {partition} is beyond high watermark {high}; topic was likely recreated"
             ),
             Some(offset) => Offset::Offset(offset),
+            None if bootstrap_missing_offsets_at_high => Offset::Offset(high),
             None if low == 0 => Offset::Beginning,
             None => panic!(
                 "market-data has no durable offset for partition {partition}, but Kafka history starts at {low}"
             ),
         };
-        let position = restored_offsets.get(&partition).copied().unwrap_or(low);
+        let position = restored_offsets.get(&partition).copied().unwrap_or({
+            if bootstrap_missing_offsets_at_high {
+                high
+            } else {
+                low
+            }
+        });
         replay_positions.insert(partition, position);
         startup_highs.insert(partition, high);
         assignment
             .add_partition_offset(&topic, partition, offset)
             .expect("build market-data Kafka assignment");
+    }
+    if bootstrap_missing_offsets_at_high {
+        let mut state = state.lock().unwrap();
+        for (&partition, &offset) in &replay_positions {
+            state.kafka_offsets.entry(partition).or_insert(offset);
+        }
     }
     consumer
         .assign(&assignment)
@@ -1331,6 +1349,9 @@ fn main() {
         .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "no" | "NO"))
         .unwrap_or(true);
     MARKET_KAFKA_REQUIRED.store(kafka_required, Ordering::Release);
+    let allow_legacy_bootstrap = std::env::var("TC_MARKET_ALLOW_LEGACY_BOOTSTRAP")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false);
 
     // Load persisted candle history, if any.
     let persist: Option<PathBuf> = (data_dir != "none").then(|| {
@@ -1376,10 +1397,18 @@ fn main() {
                 true,
             )
         });
+    let legacy_bootstrap =
+        kafka_required && !restored.5 && !restored.0.instruments().is_empty();
     assert!(
-        !kafka_required || restored.5 || restored.0.instruments().is_empty(),
+        !legacy_bootstrap || allow_legacy_bootstrap,
         "legacy market snapshot has candles but no Kafka offsets; migrate from TCM2/TCK2 with a retained full market topic or rebuild the read model explicitly"
     );
+    if legacy_bootstrap {
+        log_warn!(
+            "market-data",
+            "event=legacy_market_bootstrap offsets will start at current Kafka high watermarks; use only while the market topic has no unprocessed events"
+        );
+    }
 
     let state = Arc::new(Mutex::new(State {
         agg: restored.0,
@@ -1411,7 +1440,12 @@ fn main() {
             .name("md-kafka-replay".into())
             .spawn(move || {
                 let result = std::panic::catch_unwind(|| {
-                    kafka_trade_loop(kafka_brokers, kafka_topic, kafka_state)
+                    kafka_trade_loop(
+                        kafka_brokers,
+                        kafka_topic,
+                        kafka_state,
+                        legacy_bootstrap,
+                    )
                 });
                 MARKET_KAFKA_READY.store(false, Ordering::Release);
                 if !SHUTDOWN.load(Ordering::Acquire) {

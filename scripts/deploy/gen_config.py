@@ -331,6 +331,7 @@ def main(inventory_path, out_dir):
         write(host, {
             "TC_MARKET_KAFKA_TOPIC": "trade-market-events-v1",
             "TC_MARKET_KAFKA_REQUIRED": "true",
+            "TC_MARKET_ALLOW_LEGACY_BOOTSTRAP": "false",
             "TC_ORDER_API_ADDR": f"{inv['ingress_hosts'][0]}:9200",
         })
 

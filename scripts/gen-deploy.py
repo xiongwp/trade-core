@@ -474,6 +474,7 @@ def render_gateway_compose(topo):
         "      TC_MARKET_KAFKA_BROKERS: ${TC_MARKET_KAFKA_BROKERS:?set in gateway.env}",
         "      TC_MARKET_KAFKA_TOPIC: ${TC_MARKET_KAFKA_TOPIC:-trade-market-events-v1}",
         "      TC_MARKET_KAFKA_REQUIRED: ${TC_MARKET_KAFKA_REQUIRED:-true}",
+        "      TC_MARKET_ALLOW_LEGACY_BOOTSTRAP: ${TC_MARKET_ALLOW_LEGACY_BOOTSTRAP:-false}",
         "    ports:",
         '      - "8081:8080"',
         "    volumes:",

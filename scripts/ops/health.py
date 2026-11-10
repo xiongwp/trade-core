@@ -155,12 +155,13 @@ def check_order_api(addrs, token, limits):
 
 def check_up(kind, addrs):
     for addr in addrs:
-        path = "/metrics" if kind == "user-stream" else "/api/symbols"
+        path = "/metrics" if kind == "user-stream" else "/readyz"
         try:
             get(addr, path)
-            report("OK", f"{kind} {addr}", "up")
+            report("OK", f"{kind} {addr}", "ready")
         except OSError as error:
-            report("FAIL", f"{kind} {addr}", f"unreachable ({error})", "restart it; it rebuilds its state from Kafka")
+            report("FAIL", f"{kind} {addr}", f"not ready ({error})",
+                   "check Kafka replay and local snapshot storage before routing traffic")
 
 
 def main():
