@@ -2735,7 +2735,9 @@ impl Shard {
                 .name(format!("snapshot-{}", self.shard_id))
                 .spawn(move || {
                     let started = Instant::now();
-                    if let Err(error) = captured.write(&path) {
+                    let persisted = captured.write(&path);
+                    metrics.record_snapshot_write_result(&persisted);
+                    if let Err(error) = persisted {
                         crate::log_error!("snapshot", "event=snapshot_write_failed error={error}");
                         return;
                     }
@@ -2771,6 +2773,7 @@ impl Shard {
         let started = Instant::now();
         let persisted =
             persist_processor_snapshot(&self.processor, path, journal_seq, self.last_raft_index);
+        self.metrics.record_snapshot_write_result(&persisted);
         // The shard matches nothing while it snapshots, so this is a pause in
         // matching that grows with the books.
         let took = started.elapsed();
@@ -2799,6 +2802,8 @@ impl Shard {
             if let Some(journal) = self.journal.as_mut() {
                 let _ = journal.truncate();
             }
+        } else if let Err(error) = &persisted {
+            crate::log_error!("snapshot", "event=snapshot_write_failed error={error}");
         }
         self.last_snapshot = Instant::now();
     }

@@ -1,6 +1,7 @@
 //! Hosts multiple independent five-replica Raft groups on one physical node.
 
 use std::io::{Read, Write};
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitCode};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -84,7 +85,51 @@ fn check_ports(placements: &[GroupPlacement]) -> Result<(), String> {
 /// Parse `group|local_node|id@host:port,id@host:port;...`. Each machine gets
 /// only the entries assigned to it, allowing hundreds of groups to be spread
 /// over many physical hosts instead of starting every group everywhere.
-fn parse_placements(value: &str) -> Result<Vec<GroupPlacement>, String> {
+fn split_peer_address(value: &str) -> Result<(&str, u16), String> {
+    let value = value.trim();
+    let (host, port) = if let Some(rest) = value.strip_prefix('[') {
+        let (host, suffix) = rest
+            .split_once(']')
+            .ok_or_else(|| format!("invalid IPv6 peer address {value}"))?;
+        let port = suffix
+            .strip_prefix(':')
+            .ok_or_else(|| format!("missing port in peer address {value}"))?;
+        host.parse::<Ipv6Addr>()
+            .map_err(|_| format!("invalid IPv6 address in {value}"))?;
+        (host, port)
+    } else {
+        let (host, port) = value
+            .rsplit_once(':')
+            .ok_or_else(|| format!("missing port in peer address {value}"))?;
+        (host, port)
+    };
+    if host.is_empty() || host.chars().any(char::is_whitespace) {
+        return Err(format!("invalid host in peer address {value}"));
+    }
+    if host.parse::<Ipv4Addr>().is_err() && host.parse::<Ipv6Addr>().is_err() {
+        let valid_dns = host.len() <= 253
+            && host.split('.').all(|label| {
+                !label.is_empty()
+                    && label.len() <= 63
+                    && !label.starts_with('-')
+                    && !label.ends_with('-')
+                    && label
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            });
+        if !valid_dns {
+            return Err(format!("invalid hostname in peer address {value}"));
+        }
+    }
+    let port = port
+        .parse::<u16>()
+        .ok()
+        .filter(|port| *port != 0)
+        .ok_or_else(|| format!("invalid port in peer address {value}"))?;
+    Ok((host, port))
+}
+
+fn parse_placements(value: &str, replicas: u16) -> Result<Vec<GroupPlacement>, String> {
     value
         .split(';')
         .filter(|entry| !entry.trim().is_empty())
@@ -100,18 +145,50 @@ fn parse_placements(value: &str) -> Result<Vec<GroupPlacement>, String> {
                 .ok_or("missing local node")?
                 .parse::<u16>()
                 .map_err(|_| format!("invalid local node in {entry}"))?;
-            let peers = fields.next().ok_or("missing peers")?.to_string();
-            let local = peers
-                .split(',')
-                .find_map(|peer| {
-                    let (id, addr) = peer.split_once('@')?;
-                    (id.parse::<u16>().ok()? == local_node).then_some(addr)
-                })
+            if local_node == 0 {
+                return Err(format!("group {group} has zero local node id"));
+            }
+            let peers = fields.next().ok_or("missing peers")?.trim().to_string();
+            if peers.is_empty() {
+                return Err(format!("group {group} has no peers"));
+            }
+            let mut peer_ids = std::collections::HashSet::new();
+            let mut peer_addrs = std::collections::HashSet::new();
+            let mut local_port = None;
+            let mut peer_count = 0u16;
+            for peer in peers.split(',') {
+                let peer = peer.trim();
+                if peer.is_empty() {
+                    return Err(format!("group {group} contains an empty peer"));
+                }
+                let (id, addr) = peer
+                    .split_once('@')
+                    .filter(|(_, addr)| !addr.contains('@'))
+                    .ok_or_else(|| format!("invalid peer {peer} in group {group}"))?;
+                let id = id
+                    .parse::<u16>()
+                    .ok()
+                    .filter(|id| *id != 0)
+                    .ok_or_else(|| format!("invalid peer id {id} in group {group}"))?;
+                if !peer_ids.insert(id) {
+                    return Err(format!("duplicate peer id {id} in group {group}"));
+                }
+                let (_, port) = split_peer_address(addr)?;
+                if !peer_addrs.insert(addr.to_ascii_lowercase()) {
+                    return Err(format!("duplicate peer address {addr} in group {group}"));
+                }
+                if id == local_node {
+                    local_port = Some(port);
+                }
+                peer_count += 1;
+            }
+            if peer_count != replicas {
+                return Err(format!(
+                    "group {group} has {peer_count} peers, expected TC_RAFT_REPLICAS={replicas}"
+                ));
+            }
+            let raft_port = local_port
                 .ok_or_else(|| format!("local node {local_node} absent from group {group}"))?;
-            let raft_port = local
-                .rsplit_once(':')
-                .and_then(|(_, port)| port.parse::<u16>().ok())
-                .ok_or_else(|| format!("invalid local peer address {local}"))?;
             Ok(GroupPlacement {
                 group,
                 local_node,
@@ -171,10 +248,12 @@ struct Slot {
     restart_at: Option<Instant>,
     probe_failures: u32,
     next_probe: Instant,
+    startup_complete: bool,
+    startup_deadline: Instant,
 }
 
 impl Slot {
-    fn spawn(&mut self, binary: &str) {
+    fn spawn(&mut self, binary: &str, startup_timeout: Duration) {
         let (order_port, md_port, metrics_port) = self.ports;
         let group = self.placement.group;
         log_info!(
@@ -211,26 +290,58 @@ impl Slot {
         self.started = Instant::now();
         self.probe_failures = 0;
         self.next_probe = Instant::now();
+        self.startup_complete = false;
+        self.startup_deadline = Instant::now() + startup_timeout;
     }
 }
 
-/// Liveness: does the child answer `GET /metrics` on its metrics port?
-fn probe(port: u16) -> bool {
+/// Return the complete HTTP status code from a bounded local health request.
+fn probe_status(port: u16, path: &str) -> Option<u16> {
     let Ok(mut stream) = std::net::TcpStream::connect_timeout(
         &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
         Duration::from_secs(2),
     ) else {
-        return false;
+        return None;
     };
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     if stream
-        .write_all(b"GET /metrics HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").as_bytes())
         .is_err()
     {
-        return false;
+        return None;
     }
-    let mut head = [0u8; 12];
-    stream.read_exact(&mut head).is_ok() && head.starts_with(b"HTTP/1.1 200")
+    let mut response = [0u8; 1024];
+    let mut used = 0;
+    while used < response.len() && !response[..used].contains(&b'\n') {
+        let read = stream.read(&mut response[used..]).ok()?;
+        if read == 0 {
+            break;
+        }
+        used += read;
+    }
+    let status = std::str::from_utf8(&response[..used]).ok()?.lines().next()?;
+    let mut fields = status.split_whitespace();
+    match fields.next()? {
+        "HTTP/1.0" | "HTTP/1.1" => {}
+        _ => return None,
+    }
+    fields.next()?.parse().ok()
+}
+
+fn probe_liveness(port: u16) -> bool {
+    probe_status(port, "/healthz") == Some(200)
+}
+
+fn startup_jitter(group: u16, node: u16, max: Duration) -> Duration {
+    let max_ms = max.as_millis() as u64;
+    if max_ms == 0 {
+        return Duration::ZERO;
+    }
+    // Stable across restarts but spread across both group and node, so a
+    // simultaneous fleet reboot does not recreate the same launch wave.
+    let mixed = (group as u64).wrapping_mul(0x9e37_79b9)
+        ^ (node as u64).wrapping_mul(0x85eb_ca6b);
+    Duration::from_millis(mixed % (max_ms + 1))
 }
 
 fn env_u64(name: &str, default: u64) -> u64 {
@@ -273,7 +384,9 @@ fn main() -> ExitCode {
     assert!(groups > 0, "at least one Raft group is required");
 
     let placements = match explicit_placements {
-        Some(value) => parse_placements(&value).expect("valid TC_RAFT_GROUP_PLACEMENTS"),
+        Some(value) => {
+            parse_placements(&value, replicas).expect("valid TC_RAFT_GROUP_PLACEMENTS")
+        }
         None => (0..groups)
             .map(|group| GroupPlacement {
                 group,
@@ -296,12 +409,27 @@ fn main() -> ExitCode {
     if let Err(error) = check_ports(&placements) {
         panic!("invalid Raft group port layout: {error}");
     }
+    let max_groups = env_u64("TC_SUPERVISOR_MAX_GROUPS", 1_024).max(1) as usize;
+    assert!(
+        placements.len() <= max_groups,
+        "{} local groups exceed TC_SUPERVISOR_MAX_GROUPS={max_groups}",
+        placements.len()
+    );
     let binary = std::env::var("TC_RAFT_NODE_BIN").unwrap_or_else(|_| "raft-node".into());
     // Liveness: a child whose metrics port stops answering for this many
     // consecutive 5 s probes (after a start-up grace for WAL recovery) is
     // killed and restarted like a crashed one.
     let liveness_grace = Duration::from_secs(env_u64("TC_SUPERVISOR_LIVENESS_GRACE_SECS", 120));
     let liveness_failures = env_u64("TC_SUPERVISOR_LIVENESS_FAILURES", 6).max(1) as u32;
+    let start_concurrency = env_u64("TC_SUPERVISOR_START_CONCURRENCY", 16).max(1) as usize;
+    let startup_timeout = Duration::from_secs(env_u64(
+        "TC_SUPERVISOR_STARTUP_SLOT_TIMEOUT_SECS",
+        300,
+    ));
+    let startup_jitter_max = Duration::from_millis(env_u64(
+        "TC_SUPERVISOR_STARTUP_JITTER_MS",
+        2_000,
+    ));
     unsafe {
         let handler = on_signal as *const () as libc::sighandler_t;
         libc::signal(libc::SIGTERM, handler);
@@ -325,9 +453,13 @@ fn main() -> ExitCode {
                 child: None,
                 started: now,
                 restarts: 0,
-                restart_at: Some(now),
+                restart_at: Some(
+                    now + startup_jitter(group, placement.local_node, startup_jitter_max),
+                ),
                 probe_failures: 0,
                 next_probe: now,
+                startup_complete: false,
+                startup_deadline: now + startup_timeout,
             }
         })
         .collect();
@@ -337,6 +469,10 @@ fn main() -> ExitCode {
     // the machine and exit.
     while !SHUTDOWN.load(Ordering::SeqCst) {
         let now = Instant::now();
+        let mut starting = slots
+            .iter()
+            .filter(|slot| slot.child.is_some() && !slot.startup_complete)
+            .count();
         for slot in &mut slots {
             let group = slot.placement.group;
             if let Some(child) = slot.child.as_mut() {
@@ -358,9 +494,34 @@ fn main() -> ExitCode {
                         );
                     }
                     Ok(None) => {
-                        if slot.started.elapsed() >= liveness_grace && now >= slot.next_probe {
+                        if !slot.startup_complete && now >= slot.next_probe {
+                            slot.next_probe = now + Duration::from_millis(500);
+                            if probe_liveness(slot.ports.2) {
+                                slot.startup_complete = true;
+                                starting = starting.saturating_sub(1);
+                                log_info!(
+                                    "raft-multi-node",
+                                    "group={group} event=startup_ready recovery_ms={}",
+                                    slot.started.elapsed().as_millis()
+                                );
+                            } else if now >= slot.startup_deadline {
+                                // Release only the launch permit. The child is
+                                // left running and the ordinary liveness grace
+                                // decides whether it is truly wedged.
+                                slot.startup_complete = true;
+                                starting = starting.saturating_sub(1);
+                                log_warn!(
+                                    "raft-multi-node",
+                                    "group={group} event=startup_slot_timeout recovery_ms={}",
+                                    slot.started.elapsed().as_millis()
+                                );
+                            }
+                        } else if slot.startup_complete
+                            && slot.started.elapsed() >= liveness_grace
+                            && now >= slot.next_probe
+                        {
                             slot.next_probe = now + Duration::from_secs(5);
-                            if probe(slot.ports.2) {
+                            if probe_liveness(slot.ports.2) {
                                 slot.probe_failures = 0;
                             } else {
                                 slot.probe_failures += 1;
@@ -382,9 +543,14 @@ fn main() -> ExitCode {
                         );
                     }
                 }
-            } else if slot.restart_at.is_some_and(|at| now >= at) {
+            } else if starting < start_concurrency
+                && slot.restart_at.is_some_and(|at| now >= at)
+            {
                 slot.restart_at = None;
-                slot.spawn(&binary);
+                slot.spawn(&binary, startup_timeout);
+                if slot.child.is_some() {
+                    starting += 1;
+                }
             }
         }
         thread::sleep(Duration::from_millis(250));
@@ -424,6 +590,7 @@ mod tests {
     fn placement_assigns_only_explicit_local_replicas() {
         let placements = parse_placements(
             "7|2|1@rack-a:7071,2@rack-b:7072,3@rack-c:7073;19|1|1@rack-b:7191,2@rack-d:7192,3@rack-e:7193",
+            3,
         )
         .unwrap();
         assert_eq!(placements.len(), 2);
@@ -436,7 +603,7 @@ mod tests {
 
     #[test]
     fn a_group_placed_twice_is_rejected() {
-        assert!(parse_placements("7|1|1@a:7071;7|2|1@a:7071,2@b:7072").is_err());
+        assert!(parse_placements("7|1|1@a:7071;7|2|1@a:7071,2@b:7072", 2).is_err());
     }
 
     #[test]
@@ -487,7 +654,7 @@ mod tests {
 
     #[test]
     fn colliding_explicit_ports_are_refused() {
-        let placements = parse_placements("0|1|1@a:9101;1|1|1@a:7011").unwrap();
+        let placements = parse_placements("0|1|1@a:9101;1|1|1@a:7011", 1).unwrap();
         assert!(check_ports(&placements).unwrap_err().contains("collides"));
     }
 
@@ -516,6 +683,43 @@ mod tests {
 
     #[test]
     fn placement_requires_the_local_node_in_peer_set() {
-        assert!(parse_placements("7|3|1@rack-a:7071,2@rack-b:7072").is_err());
+        assert!(parse_placements("7|3|1@rack-a:7071,2@rack-b:7072", 2).is_err());
+    }
+
+    #[test]
+    fn placement_rejects_bad_membership_and_addresses() {
+        for invalid in [
+            "7|1|1@a:7071,1@b:7072",
+            "7|1|1@a:7071,2@a:7071",
+            "7|1|1@:7071,2@b:7072",
+            "7|1|1@bad_host:7071,2@b:7072",
+            "7|1|1@a:0,2@b:7072",
+            "7|1|1@a:7071,",
+        ] {
+            assert!(parse_placements(invalid, 2).is_err(), "accepted {invalid}");
+        }
+        assert!(parse_placements("7|1|1@a:7071", 3)
+            .unwrap_err()
+            .contains("expected TC_RAFT_REPLICAS=3"));
+    }
+
+    #[test]
+    fn placement_accepts_ipv4_ipv6_and_dns() {
+        let placements = parse_placements(
+            "7|2|1@10.0.0.1:7071,2@[2001:db8::2]:7072,3@raft-3.prod:7073",
+            3,
+        )
+        .unwrap();
+        assert_eq!(placements[0].raft_port, 7072);
+    }
+
+    #[test]
+    fn startup_jitter_is_bounded_and_spreads_groups() {
+        let max = Duration::from_secs(2);
+        let values = (0..100)
+            .map(|group| startup_jitter(group, 3, max))
+            .collect::<std::collections::HashSet<_>>();
+        assert!(values.len() > 90);
+        assert!(values.iter().all(|value| *value <= max));
     }
 }

@@ -630,7 +630,7 @@ fn main() {
                 let ready = node.leader_id() != 0
                     && !node.is_rejoining()
                     && runtime_metrics.raft_apply_lag() <= max_apply_lag
-                    && runtime_metrics.asset_wal_errors.load(Ordering::Relaxed) == 0
+                    && runtime_metrics.storage_healthy()
                     && runtime_metrics
                         .execution_outbox_pending
                         .load(Ordering::Relaxed)

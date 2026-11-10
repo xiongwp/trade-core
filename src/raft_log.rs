@@ -614,6 +614,11 @@ impl RaftNode {
             id: cluster.node_id,
             election_tick: cluster.election_tick,
             heartbeat_tick: cluster.heartbeat_tick,
+            // A partitioned leader must step down once it can no longer hear a
+            // majority. Pre-vote prevents an isolated/restarting member from
+            // needlessly increasing the term of a healthy group.
+            check_quorum: true,
+            pre_vote: true,
             max_size_per_msg: 1024 * 1024,
             max_inflight_msgs: 256,
             applied,
