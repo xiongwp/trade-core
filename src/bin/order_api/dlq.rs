@@ -91,6 +91,7 @@ pub(crate) enum PersistOutcome {
 /// the offset. A DLQ write failure is *not* treated as success — we keep
 /// retrying rather than silently drop the record.
 #[cfg_attr(not(test), allow(dead_code))]
+#[allow(clippy::too_many_arguments)] // Keeps each durable DLQ identity field explicit at call sites.
 pub(crate) fn persist_with_retry<F>(
     mut persist: F,
     dlq: &Mutex<DlqWriter>,

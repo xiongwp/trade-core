@@ -326,7 +326,7 @@ impl History {
             Resume::After { cursor, partition } => {
                 self.floor_offset
                     .get(&partition)
-                    .is_none_or(|floor| cursor < *floor)
+                    .map_or(true, |floor| cursor < *floor)
                     || entry.is_some_and(|e| cursor < e.lost_offset)
             }
         }
@@ -588,7 +588,7 @@ fn consume(
         let owned = |partition: i32| {
             shard
                 .as_ref()
-                .is_none_or(|shard| shard.owns_partition(partition))
+                .map_or(true, |shard| shard.owns_partition(partition))
         };
         match start_positions(
             &consumer,

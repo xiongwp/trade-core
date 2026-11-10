@@ -23,7 +23,12 @@ fn pipeline_backlog(addr: &str) -> std::io::Result<u64> {
             let mut fields = line.split_whitespace();
             (fields.next()? == "tc_order_ingress_backlog").then(|| fields.next()?.parse().ok())?
         })
-        .ok_or_else(|| std::io::Error::other("tc_order_ingress_backlog missing"))
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "tc_order_ingress_backlog missing",
+            )
+        })
 }
 
 fn wait_for_empty_pipeline(addr: &str) {

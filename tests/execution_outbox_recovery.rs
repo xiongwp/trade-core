@@ -2,7 +2,7 @@
 //! the Raft application watermark advances, so a committed batch's execution
 //! events can never be lost, and recovery replays them exactly once.
 
-use std::path::PathBuf;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use trade_core::asset_log::load_applied_batches;
@@ -12,8 +12,8 @@ use trade_core::prelude::*;
 use trade_core::InstrumentId;
 
 /// The durable outbox records reduced to their deterministic event ids.
-fn read_outbox_ids(path: &PathBuf) -> Vec<(u64, u32)> {
-    let mut reader = ExecutionOutboxReader::open(path.clone()).unwrap();
+fn read_outbox_ids(path: &Path) -> Vec<(u64, u32)> {
+    let mut reader = ExecutionOutboxReader::open(path.to_path_buf()).unwrap();
     let mut ids = Vec::new();
     reader
         .read_available(|record| ids.push((record.raft_index, record.ordinal)))

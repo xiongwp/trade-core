@@ -962,7 +962,7 @@ mod tests {
             .store(unix_time_ms().saturating_sub(6_000), Ordering::Release);
         assert!(!m.consensus_healthy());
 
-        let failed = Err(std::io::Error::other("disk full"));
+        let failed = Err(std::io::Error::new(std::io::ErrorKind::Other, "disk full"));
         m.record_snapshot_write_result(&failed);
         assert!(!m.storage_healthy());
         assert_eq!(m.snapshot_write_failures.load(Ordering::Relaxed), 1);

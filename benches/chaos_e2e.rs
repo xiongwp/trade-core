@@ -47,13 +47,21 @@ impl Rng {
 fn read_status(reader: &mut BufReader<TcpStream>) -> std::io::Result<u16> {
     let mut line = String::new();
     if reader.read_line(&mut line)? == 0 {
-        return Err(std::io::Error::other("connection closed"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "connection closed",
+        ));
     }
     let status = line
         .split_whitespace()
         .nth(1)
         .and_then(|s| s.parse().ok())
-        .ok_or_else(|| std::io::Error::other(format!("bad status line {line:?}")))?;
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("bad status line {line:?}"),
+            )
+        })?;
     let mut length = 0usize;
     loop {
         line.clear();
@@ -164,7 +172,7 @@ fn main() {
         let mut which = worker;
         let (cursor, resent, orders) = (cursor.clone(), resent.clone(), orders.clone());
         workers.push(std::thread::spawn(move || {
-            let mut rng = Rng(0x9e37_79b9 ^ (worker as u64 + 1) * 0x1234_5678_9abc);
+            let mut rng = Rng(0x9e37_79b9 ^ ((worker as u64 + 1) * 0x1234_5678_9abc));
             let (mut stream, mut reader) = connect(&addrs, &mut which);
             let mut recent: Vec<(u64, u32, u64)> = Vec::new();
             let mut body = Vec::new();

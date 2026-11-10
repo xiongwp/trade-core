@@ -110,9 +110,10 @@ fn ws_connect(
     let mut line = String::new();
     reader.read_line(&mut line)?;
     if !line.contains(" 101 ") {
-        return Err(std::io::Error::other(format!(
-            "websocket upgrade refused: {line}"
-        )));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("websocket upgrade refused: {line}"),
+        ));
     }
     loop {
         line.clear();
@@ -137,7 +138,10 @@ fn ws_send_batch(
         let (opcode, payload) = read_server_frame(reader)?;
         if opcode != OP_TEXT {
             if opcode == trade_core::websocket::OP_CLOSE {
-                return Err(std::io::Error::other("websocket closed by server"));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "websocket closed by server",
+                ));
             }
             continue; // pong etc.
         }
@@ -344,7 +348,9 @@ fn main() {
             barrier.clone(),
         );
         workers.push(std::thread::spawn(move || {
-            let mut rng = Rng(0x9E3779B97F4A7C15 ^ (worker_id as u64 + 1) * 0xD1B54A32D192ED03);
+            let mut rng = Rng(
+                0x9E3779B97F4A7C15 ^ ((worker_id as u64 + 1) * 0xD1B54A32D192ED03),
+            );
             let mut stream = TcpStream::connect(&addr).expect("connect order API");
             stream.set_nodelay(true).ok();
             let mut reader = BufReader::new(stream.try_clone().expect("clone socket"));

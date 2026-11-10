@@ -426,7 +426,7 @@ pub(crate) fn serve_order_query(
                     .join(" UNION ALL ");
                 format!("SELECT * FROM ({parts}) u ORDER BY created_ms DESC,row_seq DESC,order_id DESC LIMIT {limit}")
             })?;
-            rows.sort_unstable_by(|a, b| (b.9, b.11, b.0).cmp(&(a.9, a.11, a.0)));
+            rows.sort_unstable_by_key(|row| std::cmp::Reverse((row.9, row.11, row.0)));
             rows.truncate(limit);
             Ok(Some(json_array(&rows, order_json)))
         }

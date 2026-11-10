@@ -52,13 +52,10 @@ fn read(path: &str) -> io::Result<Vec<Record>> {
     }
     let mut records = Vec::new();
     let mut at = 8;
-    loop {
-        let Some(len) = bytes
-            .get(at..at + 4)
-            .map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize)
-        else {
-            break;
-        };
+    while let Some(len) = bytes
+        .get(at..at + 4)
+        .map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize)
+    {
         let Some(body) = bytes.get(at + 4..at + 4 + len) else {
             break;
         };

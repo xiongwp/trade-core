@@ -12,8 +12,8 @@ pub(crate) enum BackpressureTier {
     Soft,
     /// >= hard limit (default 5 s): reject with HTTP 429.
     Hard,
-    /// >= emergency limit (default 15 s) or the category's Raft quorum is lost:
-    /// stop writes for this category with HTTP 503. Independently recoverable.
+    /// At or above the emergency limit (default 15 s), or when the category's
+    /// Raft quorum is lost, stop writes with HTTP 503. Independently recoverable.
     Emergency,
 }
 

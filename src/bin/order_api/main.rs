@@ -288,7 +288,6 @@ fn main() {
             .expect("DB consumers require shard forwarder")
             .clone();
         let consumer_kafka = kafka.clone();
-        let category_size = category_size;
         let handle = std::thread::Builder::new()
             .name(format!("order-kafka-mysql-{worker}"))
             .spawn(move || {
@@ -300,7 +299,6 @@ fn main() {
     for worker in 0..kafka.matcher_consumers {
         let consumer_kafka = kafka.clone();
         let group_id = kafka.matcher_group.clone();
-        let category_size = category_size;
         let worker_forwarder = raft_forwarder
             .as_ref()
             .expect("matcher consumers require Raft forwarder")

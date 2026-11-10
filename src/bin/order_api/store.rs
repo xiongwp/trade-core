@@ -213,7 +213,7 @@ pub(crate) fn parse_owned_dbs(db_count: u32) -> Result<std::collections::HashSet
 /// Wrap a shard connection error with the shard index (never the URL — it
 /// carries credentials).
 pub(crate) fn io_shard_error(shard: usize, error: &dyn std::fmt::Display) -> std::io::Error {
-    std::io::Error::other(format!("shard {shard}: {error}"))
+    std::io::Error::new(std::io::ErrorKind::Other, format!("shard {shard}: {error}"))
 }
 
 pub(crate) fn role_needs_mysql(db_consumers: usize, execution_consumers: usize) -> bool {

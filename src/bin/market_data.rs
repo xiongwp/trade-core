@@ -114,7 +114,9 @@ impl State {
     /// Whether a feed that last saw `index` of `group` is caught up with the
     /// group (so its depth is current, not a lagging replica's).
     fn current(&self, group: u32, index: u64) -> bool {
-        self.applied.get(&group).is_none_or(|mark| index >= mark.0)
+        self.applied
+            .get(&group)
+            .map_or(true, |mark| index >= mark.0)
     }
 
     /// A feed announced `group`'s incarnation (0: not assigned yet).
@@ -247,7 +249,7 @@ fn decode_market_state(bytes: &[u8]) -> std::io::Result<RestoredMarket> {
     let candle_end = 12usize
         .checked_add(candle_len)
         .ok_or_else(|| bad("market state length overflow"))?;
-    if candle_end.checked_add(4).is_none_or(|end| end > body_end) {
+    if candle_end.checked_add(4).map_or(true, |end| end > body_end) {
         return Err(bad("truncated market candle state"));
     }
     let agg = KlineAggregator::decode(&bytes[12..candle_end])?;

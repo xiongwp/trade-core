@@ -56,12 +56,21 @@ pub(crate) struct OrderPipelineMetrics {
 
 impl OrderPipelineMetrics {
     pub(crate) fn try_open_http_connection(&self, max: u64) -> bool {
-        let opened = self
-            .http_active_connections
-            .try_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |active| {
-                (active < max).then_some(active + 1)
-            })
-            .is_ok();
+        let mut active = self.http_active_connections.load(AtomicOrdering::Acquire);
+        let opened = loop {
+            if active >= max {
+                break false;
+            }
+            match self.http_active_connections.compare_exchange_weak(
+                active,
+                active + 1,
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+            ) {
+                Ok(_) => break true,
+                Err(current) => active = current,
+            }
+        };
         if !opened {
             self.http_rejected_connections
                 .fetch_add(1, AtomicOrdering::Relaxed);

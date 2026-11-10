@@ -60,7 +60,7 @@ fn filesystem_available_bytes(path: &Path) -> std::io::Result<u64> {
         return Err(std::io::Error::last_os_error());
     }
     let stats = unsafe { stats.assume_init() };
-    Ok((stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64))
+    Ok((stats.f_bavail as u64).saturating_mul(stats.f_frsize))
 }
 /// Operator-created marker for replacing a voter's lost stable storage while
 /// retaining its configured node id. It persists across process crashes and
@@ -1098,6 +1098,7 @@ fn main() {
     handle.shutdown();
 }
 
+#[allow(clippy::too_many_arguments)] // One startup boundary; fields map directly to publisher durability knobs.
 fn spawn_execution_outbox_publisher(
     root: PathBuf,
     topic: String,
@@ -1877,16 +1878,15 @@ fn remember_group_config(path: &std::path::Path, current: &mut Option<u64>, fing
 
 /// A random non-zero group incarnation id below 2^53 (exact as a metric).
 fn new_incarnation_id(node_id: u64) -> u64 {
-    use std::hash::BuildHasher;
+    use std::hash::{BuildHasher, Hash, Hasher};
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_nanos());
     // RandomState is seeded from the OS's random source.
-    let random = std::collections::hash_map::RandomState::new().hash_one((
-        nanos,
-        node_id,
-        std::process::id(),
-    ));
+    let state = std::collections::hash_map::RandomState::new();
+    let mut hasher = state.build_hasher();
+    (nanos, node_id, std::process::id()).hash(&mut hasher);
+    let random = hasher.finish();
     (random & ((1 << 53) - 1)).max(1)
 }
 
@@ -2002,7 +2002,12 @@ fn read_peer_frames(mut stream: impl Read, tx: &mpsc::SyncSender<Message>) {
 /// `bytes` as peer frames: each at most [`PEER_FRAME_BYTES`], all but the
 /// last flagged [`FRAME_CONTINUES`].
 fn encode_peer_frames(bytes: &[u8]) -> Vec<u8> {
-    let chunks = bytes.len().div_ceil(PEER_FRAME_BYTES).max(1);
+    let chunks = bytes
+        .len()
+        .saturating_add(PEER_FRAME_BYTES - 1)
+        .checked_div(PEER_FRAME_BYTES)
+        .unwrap_or(0)
+        .max(1);
     let mut frame = Vec::with_capacity(bytes.len() + 4 * chunks);
     let mut pieces = bytes.chunks(PEER_FRAME_BYTES).peekable();
     while let Some(piece) = pieces.next() {
