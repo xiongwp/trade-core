@@ -262,6 +262,10 @@ fn main() {
         trade_core::InstrumentSpecs::parse(&instrument_specs_text)
             .expect("valid TC_INSTRUMENT_SPECS")
     };
+    // Per-order size limits (TC_MAX_ORDER_QTY / TC_MAX_ORDER_NOTIONAL, 0 =
+    // unlimited). Like the specs they decide rejections, so they are part of
+    // the deterministic config every replica of a group must share.
+    let risk_limits = trade_core::RiskLimits::from_env().expect("valid order limits");
     // The committed prefix recovered from the WAL, replayed below on top of
     // the engine snapshot (which records the index it covers).
     let recovered_committed = raft_node.take_committed();
@@ -275,7 +279,7 @@ fn main() {
         .unwrap_or(trade_core::exchange::DEFAULT_COMMAND_ID_WINDOW)
         .max(1);
     let (config_fingerprint, config_description) =
-        deterministic_config(&instrument_specs_text, command_id_window);
+        deterministic_config(&instrument_specs_text, command_id_window, risk_limits);
     log_info!(
         "raft-node",
         "deterministic config fingerprint={config_fingerprint:016x} ({config_description})"
@@ -305,6 +309,7 @@ fn main() {
     let (gateway, sink, handle) = build(ExchangeConfig {
         journal_dir: Some(data_dir.join("journal")),
         instrument_specs,
+        risk_limits,
         raft_wal_authoritative: true,
         snapshot_every,
         // Exact duplicate suppression lives at the Raft ingress. The old
@@ -1883,11 +1888,18 @@ const DETERMINISM_VERSION: u32 = 20_261_110;
 /// on every replica of a group for them to compute identical results and
 /// publish identically: matching rules, the dedupe window, and the routing
 /// that places execution events on Kafka partitions.
-fn deterministic_config(instrument_specs: &str, command_id_window: usize) -> (u64, String) {
+fn deterministic_config(
+    instrument_specs: &str,
+    command_id_window: usize,
+    limits: Option<trade_core::RiskLimits>,
+) -> (u64, String) {
     let env = |name: &str| std::env::var(name).unwrap_or_default();
+    let limits = limits.unwrap_or_default();
     let description = format!(
-        "determinism={DETERMINISM_VERSION};specs={};dedup_window={command_id_window};exec_partitions={};routing={:?}",
+        "determinism={DETERMINISM_VERSION};specs={};dedup_window={command_id_window};max_order_qty={};max_order_notional={};exec_partitions={};routing={:?}",
         instrument_specs.trim(),
+        limits.max_order_qty,
+        limits.max_notional,
         env("TC_EXECUTION_KAFKA_PARTITIONS").trim(),
         trade_core::sharding::RouteConfig::from_env(),
     );
@@ -2261,12 +2273,26 @@ mod tests {
     }
 
     #[test]
-    fn config_fingerprint_covers_specs_and_the_dedupe_window() {
-        let (base, description) = deterministic_config("*:tick=1", 500_000);
+    fn config_fingerprint_covers_specs_dedupe_window_and_order_limits() {
+        let limits = |qty, notional| {
+            Some(trade_core::RiskLimits {
+                max_order_qty: qty,
+                max_notional: notional,
+                max_user_orders: 0,
+            })
+        };
+        let (base, description) = deterministic_config("*:tick=1", 500_000, None);
         assert!(description.contains("dedup_window=500000"), "{description}");
-        assert_ne!(deterministic_config("*:tick=5", 500_000).0, base);
-        assert_ne!(deterministic_config("*:tick=1", 400_000).0, base);
-        assert_eq!(deterministic_config(" *:tick=1 ", 500_000).0, base);
+        assert_ne!(deterministic_config("*:tick=5", 500_000, None).0, base);
+        assert_ne!(deterministic_config("*:tick=1", 400_000, None).0, base);
+        assert_eq!(deterministic_config(" *:tick=1 ", 500_000, None).0, base);
+        // Order limits decide rejections, so replicas that differ must not agree.
+        let (with_qty, description) = deterministic_config("*:tick=1", 500_000, limits(1_000, 0));
+        assert!(description.contains("max_order_qty=1000"), "{description}");
+        assert_ne!(with_qty, base);
+        assert_ne!(deterministic_config("*:tick=1", 500_000, limits(1_000, 5)).0, with_qty);
+        // "Unlimited" spelled as all-zero limits is the same config as none.
+        assert_eq!(deterministic_config("*:tick=1", 500_000, limits(0, 0)).0, base);
     }
 
     #[test]

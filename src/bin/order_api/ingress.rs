@@ -130,6 +130,11 @@ pub(crate) fn order_from_query(query: &str) -> Result<Order, String> {
     if let Some(spec) = instrument_specs().get(order.instrument) {
         spec.check(&order)?;
     }
+    // Same per-order limits as the matching nodes (fast fail only; the engine
+    // stays authoritative).
+    if let Some(limits) = order_limits() {
+        limits.check_static(&order)?;
+    }
     Ok(order)
 }
 
@@ -170,6 +175,13 @@ pub(crate) fn order_command_from_query(query: &str) -> Result<trade_core::Comman
             kind,
         },
     ))
+}
+
+/// `TC_MAX_ORDER_QTY` / `TC_MAX_ORDER_NOTIONAL` (same values as the matching
+/// nodes'); `None` when neither is set.
+pub(crate) fn order_limits() -> Option<trade_core::RiskLimits> {
+    static LIMITS: std::sync::OnceLock<Option<trade_core::RiskLimits>> = std::sync::OnceLock::new();
+    *LIMITS.get_or_init(|| trade_core::RiskLimits::from_env().expect("valid order limits"))
 }
 
 /// `TC_INSTRUMENT_SPECS` (same format and value as the matching nodes').

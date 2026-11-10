@@ -343,6 +343,9 @@ services:
     command: ["exec order-api"]
     environment:
       TC_LOG: ${TC_LOG:-info}
+      # Fast-fail copy of the matching nodes' per-order limits (same values).
+      TC_MAX_ORDER_QTY: ${TC_MAX_ORDER_QTY:-0}
+      TC_MAX_ORDER_NOTIONAL: ${TC_MAX_ORDER_NOTIONAL:-0}
       RUST_BACKTRACE: ${RUST_BACKTRACE:-1}
       TC_SLOW_FSYNC_WARN_MS: ${TC_SLOW_FSYNC_WARN_MS:-50}
       TC_ORDER_MYSQL_SHARD_URLS: ${TC_ORDER_MYSQL_SHARD_URLS:-mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-0:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-1:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-2:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-3:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-4:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-5:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-6:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-7:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-8:3306/mysql,mysql://root:${MYSQL_ROOT_PASSWORD:-local-root-password}@mysql-order-9:3306/mysql}

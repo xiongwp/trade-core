@@ -139,6 +139,31 @@ pub struct RiskLimits {
 }
 
 impl RiskLimits {
+    /// Read the per-order limits from the environment:
+    /// `TC_MAX_ORDER_QTY` (lots) and `TC_MAX_ORDER_NOTIONAL` (price * qty, in
+    /// ticks * lots). Unset, empty or `0` means unlimited. `Ok(None)` when
+    /// neither limit is set, so the engine skips the check entirely.
+    ///
+    /// On matching nodes these are replicated-state rules: every replica of a
+    /// group must use the same values (they are part of the config fingerprint).
+    pub fn from_env() -> Result<Option<RiskLimits>, String> {
+        fn read<T: std::str::FromStr + Default>(name: &str) -> Result<T, String> {
+            match std::env::var(name) {
+                Ok(text) if !text.trim().is_empty() => text
+                    .trim()
+                    .parse()
+                    .map_err(|_| format!("{name} must be a non-negative integer, got `{text}`")),
+                _ => Ok(T::default()),
+            }
+        }
+        let limits = RiskLimits {
+            max_order_qty: read("TC_MAX_ORDER_QTY")?,
+            max_notional: read("TC_MAX_ORDER_NOTIONAL")?,
+            max_user_orders: 0,
+        };
+        Ok((limits != RiskLimits::default()).then_some(limits))
+    }
+
     /// Order-shape checks (no book state needed). `Err(reason)` rejects.
     pub fn check_static(&self, order: &Order) -> Result<(), &'static str> {
         if self.max_order_qty > 0 && order.quantity > self.max_order_qty {
@@ -343,6 +368,28 @@ impl<F: FnMut() -> OrderId + Send> AsyncRiskStrategy for MarginMonitor<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn order_limits_read_from_env() {
+        // The only test touching these variables.
+        std::env::remove_var("TC_MAX_ORDER_QTY");
+        std::env::remove_var("TC_MAX_ORDER_NOTIONAL");
+        assert_eq!(RiskLimits::from_env(), Ok(None));
+        std::env::set_var("TC_MAX_ORDER_QTY", "0");
+        assert_eq!(RiskLimits::from_env(), Ok(None), "0 means unlimited");
+        std::env::set_var("TC_MAX_ORDER_QTY", " 1000 ");
+        std::env::set_var("TC_MAX_ORDER_NOTIONAL", "5000000");
+        let limits = RiskLimits::from_env().unwrap().unwrap();
+        assert_eq!((limits.max_order_qty, limits.max_notional), (1000, 5_000_000));
+        let order = Order::limit(OrderId(1), Side::Buy, 100, 1001);
+        assert_eq!(limits.check_static(&order), Err("max-qty"));
+        let order = Order::limit(OrderId(2), Side::Buy, 10_000, 600);
+        assert_eq!(limits.check_static(&order), Err("max-notional"));
+        std::env::set_var("TC_MAX_ORDER_QTY", "-1");
+        assert!(RiskLimits::from_env().is_err());
+        std::env::remove_var("TC_MAX_ORDER_QTY");
+        std::env::remove_var("TC_MAX_ORDER_NOTIONAL");
+    }
 
     #[test]
     fn margin_monitor_flags_underwater_longs() {

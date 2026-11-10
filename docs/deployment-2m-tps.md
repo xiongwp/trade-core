@@ -71,6 +71,8 @@ python3 scripts/deploy/gen_config.py inventory.json out/
 | `TC_ORDER_KAFKA_PARTITIONS_PER_TOPIC` | 16 | 每个指令 topic 16 个分区，共 1,024 个 |
 | `TC_INSTRUMENT_SPECS` | 业务配置 | 交易规则，同一组的副本必须一致，见 6.2 |
 | `TC_DEDUP_WINDOW_IDS` | 2000000 | 去重窗口，同一组的副本必须一致，见 6.2 |
+| `TC_MAX_ORDER_QTY` | 业务配置（inventory `max_order_qty`） | 单笔订单数量上限（lot），0 = 不限。撮合节点和 order-api 必须相同，计入配置指纹 |
+| `TC_MAX_ORDER_NOTIONAL` | 业务配置（inventory `max_order_notional`） | 单笔限价单金额上限（价格 × 数量，单位 tick × lot），0 = 不限；市价单没有价格，不做金额检查。同上 |
 
 **为什么 `TC_VIRTUAL_DB_COUNT` 必须很大**：订单先哈希到逻辑库，逻辑库再映射到物理库。下表用和代码完全相同的哈希算法，算出 400 个物理库的负载分布：
 

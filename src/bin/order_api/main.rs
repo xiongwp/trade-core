@@ -128,6 +128,7 @@ fn main() {
     // Parse the instrument-rule table now: a bad value fails startup, not the
     // first order.
     let _ = instrument_specs();
+    let _ = ingress::order_limits();
     let metrics = Arc::new(OrderPipelineMetrics::default());
     let matcher_groups = parse_matcher_groups();
     let token = std::env::var("TC_ORDER_API_TOKEN").expect("TC_ORDER_API_TOKEN");

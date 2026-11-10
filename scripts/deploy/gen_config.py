@@ -100,6 +100,11 @@ def main(inventory_path, out_dir):
         "TC_ORDER_KAFKA_BROKERS": brokers,
         "TC_EXECUTION_KAFKA_BROKERS": brokers,
         "TC_MARKET_KAFKA_BROKERS": brokers,
+        # Per-order limits (lots; price * qty in ticks * lots). 0 = unlimited.
+        # Replicated-state rules: matching nodes fingerprint them, order-api
+        # pre-checks with the same values, so they must be identical everywhere.
+        "TC_MAX_ORDER_QTY": int(inv.get("max_order_qty", 0)),
+        "TC_MAX_ORDER_NOTIONAL": int(inv.get("max_order_notional", 0)),
     }
 
     # Raft placement. With failure domains, replicas rotate across distinct

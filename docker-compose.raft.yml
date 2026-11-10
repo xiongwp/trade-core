@@ -33,6 +33,9 @@ x-raft-environment: &raft-environment
   # TC_RAFT_CONFIG_CHECK=0 only while rolling from a build without the check.
   TC_INSTRUMENT_SPECS: "${TC_INSTRUMENT_SPECS:-}"
   TC_DEDUP_WINDOW_IDS: "${TC_DEDUP_WINDOW_IDS:-500000}"
+  # Per-order limits, 0 = unlimited. Must match the order service's values.
+  TC_MAX_ORDER_QTY: "${TC_MAX_ORDER_QTY:-0}"
+  TC_MAX_ORDER_NOTIONAL: "${TC_MAX_ORDER_NOTIONAL:-0}"
   TC_RAFT_CONFIG_CHECK: "${TC_RAFT_CONFIG_CHECK:-1}"
   # 1 on every replica only for a coordinated whole-group config change.
   TC_RAFT_CONFIG_ADOPT: "${TC_RAFT_CONFIG_ADOPT:-0}"
