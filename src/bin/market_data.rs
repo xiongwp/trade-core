@@ -50,6 +50,10 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 static MARKET_KAFKA_REQUIRED: AtomicBool = AtomicBool::new(true);
 static MARKET_KAFKA_READY: AtomicBool = AtomicBool::new(false);
 static MARKET_STORAGE_HEALTHY: AtomicBool = AtomicBool::new(true);
+static MARKET_KAFKA_REPLAY_LAG: AtomicU64 = AtomicU64::new(0);
+static MARKET_EVENTS_APPLIED: AtomicU64 = AtomicU64::new(0);
+static MARKET_STATE_SAVE_FAILURES: AtomicU64 = AtomicU64::new(0);
+static MARKET_LAST_PERSIST_UNIX: AtomicU64 = AtomicU64::new(0);
 
 /// Async-signal-safe handler: touches only an atomic flag, nothing else.
 extern "C" fn on_signal(_sig: libc::c_int) {
@@ -439,6 +443,41 @@ fn now_sec() -> u64 {
         .unwrap_or(0)
 }
 
+fn market_metrics(state: &State) -> String {
+    format!(
+        "# TYPE tc_market_kafka_required gauge\n\
+tc_market_kafka_required {}\n\
+# TYPE tc_market_kafka_ready gauge\n\
+tc_market_kafka_ready {}\n\
+# TYPE tc_market_kafka_replay_lag gauge\n\
+tc_market_kafka_replay_lag {}\n\
+# TYPE tc_market_events_applied_total counter\n\
+tc_market_events_applied_total {}\n\
+# TYPE tc_market_storage_healthy gauge\n\
+tc_market_storage_healthy {}\n\
+# TYPE tc_market_state_save_failures_total counter\n\
+tc_market_state_save_failures_total {}\n\
+# TYPE tc_market_last_persist_unix_seconds gauge\n\
+tc_market_last_persist_unix_seconds {}\n\
+# TYPE tc_market_asset_watermarks gauge\n\
+tc_market_asset_watermarks {}\n\
+# TYPE tc_market_kafka_partitions gauge\n\
+tc_market_kafka_partitions {}\n\
+# TYPE tc_market_instruments gauge\n\
+tc_market_instruments {}\n",
+        u64::from(MARKET_KAFKA_REQUIRED.load(Ordering::Acquire)),
+        u64::from(MARKET_KAFKA_READY.load(Ordering::Acquire)),
+        MARKET_KAFKA_REPLAY_LAG.load(Ordering::Acquire),
+        MARKET_EVENTS_APPLIED.load(Ordering::Relaxed),
+        u64::from(MARKET_STORAGE_HEALTHY.load(Ordering::Acquire)),
+        MARKET_STATE_SAVE_FAILURES.load(Ordering::Relaxed),
+        MARKET_LAST_PERSIST_UNIX.load(Ordering::Acquire),
+        state.applied.len(),
+        state.kafka_offsets.len(),
+        state.agg.instruments().len(),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Feed: subscribe to trade-core's fanout, ingest trades + depth
 // ---------------------------------------------------------------------------
@@ -621,6 +660,15 @@ fn feed_one(md_addr: String, state: Arc<Mutex<State>>) {
 /// trade and is partitioned by Raft group, preserving the order required by
 /// `State::take`. TCP fanout remains enabled for low-latency depth and may win
 /// the race for a trade; the same event id makes the Kafka copy a no-op.
+fn kafka_replay_lag(highs: &HashMap<i32, i64>, positions: &HashMap<i32, i64>) -> u64 {
+    highs
+        .iter()
+        .map(|(partition, high)| {
+            high.saturating_sub(positions.get(partition).copied().unwrap_or(0)) as u64
+        })
+        .sum()
+}
+
 fn kafka_trade_loop(
     brokers: String,
     topic: String,
@@ -697,6 +745,10 @@ fn kafka_trade_loop(
     let mut caught_up = startup_highs
         .iter()
         .all(|(partition, high)| replay_positions.get(partition).is_some_and(|offset| offset >= high));
+    MARKET_KAFKA_REPLAY_LAG.store(
+        kafka_replay_lag(&startup_highs, &replay_positions),
+        Ordering::Release,
+    );
     MARKET_KAFKA_READY.store(caught_up, Ordering::Release);
     log_info!(
         "market-data",
@@ -734,7 +786,9 @@ fn kafka_trade_loop(
                     "non-trade event in market topic partition={partition} offset={}",
                     message.offset()
                 );
-                apply_trade_event(&mut state, event, ts);
+                if apply_trade_event(&mut state, event, ts) {
+                    MARKET_EVENTS_APPLIED.fetch_add(1, Ordering::Relaxed);
+                }
                 state
                     .kafka_offsets
                     .entry(partition)
@@ -746,6 +800,10 @@ fn kafka_trade_loop(
                         .get(partition)
                         .is_some_and(|offset| offset >= high)
                 });
+                MARKET_KAFKA_REPLAY_LAG.store(
+                    kafka_replay_lag(&startup_highs, &replay_positions),
+                    Ordering::Release,
+                );
                 MARKET_KAFKA_READY.store(caught_up, Ordering::Release);
             }
             Err(error) => {
@@ -991,6 +1049,15 @@ fn handle_http(
 
     match path {
         "/healthz" => respond(&mut stream, "200 OK", "text/plain", b"ok\n"),
+        "/metrics" => {
+            let body = market_metrics(&state.lock().unwrap());
+            respond(
+                &mut stream,
+                "200 OK",
+                "text/plain; version=0.0.4",
+                body.as_bytes(),
+            );
+        }
         "/readyz" => {
             let kafka_ready = !MARKET_KAFKA_REQUIRED.load(Ordering::Acquire)
                 || MARKET_KAFKA_READY.load(Ordering::Acquire);
@@ -1477,9 +1544,13 @@ fn main() {
                 let parts = market_state_parts(&save_state.lock().unwrap());
                 let bytes = frame_market_state(parts);
                 match write_market_state(&path, &bytes) {
-                    Ok(()) => MARKET_STORAGE_HEALTHY.store(true, Ordering::Release),
+                    Ok(()) => {
+                        MARKET_STORAGE_HEALTHY.store(true, Ordering::Release);
+                        MARKET_LAST_PERSIST_UNIX.store(now_sec(), Ordering::Release);
+                    }
                     Err(error) => {
                         MARKET_STORAGE_HEALTHY.store(false, Ordering::Release);
+                        MARKET_STATE_SAVE_FAILURES.fetch_add(1, Ordering::Relaxed);
                         log_warn!("market-data", "event=history_save_failed error={error}");
                     }
                 }
