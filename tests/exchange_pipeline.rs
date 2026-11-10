@@ -233,6 +233,7 @@ fn modify_reduce_keeps_priority_and_reports_modified() {
     assert!(reports.contains(&ExecReport::Modified {
         instrument: sym,
         order_id: OrderId(1),
+        price: 100,
         remaining: 4,
         user: 0,
     }));

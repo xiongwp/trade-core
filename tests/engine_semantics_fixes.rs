@@ -111,8 +111,29 @@ fn an_amend_that_trades_updates_positions_and_reports_an_stp_stop_as_cancelled()
         )),
         "a stopped taker is gone, not Modified: {out:?}"
     );
+    // The amend itself is acknowledged first (new terms), but nothing after
+    // the trade may claim the order still rests.
+    let first_trade = out
+        .iter()
+        .position(|r| matches!(r, ExecReport::Trade { .. }))
+        .expect("the amend traded");
     assert!(
-        !out.iter().any(|r| matches!(r, ExecReport::Modified { .. })),
+        !out[first_trade..]
+            .iter()
+            .any(|r| matches!(r, ExecReport::Modified { .. })),
+        "{out:?}"
+    );
+    assert!(
+        matches!(
+            out[..first_trade]
+                .iter()
+                .find(|r| matches!(r, ExecReport::Modified { .. })),
+            Some(ExecReport::Modified {
+                price: 102,
+                remaining: 10,
+                ..
+            })
+        ),
         "{out:?}"
     );
 }

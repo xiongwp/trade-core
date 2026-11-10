@@ -593,7 +593,15 @@ pub(crate) fn persist_execution_shard(
                 Value::from(event.report.instrument.0),
                 Value::from(event.report.type_code),
                 Value::from(event.report.qty),
-                Value::from(fill.map_or(0, |fill| fill.price)),
+                // A trade's fill price, or an amend's new price.
+                Value::from(fill.map_or(
+                    if event.report.type_code == wire::RT_MODIFIED {
+                        event.report.price
+                    } else {
+                        0
+                    },
+                    |fill| fill.price,
+                )),
                 Value::from(fill.map_or(0, |fill| fill.fee)),
                 Value::from(fill.map_or(0, |fill| fill.role)),
                 Value::from(record.partition),
@@ -690,20 +698,27 @@ pub(crate) fn drain_statements(db: &str, shard_table: u32, period: u64) -> Strin
                 MAX(IF(report_type={partial},event_qty,0)) partial_qty, \
                 MAX(IF(report_type={filled},1,0)) has_filled, \
                 MAX(IF(rn=1,report_type,0)) latest_type, \
-                SUM(IF(report_type={trade},CAST(event_qty AS DECIMAL(38,0))*event_price,0)) trade_notional \
+                SUM(IF(report_type={trade},CAST(event_qty AS DECIMAL(38,0))*event_price,0)) trade_notional, \
+                MAX(IF(report_type={modified},1,0)) has_modify, \
+                SUM(IF(report_type={trade} AND kafka_offset<mod_offset,event_qty,0)) trade_before_modify, \
+                MAX(IF(report_type={modified} AND kafka_offset=mod_offset,event_qty,0)) modify_remaining, \
+                MAX(IF(report_type={modified} AND kafka_offset=mod_offset,event_price,0)) modify_price \
          FROM ( \
-           SELECT p.*, ROW_NUMBER() OVER (PARTITION BY target_order_id ORDER BY kafka_offset DESC) rn \
+           SELECT p.*, ROW_NUMBER() OVER (PARTITION BY target_order_id ORDER BY kafka_offset DESC) rn, \
+                  MAX(IF(p.report_type={modified},p.kafka_offset,NULL)) OVER (PARTITION BY target_order_id) mod_offset \
            FROM {db}.pending_execution_events p WHERE shard_table={shard_table} \
          ) ranked GROUP BY target_order_id \
          ) e ON e.target_order_id=o.order_id \
-         SET o.status=CASE \
-               WHEN e.has_filled=1 OR GREATEST(o.filled_qty+e.trade_qty,e.partial_qty)>=o.qty THEN 'FILLED' \
+         SET o.qty={new_qty}, \
+             o.price=IF(e.has_modify=1,e.modify_price,o.price), \
+             o.status=CASE \
+               WHEN e.has_filled=1 OR GREATEST(o.filled_qty+e.trade_qty,e.partial_qty)>={new_qty} THEN 'FILLED' \
                WHEN e.latest_type={cancelled} THEN 'CANCELLED' \
                WHEN e.latest_type={rejected} THEN 'REJECTED' \
                WHEN e.latest_type={stop_accepted} THEN 'UNTRIGGERED' \
                WHEN GREATEST(o.filled_qty+e.trade_qty,e.partial_qty)>0 THEN 'PARTIAL' \
                ELSE 'OPEN' END, \
-             o.filled_qty=LEAST(o.qty,GREATEST(o.filled_qty+e.trade_qty,e.partial_qty,IF(e.has_filled=1,o.qty,0))), \
+             o.filled_qty=LEAST({new_qty},GREATEST(o.filled_qty+e.trade_qty,e.partial_qty,IF(e.has_filled=1,{new_qty},0))), \
              o.filled_notional=o.filled_notional+e.trade_notional",
         trade = wire::RT_TRADE,
         partial = wire::RT_PARTIAL,
@@ -711,6 +726,13 @@ pub(crate) fn drain_statements(db: &str, shard_table: u32, period: u64) -> Strin
         cancelled = wire::RT_CANCELLED,
         rejected = wire::RT_REJECTED,
         stop_accepted = wire::RT_STOP_ACCEPTED,
+        modified = wire::RT_MODIFIED,
+        // An amend's `remaining` is the new OPEN quantity (engine semantics),
+        // so the order's total becomes what had filled before the latest
+        // amend plus that remaining. Every assignment uses the pre-update
+        // o.filled_qty, and o.qty changes only when an amend is present, so
+        // the result does not depend on MySQL's assignment order.
+        new_qty = "IF(e.has_modify=1,o.filled_qty+e.trade_before_modify+e.modify_remaining,o.qty)",
     );
     sql.push_str(";\n");
     sql.push_str(&format!(

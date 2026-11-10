@@ -315,9 +315,15 @@ pub enum ExecReport {
         command_id: u64,
         reason: &'static str,
     },
+    /// An amend took effect: the order now rests at `price` with `remaining`
+    /// still open. A re-entering amend (price change or size increase)
+    /// reports this first, before any trade it makes on re-entry, so a
+    /// projection always learns the new terms — then a final Modified (if it
+    /// traded and still rests), Filled or Cancelled.
     Modified {
         instrument: InstrumentId,
         order_id: OrderId,
+        price: Price,
         remaining: Qty,
         user: u64,
     },
@@ -1928,6 +1934,7 @@ impl Processor {
                     } => emit(ExecReport::Modified {
                         instrument,
                         order_id,
+                        price: new_price,
                         remaining,
                         user,
                     }),
@@ -1937,6 +1944,16 @@ impl Processor {
                         user,
                     }),
                     ModifyOutcome::Requoted(report) => {
+                        // The amend itself first: new price, new remaining.
+                        // Without it a re-entry that filled at once carried
+                        // no new terms at all (just trades + Filled).
+                        emit(ExecReport::Modified {
+                            instrument,
+                            order_id,
+                            price: new_price,
+                            remaining: new_qty,
+                            user,
+                        });
                         let last_price = print_range(&report.trades);
                         // The re-entry is a new submission: report makers that
                         // self-trade prevention cancelled, and book positions,
@@ -1996,12 +2013,17 @@ impl Processor {
                         // Modified (still live) before.
                         let remaining = new_qty.saturating_sub(report.filled);
                         if report.resting {
-                            emit(ExecReport::Modified {
-                                instrument,
-                                order_id,
-                                remaining,
-                                user,
-                            });
+                            // Untraded re-entry: the opening Modified already
+                            // said everything.
+                            if report.filled > 0 {
+                                emit(ExecReport::Modified {
+                                    instrument,
+                                    order_id,
+                                    price: new_price,
+                                    remaining,
+                                    user,
+                                });
+                            }
                         } else if report.status == OrderStatus::Filled {
                             emit(ExecReport::Filled {
                                 instrument,

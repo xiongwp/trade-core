@@ -763,9 +763,10 @@ pub fn encode_report(r: &ExecReport, out: &mut [u8; REPORT_LEN]) {
         ExecReport::Modified {
             instrument,
             order_id,
+            price,
             remaining,
             ..
-        } => put(RT_MODIFIED, instrument, order_id, 0, 0, remaining, 0),
+        } => put(RT_MODIFIED, instrument, order_id, 0, price, remaining, 0),
         ExecReport::NotFound {
             instrument,
             order_id,
@@ -1040,8 +1041,8 @@ impl fmt::Display for DecodedReport {
             ),
             RT_MODIFIED => write!(
                 f,
-                "MODIFIED   {} {} remaining {}",
-                self.instrument, self.order_id, self.qty
+                "MODIFIED   {} {} remaining {} @ {}",
+                self.instrument, self.order_id, self.qty, self.price
             ),
             RT_NOTFOUND => write!(f, "NOTFOUND   {} {}", self.instrument, self.order_id),
             other => write!(f, "UNKNOWN({other})"),

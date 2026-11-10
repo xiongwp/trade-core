@@ -538,7 +538,10 @@ fn event_json(payload: &[u8]) -> Option<(u64, String)> {
         wire::RT_MAKER_FILLED => format!("{{\"e\":\"FILLED\",{base},\"role\":\"maker\"}}"),
         wire::RT_RESTING => format!("{{\"e\":\"RESTING\",{base}}}"),
         wire::RT_CANCELLED => format!("{{\"e\":\"CANCELLED\",{base}}}"),
-        wire::RT_MODIFIED => format!("{{\"e\":\"MODIFIED\",{base},\"remaining\":{}}}", report.qty),
+        wire::RT_MODIFIED => format!(
+            "{{\"e\":\"MODIFIED\",{base},\"price\":{},\"remaining\":{}}}",
+            report.price, report.qty
+        ),
         wire::RT_TRIGGERED => format!("{{\"e\":\"TRIGGERED\",{base}}}"),
         wire::RT_REJECTED => format!(
             "{{\"e\":\"REJECTED\",{base},\"reason\":\"{}\"}}",

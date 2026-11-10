@@ -371,6 +371,62 @@ fn kafka_cancel(
     }
 }
 
+fn kafka_modify(
+    order_id: u64,
+    new_price: u64,
+    new_qty: u64,
+    cmd_id: u64,
+    user: u64,
+    instrument: u32,
+    offset: i64,
+) -> KafkaRecord {
+    let mut frame = [0u8; wire::MSG_LEN];
+    wire::encode_modify(
+        InstrumentId(instrument),
+        OrderId(order_id),
+        new_price,
+        new_qty,
+        cmd_id,
+        &mut frame,
+    );
+    KafkaRecord {
+        topic: "mysql-it".into(),
+        partition: 0,
+        offset,
+        category_id: sharding::asset_category(InstrumentId(instrument), 1_000),
+        user,
+        frame,
+    }
+}
+
+/// The engine's Modified report: `remaining` is the new open quantity.
+fn modified_event(
+    target_order_id: u64,
+    price: u64,
+    remaining: u64,
+    instrument: u32,
+    raft_index: u64,
+    offset: i64,
+) -> ExecutionKafkaRecord {
+    let mut record = report_event(wire::RT_MODIFIED, target_order_id, instrument, raft_index, offset);
+    record.event.report.price = price;
+    record.event.report.qty = remaining;
+    record
+}
+
+fn trade_at(
+    target_order_id: u64,
+    price: u64,
+    qty: u64,
+    instrument: u32,
+    raft_index: u64,
+    offset: i64,
+) -> ExecutionKafkaRecord {
+    let mut record = trade_event(target_order_id, target_order_id ^ 0xff, instrument, qty, raft_index, 0, offset);
+    record.event.report.price = price;
+    record
+}
+
 fn report_event(
     type_code: u8,
     target_order_id: u64,
@@ -812,6 +868,101 @@ fn mysql8_command_writer_hands_the_pending_drain_to_the_execution_writer() {
 
 /// Same disposable MySQL 8 as above. Found by the 10k-user stress run:
 /// 129 orders were stuck in CANCEL_PENDING.
+/// Same disposable MySQL 8 as above. The order row follows the engine's
+/// Modified reports (new price, new REMAINING quantity), never the request.
+#[test]
+#[ignore = "requires disposable MySQL 8 via TC_TEST_MYSQL_URL"]
+fn mysql8_amend_follows_engine_reports() {
+    let store = mysql_test_store().expect("TC_TEST_MYSQL_URL must be set");
+    let seed = (std::process::id() as u64) << 32 | journal::now_nanos() as u64 & 0xffff_ffff;
+    let (in_place, repriced, late) = (seed | 1, seed | 2, seed | 3);
+    let (user, instrument) = (88_001, 42_004);
+    let row = |order: u64| -> Option<(u64, u64, u64, String)> {
+        let route = store.routing.route_order_id(order);
+        store
+            .shard(0)
+            .get_conn()
+            .unwrap()
+            .exec_first(
+                format!(
+                    "SELECT price,qty,filled_qty,status FROM order_db_0.{} WHERE order_id=:id",
+                    route.table_name()
+                ),
+                params! {"id" => order},
+            )
+            .unwrap()
+    };
+
+    persist_mysql_shard(
+        &store,
+        0,
+        &[
+            kafka_new(in_place, user, instrument, 10, 1),
+            kafka_new(repriced, user, instrument, 10, 2),
+            kafka_new(late, user, instrument, 10, 3),
+        ],
+    )
+    .unwrap();
+    // All three: 3 of 10 fill at 1000 (late fills completely).
+    persist_events(
+        &store,
+        vec![
+            report_event(wire::RT_RESTING, in_place, instrument, seed, 1),
+            trade_at(in_place, 1_000, 3, instrument, seed + 1, 2),
+            report_event(wire::RT_RESTING, repriced, instrument, seed + 2, 3),
+            trade_at(repriced, 1_000, 3, instrument, seed + 3, 4),
+            trade_at(late, 1_000, 10, instrument, seed + 4, 5),
+            report_event(wire::RT_FILLED, late, instrument, seed + 5, 6),
+        ],
+    )
+    .unwrap();
+
+    // The amend requests themselves change nothing (late: the engine will
+    // answer NotFound — the order already filled).
+    persist_mysql_shard(
+        &store,
+        0,
+        &[
+            kafka_modify(in_place, 1_000, 5, seed + 10, user, instrument, 4),
+            kafka_modify(repriced, 1_005, 5, seed + 11, user, instrument, 5),
+            kafka_modify(late, 1_005, 5, seed + 12, user, instrument, 6),
+        ],
+    )
+    .unwrap();
+    assert_eq!(row(in_place), Some((1_000, 10, 3, "PARTIAL".into())));
+    assert_eq!(row(late), Some((1_000, 10, 10, "FILLED".into())));
+
+    // in_place: reduce to remaining 5, then 2 more fill -> 5 of 8.
+    // repriced: re-enters at 1005 x 5 and fills all 5 at once -> 8 of 8.
+    // Both amends land in one batch with their trades.
+    persist_events(
+        &store,
+        vec![
+            modified_event(in_place, 1_000, 5, instrument, seed + 6, 7),
+            trade_at(in_place, 1_000, 2, instrument, seed + 7, 8),
+            modified_event(repriced, 1_005, 5, instrument, seed + 8, 9),
+            trade_at(repriced, 1_005, 5, instrument, seed + 9, 10),
+            report_event(wire::RT_FILLED, repriced, instrument, seed + 10, 11),
+            report_event(wire::RT_NOTFOUND, late, instrument, seed + 11, 12),
+        ],
+    )
+    .unwrap();
+    assert_eq!(row(in_place), Some((1_000, 8, 5, "PARTIAL".into())));
+    assert_eq!(row(repriced), Some((1_005, 8, 8, "FILLED".into())));
+    assert_eq!(row(late), Some((1_000, 10, 10, "FILLED".into())));
+
+    // A later batch after the amend: the remaining 3 of in_place fill.
+    persist_events(
+        &store,
+        vec![
+            trade_at(in_place, 1_000, 3, instrument, seed + 12, 13),
+            report_event(wire::RT_FILLED, in_place, instrument, seed + 13, 14),
+        ],
+    )
+    .unwrap();
+    assert_eq!(row(in_place), Some((1_000, 8, 8, "FILLED".into())));
+}
+
 #[test]
 #[ignore = "requires disposable MySQL 8 via TC_TEST_MYSQL_URL"]
 fn mysql8_cancel_request_never_overwrites_order_status() {

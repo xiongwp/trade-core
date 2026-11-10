@@ -35,6 +35,7 @@ ACCEPTED, TRADE, FILLED, PARTIAL, RESTING, CANCELLED, REJECTED, MODIFIED = 1, 2,
 NAMES = {1: "ACCEPTED", 2: "TRADE", 3: "FILLED", 4: "PARTIAL", 5: "RESTING", 6: "CANCELLED", 7: "REJECTED", 8: "MODIFIED"}
 
 # Event: (position, type, qty, price). position = (raft_index, ordinal).
+# MODIFIED: qty = the new remaining (open) quantity, price = the new price.
 Ev = namedtuple("Ev", "pos type qty price")
 # Command: ("new", qty, price) or ("modify", new_qty, new_price)
 
@@ -51,6 +52,13 @@ def drain(row, pending):
     latest = evs[-1].type
     notional = sum(e.qty * e.price for e in evs if e.type == TRADE)
     qty, filled, status, fnot = row["qty"], row["filled"], row["status"], row["notional"]
+    price = row["price"]
+    mods = [e for e in evs if e.type == MODIFIED]
+    if mods:
+        # Latest amend: total = filled before it + its remaining.
+        last = mods[-1]
+        before = sum(e.qty for e in evs if e.type == TRADE and e.pos < last.pos)
+        qty, price = filled + before + last.qty, last.price
     g = max(filled + trade_qty, partial_qty)
     if has_filled or g >= qty:
         status = "FILLED"
@@ -63,7 +71,7 @@ def drain(row, pending):
     else:
         status = "OPEN"
     filled = min(qty, max(filled + trade_qty, partial_qty, qty if has_filled else 0))
-    new = dict(row, filled=filled, status=status, notional=fnot + notional)
+    new = dict(row, qty=qty, price=price, filled=filled, status=status, notional=fnot + notional)
     keys = {e.pos for e in evs}
     fills = {e for e in evs if e.type == TRADE}
     return new, keys, fills
@@ -118,9 +126,8 @@ class Model:
             if cmd[0] == "new":
                 if t["row"] is None:
                     t["row"] = dict(qty=cmd[1], price=cmd[2], filled=0, status="PENDING", notional=0)
-            else:  # modify: UPDATE ... SET price, qty, status='MODIFY_PENDING'
-                if t["row"] is not None:
-                    t["row"] = dict(t["row"], qty=cmd[1], price=cmd[2], status="MODIFY_PENDING")
+            else:  # modify: the request changes nothing; the engine's reports decide
+                pass
             ok = dict(t, cmd_pos=s["cmd_pos"] + 1, cmd_off=s["cmd_pos"] + 1, dirty=True)
             out.append(("cmd", ok))
             if s["crashes"] < self.max_crashes:
@@ -173,12 +180,16 @@ class Model:
         return len(seen), violations
 
 
-def expected(status, filled, fills, notional):
+def expected(status, filled, fills, notional, qty=None, price=None):
     def truth(s):
         row = s["row"]
         problems = []
         if row is None:
             return "order row missing"
+        if qty is not None and row["qty"] != qty:
+            problems.append(f"qty {row['qty']} != {qty}")
+        if price is not None and row["price"] != price:
+            problems.append(f"price {row['price']} != {price}")
         if row["status"] != status:
             problems.append(f"status {row['status']} != {status}")
         if row["filled"] != filled:
@@ -213,17 +224,32 @@ def scenarios():
     yield ("partial fill, modify to remaining 5, 2 more fill (still resting 3)",
            [("new", 10, 100), ("modify", 5, 100)],
            [Ev(p(1), ACCEPTED, 0, 0), Ev(p(1, 1), RESTING, 0, 0), Ev(p(2), TRADE, 3, 100),
-            Ev(p(3), MODIFIED, 5, 0), Ev(p(4), TRADE, 2, 100)],
-           expected("PARTIAL", 5, 2, 500))
+            Ev(p(3), MODIFIED, 5, 100), Ev(p(4), TRADE, 2, 100)],
+           expected("PARTIAL", 5, 2, 500, qty=8, price=100))
     yield ("partial fill, modify to remaining 5, all 5 fill",
            [("new", 10, 100), ("modify", 5, 100)],
            [Ev(p(1), ACCEPTED, 0, 0), Ev(p(1, 1), RESTING, 0, 0), Ev(p(2), TRADE, 3, 100),
-            Ev(p(3), MODIFIED, 5, 0), Ev(p(4), TRADE, 5, 100), Ev(p(4, 1), FILLED, 0, 0)],
-           expected("FILLED", 8, 2, 800))
-    yield ("modify without fills",
+            Ev(p(3), MODIFIED, 5, 100), Ev(p(4), TRADE, 5, 100), Ev(p(4, 1), FILLED, 0, 0)],
+           expected("FILLED", 8, 2, 800, qty=8, price=100))
+    yield ("modify without fills (re-entry rests at the new price)",
            [("new", 10, 100), ("modify", 6, 101)],
-           [Ev(p(1), ACCEPTED, 0, 0), Ev(p(1, 1), RESTING, 0, 0), Ev(p(2), MODIFIED, 6, 0)],
-           expected("OPEN", 0, 0, 0))
+           [Ev(p(1), ACCEPTED, 0, 0), Ev(p(1, 1), RESTING, 0, 0), Ev(p(2), MODIFIED, 6, 101)],
+           expected("OPEN", 0, 0, 0, qty=6, price=101))
+    # A re-entering amend reports the new terms first, then its own trades.
+    yield ("partial fill, re-price to 105 x 5, fills all 5 on re-entry",
+           [("new", 10, 100), ("modify", 5, 105)],
+           [Ev(p(1), ACCEPTED, 0, 0), Ev(p(1, 1), RESTING, 0, 0), Ev(p(2), TRADE, 3, 100),
+            Ev(p(3), MODIFIED, 5, 105), Ev(p(3, 1), TRADE, 5, 105), Ev(p(3, 2), FILLED, 0, 0)],
+           expected("FILLED", 8, 2, 825, qty=8, price=105))
+    yield ("partial fill, re-price to 105 x 5, 2 fill on re-entry, 3 rest",
+           [("new", 10, 100), ("modify", 5, 105)],
+           [Ev(p(1), ACCEPTED, 0, 0), Ev(p(1, 1), RESTING, 0, 0), Ev(p(2), TRADE, 3, 100),
+            Ev(p(3), MODIFIED, 5, 105), Ev(p(3, 1), TRADE, 2, 105), Ev(p(3, 2), MODIFIED, 3, 105)],
+           expected("PARTIAL", 5, 2, 510, qty=8, price=105))
+    yield ("amend arrives after the order filled (engine answers NotFound: no event)",
+           [("new", 10, 100), ("modify", 5, 101)],
+           [Ev(p(1), ACCEPTED, 0, 0), Ev(p(1, 1), TRADE, 10, 100), Ev(p(1, 2), FILLED, 0, 0)],
+           expected("FILLED", 10, 1, 1000, qty=10, price=100))
 
 
 def main():

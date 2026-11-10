@@ -154,13 +154,25 @@ fn post_only_amend_that_would_take_cancels_instead_of_trading() {
         },
     );
     assert!(!has_trade(&reports), "{reports:?}");
-    assert!(matches!(
-        reports[..],
-        [ExecReport::Cancelled {
-            order_id: OrderId(2),
-            ..
-        }]
-    ));
+    // The re-entry reports its new terms first, then ends cancelled.
+    assert!(
+        matches!(
+            reports[..],
+            [
+                ExecReport::Modified {
+                    order_id: OrderId(2),
+                    price: 100,
+                    remaining: 5,
+                    ..
+                },
+                ExecReport::Cancelled {
+                    order_id: OrderId(2),
+                    ..
+                }
+            ]
+        ),
+        "{reports:?}"
+    );
     assert_eq!(p.engine(SYM).unwrap().book().best_ask(), Some(100));
 }
 

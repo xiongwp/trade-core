@@ -171,7 +171,6 @@ pub(crate) fn persist_mysql_shard_with(
         0
     });
     let mut orders_by_table: BTreeMap<u32, Vec<Value>> = BTreeMap::new();
-    let mut modifies = Vec::new();
 
     for record in records {
         let command = wire::WireView::parse(&record.frame)
@@ -211,18 +210,11 @@ pub(crate) fn persist_mysql_shard_with(
             // FILLED/CANCELLED, and a late cancel's NotFound then left them
             // stuck (Binance spot likewise never uses PENDING_CANCEL).
             trade_core::Command::Cancel { .. } => {}
-            trade_core::Command::Modify {
-                order_id,
-                new_price,
-                new_qty,
-                ..
-            } => modifies.push((
-                route.table_name(),
-                order_id.0,
-                record.user,
-                new_price,
-                new_qty,
-            )),
+            // Likewise an amend request changes nothing: the engine's
+            // Modified (new price + remaining) or its refusal decides. Writing
+            // price/qty/MODIFY_PENDING here overwrote finished orders and
+            // treated the new remaining quantity as the new total.
+            trade_core::Command::Modify { .. } => {}
             trade_core::Command::ForceClose {
                 instrument,
                 user,
@@ -248,7 +240,7 @@ pub(crate) fn persist_mysql_shard_with(
     // Every write of the batch in one round trip (values inlined, see
     // `multi_insert_sql`): one prepare + execute per order table used to
     // dominate, with a batch spread over ~100 tables per database.
-    let mut statements = Vec::with_capacity(orders_by_table.len() + modifies.len() + 1);
+    let mut statements = Vec::with_capacity(orders_by_table.len() + 1);
     if command_log_enabled() {
         statements.extend(multi_insert_sql(
             &format!("INSERT IGNORE INTO {db}.processed_commands (category_id,kafka_partition,kafka_offset,command_id,user_id,shard_table)"),
@@ -262,11 +254,6 @@ pub(crate) fn persist_mysql_shard_with(
             &format!("INSERT IGNORE INTO {db}.asset_orders_{table:03} (order_id,category_id,user_id,instrument,side,price,qty,status)"),
             8,
             values,
-        ));
-    }
-    for (table, order_id, user, new_price, new_qty) in &modifies {
-        statements.push(format!(
-            "UPDATE {db}.{table} SET price={new_price},qty={new_qty},status='MODIFY_PENDING' WHERE order_id={order_id} AND user_id={user}"
         ));
     }
     if !statements.is_empty() {
