@@ -4,6 +4,10 @@
 //!
 //! Run: cargo bench --bench kafka_produce -- BROKERS TOPIC [SECONDS] [THREADS] [BATCH]
 //!
+//! The benchmark refuses known production topics. Set
+//! `TC_ALLOW_PRODUCTION_BENCHMARK_TOPIC=1` only for an intentionally isolated
+//! environment whose business data may be destroyed.
+//!
 //! Each thread sends batches of BATCH messages to rotating partitions and
 //! waits for every acknowledgement before the next batch, as the outbox
 //! publisher does. Reports acknowledged messages/s and MB/s (uncompressed).
@@ -16,6 +20,15 @@ use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::ClientConfig;
 
 const MESSAGE_BYTES: usize = 104;
+const DEFAULT_TOPIC: &str = "trade-benchmark-v1";
+const PRODUCTION_TOPICS: &[&str] = &[
+    "trade-executions-v1",
+    "trade-market-events-v1",
+    "trade-order-db-v1",
+    "trade-user-events-v1",
+    "trade-execution-outbox-cursors-v1",
+    "trade-route-control-v1",
+];
 
 fn main() {
     let args: Vec<String> = std::env::args()
@@ -29,7 +42,14 @@ fn main() {
     let topic = args
         .get(1)
         .cloned()
-        .unwrap_or_else(|| "trade-executions-v1".into());
+        .unwrap_or_else(|| DEFAULT_TOPIC.into());
+    let production_override = std::env::var("TC_ALLOW_PRODUCTION_BENCHMARK_TOPIC")
+        .is_ok_and(|value| value == "1");
+    assert!(
+        production_override
+            || (!PRODUCTION_TOPICS.contains(&topic.as_str()) && !topic.starts_with("orders-v2-g")),
+        "refusing to publish benchmark payloads to production topic {topic}; use {DEFAULT_TOPIC}"
+    );
     let seconds: u64 = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(60);
     let threads: usize = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(8);
     let batch: usize = args.get(4).and_then(|v| v.parse().ok()).unwrap_or(4096);

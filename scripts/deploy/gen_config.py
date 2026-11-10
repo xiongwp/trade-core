@@ -358,6 +358,7 @@ def main(inventory_path, out_dir):
         f.write(f"rpk topic create --brokers=$B -p {db_count} -r 3 -c retention.ms=$R trade-order-db-v1\n")
         f.write(f"rpk topic create --brokers=$B -p {db_count} -r 3 -c retention.ms=$R trade-executions-v1\n")
         f.write(f"rpk topic create --brokers=$B -p {groups} -r 3 -c retention.ms=$R trade-market-events-v1\n")
+        f.write(f"rpk topic create --brokers=$B -p {db_count} -r 3 -c retention.ms=3600000 trade-benchmark-v1\n")
         f.write(f"rpk topic create --brokers=$B -p {groups} -r 3 -c cleanup.policy=compact trade-execution-outbox-cursors-v1\n")
         f.write("rpk topic create --brokers=$B -p 1 -r 3 -c cleanup.policy=compact trade-route-control-v1\n")
         if push_hosts:

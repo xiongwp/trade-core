@@ -66,8 +66,10 @@ python3 scripts/calibrate/rates.py --seconds 300 \
 **测量**：在 2–4 台客户端机器上同时运行下面的命令，把各台的 MB/s 加起来：
 
 ```bash
-cargo bench --bench kafka_produce -- kf01:9092,kf02:9092,kf03:9092 trade-executions-v1 300 8 4096
+cargo bench --bench kafka_produce -- kf01:9092,kf02:9092,kf03:9092 trade-benchmark-v1 300 8 4096
 ```
+
+压测程序会拒绝写入已知业务 Topic，避免随机压测载荷被正式消费者当成业务事件。
 
 逐步增加客户端数量或线程数，直到总带宽不再上升。这时 broker 的磁盘或网卡应该已经接近饱和，用 `iostat` 和 `sar -n DEV` 确认。
 

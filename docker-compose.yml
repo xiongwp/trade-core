@@ -124,6 +124,10 @@ services:
           --partitions=${TC_MARKET_KAFKA_PARTITIONS:-4} --replicas=3 \
           "${TC_MARKET_KAFKA_TOPIC:-trade-market-events-v1}"
         rpk topic create --if-not-exists --brokers=redpanda:9092 \
+          --partitions=${TC_BENCHMARK_KAFKA_PARTITIONS:-16} --replicas=3 \
+          --topic-config retention.ms=${TC_BENCHMARK_KAFKA_RETENTION_MS:-3600000} \
+          "${TC_BENCHMARK_KAFKA_TOPIC:-trade-benchmark-v1}"
+        rpk topic create --if-not-exists --brokers=redpanda:9092 \
           --partitions=${TC_EXECUTION_CURSOR_PARTITIONS:-16} --replicas=3 \
           --topic-config cleanup.policy=compact \
           "${TC_EXECUTION_CURSOR_TOPIC:-trade-execution-outbox-cursors-v1}"
