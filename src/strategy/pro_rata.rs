@@ -36,9 +36,12 @@ use crate::types::Qty;
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ProRata;
 
+type Remainder = (u32, u128);
+type ProRataScratch = (Vec<Qty>, Vec<Remainder>);
+
 thread_local! {
     /// (floored shares, (idx, fractional remainder)) reused across crosses.
-    static SCRATCH: RefCell<(Vec<Qty>, Vec<(u32, u128)>)> =
+    static SCRATCH: RefCell<ProRataScratch> =
         const { RefCell::new((Vec::new(), Vec::new())) };
 }
 

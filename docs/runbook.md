@@ -44,6 +44,7 @@ symptom. Each entry: **symptom** (which alert or `event=` log line fires),
 | `tc_asset_wal_errors` | command/application durability failures — should stay 0 |
 | `tc_snapshot_write_failures` | atomic engine-snapshot writes that failed |
 | `tc_storage_healthy` | 1 only while local WAL/proof and latest snapshot write are healthy |
+| `tc_storage_free_bytes` | filesystem headroom for this replica's data directory |
 | `tc_order_dlq_total` | order-api messages dead-lettered (poison) |
 
 ### Fail-stop philosophy

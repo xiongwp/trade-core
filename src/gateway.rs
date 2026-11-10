@@ -314,13 +314,15 @@ pub fn serve_forever(
 ) -> io::Result<()> {
     let gateway = Mutex::new(gateway);
     serve_committed_forever(
-        listener,
-        md_listener,
-        0,
-        None,
-        sink,
-        running,
-        max_cmds_per_sec,
+        CommittedServerConfig {
+            listener,
+            md_listener,
+            md_group: 0,
+            metrics: None,
+            sink,
+            running,
+            max_cmds_per_sec,
+        },
         move |commands| {
             let gateway = gateway.lock().expect("gateway lock");
             for command in commands {
@@ -330,6 +332,16 @@ pub fn serve_forever(
         },
         |_| {},
     )
+}
+
+pub struct CommittedServerConfig {
+    pub listener: TcpListener,
+    pub md_listener: Option<TcpListener>,
+    pub md_group: u32,
+    pub metrics: Option<Arc<crate::metrics::Metrics>>,
+    pub sink: ResultSink,
+    pub running: Arc<AtomicBool>,
+    pub max_cmds_per_sec: u64,
 }
 
 /// Serve the wire protocol while handing decoded commands to a consensus
@@ -361,13 +373,7 @@ where
 /// disconnect ends only that TCP session; Raft, journals and the next session
 /// continue with the already committed state.
 pub fn serve_committed_forever<F, R>(
-    listener: TcpListener,
-    md_listener: Option<TcpListener>,
-    md_group: u32,
-    metrics: Option<Arc<crate::metrics::Metrics>>,
-    sink: ResultSink,
-    running: Arc<AtomicBool>,
-    max_cmds_per_sec: u64,
+    config: CommittedServerConfig,
     submit: F,
     report_callback: R,
 ) -> io::Result<()>
@@ -375,6 +381,15 @@ where
     F: Fn(Vec<Command>) -> Option<u64> + Send + Sync + 'static,
     R: Fn(&crate::exchange::ExecutionReportEvent) + Send + Sync + 'static,
 {
+    let CommittedServerConfig {
+        listener,
+        md_listener,
+        md_group,
+        metrics,
+        sink,
+        running,
+        max_cmds_per_sec,
+    } = config;
     let fanout = md_listener.map(|l| {
         crate::log_info!(
             "gateway",

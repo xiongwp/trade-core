@@ -79,6 +79,8 @@ pub struct Metrics {
     pub asset_wal_errors: AtomicU64,
     pub snapshot_write_failures: AtomicU64,
     snapshot_write_failed: AtomicBool,
+    pub storage_free_bytes: AtomicU64,
+    storage_space_low: AtomicBool,
     pub raft_commit_ns_total: AtomicU64,
     pub raft_commit_ns_max: AtomicU64,
     pub raft_commit_samples: AtomicU64,
@@ -191,6 +193,7 @@ impl Metrics {
             format!("# HELP tc_command_latency_ns_max Maximum matching command processing time in nanoseconds\n# TYPE tc_command_latency_ns_max gauge\ntc_command_latency_ns_max {}\n", self.command_latency_ns_max.load(Ordering::Relaxed)),
             c("asset_wal_errors", "Command/application durability failures", self.asset_wal_errors.load(Ordering::Relaxed)),
             c("snapshot_write_failures", "Engine snapshot persistence failures", self.snapshot_write_failures.load(Ordering::Relaxed)),
+            format!("# HELP tc_storage_free_bytes Bytes available to the Raft data filesystem\n# TYPE tc_storage_free_bytes gauge\ntc_storage_free_bytes {}\n", self.storage_free_bytes.load(Ordering::Relaxed)),
             format!("# HELP tc_storage_healthy Local WAL and snapshot storage health (1 = healthy)\n# TYPE tc_storage_healthy gauge\ntc_storage_healthy {}\n", self.storage_healthy() as u8),
             c("raft_commit_ns_total", "Total Raft quorum commit time in nanoseconds", self.raft_commit_ns_total.load(Ordering::Relaxed)),
             c("raft_commit_samples", "Raft quorum commit batches", self.raft_commit_samples.load(Ordering::Relaxed)),
@@ -255,6 +258,13 @@ impl Metrics {
     pub fn storage_healthy(&self) -> bool {
         self.asset_wal_errors.load(Ordering::Acquire) == 0
             && !self.snapshot_write_failed.load(Ordering::Acquire)
+            && !self.storage_space_low.load(Ordering::Acquire)
+    }
+
+    pub fn set_storage_free_bytes(&self, bytes: u64, minimum: u64) {
+        self.storage_free_bytes.store(bytes, Ordering::Release);
+        self.storage_space_low
+            .store(bytes < minimum, Ordering::Release);
     }
 
     pub fn record_snapshot_write_result(&self, result: &std::io::Result<()>) {
@@ -472,8 +482,7 @@ impl LatencyHistogram {
         }
         let rank = q * total as f64;
         let mut cum: u64 = 0;
-        for i in 0..BUCKET_COUNT {
-            let c = counts[i];
+        for (i, &c) in counts.iter().enumerate() {
             let cum_before = cum;
             cum += c;
             if cum as f64 >= rank && c > 0 {
@@ -506,7 +515,7 @@ impl LatencyHistogram {
         let _ = write!(out, "# HELP tc_{base} {help}\n# TYPE tc_{base} histogram\n");
         self.render_into(&mut out, base, None);
         for suffix in ["p50", "p90", "p99"] {
-            let _ = write!(out, "# TYPE tc_{base}_{suffix} gauge\n");
+            let _ = writeln!(out, "# TYPE tc_{base}_{suffix} gauge");
         }
         out
     }
@@ -530,29 +539,29 @@ impl LatencyHistogram {
             None => (String::new(), String::new()),
         };
         let mut cum: u64 = 0;
-        for i in 0..FINITE_BUCKETS {
-            cum += counts[i];
-            let _ = write!(
+        for (i, count) in counts.iter().take(FINITE_BUCKETS).enumerate() {
+            cum += count;
+            let _ = writeln!(
                 out,
-                "tc_{base}_bucket{{{}le=\"{}\"}} {}\n",
+                "tc_{base}_bucket{{{}le=\"{}\"}} {}",
                 bucket_prefix,
                 bucket_le(i),
                 cum
             );
         }
         cum += counts[FINITE_BUCKETS];
-        let _ = write!(
+        let _ = writeln!(
             out,
-            "tc_{base}_bucket{{{}le=\"+Inf\"}} {}\n",
+            "tc_{base}_bucket{{{}le=\"+Inf\"}} {}",
             bucket_prefix, cum
         );
-        let _ = write!(out, "tc_{base}_sum{} {}\n", gauge_extra, sum_ns);
-        let _ = write!(out, "tc_{base}_count{} {}\n", gauge_extra, total);
+        let _ = writeln!(out, "tc_{base}_sum{} {}", gauge_extra, sum_ns);
+        let _ = writeln!(out, "tc_{base}_count{} {}", gauge_extra, total);
         // Estimated quantile gauges (nanoseconds).
         for (q, suffix) in [(0.5, "p50"), (0.9, "p90"), (0.99, "p99")] {
-            let _ = write!(
+            let _ = writeln!(
                 out,
-                "tc_{base}_{suffix}{} {}\n",
+                "tc_{base}_{suffix}{} {}",
                 gauge_extra,
                 Self::quantile_from(&counts, q)
             );
@@ -594,7 +603,7 @@ impl LatencyHistograms {
             // Quantile gauges share the base name with a suffix; declare their
             // TYPE so scrapers treat them as gauges rather than histogram parts.
             for suffix in ["p50", "p90", "p99"] {
-                let _ = write!(out, "# TYPE tc_{base}_{suffix} gauge\n");
+                let _ = writeln!(out, "# TYPE tc_{base}_{suffix} gauge");
             }
         }
     }
@@ -674,7 +683,7 @@ impl LabeledHistogram {
             self.hists[i].render_into(out, base, Some(&kv));
         }
         for suffix in ["p50", "p90", "p99"] {
-            let _ = write!(out, "# TYPE tc_{base}_{suffix} gauge\n");
+            let _ = writeln!(out, "# TYPE tc_{base}_{suffix} gauge");
         }
     }
 }
@@ -958,6 +967,10 @@ mod tests {
         assert!(!m.storage_healthy());
         assert_eq!(m.snapshot_write_failures.load(Ordering::Relaxed), 1);
         m.record_snapshot_write_result(&Ok(()));
+        assert!(m.storage_healthy());
+        m.set_storage_free_bytes(99, 100);
+        assert!(!m.storage_healthy());
+        m.set_storage_free_bytes(100, 100);
         assert!(m.storage_healthy());
     }
 

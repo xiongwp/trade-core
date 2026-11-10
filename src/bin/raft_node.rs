@@ -4,9 +4,11 @@
 //! Client frames reach the matching queue only through committed Raft entries.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::ffi::CString;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
@@ -49,6 +51,17 @@ fn max_raft_message_bytes() -> usize {
 const PEER_FRAME_BYTES: usize = 16 << 20;
 /// Set in a frame's length word when more frames of the same message follow.
 const FRAME_CONTINUES: u32 = 1 << 31;
+
+fn filesystem_available_bytes(path: &Path) -> std::io::Result<u64> {
+    let path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in data path"))?;
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    if unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let stats = unsafe { stats.assume_init() };
+    Ok((stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64))
+}
 /// Operator-created marker for replacing a voter's lost stable storage while
 /// retaining its configured node id. It persists across process crashes and
 /// is removed only after the leader has rediscovered this member's real log
@@ -314,6 +327,17 @@ fn main() {
     });
     let metrics = handle.metrics.clone();
     metrics.set_ready(false);
+    let minimum_free_bytes = std::env::var("TC_RAFT_MIN_FREE_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(1 << 30);
+    match filesystem_available_bytes(&data_dir) {
+        Ok(bytes) => metrics.set_storage_free_bytes(bytes, minimum_free_bytes),
+        Err(error) => {
+            metrics.set_storage_free_bytes(0, minimum_free_bytes.max(1));
+            log_error!("raft-node", "event=storage_probe_failed error={error}");
+        }
+    }
     // Single-group deployment: register one commit-latency series (group 0).
     // A future split-matching topology registers one per group here.
     metrics.register_raft_commit_groups(1);
@@ -365,6 +389,7 @@ fn main() {
     let runtime_snapshot_path = engine_snapshot_path.clone();
     let runtime_rejoin_marker_path = rejoin_marker_path.clone();
     let runtime_asset_root = asset_root.clone();
+    let runtime_data_dir = data_dir.clone();
     // Migration steps proposed by the admin routes below: (entry, reply with
     // the committed index). Only a leader proposes; elsewhere the reply
     // channel is dropped and the caller is told to ask the leader.
@@ -384,6 +409,7 @@ fn main() {
             // incarnation (see below).
             let mut incarnation_proposed = false;
             let mut last_tick = Instant::now();
+            let mut last_storage_probe = Instant::now() - Duration::from_secs(1);
             // Compaction probe: the matching snapshot's applied index, cached
             // against the file's (mtime, len) and re-checked at most once a
             // second. Decoding the snapshot (every resting order) on each 2 ms
@@ -620,6 +646,21 @@ fn main() {
                     }
                 }
                 was_leader = leader;
+                if last_storage_probe.elapsed() >= Duration::from_secs(1) {
+                    last_storage_probe = Instant::now();
+                    match filesystem_available_bytes(&runtime_data_dir) {
+                        Ok(bytes) => runtime_metrics
+                            .set_storage_free_bytes(bytes, minimum_free_bytes),
+                        Err(error) => {
+                            runtime_metrics
+                                .set_storage_free_bytes(0, minimum_free_bytes.max(1));
+                            log_error!(
+                                "raft-node",
+                                "event=storage_probe_failed error={error}"
+                            );
+                        }
+                    }
+                }
                 runtime_leadership.store(leader, Ordering::Release);
                 runtime_metrics.set_raft_state(
                     leader as u64 * 2,
@@ -1021,13 +1062,15 @@ fn main() {
 
     let ingress_running = running.clone();
     gateway::serve_committed_forever(
-        listener,
-        Some(md_listener),
-        raft_group_id,
-        Some(metrics.clone()),
-        sink,
-        running.clone(),
-        0,
+        gateway::CommittedServerConfig {
+            listener,
+            md_listener: Some(md_listener),
+            md_group: raft_group_id,
+            metrics: Some(metrics.clone()),
+            sink,
+            running: running.clone(),
+            max_cmds_per_sec: 0,
+        },
         move |commands| {
             // Bounded: a batch held here while this node is not a ready
             // leader would otherwise be proposed whenever it becomes one,

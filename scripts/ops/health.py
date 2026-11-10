@@ -88,8 +88,9 @@ def check_group(group, replicas, limits):
         report("WARN", f"group {group}", f"several replicas report leadership {terms}", "an old leader not yet stepped down; recheck in a few seconds")
     leader = max(leaders, key=lambda a: seen[a].get("tc_raft_term", 0))
     lm = seen[leader]
-    heartbeat_age = time.time() * 1000 - lm.get("tc_raft_runtime_heartbeat_unix_ms", 0)
-    if heartbeat_age > 5_000:
+    heartbeat = lm.get("tc_raft_runtime_heartbeat_unix_ms")
+    heartbeat_age = time.time() * 1000 - heartbeat if heartbeat else 0
+    if heartbeat and heartbeat_age > 5_000:
         report("FAIL", f"group {group} leader {leader}",
                f"Raft runtime heartbeat stale by {heartbeat_age / 1000:,.1f}s",
                "capture thread stacks; restart only this group process")

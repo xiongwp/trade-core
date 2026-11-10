@@ -192,6 +192,7 @@ def main(inventory_path, out_dir):
         "TC_RAFT_CONFIG_ADOPT": 0,
         "TC_RAFT_READY_MAX_APPLY_LAG": 32,
         "TC_RAFT_READY_MAX_OUTBOX_PENDING": 50_000,
+        "TC_RAFT_MIN_FREE_BYTES": 10 * 1024**3,
         "TC_RAFT_TRANSPORT_QUEUE": 8192,
         "TC_MATCH_POOL_PER_ASSET": 4096,
         "TC_EXECUTION_OUTBOX_SYNC_EVERY": 1,

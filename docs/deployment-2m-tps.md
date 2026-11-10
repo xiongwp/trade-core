@@ -119,6 +119,7 @@ raft-multi-node 1 64 /data
 | `TC_RAFT_CONFIG_ADOPT` | 0 | 平时为 0；全组统一修改上面那些确定性参数时，所有副本临时设为 1 |
 | `TC_RAFT_READY_MAX_APPLY_LAG` | 32 | 应用滞后超过这么多条时，节点不接新指令 |
 | `TC_RAFT_READY_MAX_OUTBOX_PENDING` | 50000 | outbox 待发事件超过这么多时，节点不接新指令（不要太小，防止成交高峰时误判） |
+| `TC_RAFT_MIN_FREE_BYTES` | 10 GiB | 数据盘可用空间低于该值时主动降 readiness，避免等到 WAL 遇到 ENOSPC |
 | `TC_RAFT_TRANSPORT_QUEUE` | 8192 | 副本之间的消息队列长度 |
 | `TC_MATCH_POOL_PER_ASSET` | 4096 | 每个品种预分配的订单槽数，热门品种可以调大 |
 | `TC_EXECUTION_OUTBOX_SYNC_EVERY` | 1 | 每个 Raft 条目刷盘一次 outbox，**不要调大** |

@@ -58,7 +58,7 @@ impl OrderPipelineMetrics {
     pub(crate) fn try_open_http_connection(&self, max: u64) -> bool {
         let opened = self
             .http_active_connections
-            .fetch_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |active| {
+            .try_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |active| {
                 (active < max).then_some(active + 1)
             })
             .is_ok();
